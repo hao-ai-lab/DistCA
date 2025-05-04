@@ -9,13 +9,34 @@ from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, T
 from rich.console import Console
 from rich import print as rprint
 
+filename = 'cp_shardq2'
+result_path = Path(__file__).parent.parent / 'results' / f'{filename}.jsonl'
+result_path.parent.mkdir(parents=True, exist_ok=True)
+
+
 K = 1024
 M = K * K
 
-def get_mask(qo_len, kv_len, rank, batch_size):
-    # Dummy mask generation for illustration; replace with your actual logic.
-    mask = torch.ones(batch_size * qo_len, kv_len, dtype=torch.bool)
-    return mask
+def get_mask(q_length, kv_length, rank, batch_size):
+    assert q_length % 2 == 0
+    q_length = q_length // 2
+    a = torch.zeros((q_length, kv_length), dtype=torch.bool)
+    b = torch.ones((q_length, kv_length), dtype=torch.bool)
+
+    # Upper
+    for i in range(q_length):
+        right = rank * q_length + i + 1
+        a[i, :right] = True
+    for i in range(q_length):
+        start = kv_length - q_length * (rank+1) + i + 1
+        # print(start)
+        b[i, start:] = False
+        pass
+    # concat a, b 
+    c = torch.cat([a, b], dim=0)
+    # replicate c `batch_size` times
+    d = torch.cat([c] * batch_size, dim=0)
+    return d
 
 def visualize_mask_heatmap(mask):
     import matplotlib.pyplot as plt
@@ -31,11 +52,11 @@ def run_flash_attention(rank, batch_size, qo_len, kv_len, num_qo_heads, num_kv_h
         v = torch.randn(kv_len, num_kv_heads, head_dim).half().to(device)
         mask = get_mask(qo_len, kv_len, rank, batch_size).to(device)
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
         compute_times = []
 
         for _ in range(10):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
             _ = flashinfer.single_prefill_with_kv_cache(q, k, v, custom_mask=mask)
             end_event.record()
@@ -68,7 +89,7 @@ def safe_run_flash_attention(rank, batch_size, qo_len, kv_len, num_qo_heads, num
         args=(rank, batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, device, queue)
     )
     p.start()
-    p.join(timeout=60)
+    p.join(timeout=300) # seconds
 
     if p.is_alive():
         p.terminate()
@@ -83,17 +104,30 @@ if __name__ == "__main__":
     qo_lens = [8, 16, 32, 64, 128, 256]
     batch_sizes = [1, 2, 4, 8]
     result = []
-    
-    result_path = Path(__file__).parent.parent / 'results' / 'cp_shardq.jsonl'
-    result_path.parent.mkdir(parents=True, exist_ok=True)
 
+    configs = dict(
+        llama8b = dict(
+            num_qo_heads=32,
+            num_kv_heads=8,
+            head_dim=128,
+        ),
+        llama70b = dict(
+            num_qo_heads=64,
+            num_kv_heads=8,
+            head_dim=128,
+        )
+    )
+    
     # Load existing results
     completed_runs = set()
     if result_path.exists():
         with open(result_path, "r") as f:
             for line in f:
                 item = json.loads(line)
-                key = (item['cp_degree'], item['rank'], item['batch_size'], item['qo_len'])
+                key = (
+                    item['cp_degree'], item['rank'], item['batch_size'], item['qo_len'],
+                    item['num_qo_heads'], item['num_kv_heads'], item['head_dim']
+                )
                 completed_runs.add(key)
 
     total_tasks = len(batch_sizes) * len(qo_lens) * sum([
@@ -109,32 +143,42 @@ if __name__ == "__main__":
         console=console,
     ) as progress:
         task = progress.add_task("[cyan]Running flash attention benchmarks...", total=total_tasks)
+        for name, config in configs.items():
+            for cp_degree in cp_degrees:
+                for batch_size in batch_sizes:
+                    for qo_len in qo_lens:
+                        for rank in range(cp_degree):
+                            # Skip if already computed
+                            num_qo_heads = config['num_qo_heads']
+                            num_kv_heads = config['num_kv_heads']
+                            head_dim = config['head_dim']
+                            key = (
+                                cp_degree, rank, batch_size, qo_len,
+                                num_qo_heads, num_kv_heads, head_dim,
+                            )
+                            if key in completed_runs:
+                                progress.console.print(f"[yellow]Skipping completed run: cp_degree={cp_degree}, rank={rank}, batch_size={batch_size}, qo_len={qo_len}[/yellow]")
+                                progress.advance(task)
+                                continue
 
-        for cp_degree in cp_degrees:
-            for batch_size in batch_sizes:
-                for qo_len in qo_lens:
-                    for rank in range(cp_degree):
-                        # Skip if already computed
-                        if (cp_degree, rank, batch_size, qo_len) in completed_runs:
-                            progress.console.print(f"[yellow]Skipping completed run: cp_degree={cp_degree}, rank={rank}, batch_size={batch_size}, qo_len={qo_len}[/yellow]")
+                            adjusted_qo_len = K * (qo_len // cp_degree)
+                            kv_len = K * qo_len
+                            res = safe_run_flash_attention(
+                                rank, batch_size, adjusted_qo_len, kv_len, 
+                                num_qo_heads, num_kv_heads, head_dim,
+                            )
                             progress.advance(task)
-                            continue
+                            if "error" in res:
+                                rprint(f"[red]Error in cp_degree={cp_degree}, rank={rank}, batch_size={batch_size}, qo_len={qo_len}: {res['error']}[/red]")
+                                continue
 
-                        adjusted_qo_len = K * (qo_len // 2 // cp_degree)
-                        kv_len = K * qo_len
-                        res = safe_run_flash_attention(rank, batch_size, adjusted_qo_len, kv_len, 32, 8)
-                        progress.advance(task)
-                        if "error" in res:
-                            rprint(f"[red]Error in cp_degree={cp_degree}, rank={rank}, batch_size={batch_size}, qo_len={qo_len}: {res['error']}[/red]")
-                            continue
+                            rprint(f"[green]cp_degree={cp_degree}, rank={rank}, batch_size={batch_size}, qo_len={qo_len}: {res['median_compute_time']:.2f} ms[/green]")
+                        
+                            # Add cp_degree to result
+                            res['cp_degree'] = cp_degree
+                            result.append(res)
 
-                        rprint(f"[green]cp_degree={cp_degree}, rank={rank}, batch_size={batch_size}, qo_len={qo_len}: {res['median_compute_time']:.2f} ms[/green]")
-                    
-                        # Add cp_degree to result
-                        res['cp_degree'] = cp_degree
-                        result.append(res)
-
-                        with open(result_path, "a") as f:
-                            json.dump(res, f)
-                            f.write("\n")
+                            with open(result_path, "a") as f:
+                                json.dump(res, f)
+                                f.write("\n")
                         
