@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from rich import print
+from pathlib import Path
 
 parser = argparse.ArgumentParser(description="per-sequence CP test arguments")
 parser.add_argument("--context_length", type=int,  default=128)   # ×1024
@@ -22,6 +23,10 @@ parser.add_argument("--std_doc_len",   type=float,default=0.5)
 parser.add_argument("--cp_size",       type=int,  default=4)
 parser.add_argument("--fix_seed",      type=int,  default=1)
 parser.add_argument("--doc_lens",      type=str,  default=None)
+parser.add_argument("--output_path",   type=str,  default=None)
+
+default_output_path = Path(__file__).parent.parent / "results" / "docshard_result.jsonl"
+
 
 
 from flash_attn.flash_attn_interface import (
@@ -214,34 +219,55 @@ def run(rank: int, world_size: int, args):
     print("rank:{}, per_seq_latency:{:.3f}ms, per_doc_latency:{:.3f}ms, speedup:{:.3f}x".format(rank, per_seq_latency, per_doc_latency, speedup))
     dist.barrier(device_ids=[rank])
     
-    # gather `per_seq_latency` and `per_doc_latency` to rank 0
-    per_seq_latency_list = [torch.zeros(1, dtype=torch.float32, device=device) for _ in range(world_size)]
-    per_doc_latency_list = [torch.zeros(1, dtype=torch.float32, device=device) for _ in range(world_size)]
-    dist.gather(per_seq_latency, per_seq_latency_list, dst=0)
-    dist.gather(per_doc_latency, per_doc_latency_list, dst=0)
+    # Convert float latencies to tensors
+    per_seq_latency_tensor = torch.tensor([per_seq_latency], dtype=torch.float32, device=device)
+    per_doc_latency_tensor = torch.tensor([per_doc_latency], dtype=torch.float32, device=device)
+
+    if rank == 0:
+        # Only create gather lists on rank 0
+        per_seq_latency_list = [torch.zeros(1, dtype=torch.float32, device=device) for _ in range(world_size)]
+        per_doc_latency_list = [torch.zeros(1, dtype=torch.float32, device=device) for _ in range(world_size)]
+        dist.gather(per_seq_latency_tensor, per_seq_latency_list, dst=0)
+        dist.gather(per_doc_latency_tensor, per_doc_latency_list, dst=0)
+    else:
+        # On other ranks, don't specify gather_list
+        dist.gather(per_seq_latency_tensor, dst=0)
+        dist.gather(per_doc_latency_tensor, dst=0)
 
     dist.destroy_process_group()
 
-    item = dict(
-        per_seq_latency=per_seq_latency_list,
-        per_doc_latency=per_doc_latency_list,
-        speedup=speedup,
-        context_length=context_length,
-        batch_size=batch_size,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        cp_size=cp_size,
-        doc_lens=doc_lens,
-    )
-
     if rank == 0:
-        with open("result.jsonl", "a") as f:
+        per_seq_latency_list = [
+            per_seq_latency_list[i].tolist() for i in range(world_size)
+        ]
+        per_doc_latency_list = [
+            per_doc_latency_list[i].tolist() for i in range(world_size)
+        ]
+
+        item = dict(
+            per_seq_latency=per_seq_latency_list,
+            per_doc_latency=per_doc_latency_list,
+            speedup=speedup,
+            context_length=context_length,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            cp_size=cp_size,
+            doc_lens=doc_lens,
+        )
+        
+        with open(args.output_path, "a") as f:
             f.write(json.dumps(item) + "\n")
+
+        print_on_main(rank, item)
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
+
+    if args.output_path is None:
+        args.output_path = str(default_output_path)
 
     world_size = args.cp_size
     mp.spawn(
@@ -250,3 +276,9 @@ if __name__ == "__main__":
         args=(world_size, args),
         join=True,
     )
+
+
+"""
+python main_docshard.py --batch_size 1 --num_heads 32 --head_dim 128 --cp_size 4 --doc_lens '[i * 1024 for i in [16] + [1] * 16 ]'
+python main_docshard.py --batch_size 1 --num_heads 32 --head_dim 128 --cp_size 4 --doc_lens '[i * 1024 for i in [2] * 16 ]'
+"""
