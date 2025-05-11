@@ -18,7 +18,7 @@ result_path.parent.mkdir(parents=True, exist_ok=True)
 Config = namedtuple('Config', ['rank', 'batch_size', 'qo_len', 'kv_len', 'num_qo_heads', 'num_kv_heads', 'head_dim', 'tp_size'])
 
 def get_mask(q_length, kv_length, rank, batch_size):
-    a = torch.tril(torch.ones(q_length, kv_length), dtype=torch.bool)
+    a = torch.tril(torch.ones(q_length, kv_length, dtype=torch.bool))
     b = torch.cat([a] * batch_size, dim=0)
     return b
 
@@ -135,56 +135,57 @@ if __name__ == "__main__":
                 )
                 completed_runs.add(config_tuple)
     
-    for name, model_config in configs.items():
-        for tp_size in tp_sizes:
-            for k in range(10, 20 + 1):
-                qo_len = kv_len = 2 ** k
-                config = dict(
-                    rank=0,
-                    batch_size=1,
-                    qo_len=qo_len,
-                    kv_len=kv_len,
-                    num_qo_heads=model_config['num_qo_heads'],
-                    num_kv_heads=model_config['num_kv_heads'],
-                    head_dim=model_config['head_dim'],
-                    tp_size=tp_size,
-                )
-                config_tuple = Config(
-                    rank=config['rank'],
-                    batch_size=config['batch_size'],
-                    qo_len=config['qo_len'],
-                    kv_len=config['kv_len'],
-                    num_qo_heads=config['num_qo_heads'],
-                    num_kv_heads=config['num_kv_heads'],
-                    head_dim=config['head_dim'],
-                    tp_size=tp_size
-                )
-                if config_tuple in completed_runs:
-                    print(f"Skipping already computed config: {config_tuple}")
-                    continue
+    for batch_size in [1, 2, 4, 8]:    
+        for name, model_config in configs.items():
+            for tp_size in tp_sizes:
+                for k in range(10, 20 + 1):
+                    qo_len = kv_len = 2 ** k
+                    config = dict(
+                        rank=0,
+                        batch_size=batch_size,
+                        qo_len=qo_len,
+                        kv_len=kv_len,
+                        num_qo_heads=model_config['num_qo_heads'],
+                        num_kv_heads=model_config['num_kv_heads'],
+                        head_dim=model_config['head_dim'],
+                        tp_size=tp_size,
+                    )
+                    config_tuple = Config(
+                        rank=config['rank'],
+                        batch_size=config['batch_size'],
+                        qo_len=config['qo_len'],
+                        kv_len=config['kv_len'],
+                        num_qo_heads=config['num_qo_heads'],
+                        num_kv_heads=config['num_kv_heads'],
+                        head_dim=config['head_dim'],
+                        tp_size=tp_size
+                    )
+                    if config_tuple in completed_runs:
+                        print(f"Skipping already computed config: {config_tuple}")
+                        continue
 
-                print(f"Running {name} with tp_size={tp_size}, k={k}, qo_len {qo_len}, kv_len {kv_len}, num_qo_heads {model_config['num_qo_heads'] // tp_size}, num_kv_heads {model_config['num_kv_heads'] // tp_size}, head_dim {model_config['head_dim']}")
-                
-                results_queue = mp.Queue()
-                p = mp.Process(target=run_benchmark, args=(config, results_queue))
-                p.start()
-                p.join()
+                    print(f"Running {name} with tp_size={tp_size}, k={k}, qo_len {qo_len}, kv_len {kv_len}, num_qo_heads {model_config['num_qo_heads'] // tp_size}, num_kv_heads {model_config['num_kv_heads'] // tp_size}, head_dim {model_config['head_dim']}")
+                    
+                    results_queue = mp.Queue()
+                    p = mp.Process(target=run_benchmark, args=(config, results_queue))
+                    p.start()
+                    p.join()
 
-                if p.is_alive():
-                    p.terminate()
-                    continue
+                    if p.is_alive():
+                        p.terminate()
+                        continue
 
-                config_result, result = results_queue.get()
-                if config_result is None:
-                    print(f"Failed {config} run with error: {result}")
-                    sleep(3)
-                    continue
-                results[config_result] = result
-                print(f"Finished {config_result} with result: {result}")
+                    config_result, result = results_queue.get()
+                    if config_result is None:
+                        print(f"Failed {config} run with error: {result}")
+                        sleep(3)
+                        continue
+                    results[config_result] = result
+                    print(f"Finished {config_result} with result: {result}")
 
-                result_dict = dict(
-                    **config, 
-                    computed_time=result,
-                )
-                with open(result_path, 'a') as f:
-                    f.write(json.dumps(result_dict) + '\n')
+                    result_dict = dict(
+                        **config, 
+                        computed_time=result,
+                    )
+                    with open(result_path, 'a') as f:
+                        f.write(json.dumps(result_dict) + '\n')

@@ -106,7 +106,8 @@ def safe_run_flash_attention(rank, batch_size, qo_len, kv_len, num_qo_heads, num
 if __name__ == "__main__":
     mp.set_start_method("spawn")  # Safe for CUDA
     cp_degrees = [4, 8, 2, 1]
-    qo_lens = [8, 16, 32, 64, 128, 256]
+    # qo_lens = [8, 16, 32, 64, 128, 256]
+    qo_lens = [512, 1024]
     batch_sizes = [1, 2, 4, 8]
     result = []
 
