@@ -5,7 +5,7 @@ import enum
 import pandas as pd
 from functools import lru_cache
 
-from utils import dtype_to_str, DTYPE, CommType
+from .utils import dtype_to_str, DTYPE, CommType
 
 KB = 1024
 

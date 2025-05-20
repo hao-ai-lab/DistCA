@@ -1,14 +1,16 @@
 import enum
+import os
 import pandas as pd
 from functools import lru_cache
 
-from utils import dtype_to_str, DTYPE, CommType
+from .utils import dtype_to_str, DTYPE, CommType
 
 KB = 1024
 
-GEMM_TMPL = "profile/comp/{gpu}/gemm.csv"
-MHA_TMPL = "profile/comp/{gpu}/mha.csv"
-BI_MHA_TMPL = "profile/comp/{gpu}/bimha.csv"
+this_dir = os.path.dirname(os.path.abspath(__file__))
+GEMM_TMPL = os.path.join(this_dir, "profile/comp/{gpu}/gemm.csv")
+MHA_TMPL = os.path.join(this_dir, "profile/comp/{gpu}/mha.csv")
+BI_MHA_TMPL = os.path.join(this_dir, "profile/comp/{gpu}/bimha.csv")
 
 
 @lru_cache(maxsize=512)
