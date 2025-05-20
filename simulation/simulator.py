@@ -71,7 +71,7 @@ class Simulator:
             num_tokens: 1-dim array of shape (num_data,). Each datapoint is the number of tokens
             of a data sample in the batch.
         """
-        tp_log = np.log2(tp_degree)
+        tp_log = int(np.log2(tp_degree))
         mlp_time = self.mlp_time[tp_log]
         # 1. clip num_tokens to the nearest power of 2
         num_tokens = num_tokens / cp_degree
@@ -79,7 +79,7 @@ class Simulator:
 
         num_tokens_log_floor = np.floor(num_tokens_log).astype(int)
         max_index = self.mlp_time.shape[0] - 2
-        clipped_index = np.clip(0, max_index)
+        clipped_index = np.clip(num_tokens_log_floor, 0, max_index)
 
         # 2. get the mlp time
         mlp_time_left = mlp_time[list(clipped_index)]
