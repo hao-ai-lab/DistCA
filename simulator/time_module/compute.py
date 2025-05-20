@@ -75,6 +75,34 @@ def _interpolate(
         r2 = (col2_val - small[col2]) / (large[col2] - small[col2])
         r = (r1 * r2) ** 0.5
         return small[target_col] * (1 - r) + large[target_col] * r
+    
+def _interpolate_1d(
+    df: pd.DataFrame,
+    col: str,
+    val: int,
+    target_col: str,
+) -> float:
+    small = df[df[col] <= val]
+    large = df[df[col] >= val]
+    if len(small) == 0 or len(large) == 0:
+        if len(small) == 0 and len(large) != 0:
+            return large.iloc[0][target_col]
+        if len(large) == 0 and len(small) != 0:
+            return small.iloc[-1][target_col]
+        else:
+            raise ValueError(
+                f"Cannot interpolate. {col}={val}"
+            )
+
+    small = small.iloc[-1]
+    large = large.iloc[0]
+    if small[col] == large[col]:
+        return small[target_col]
+
+    r = (val - small[col]) / (large[col] - small[col])
+    return small[target_col] * (1 - r) + large[target_col] * r
+
+
 
 @lru_cache(maxsize=512)
 def _gemm_time(
@@ -134,6 +162,7 @@ def gemm_time(
 @lru_cache(maxsize=512)
 def attn_time(
     gpu: str,
+    cp: int,
     head_dim: int,
     nhead: int,
     tokens: int,
@@ -141,8 +170,11 @@ def attn_time(
     is_fwd:bool=True,
 ) -> float:
     df = _mha_df(gpu)
-    df = df[df["dtype"] == dtype]
-    df = df[df["head_dim"] == head_dim]
+    df = df[
+        (df["cp"] == cp) &
+        (df["dtype"] == dtype) &
+        (df["head_dim"] == head_dim)
+    ]
     assert (
         not df.empty
     ), f"Cannot find attn time for {gpu}, {dtype}, {head_dim}"
