@@ -8,9 +8,9 @@ from .utils import dtype_to_str, DTYPE, CommType
 KB = 1024
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-GEMM_TMPL = os.path.join(this_dir, "profile/comp/{gpu}/gemm.csv")
-MHA_TMPL = os.path.join(this_dir, "profile/comp/{gpu}/mha.csv")
-BI_MHA_TMPL = os.path.join(this_dir, "profile/comp/{gpu}/bimha.csv")
+GEMM_TMPL = os.path.join(this_dir, "profile/{gpu}/comp/gemm.csv")
+MHA_TMPL = os.path.join(this_dir, "profile/{gpu}/comp/mha.csv")
+BI_MHA_TMPL = os.path.join(this_dir, "profile/{gpu}/comp/bimha.csv")
 
 
 @lru_cache(maxsize=512)
@@ -134,23 +134,23 @@ def gemm_time(
 @lru_cache(maxsize=512)
 def attn_time(
     gpu: str,
-    head_size: int,
-    num_heads: int,
+    head_dim: int,
+    nhead: int,
     tokens: int,
     dtype: str,
     is_fwd:bool=True,
 ) -> float:
     df = _mha_df(gpu)
     df = df[df["dtype"] == dtype]
-    df = df[df["head_size"] == head_size]
+    df = df[df["head_dim"] == head_dim]
     assert (
         not df.empty
-    ), f"Cannot find attn time for {gpu}, {dtype}, {head_size}"
+    ), f"Cannot find attn time for {gpu}, {dtype}, {head_dim}"
     # Round up to the nearest multiple of 16.
 
-    fwdbwd = "fwd" if is_fwd else "bwd"
+    fwdbwd = "fwd(us)" if is_fwd else "bwd(us)"
     exe_time = _interpolate(
-        df, "tokens", tokens, "num_heads", num_heads, fwdbwd
+        df, "tokens", tokens, "nhead", nhead, fwdbwd
     )
     return exe_time
 
