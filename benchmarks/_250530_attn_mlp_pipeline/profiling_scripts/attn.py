@@ -344,7 +344,9 @@ def main_3_attn_dist():
             tp = 1,
             **model_config,
         )
-        print(f"Batch: {batch}, TP: {1}, CP: {1}, Result: {avg_duration:.2f} ms")
+        # print(f"Batch: {batch}, TP: {1}, CP: {1}, Result: {avg_duration:.2f} ms")
+        print(f"Batch: {batch}")
+        print(f"Duration: {avg_duration:.2f} ms")
         pass
     # for batch in batches:
     #     for tp in [1, 2, 4, 8]:
