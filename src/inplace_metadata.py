@@ -1,5 +1,7 @@
 import torch
 
+# NOTE(yonghao): this file will be later offloaded to a cuda kernel in a decentralized paradigm.
+@torch.no_grad()
 def compute_dst_offsets(
     glob_dst_id: torch.Tensor
 ) -> torch.Tensor:
@@ -14,25 +16,29 @@ def compute_dst_offsets(
         glob_dst_id (torch.Tensor): A tensor of shape (world_size, num_tokens, ...)
                                     where each value is the destination rank for a token.
                                     Can be 2D for query or 3D for key_value.
+                                    Value -1 indicates padding that should be ignored.
 
     Returns:
         torch.Tensor: A tensor of the same shape as glob_dst_id, containing the
                       calculated destination offset for each token.
     """
-    if not glob_dst_id.is_cuda:
-        raise TypeError("Input tensor must be a CUDA tensor.")
 
     original_shape = glob_dst_id.shape
     world_size = original_shape[0]
 
     # Flatten the tensor to 2D (world_size, total_tokens_per_rank) for generic processing
-    assert glob_dst_id.dim() == 2, "glob_dst_id must be 2D"
+    glob_dst_id = glob_dst_id.reshape(world_size, -1)
 
-    num_tokens = glob_dst_id.shape[1]
+    # Create mask for valid (non-padding) tokens
+    valid_mask = glob_dst_id != -1
 
     # 1. Count how many tokens each rank sends to every other rank.
     # `counts[d, s]` will be the number of tokens sent from rank `s` to rank `d`.
-    one_hot_dest = torch.nn.functional.one_hot(glob_dst_id, num_classes=world_size).long()
+    # Add world_size to glob_dst_id to handle -1, then subtract later
+    shifted_dst_id = glob_dst_id + 1
+    one_hot_dest = torch.nn.functional.one_hot(shifted_dst_id, num_classes=world_size + 1).long()
+    # Only keep the relevant classes (original 0 to world_size-1)
+    one_hot_dest = one_hot_dest[:, :, 1:] * valid_mask.unsqueeze(-1)
     counts = torch.sum(one_hot_dest, dim=1).transpose(0, 1)
 
     # 2. Calculate the base offset for tokens from each source rank.
@@ -50,20 +56,26 @@ def compute_dst_offsets(
     # We use the destination IDs to gather the correct base offset for each token.
     # `base_offsets_gathered[s, t]` = base_offset at `dest_id[s,t]` for tokens from `s`
     src_rank_indices = torch.arange(world_size, device=glob_dst_id.device).unsqueeze(1)
-    base_offsets_gathered = base_offsets[glob_dst_id, src_rank_indices]
+    # For invalid tokens (padding), we'll gather from index 0 but mask it out later
+    gather_ids = torch.where(valid_mask, glob_dst_id, torch.zeros_like(glob_dst_id))
+    base_offsets_gathered = base_offsets[gather_ids, src_rank_indices]
 
     glob_dst_offset_flat = base_offsets_gathered + intra_rank_offsets
+    
+    # Mask out offsets for padding tokens with -1
+    glob_dst_offset_flat = torch.where(valid_mask, glob_dst_offset_flat, -1 * torch.ones_like(glob_dst_offset_flat))
 
     # Reshape back to the original input shape
     return glob_dst_offset_flat.reshape(original_shape)
 
 
+@torch.no_grad()
 def compute_reverse_comm(
     fwd_dst_id: torch.Tensor,
     fwd_dst_offset: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Computes the reverse communication pattern for the return trip of MoE gating.
+    Computes the reverse communication pattern for the return trip of attention dispatching.
 
     Given the forward communication pattern (where tokens were sent), this function
     calculates the destination rank and offset for each result to be sent back to its
@@ -72,6 +84,7 @@ def compute_reverse_comm(
     Args:
         fwd_dst_id (torch.Tensor): The forward destination rank for each token.
                                    Shape (world_size, num_tokens, ...).
+                                   Value -1 indicates padding that should be ignored.
         fwd_dst_offset (torch.Tensor): The forward destination offset for each token.
                                        Shape (world_size, num_tokens, ...).
 
@@ -80,8 +93,6 @@ def compute_reverse_comm(
         - rev_dst_id (torch.Tensor): The reverse destination (original source rank).
         - rev_dst_offset (torch.Tensor): The reverse offset (original token index).
     """
-    if not fwd_dst_id.is_cuda or not fwd_dst_offset.is_cuda:
-        raise TypeError("Input tensors must be CUDA tensors.")
 
     original_shape = fwd_dst_id.shape
     world_size = original_shape[0]
@@ -91,8 +102,12 @@ def compute_reverse_comm(
     fwd_dst_offset_flat = fwd_dst_offset.reshape(world_size, -1)
     num_tokens_per_rank = fwd_dst_id_flat.shape[1]
 
+    # Create mask for valid (non-padding) tokens
+    valid_mask = fwd_dst_id_flat != -1
+
     # 1. Determine the number of tokens received by each rank to size the reverse tensors.
-    one_hot_dest = torch.nn.functional.one_hot(fwd_dst_id_flat, num_classes=world_size).long()
+    one_hot_dest = torch.nn.functional.one_hot(torch.where(valid_mask, fwd_dst_id_flat, 0), num_classes=world_size).long()
+    one_hot_dest = one_hot_dest * valid_mask.unsqueeze(-1)  # Mask out padding tokens
     num_received = torch.sum(one_hot_dest, dim=(0, 1)) # Sum across both source and token dims
     max_received = torch.max(num_received)
 
@@ -105,6 +120,7 @@ def compute_reverse_comm(
     fwd_o_flat = fwd_dst_offset_flat.flatten()
     src_r_flat = src_rank_indices.flatten()
     src_t_flat = src_token_indices.flatten()
+    valid_mask_flat = valid_mask.flatten()
 
     # 4. Perform the scatter operation to build the reverse map.
     # We use the forward destination (rank, offset) to compute a global destination index.
@@ -112,11 +128,22 @@ def compute_reverse_comm(
     rev_dst_id = torch.zeros(world_size, max_received, dtype=torch.long, device=fwd_dst_id.device)
     rev_dst_offset = torch.zeros(world_size, max_received, dtype=torch.long, device=fwd_dst_id.device)
 
+    # Only scatter valid tokens
+    valid_indices = torch.where(valid_mask_flat)[0]
+    valid_fwd_d = fwd_d_flat[valid_indices]
+    valid_fwd_o = fwd_o_flat[valid_indices]
+    valid_src_r = src_r_flat[valid_indices]
+    valid_src_t = src_t_flat[valid_indices]
+
     # Scatter source ranks into the reverse destination id tensor
-    rev_dst_id.view(-1).scatter_(0, fwd_d_flat * max_received + fwd_o_flat, src_r_flat)
+    rev_dst_id.view(-1).scatter_(0, valid_fwd_d * max_received + valid_fwd_o, valid_src_r)
 
     # Scatter source tokens into the reverse destination offset tensor
-    rev_dst_offset.view(-1).scatter_(0, fwd_d_flat * max_received + fwd_o_flat, src_t_flat)
+    rev_dst_offset.view(-1).scatter_(0, valid_fwd_d * max_received + valid_fwd_o, valid_src_t)
+
+    # mask -1 based on num_received: those indices >= num_received should be masked
+    rev_dst_id = rev_dst_id.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1)
+    rev_dst_offset = rev_dst_offset.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1)
 
     return rev_dst_id, rev_dst_offset
 
@@ -127,24 +154,52 @@ if __name__ == '__main__':
     CP_DEGREE = 2
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # --- Test Offset Calculation ---
-    # Mock global destination IDs for query (2D)
-    glob_query_dst_id = torch.randint(0, WORLD_SIZE, (WORLD_SIZE, NUM_TOKENS), device=DEVICE)
-    print("Global Query Destination IDs:\n", glob_query_dst_id)
-    
-    glob_query_dst_offset = compute_dst_offsets(glob_query_dst_id)
-    print("\nGlobal Query Destination Offsets:\n", glob_query_dst_offset)
+    def orchestrate(tensor: torch.Tensor, dst_id: torch.Tensor, dst_offset: torch.Tensor, dst_tensor: torch.Tensor | None = None):
+        world_size = dst_id.shape[0]
+        one_hot_dest = torch.nn.functional.one_hot(dst_id.reshape(world_size, -1) + 1, num_classes=world_size + 1).long()[:, :, 1:]
+        num_received = torch.sum(one_hot_dest, dim=(0, 1)) # Sum across both source and token dims
+        max_received = torch.max(num_received)
+        if dst_tensor is None:
+            dst_tensor = torch.zeros(world_size, max_received, dtype=tensor.dtype, device=tensor.device)
+            orig_shape = dst_tensor.shape
+        else:
+            orig_shape = dst_tensor.shape
+            dst_tensor = dst_tensor.reshape(world_size, -1)
 
-    # Mock global destination IDs for key_value (3D)
-    glob_kv_dst_id = torch.randint(0, WORLD_SIZE, (WORLD_SIZE, NUM_TOKENS, CP_DEGREE), device=DEVICE)
-    print("\nGlobal KV Destination IDs:\n", glob_kv_dst_id)
-    
-    glob_kv_dst_offset = compute_dst_offsets(glob_kv_dst_id)
-    print("\nGlobal KV Destination Offsets:\n", glob_kv_dst_offset)
-    
-    # --- Test Reverse Communication Calculation ---
-    print("\n--- Computing Reverse Communication ---")
-    rev_id, rev_offset = compute_reverse_comm(glob_kv_dst_id, glob_kv_dst_offset)
-    
-    print("\nReverse Destination IDs (Original Source Ranks):\n", rev_id)
-    print("\nReverse Destination Offsets (Original Token Indices):\n", rev_offset)
+        if dst_id.dim() == 3:
+            sp_size = dst_id.shape[2]
+        else:
+            sp_size = None
+
+        for i in range(world_size):
+            if sp_size:
+                for j in range(sp_size):
+                    ids = dst_id[i, :, j]
+                    offsets = dst_offset[i, :, j]
+                    mask = ids != -1
+                    ids = ids[mask]
+                    offsets = offsets[mask]
+                    dst_tensor[ids, offsets] = tensor[i][mask]
+            else:
+                ids = dst_id[i]
+                offsets = dst_offset[i]
+                # remove indices with value -1 (dummy value as masks)
+                mask = ids != -1
+                ids = ids[mask]
+                offsets = offsets[mask]
+                dst_tensor[ids, offsets] = tensor[i][mask]
+
+        return dst_tensor.reshape(orig_shape)
+
+    dst_id = torch.randint(-1, WORLD_SIZE, (WORLD_SIZE, NUM_TOKENS, CP_DEGREE), device=DEVICE)
+    tensor = torch.randn(WORLD_SIZE, NUM_TOKENS, device=DEVICE)
+
+    # forward communication
+    dst_offset = compute_dst_offsets(dst_id)
+    dst_tensor = orchestrate(tensor, dst_id, dst_offset)
+    # reverse communication
+    rev_dst_id, rev_dst_offset = compute_reverse_comm(dst_id, dst_offset)
+    back_tensor = torch.zeros_like(dst_id, dtype=dst_tensor.dtype, device=DEVICE)
+    back_tensor = orchestrate(dst_tensor, rev_dst_id, rev_dst_offset, dst_tensor=back_tensor)
+    back_tensor = back_tensor.sum(dim=2) / (back_tensor != 0).sum(dim=2)
+    assert torch.allclose(tensor, back_tensor)
