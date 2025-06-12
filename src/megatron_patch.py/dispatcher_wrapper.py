@@ -52,11 +52,11 @@ class n_to_n_dispatch(torch.autograd.Function):
                 key_value_in: Optional[torch.Tensor]=None,
                 key_value_dst_id: Optional[torch.Tensor]=None,
                 key_value_dst_offset: Optional[torch.Tensor]=None,
+                out_key_value_shape: Optional[torch.Size]=None,
                 rev_query_dst_id: Optional[torch.Tensor]=None,
                 rev_query_dst_offset: Optional[torch.Tensor]=None,
                 rev_key_value_dst_id: Optional[torch.Tensor]=None,
                 rev_key_value_dst_offset: Optional[torch.Tensor]=None,
-                out_key_value_shape: Optional[torch.Size]=None,
                 stream: Optional[torch.cuda.Stream]=None,
                 event: Optional[torch.cuda.Event]=None,
                ):
@@ -138,6 +138,7 @@ class n_to_n_dispatch(torch.autograd.Function):
         else:
             assert key_value_dst_mask is None
             assert hidden_kv == 0
+            key_value_in_grad = None
 
         num_token_query = rev_query_dst_id.shape[0]
         num_token_kv = rev_key_value_dst_id.shape[0]
@@ -164,4 +165,8 @@ class n_to_n_dispatch(torch.autograd.Function):
             # gather gradients from all copies
             key_value_in_grad = (key_value_in_grad * key_value_dst_mask).sum(dim=-1)
 
-        return query_in_grad, key_value_in_grad
+        return (query_in_grad, None, None, None,    # 3 Nones: rank, offset, shape
+                key_value_in_grad, None, None, None,# same as above
+                None, None, None, None, # reverse indices and offsets
+                None, None, # stream and event
+                )

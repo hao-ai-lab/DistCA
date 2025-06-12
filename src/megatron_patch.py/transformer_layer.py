@@ -111,7 +111,18 @@ class TransformerLayer(MegatronTransformerLayer):
 
         def mlp_to_attn(query, key_value, plan: torch.Tensor=None):
             # TODO: based on the plan, launch an all2all to redistribute the tensors across all data parallel, context parallel, and pipeline parallels devices.
-            raise NotImplementedError("mlp_to_attn not implemented")
+            query_out, key_value_out = n_to_n_dispatch.apply(
+                query_in=query,
+                query_dst_id=query_dst_ids,
+                query_dst_offset=query_dst_offsets,
+                out_query_shape=query_out_shape,
+                key_value_in=key_value,
+                key_value_dst_id=kv_dst_ids,
+                key_value_dst_offset=kv_dst_offsets,
+                out_key_value_shape=kv_out_shape,
+                stream=stream,
+                event=event,
+            )
 
         # 1. split input into two microbatches
         args = [hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
