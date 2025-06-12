@@ -1,6 +1,3 @@
-import warnings
-from abc import ABC
-from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -141,7 +138,7 @@ class TransformerLayer(MegatronTransformerLayer):
         # 2. pre-self-attention forward microbatch 0.
         # Ideally, this part should merge to the previous layer's post-self-attention to maximize
         # the communication-computation overlap.
-        query_0, key_0, value_0, rotary_pos_emb_0, residual_0 = self._forward_pre_self_attn(
+        query_0, key_0, value_0, rotary_pos_emb_0, residual_0 = self._forward_pre_core_attn(
             hidden_states_0,
             attention_mask_0,
             context_0,
@@ -152,7 +149,7 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         # 3. pre-attention forward of microbatch 1, mlp2attn all2all of microbatch 0
         query_0, key_0, value_0, rotary_pos_emb_0 = mlp_to_attn(query_0, key_0, value_0, plan=plan)
-        query_1, key_1, value_1, rotary_pos_emb_1, residual_1 = self._forward_pre_self_attn(
+        query_1, key_1, value_1, rotary_pos_emb_1, residual_1 = self._forward_pre_core_attn(
             hidden_states_1,
             attention_mask_1,
             context_1,
@@ -163,7 +160,7 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         query_1, key_1, value_1, rotary_pos_emb_1 = mlp_to_attn(query_1, key_1, value_1, plan=plan)
-        core_attn_out_0 = self._forward_self_attn(
+        core_attn_out_0 = self._forward_core_attn(
             query_0,
             key_0,
             value_0,
@@ -177,7 +174,7 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         core_attn_out_0 = attn_to_mlp(core_attn_out_0, plan=plan)
-        core_attn_out_1 = self._forward_self_attn(
+        core_attn_out_1 = self._forward_core_attn(
             query_1,
             key_1,
             value_1,
@@ -191,13 +188,13 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
         core_attn_out_1 = attn_to_mlp(core_attn_out_1, plan=plan)
-        mlp_output_0, context_0 = self._forward_post_self_attn(
+        mlp_output_0, context_0 = self._forward_post_core_attn(
             core_attn_out_0,
             residual_0,
             context_0,
             context_mask_0,
         )
-        mlp_output_1, context_1 = self._forward_post_self_attn(
+        mlp_output_1, context_1 = self._forward_post_core_attn(
             core_attn_out_1,
             residual_1,
             context_1,
@@ -212,7 +209,7 @@ class TransformerLayer(MegatronTransformerLayer):
             context = [context_0, context_1]
         return output, context
 
-    def _forward_pre_self_attn(
+    def _forward_pre_core_attn(
         self,
         hidden_states: Tensor,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -243,7 +240,7 @@ class TransformerLayer(MegatronTransformerLayer):
         query, key, value = self.self_attention.get_query_key_value_tensors(input_layernorm_output, None)
         return query, key, value, rotary_pos_emb, residual
 
-    def _forward_self_attn(
+    def _forward_core_attn(
         self,
         query: Tensor,
         key: Tensor,
@@ -349,7 +346,7 @@ class TransformerLayer(MegatronTransformerLayer):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         return core_attn_out
 
-    def _forward_post_self_attn(
+    def _forward_post_core_attn(
         self,
         core_attn_out: Tensor,
         residual: Tensor,
