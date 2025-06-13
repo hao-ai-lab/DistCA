@@ -97,7 +97,6 @@ class n_to_n_dispatch(torch.autograd.Function):
                     num_token, hidden_q, hidden_kv, max_cp_degree
                 )
                 event.record(stream)
-                event.wait(stream)
         else:
             dispatch(
                 out_query, out_key_value, query_in, key_value_in,
@@ -152,7 +151,6 @@ class n_to_n_dispatch(torch.autograd.Function):
                     num_token_query, num_token_kv, hidden_q, hidden_kv
                 )
                 event.record(stream)
-                event.wait(stream)
         else:
             dispatch_reverse(
                 query_in_grad, key_value_in_grad, out_query_grad, out_key_value_grad,
