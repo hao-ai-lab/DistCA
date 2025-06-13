@@ -3,7 +3,7 @@
 from ortools.sat.python import cp_model
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 
 # ————————————————————————————————————————————————————————————
@@ -18,6 +18,7 @@ def mlp_time(x: int) -> float:
     """O(seq) MLP cost (arbitrary demo model)."""
     return x
 
+INF = 10**9
 
 # ————————————————————————————————————————————————————————————
 #  Dataclass to hold the results
@@ -43,12 +44,20 @@ class WlbLlmSolution:
             print(f"- Worker {w:<2d}: docs {docs}  —  latency {self.lat_worker[w]} ms")
         print(f"- Maximum latency: {self.lat_max}\n")
 
+    def dump_object(self) -> Dict[str, Any]:
+        return dict(
+            batches=self.batches,
+            lat_max=self.lat_max,
+            lat_worker=self.lat_worker,
+            doc2worker=self.doc2worker,
+        )
+
 
 # ————————————————————————————————————————————————————————————
 #  Main solver class
 # ————————————————————————————————————————————————————————————
 class WlbLlmSolver:
-    """Minimise the slowest worker’s latency subject to length and assignment constraints."""
+    """Minimise the slowest worker's latency subject to length and assignment constraints."""
 
     def solve(
         self,
@@ -63,7 +72,6 @@ class WlbLlmSolver:
 
         # ——— CP-SAT model ——————————————————————————————————————————
         model = cp_model.CpModel()
-        INF = 10**9
 
         # Decision: x[d,w] == 1  ⇔  doc d served by worker w
         x = {

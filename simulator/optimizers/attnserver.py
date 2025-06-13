@@ -23,6 +23,16 @@ class AttnServerSolution:
     solver: cp_model.CpSolver
     variables: dict[str, 'cp_model.BoolVarT | cp_model.IntVar']
 
+
+    def dump_object(self):
+        return dict(
+            batches=self.batches,
+            lat_max=self.lat_max,
+            lat_worker=self.lat_worker,
+            worker2plan=self.worker2plan,
+            doc2worker=self.doc2worker,
+        )
+
     def print_solution(self):
         print("AttnServer Solution:")
         for i, (worker, plan) in enumerate(self.worker2plan.items()):
@@ -34,7 +44,7 @@ class AttnServerSolution:
 
 class AttnServerSolver:
     def __init__(self, parallel_plan: list[tuple[int, int]] = None):
-        if parallel_plan is None:
+        if not parallel_plan:
             parallel_plan = [(tp, cp) for tp in [1, 2, 4, 8] for cp in [1, 2, 4, 8]]
             parallel_plan.append((0, 0))
         self.parallel_plan = parallel_plan
