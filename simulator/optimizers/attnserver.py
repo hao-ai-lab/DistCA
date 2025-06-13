@@ -10,6 +10,8 @@ class AttnServerSolution:
     doc2worker: dict[int, int]
     # batches = worker -> batch
     batches: list[int]
+    # parallel plan
+    parallel_plan: list[tuple[int, int]]
     # max latency
     lat_max: int
     # latency per worker
@@ -163,6 +165,7 @@ class AttnServerSolver:
             worker2plan=worker2plan,
             doc2worker=doc2worker,
             batches=batches,
+            parallel_plan=parallel_plan,
             lat_max=solver.Value(lat_max),
             lat_worker=[solver.Value(lat_worker[i]) for i in range(num_workers)],
             lat_doc_table=latency,

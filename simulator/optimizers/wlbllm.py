@@ -1,122 +1,143 @@
-# %%
-"""
-WLB-LLM ILP Problem Solution
+# wlb_llm_solver.py
+# Re-implementation of the PuLP demo in the same style as the AttnServer example
+from ortools.sat.python import cp_model
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
-Problem:
 
-    minimize max_j sum( (Wa[d_i] +  Wl[d_i]) * (x_ij * d_i) )
-
-subject to
-- sum_j(x_ij) = 1 for all i
-- sum_i(x_ij * d_i) <= Lmax
-- x_ij \in {0, 1} for all i, j
-- i = 1 ... N = number of documents
-- j = 1 ... M = number of workers
-- Lmax = 16*K = maximum length of the document
-"""
-
-import pulp
-
+# ————————————————————————————————————————————————————————————
+#  Problem-specific helpers
+# ————————————————————————————————————————————————————————————
 def attn_time(x: int) -> float:
-    """Calculate the attention time for a given document length.
-
-    Args:
-        x (int): The length of the document in tokens.
-
-    Returns:
-        float: The attention computation time in milliseconds.
-    """
-
+    """O(seq²) quadratic attention cost (arbitrary demo model)."""
     return x ** 2
-    pass
+
 
 def mlp_time(x: int) -> float:
-    """Calculate the MLP time for a given document length.
-
-    Args:
-        x (int): The length of the document in tokens.
-
-    Returns:
-        float: The MLP computation time in milliseconds.
-    """
+    """O(seq) MLP cost (arbitrary demo model)."""
     return x
 
 
+# ————————————————————————————————————————————————————————————
+#  Dataclass to hold the results
+# ————————————————————————————————————————————————————————————
+@dataclass
+class WlbLlmSolution:
+    # document → worker assignment
+    doc2worker: Dict[int, int]
+    # worker → docs actually served
+    batches: List[List[int]]
+    # latency per worker and objective
+    lat_worker: List[int]
+    lat_max: int
 
-def wlbllm_ilp_solver(
-    doc_lengths: list[int],
-    max_length: int,
-    max_micro_batches: int,
-):
-    """Solve the WLB-LLM ILP problem.
+    # raw artefacts (optional – handy for debugging / tweaking)
+    model: cp_model.CpModel
+    solver: cp_model.CpSolver
+    variables: Dict[str, object]
 
-    Args:
-        doc_lengths (list[int]): The lengths of the documents.
-        max_length (int): The maximum length of the document.
-        max_micro_batches (int): The maximum number of workers.
-    
-    Returns:
-        pulp.LpProblem: The problem object.
-    """
-    # Create the problem
-    problem = pulp.LpProblem("WLB-LLM ILP Problem", pulp.LpMinimize)
-
-    # Create the decision variables
-    x = pulp.LpVariable.dicts("x", (range(len(doc_lengths)), range(max_micro_batches)), cat="Binary")
-    T = pulp.LpVariable("T", lowBound=0)
-
-    # Create the objective function
-    problem += T
-        
-    # Objective function
-    for j in range(max_micro_batches):
-        a = pulp.lpSum(x[i][j] * (attn_time(doc_lengths[i]) + mlp_time(doc_lengths[i])) for i in range(len(doc_lengths)))
-        problem += a <= T, f"A_{j}"
-        pass
-
-    # Subject to sum(x_ij) = 1 for all i
-    for i in range(len(doc_lengths)):
-        X_i = pulp.lpSum(x[i][j] for j in range(max_micro_batches))
-        problem += X_i == 1, f"X_{i}"
-
-    # Subject to sum(x_ij * d_i) <= Lmax for all j
-    for j in range(max_micro_batches):
-        C_j = pulp.lpSum(x[i][j] * doc_lengths[i] for i in range(len(doc_lengths)))
-        problem += C_j <= max_length, f"C_{j}"
-
-    problem.solve()
-
-    
-    xs = dict()
-    for i in range(len(doc_lengths)):
-        for j in range(max_micro_batches):
-            if x[i][j].varValue == 1:
-                xs[i] = j
-
-    return problem, xs, pulp.value(T)
+    def print_solution(self) -> None:  # noqa: D401 (simple “Print …”)
+        print("WLB-LLM ILP Solution")
+        for w, docs in enumerate(self.batches):
+            print(f"- Worker {w:<2d}: docs {docs}  —  latency {self.lat_worker[w]} ms")
+        print(f"- Maximum latency: {self.lat_max}\n")
 
 
+# ————————————————————————————————————————————————————————————
+#  Main solver class
+# ————————————————————————————————————————————————————————————
+class WlbLlmSolver:
+    """Minimise the slowest worker’s latency subject to length and assignment constraints."""
 
-def test_wlbllm_ilp_solver():
+    def solve(
+        self,
+        doc_lengths: List[int],
+        max_length: int,
+        num_workers: int,
+        *,
+        time_limit_s: int | None = 30,
+    ) -> WlbLlmSolution:
+        n_docs = len(doc_lengths)
+        costs = [int(attn_time(d) + mlp_time(d)) for d in doc_lengths]  # ms, cast to int
+
+        # ——— CP-SAT model ——————————————————————————————————————————
+        model = cp_model.CpModel()
+        INF = 10**9
+
+        # Decision: x[d,w] == 1  ⇔  doc d served by worker w
+        x = {
+            (d, w): model.NewBoolVar(f"x_{d}_{w}")
+            for d in range(n_docs)
+            for w in range(num_workers)
+        }
+
+        # 1. Each doc goes to exactly one worker
+        for d in range(n_docs):
+            model.Add(sum(x[d, w] for w in range(num_workers)) == 1)
+
+        # 2. Per-worker length budget  Σ len_d * x[d,w] ≤ L_max
+        for w in range(num_workers):
+            model.Add(
+                sum(doc_lengths[d] * x[d, w] for d in range(n_docs)) <= max_length
+            )
+
+        # 3. Latency per worker  lat_w = Σ cost_d * x[d,w]
+        lat_worker = [
+            model.NewIntVar(0, INF, f"lat_{w}") for w in range(num_workers)
+        ]
+        for w in range(num_workers):
+            model.Add(
+                lat_worker[w]
+                == sum(costs[d] * x[d, w] for d in range(n_docs))
+            )
+
+        # 4. Objective  —  minimise the maximum worker latency
+        lat_max = model.NewIntVar(0, INF, "lat_max")
+        for w in range(num_workers):
+            model.Add(lat_worker[w] <= lat_max)
+        model.Minimize(lat_max)
+
+        # ——— Solve ———————————————————————————————————————————————
+        solver = cp_model.CpSolver()
+        if time_limit_s:
+            solver.parameters.max_time_in_seconds = time_limit_s
+        solver.parameters.num_search_workers = 0  # use all cores
+        status = solver.Solve(model)
+
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise RuntimeError("No feasible solution found")
+
+        # ——— Extract assignment ————————————————————————————
+        doc2worker: Dict[int, int] = {}
+        batches: List[List[int]] = [[] for _ in range(num_workers)]
+        for d in range(n_docs):
+            for w in range(num_workers):
+                if solver.Value(x[d, w]):
+                    doc2worker[d] = w
+                    batches[w].append(doc_lengths[d])
+                    break
+
+        return WlbLlmSolution(
+            doc2worker=doc2worker,
+            batches=batches,
+            lat_worker=[solver.Value(lw) for lw in lat_worker],
+            lat_max=solver.Value(lat_max),
+            model=model,
+            solver=solver,
+            variables=dict(x=x, lat_worker=lat_worker, lat_max=lat_max),
+        )
+
+
+# ————————————————————————————————————————————————————————————
+#  tiny smoke-test
+# ————————————————————————————————————————————————————————————
+
+def test_solver():
+    solver = WlbLlmSolver()
     doc_lengths = [1, 2, 3, 4]
-    max_length = 16 # = Lmax
-    max_micro_batches = 4 # = M
-    problem, xs, T = wlbllm_ilp_solver(doc_lengths, max_length, max_micro_batches)
-    batches = []
-    for j in range(max_micro_batches):  
-        batches.append([])
-    for i in range(len(doc_lengths)):
-        batches[xs[i]].append(doc_lengths[i])
-    
-    print(f"doc_lengths: {doc_lengths}")
-    print(f"T: {T}")
-    print(f"xs: {xs}")
-    print(f"batches: {batches}")
-    return batches, T
+    sol = solver.solve(doc_lengths, max_length=16, num_workers=4)
+    sol.print_solution()
 
-
-
-# %%
 if __name__ == "__main__":
-    test_wlbllm_ilp_solver()
-# %%
+    test_solver()
