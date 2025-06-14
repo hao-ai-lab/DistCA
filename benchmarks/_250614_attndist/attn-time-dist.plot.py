@@ -24,7 +24,7 @@ print(f"Processing: {name}")
 
 # %%
 import pandas as pd
-filename = f"{name}.psv"
+filename = f"data-run/{name}.psv"
 # filename = f"attn-dist_multimodal-64k.psv"
 df = pd.read_csv(f"{filename}", sep="|")
 df.head()
@@ -82,9 +82,9 @@ fig.add_trace(go.Scatter(
 ))
 
 # Save the plot as an interactive HTML file
-fig.write_html(f"plot/{filename}.scatter.html")
+fig.write_html(f"plot/{name}.scatter.html")
 # Save the plot as a PNG file
-fig.write_image(f"plot/{filename}.scatter.png")
+fig.write_image(f"plot/{name}.scatter.png")
 
 
 # Show the plot
@@ -141,9 +141,9 @@ fig_diff.update_layout(
 )
 
 # Save the plot as an interactive HTML file
-fig_diff.write_html(f"plot/{filename}.diff_scatter.html")
+fig_diff.write_html(f"plot/{name}.diff_scatter.html")
 # Save the plot as a PNG file
-fig_diff.write_image(f"plot/{filename}.diff_scatter.png")
+fig_diff.write_image(f"plot/{name}.diff_scatter.png")
 
 # Show the plot
 fig_diff.show()
@@ -195,9 +195,9 @@ fig_bs_diff.update_layout(
 )
 
 # Save the plot as an interactive HTML file
-fig_bs_diff.write_html(f"plot/{filename}.bs_diff_scatter.html")
+fig_bs_diff.write_html(f"plot/{name}.bs_diff_scatter.html")
 # Save the plot as a PNG file
-fig_bs_diff.write_image(f"plot/{filename}.bs_diff_scatter.png")
+fig_bs_diff.write_image(f"plot/{name}.bs_diff_scatter.png")
 
 # Show the plot
 fig_bs_diff.show()
@@ -208,7 +208,7 @@ fig_bs_rel_error = go.Figure()
 
 # Iterate through unique (tp, cp) combinations
 for (tp, cp) in df[['tp', 'cp']].drop_duplicates().itertuples(index=False):
-    subset = df[(df['tp'] == tp) & (df['cp'] == cp)]
+    subset = df[(df['tp'] == tp) & (df['cp'] == cp)].copy()  # Use .copy() to avoid SettingWithCopyWarning
     
     # Calculate color based on tp (grey to red)
     tp_color_val = (tp_values.index(tp) / (len(tp_values) - 1)) if len(tp_values) > 1 else 0
@@ -223,8 +223,8 @@ for (tp, cp) in df[['tp', 'cp']].drop_duplicates().itertuples(index=False):
                     f'{(int(tp_color.split(",")[1]) + int(cp_color.split(",")[1]))//2}, ' \
                     f'{(int(tp_color.split(",")[2].split(")")[0]) + int(cp_color.split(",")[2].split(")")[0]))//2})'
     
-    # Calculate relative error
-    subset['relative_error'] = (subset['real_attn_time_ms'] - subset['sim_attn_time_ms']) / subset['real_attn_time_ms']
+    # Calculate relative error using .loc to avoid SettingWithCopyWarning
+    subset.loc[:, 'relative_error'] = (subset['real_attn_time_ms'] - subset['sim_attn_time_ms']) / subset['real_attn_time_ms']
     
     # Add scatter trace for each (tp, cp) combination
     # Plotting the relative error vs batch size
@@ -251,9 +251,9 @@ fig_bs_rel_error.update_layout(
 )
 
 # Save the plot as an interactive HTML file
-fig_bs_rel_error.write_html(f"plot/{filename}.bs_rel_error_scatter.html")
+fig_bs_rel_error.write_html(f"plot/{name}.bs_rel_error_scatter.html")
 # Save the plot as a PNG file
-fig_bs_rel_error.write_image(f"plot/{filename}.bs_rel_error_scatter.png")
+fig_bs_rel_error.write_image(f"plot/{name}.bs_rel_error_scatter.png")
 
 # Show the plot
 fig_bs_rel_error.show()
@@ -278,6 +278,7 @@ for tp in tp_values:
         subset = df[(df['tp'] == tp) & (df['cp'] == cp)]
         real_times = subset['real_attn_time_ms']
         sim_times = subset['sim_attn_time_ms']
+        total_len = subset['total_len'].max().item()
 
         # Add histogram for real attention times
         fig_time_dist.add_trace(
@@ -312,6 +313,12 @@ for tp in tp_values:
             showlegend=True
         )
 
+        # also get the mlp time for the current (tp, cp) combination
+        from d2.timemodule import get_mlp_time
+        mlp_time = get_mlp_time(
+            x = total_len, tp = tp, cp = cp,
+        )
+
         # Update x-axis labels
         fig_time_dist.update_xaxes(title_text='Time (ms)', row=1, col=1)
         fig_time_dist.update_xaxes(title_text='Time (ms)', row=2, col=1)
@@ -321,10 +328,10 @@ for tp in tp_values:
         fig_time_dist.update_yaxes(title_text='Frequency', row=2, col=1)
 
         # Save the plot as an interactive HTML file
-        fig_time_dist.write_html(f"plot/{filename}.time_distribution.tp{tp}.cp{cp}.html")
+        fig_time_dist.write_html(f"plot/{name}.time_distribution.tp{tp}.cp{cp}.html")
 
         # Save the plot as a PNG file
-        fig_time_dist.write_image(f"plot/{filename}.time_distribution.tp{tp}.cp{cp}.png")
+        fig_time_dist.write_image(f"plot/{name}.time_distribution.tp{tp}.cp{cp}.png")
 
         # Show the plot
         fig_time_dist.show()
