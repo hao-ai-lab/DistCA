@@ -1,10 +1,10 @@
 # %%
 
-import wlbllm as wlbllm
-import attnserver as attnserver
+import d2.simulator.optimizers.wlbllm as wlbllm
+import d2.simulator.optimizers.attnserver as attnserver
 
-from attnserver import AttnServerSolver
-from wlbllm import WlbLlmSolver
+from d2.simulator.optimizers.attnserver import AttnServerSolver
+from d2.simulator.optimizers.wlbllm import WlbLlmSolver
 
 
 # %%

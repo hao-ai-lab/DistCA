@@ -1,11 +1,11 @@
 # wlb_llm_solver.py
 # Re-implementation of the PuLP demo in the same style as the AttnServer example
-from ortools.sat.python import cp_model
 import numpy as np
+from ortools.sat.python import cp_model
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Any
 
-import timemodule as tm
+import d2.timemodule as tm
 
 INF = int(1e15)
 # ————————————————————————————————————————————————————————————
@@ -70,7 +70,7 @@ class WlbLlmSolver:
 
     
     def get_mlp_time(self, x: int, tp: int, cp: int) -> float:
-        import timemodule as tm
+        import d2.timemodule.compute as tm
         return tm.get_mlp_time(x, tp, cp)
 
     def solve(

@@ -1,7 +1,7 @@
 # %%
 
-from attnserver import AttnServerSolver
-from wlbllm import WlbLlmSolver
+from d2.simulator.optimizers.attnserver import AttnServerSolver
+from d2.simulator.optimizers.wlbllm import WlbLlmSolver
 
 import numpy as np
 import time
@@ -80,7 +80,7 @@ def wlbllm_vs_attnserver(
 full_results = []
 display_results = []
 
-from samples import (
+from d2.simulator.optimizers.samples import (
     sample_multimodal_gaussian, 
     sample_random_docs,
     sample_wlbllm_docs,

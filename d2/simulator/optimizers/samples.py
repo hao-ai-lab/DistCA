@@ -1,8 +1,8 @@
+import os
+import json
 import numpy as np
 from typing import Deque, Iterable, List, Sequence
 from collections import deque
-import os
-import json
 from pathlib import Path
 
 def sample_random_docs(
@@ -104,7 +104,7 @@ def sample_wlbllm_docs(
         A list of document lengths.
     """
     thisdir = Path(os.path.dirname(__file__))
-    docpath = thisdir / "dist_wlbllm.json"
+    docpath = thisdir.parent / "data" / "dist_wlbllm.json"
     with open(docpath, "r") as f:
         docs = json.load(f)
     rng = np.random.default_rng(seed)

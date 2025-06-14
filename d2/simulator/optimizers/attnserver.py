@@ -2,7 +2,7 @@ from ortools.sat.python import cp_model
 import numpy as np
 from dataclasses import dataclass
 
-import timemodule as tm
+import d2.timemodule as tm
 
 
 @dataclass
@@ -69,7 +69,7 @@ class AttnServerSolver:
                 doc_length = batch[k]
                 # TODO: Put the proper modeling here.
                 # latency[j, k] = doc_length / (1 + tp * (cp ** 0.5))
-                import timemodule as tm
+                import d2.timemodule.compute as tm
                 if tp * cp == 0:
                     latency[j, k] = tm.INF
                 else:
