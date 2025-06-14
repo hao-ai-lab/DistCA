@@ -10,7 +10,6 @@ args = args or ["attn-dist_wlbllm-64k", "attn-dist_multimodal-64k"]
 # If multiple names are provided, recursively call the script
 if len(args) > 1:
     for name in args:
-        print(f"Processing: {name}")
         subprocess.run([sys.executable, __file__, name])
     sys.exit(0)
 
@@ -254,5 +253,73 @@ fig_bs_rel_error.write_image(f"{filename}.bs_rel_error_scatter.png")
 
 # Show the plot
 fig_bs_rel_error.show()
+
+# %%
+# Create a subplot for real and simulated attention time distribution
+from plotly.subplots import make_subplots
+fig_time_dist = make_subplots(
+    rows=2, cols=1, 
+    subplot_titles=('Real Attention Time Distribution', 'Simulated Attention Time Distribution'),
+    vertical_spacing=0.1
+)
+
+# Flatten the data across all (tp, cp) combinations
+real_times = []
+sim_times = []
+
+for tp in tp_values:
+    for cp in cp_values:
+        subset = df[(df['tp'] == tp) & (df['cp'] == cp)]
+        real_times.extend(subset['real_attn_time_ms'])
+        sim_times.extend(subset['sim_attn_time_ms'])
+
+# Add histogram for real attention times
+fig_time_dist.add_trace(
+    go.Histogram(
+        x=real_times, 
+        name='Real Attention Time',
+        marker_color='blue',
+        opacity=0.7
+    ),
+    row=1, col=1
+)
+
+# Add histogram for simulated attention times
+fig_time_dist.add_trace(
+    go.Histogram(
+        x=sim_times, 
+        name='Simulated Attention Time',
+        marker_color='red',
+        opacity=0.7
+    ),
+    row=2, col=1
+)
+
+# Update layout
+fig_time_dist.update_layout(
+    title=(
+        f'Distribution of Real vs Simulated Attention Times - {name} Dataset<br>'
+        f'Dataset: {name}, Size: {size}, Max Context Length: {max_ctx_length}'
+    ),
+    height=600,
+    showlegend=True
+)
+
+# Update x-axis labels
+fig_time_dist.update_xaxes(title_text='Time (ms)', row=1, col=1)
+fig_time_dist.update_xaxes(title_text='Time (ms)', row=2, col=1)
+
+# Update y-axis labels
+fig_time_dist.update_yaxes(title_text='Frequency', row=1, col=1)
+fig_time_dist.update_yaxes(title_text='Frequency', row=2, col=1)
+
+# Save the plot as an interactive HTML file
+fig_time_dist.write_html(f"{filename}.time_distribution.html")
+
+# Save the plot as a PNG file
+fig_time_dist.write_image(f"{filename}.time_distribution.png")
+
+# Show the plot
+fig_time_dist.show()
 
 # %%
