@@ -2,119 +2,195 @@
 #include <cuda.h>
 #include <nvshmem.h>
 
+#include "core/common_utils.h"
+#include "core/cuda_utils.h"
 #include "core/in_place_attn_switch.h"
 
 namespace {
-template <typename T_q, typename T_kv>
+template <bool KEY_VALUE>
 __global__ void qkv_dispatch_kernel(
-    T_q* query_out,
-    T_kv* key_value_out,
-    const T_q* query_in,
-    const T_kv* key_value_in,
+    std::byte* query_out,
+    std::byte* key_value_out,
+    const std::byte* query_in,
+    const std::byte* key_value_in,
     const int32_t* query_dst_id,
     const int32_t* query_dst_offset,
     const int32_t* key_value_dst_id,
     const int32_t* key_value_dst_offset,
-    size_t token,
-    size_t hidden_q,
-    size_t hidden_kv,
-    uint32_t cp_degree
+    size_t num_tokens,
+    size_t q_stride,
+    size_t kv_stride,
+    uint32_t max_cp_degree,
+    // nvshmem buffers
+    std::byte* q_send_buffer,
+    std::byte* q_recv_buffer,
+    std::byte* kv_send_buffer,
+    std::byte* kv_recv_buffer,
+    // receive info
+    int num_q_to_recv,
+    int num_kv_to_recv
 ) {
     // --- Calculate thread/warp IDs based on the new launch grid ---
-    const unsigned warp_size = 32;
-    // The local warp and lane index for the current thread
-    const unsigned warp_id_in_block = threadIdx.x / warp_size;
-    const unsigned lane_id = threadIdx.x % warp_size;
-    
-    // The number of warps per block is determined by the launch configuration
-    const unsigned warps_per_block = blockDim.x / warp_size;
+    const unsigned WARP_SIZE = 32;
+    const unsigned NUM_WARPS = blockDim.x / WARP_SIZE;
 
-    // The globally unique ID for the current warp across the entire grid
-    const unsigned global_warp_id = blockIdx.x * warps_per_block + warp_id_in_block;
-    // The total number of warps launched in the grid
-    const unsigned total_warps_in_grid = gridDim.x * warps_per_block;
+    // NOTE(yonghao): a warp is the minimum unit of token-level communication.
+    const unsigned lane_id = threadIdx.x % WARP_SIZE;
+    const unsigned warp_id = threadIdx.x / WARP_SIZE;
+    // NOTE(yonghao): a warp group is responsible for one token. (potentially multiple destinations)
+    const unsigned warp_group_id = blockIdx.x;
+    // NOTE(yonghao): We may later use a warp for metadata, and then this is different from blockIdx.x
+    const unsigned warp_group_size = NUM_WARPS * WARP_SIZE;
+    const unsigned num_warp_groups = gridDim.x;
+    // NOTE(yonghao): we may put some metadata for each token's send buffer.
+    const unsigned Q_BUFFER_STRIDE = q_stride;
+    const unsigned KV_BUFFER_STRIDE = kv_stride;
 
     // --- SENDER-SIDE LOGIC with Warp-Level Grid-Stride Loop ---
     
-    // Each warp processes one token at a time and strides through the entire dataset.
-    // This allows a grid of any size to process all 'token' items.
-    for (int token_idx = global_warp_id; token_idx < token; token_idx += total_warps_in_grid) {
-        
+    // Each warp group processes one token at a time and strides through the entire sequence.
+    // This allows a grid of any size to process all tokens.
+    for (int token_idx = warp_group_id; token_idx < num_tokens; token_idx += num_warp_groups) {
+
+        const int4* query_token = (int4*)(query_in + token_idx * q_stride);
+        std::byte* q_send_buffer_token = q_send_buffer + token_idx * Q_BUFFER_STRIDE;
+
+        const int4* key_value_token = KEY_VALUE ? (int4*)(key_value_in + token_idx * kv_stride) : nullptr;
+        std::byte* kv_send_buffer_token = nullptr;
+        if constexpr (KEY_VALUE) {
+            kv_send_buffer_token = kv_send_buffer + token_idx * KV_BUFFER_STRIDE;
+        }
+
+        // Perform warp group-cooperative memcpy
+        for (int i = threadIdx.x; i * sizeof(int4) < q_stride; i += warp_group_size) {
+            ((int4*)q_send_buffer_token)[i] = query_token[i];
+        }
+        if constexpr (KEY_VALUE) {
+            for (int i = threadIdx.x; i * sizeof(int4) < kv_stride; i += warp_group_size) {
+                ((int4*)kv_send_buffer_token)[i] = key_value_token[i];
+            }
+        }
+        // Synchronize the warps within this warp group.
+        asm volatile("bar.sync 1, %0;" ::"r"(warp_group_size));
+
         // --- 1. Dispatch the query tensor ---
         // The first lane of the assigned warp is responsible for dispatching the query.
-        if (lane_id == 0) {
+        if (warp_id == 0) {
             int query_dest_rank = query_dst_id[token_idx];
             int query_dest_offset = query_dst_offset[token_idx];
-            const T_q* query_src_ptr = query_in + token_idx * hidden_q;
-            T_q* query_dest_ptr = query_out + query_dest_offset * hidden_q;
-            
-            nvshmem_putmem_nbi(query_dest_ptr, query_src_ptr, hidden_q * sizeof(T_q), query_dest_rank);
+            std::byte* q_recv_buffer_token = q_recv_buffer + query_dest_offset * q_stride;
+
+            // TODO(yonghao): use a nvshmemx_putmem_signal_nbi_warp to add a signal on the receiver.
+            nvshmem_putmem_nbi(
+                q_recv_buffer_token,
+                q_send_buffer_token,
+                q_stride,
+                query_dest_rank
+            );
         }
 
         // --- 2. Dispatch the key_value tensor, if any ---
         // attn_out -> mlp only uses the query_tensor's part: each token is sent to only one rank.
-        // The lanes of the warp cooperate to dispatch the `cp_degree` copies.
-        // This loop strides by `warp_size`, so if cp_degree > 32, all lanes stay busy.
-        if (key_value_in != nullptr) {
-            for (int i = lane_id; i < cp_degree; i += warp_size) {
-                int kv_idx = token_idx * cp_degree + i;
-                
+        if constexpr (KEY_VALUE) {
+            for (int j = warp_id; j < max_cp_degree; j += NUM_WARPS) {
+                int kv_idx = token_idx * max_cp_degree + j;
+
                 int kv_dest_rank = key_value_dst_id[kv_idx];
                 if (kv_dest_rank == -1) {
                     continue;
                 }
                 int kv_dest_offset = key_value_dst_offset[kv_idx];
-                const T_kv* kv_src_ptr = key_value_in + token_idx * hidden_kv;
-                T_kv* kv_dest_ptr = key_value_out + kv_dest_offset * hidden_kv;
+                std::byte* kv_out_buffer = key_value_out + kv_dest_offset * kv_stride;
 
-                nvshmem_putmem_nbi(kv_dest_ptr, kv_src_ptr, hidden_kv * sizeof(T_kv), kv_dest_rank);
+                // TODO(yonghao): use a nvshmemx_putmem_signal_nbi_warp to add a signal on the receiver.
+                nvshmem_putmem_nbi(kv_out_buffer, kv_send_buffer_token, kv_stride, kv_dest_rank);
             }
         }
     }
 
-    // --- RECEIVER-SIDE SYNCHRONIZATION ---
-
-    // The cooperative group sync ensures all threads in the grid finish their loops.
+    // Sync before moving on to the receiver-side logic.
     cooperative_groups::this_grid().sync();
 
-    // per grid barrier
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        nvshmem_quiet();
+    // --- RECEIVER-SIDE SYNCHRONIZATION ---
+
+    // FIXME(yonghao): add a sync signal to ensure that send is done. Only recv after that.
+
+    // memcpy to the dst tensor. No need to have a metadata handler warp.
+    for (int token_idx = blockIdx.x; token_idx < num_q_to_recv; token_idx += gridDim.x) {
+        std::byte* q_recv_buffer_token = q_recv_buffer + token_idx * Q_BUFFER_STRIDE;
+        int4* query_token = (int4*)(query_out + token_idx * q_stride);
+
+        // Perform warp-cooperative memcpy
+        for (int i = threadIdx.x; i * sizeof(int4) < q_stride; i += warp_group_size) {
+            query_token[i] = ((int4*)q_recv_buffer_token)[i];
+        }
+    }
+    if constexpr (KEY_VALUE) {
+        for (int token_idx = blockIdx.x; token_idx < num_kv_to_recv; token_idx += gridDim.x) {
+            int4* key_value_token = (int4*)(key_value_out + token_idx * kv_stride);
+            std::byte* kv_recv_buffer_token = kv_recv_buffer + token_idx * KV_BUFFER_STRIDE;
+
+            for (int i = threadIdx.x; i * sizeof(int4) < kv_stride; i += warp_group_size) {
+                key_value_token[i] = ((int4*)kv_recv_buffer_token)[i];
+            }
+        }
     }
 }
 };  // namespace
 
 namespace attn {
-template <typename T_q, typename T_kv>
-void qkv_dispatch(
-    T_q* query_out,
-    T_kv* key_value_out,
-    const T_q* query_in,
-    const T_kv* key_value_in,
+
+DispatchHelper::DispatchHelper(
+    size_t q_stride,
+    size_t kv_stride,
+    size_t max_tokens_query,
+    size_t max_tokens_key_value
+) : q_stride(q_stride), kv_stride(kv_stride), max_tokens_query(max_tokens_query), max_tokens_key_value(max_tokens_key_value) {
+
+    q_send_buffer = (std::byte *)nvshmem_malloc(max_tokens_query * q_stride);
+    q_recv_buffer = (std::byte *)nvshmem_malloc(max_tokens_query * q_stride);
+    kv_send_buffer = (std::byte *)nvshmem_malloc(max_tokens_key_value * kv_stride);
+    kv_recv_buffer = (std::byte *)nvshmem_malloc(max_tokens_key_value * kv_stride);
+}
+
+DispatchHelper::~DispatchHelper() {
+    nvshmem_free(q_send_buffer);
+    nvshmem_free(q_recv_buffer);
+    nvshmem_free(kv_send_buffer);
+    nvshmem_free(kv_recv_buffer);
+}
+
+void DispatchHelper::dispatch(
+    std::byte* query_out,
+    std::byte* key_value_out,
+    const std::byte* query_in,
+    const std::byte* key_value_in,
     const int32_t* query_dst_id,
     const int32_t* query_dst_offset,
     const int32_t* key_value_dst_id,
     const int32_t* key_value_dst_offset,
-    size_t token,
-    size_t hidden_q,
-    size_t hidden_kv,
-    uint32_t cp_degree,
+    size_t num_send_tokens,
+    size_t num_recv_tokens_query,
+    size_t num_recv_tokens_key_value,
+    size_t max_cp_degree,
     cudaStream_t stream
 ) {
-    // A grid for each token
-    int numSMs;
-    CUDACHECK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, device));
+    int numSMs = get_sm_count();
+
+    const bool has_key_value = key_value_out != nullptr;
 
     constexpr unsigned NUM_WARPS = 10;
     const unsigned numBlocks = std::min(
         std::max(
-            ceil_div<unsigned>(token, NUM_WARPS), (unsigned)(token * cp_degree)
+            ceil_div<unsigned>(num_send_tokens, NUM_WARPS), (unsigned)(num_send_tokens * max_cp_degree)
         ),
         static_cast<unsigned>(numSMs)
     );
     dim3 dimGrid(numBlocks, 1, 1);
     dim3 dimBlock(NUM_WARPS * 32, 1, 1);
 
+    // FIXME(yonghao): shared memory.
+    const size_t sharedMemory = 0;
     // CudaLaunchCooperativeKernel
     void* args[] = {
         &query_out,
@@ -125,32 +201,26 @@ void qkv_dispatch(
         &query_dst_offset,
         &key_value_dst_id,
         &key_value_dst_offset,
-        &token,
-        &hidden_q,
-        &hidden_kv,
-        &cp_degree
+        &num_send_tokens,
+        &q_stride,
+        &kv_stride,
+        &max_cp_degree,
+        &q_send_buffer,
+        &q_recv_buffer,
+        &kv_send_buffer,
+        &kv_recv_buffer,
+        &num_recv_tokens_query,
+        &num_recv_tokens_key_value
     };
-    CUDACHECK(cudaLaunchKernel(qkv_dispatch_kernel, dimGrid, dimBlock, args, 0, stream));
+    CUDACHECK(cudaLaunchCooperativeKernel(
+        (void *)&qkv_dispatch_kernel<has_key_value>,
+        dimGrid,
+        dimBlock,
+        args,
+        sharedMemory,
+        stream
+    ));
 }
 
-#define INSTANTIATE_QKV_DISPATCH(T_q, T_kv) \
-    template void qkv_dispatch<T_q, T_kv>( \
-        T_q* query_out, \
-        T_kv* key_value_out, \
-        const T_q* query_in, \
-        const T_kv* key_value_in, \
-        const int32_t* query_dst_id, \
-        const int32_t* query_dst_offset, \
-        const int32_t* key_value_dst_id, \
-        const int32_t* key_value_dst_offset, \
-        size_t token, \
-        size_t hidden_q, \
-        size_t hidden_kv, \
-        uint32_t cp_degree, \
-        cudaStream_t stream);
-
-INSTANTIATE_QKV_DISPATCH(float, float);
-INSTANTIATE_QKV_DISPATCH(nv_bfloat16, nv_bfloat16);
-INSTANTIATE_QKV_DISPATCH(half, half);
 };  // namespace attn
 
