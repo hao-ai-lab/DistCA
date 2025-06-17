@@ -2,7 +2,16 @@
 
 This is a low-fidelity (more optimized but not accurate implementation) reproduction of the WLBLLM Optimal baseline.
 
-Implementation Detail:
+# Quick Start
+
+
+```bash
+# You may want to have the wlbllm_optimal package available in the shared file system.
+pip install -e .
+bash run.sh
+```
+
+# Implementation
 
 ## `pretrain_gpt.py` 
 
