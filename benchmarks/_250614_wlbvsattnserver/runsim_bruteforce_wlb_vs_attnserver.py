@@ -77,6 +77,18 @@ def wlbllm_vs_attnserver(
 
 # %%
 
+import matplotlib.pyplot as plt
+from d2.simulator.optimizers.samples import sample_wlbllm_docs_altered
+for i in [64,128,256,512,1024,2048]:
+    docs = sample_wlbllm_docs_altered(size=i)
+    plt.hist(docs, bins=100, edgecolor='black')
+    plt.show()
+
+
+# %%
+
+# %%
+
 full_results = []
 display_results = []
 
@@ -87,45 +99,77 @@ from d2.simulator.optimizers.samples import (
     batch_documents,
 )
 
-# docs = sample_multimodal_gaussian(
-#     means=[1*K,  8*K, 16*K], 
-#     sigmas=[0.1*K, 0.2*K, 0.2*K], 
-#     weights=[0.3, 0.25, 0.45], 
-#     size=64,
-#     seed=42,
-# )
-# docs = sample_random_docs(
-#     max_ctx_length = 64 * K,
-#     # size = 1 * K,
-#     size = 128,
-#     seed=42,
-# )
 
-docs = sample_wlbllm_docs(
-    size = 128,
-    seed=42,
-)
+
+num_batches = 1
+num_workers = 4
+num_total_devices = 8
+
+# sample_size = 64
+# sample_size = 128
+# sample_size = 256
+# sample_size = 512
+# sample_size = 1024
+sample_size = 2048
+
+# name = "multimodal_gaussian"
+name = "wlbllm_docs"
+# name = "random_docs"
+
+if name == "multimodal_gaussian":
+    docs = sample_multimodal_gaussian(
+        means=[1*K,  8*K, 16*K], 
+        sigmas=[0.1*K, 0.2*K, 0.2*K], weights=[0.3, 0.25, 0.45], 
+        size=sample_size, seed=42,
+    )
+elif name == "random_docs":
+    docs = sample_random_docs(max_ctx_length = 64 * K, size = sample_size, seed=42,)
+elif name == "wlbllm_docs":
+    docs = sample_wlbllm_docs(
+        size = sample_size,
+        seed=42,
+    )
+
 
 batches = batch_documents(
     docs, 
-    max_ctx_length = 64 * K,
+    max_ctx_length = 64 * K * num_batches,
     # max_ctx_length = 16 * K,
 )
 batches = list(batches)
+flatted_batches = [x for xs in batches for x in xs]
 
+# Plot the distribution of docs and flatted_batches
+plt.figure(figsize=(10, 8))
 
-# # Plot the distribution of docs
+# Upper subplot for docs
+plt.subplot(2, 1, 1)
 plt.hist(docs, bins=100, edgecolor='black')
+plt.title('Distribution of Docs')
+plt.xlabel('Document Length')
+plt.ylabel('Frequency')
+
+# Lower subplot for flatted_batches
+plt.subplot(2, 1, 2)
+plt.hist(flatted_batches, bins=100, edgecolor='black')
+plt.title('Distribution of Flatted Batches')
+plt.xlabel('Batch Length')
+plt.ylabel('Frequency')
+
+plt.tight_layout()
 plt.show()
+
+print(len(batches))
 
 # batches
 
 
 
 # %%
+print(batches[0])
 
-num_workers = 4
-num_total_devices = 32
+# %%
+
 
 cumulative_batches = []
 for i, batch in enumerate(batches):
@@ -169,7 +213,7 @@ for i, batch in enumerate(batches):
         plt.figure(figsize=(10, 10))  # Increased figure height to accommodate two subplots
         
         # Top subplot for speedup distribution
-        plt.subplot(2, 1, 1)
+        plt.subplot(3, 1, 1)
         bin_edges = [-20, -18, -16, -14, -12, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]
         n, bins, patches = plt.hist(display_results, bins=bin_edges, edgecolor='black')
         
@@ -178,24 +222,29 @@ for i, batch in enumerate(batches):
             plt.text(x + (bins[1]-bins[0])/2, count, str(int(count)), 
                      ha='center', va='bottom')
         
-        plt.title(f'Distribution of Speedup (Workers: {num_workers}, Devices: {num_total_devices})')
+        plt.title(f'Speedup (Workers: {num_workers}, Devices: {num_total_devices})')
         plt.xlabel('Speedup (%)')
         plt.ylabel('Frequency')
         plt.grid(True, axis='y', linestyle='--', alpha=0.7)
         
         # Bottom subplot for cumulative batches distribution
-        plt.subplot(2, 1, 2)
-        batch_bin_edges = list(range(0, int(max(cumulative_batches))+1000, 1000))
-        plt.hist(cumulative_batches, bins=batch_bin_edges, edgecolor='black')
-        plt.title('Distribution of Cumulative Batch Sizes')
-        plt.xlabel('Batch Size (tokens)')
+        plt.subplot(3, 1, 2)
+        batch_bin_edges = list(range(0, int(sum(docs))+1000, 1000))
+        plt.hist(docs, bins=batch_bin_edges, edgecolor='black')
+        plt.title(f'Post-pack Document Distribution (total docs: {len(docs)})')
+        plt.xlabel('Document length (tokens)')
         plt.ylabel('Frequency')
         plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+
+        plt.subplot(3, 1, 3)
+        
+
         
         plt.tight_layout()
         plt.show()
-    if (i + 1) % 10 == 0:
-        plot_speedup_distribution()
+    
+    # if (i + 1) % 10 == 0:
+    plot_speedup_distribution()
 
 plot_speedup_distribution()
 

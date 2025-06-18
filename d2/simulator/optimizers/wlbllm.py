@@ -52,8 +52,7 @@ class WlbLlmSolution:
 class WlbLlmSolver:
     """Minimise the slowest worker's latency subject to length and assignment constraints."""
 
-    def get_attn_time(self, x: int, tp: int, cp: int) -> float:
-
+    def get_network_time(self, x: int, tp: int, cp: int) -> float:
         hqo = 64
         hkv = 4
         d = 128
@@ -61,12 +60,26 @@ class WlbLlmSolver:
         allreduce_perdevice_nelem = x * hqo * d // tp
         allgather_perdevice_nelem = x * d * max(1, hkv // cp)
 
-        
-        attn = tm.get_attn_time(x, tp, cp)
         allreduce_time = tm.get_allreduce_time(allreduce_perdevice_nelem, tp)
         allgather_time = tm.get_allgather_time(allgather_perdevice_nelem, cp)
+        return allreduce_time + allgather_time
+    
+    def get_attn_time(self, x: int, tp: int, cp: int) -> float:
 
-        return attn + allreduce_time + allgather_time
+        hqo = 64
+        hkv = 4
+        d = 128
+
+        # allreduce_perdevice_nelem = x * hqo * d // tp
+        # allgather_perdevice_nelem = x * d * max(1, hkv // cp)
+
+        
+        attn = tm.get_attn_time(x, tp, cp)
+        # allreduce_time = tm.get_allreduce_time(allreduce_perdevice_nelem, tp)
+        # allgather_time = tm.get_allgather_time(allgather_perdevice_nelem, cp)
+
+        # return attn + allreduce_time + allgather_time
+        return attn
 
     
     def get_mlp_time(self, x: int, tp: int, cp: int) -> float:
@@ -87,8 +100,18 @@ class WlbLlmSolver:
         n_docs = len(doc_lengths)
         attn_time = self.get_attn_time
         mlp_time = self.get_mlp_time
+        network_time = self.get_network_time
 
-        costs = [int(attn_time(d, tp = tp, cp = cp) + mlp_time(d, tp = tp, cp = cp)) for d in doc_lengths]  # ms, cast to int
+        costs = [
+            int(
+                attn_time(d, tp = tp, cp = cp) 
+                + mlp_time(d, tp = tp, cp = cp) 
+                # + network_time(d, tp = tp, cp = cp)
+            ) 
+            for d in doc_lengths
+        ]
+
+        print(f"costs (tp={tp}, cp={cp}): {costs[0]}")
 
         # ——— CP-SAT model ——————————————————————————————————————————
         model = cp_model.CpModel()
