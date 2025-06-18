@@ -8,7 +8,7 @@ import torch
 
 _lib_path = os.path.join(os.path.dirname(__file__), "libas_comm.so")
 torch.ops.load_library(_lib_path)
-_ops = torch.ops.attn_kernels
+_ops = torch.ops.dispatch_kernels
 
 ###### NVSHMEM utils ######
 
@@ -59,11 +59,11 @@ def create_dispatcher(
     max_tokens_query: int,
     max_tokens_key_value: int,
 ):
-    return _ops.create_dispatcher(q_stride, kv_stride, max_tokens_query, max_tokens_key_value)
+    return _ops.create_dispatch_helper(q_stride, kv_stride, max_tokens_query, max_tokens_key_value)
 
 
 def destroy_dispatcher(dispatcher) -> None:
-    _ops.destroy_dispatcher(dispatcher)
+    _ops.destroy_dispatch_helper(dispatcher)
 
 
 class DispatcherWrapper:
@@ -89,11 +89,17 @@ class DispatcherWrapper:
         self.max_tokens_key_value = max_tokens_key_value
 
     def maybe_update(self,
+                     q_stride: int,
+                     kv_stride: int,
                      max_tokens_query: int,
                      max_tokens_key_value: int,
                      ):
-        if (self.max_tokens_query < max_tokens_query or
+        if (self.max_tokens_query * self.q_stride < max_tokens_query * q_stride or
+            self.max_tokens_key_value * self.kv_stride < max_tokens_key_value * kv_stride or
+            self.max_tokens_query < max_tokens_query or
             self.max_tokens_key_value < max_tokens_key_value):
+            self.q_stride = q_stride
+            self.kv_stride = kv_stride
             self.max_tokens_query = max_tokens_query
             self.max_tokens_key_value = max_tokens_key_value
             destroy_dispatcher(self.dispatcher)
@@ -110,6 +116,7 @@ class DispatcherStorage:
 
     def __init__(self):
         self._dispatcher_dict: Dict[Tuple[int, int], DispatcherWrapper] = {}
+        self._current_dispatcher: Optional[DispatcherWrapper] = None
 
     def get_dispatcher(
         self,
@@ -118,16 +125,18 @@ class DispatcherStorage:
         max_tokens_query: int,
         max_tokens_key_value: int,
     ):
-        key = (q_stride, kv_stride)
-        if key not in self._dispatcher_dict:
-            self._dispatcher_dict[key] = DispatcherWrapper(
+        if self._current_dispatcher is None:
+            # avoid allocating a buffer of size 0
+            max_tokens_key_value = max(max_tokens_key_value, 1)
+            kv_stride = max(kv_stride, 1)
+            self._current_dispatcher = DispatcherWrapper(
                 q_stride, kv_stride, max_tokens_query, max_tokens_key_value
             )
-        self._dispatcher_dict[key].maybe_update(
-            max_tokens_query=max_tokens_query,
-            max_tokens_key_value=max_tokens_key_value,
-        )
-        return self._dispatcher_dict[key]
+        else:
+            self._current_dispatcher.maybe_update(
+                q_stride, kv_stride, max_tokens_query, max_tokens_key_value
+            )
+        return self._current_dispatcher
 
 
 _dispatcher_storage = DispatcherStorage()
@@ -144,11 +153,16 @@ def dispatch(
     key_value_dst_offset: Optional[torch.Tensor],
     dispatcher = None,
 ):
+    q_stride = query_in.stride(0) * query_in.element_size()
+    kv_stride = (key_value_in.stride(0) * key_value_in.element_size()
+                 if key_value_in is not None else 0)
+    max_tokens_query = query_in.size(0)
+    max_tokens_key_value = key_value_in.size(0) if key_value_in is not None else 0
     dispatcher = dispatcher or _dispatcher_storage.get_dispatcher(
-        q_stride=query_in.stride(1),
-        kv_stride=key_value_in.stride(1) if key_value_in is not None else 0,
-        max_tokens_query=query_in.size(0),
-        max_tokens_key_value=key_value_in.size(0) if key_value_in is not None else 0,
+        q_stride=q_stride,
+        kv_stride=kv_stride,
+        max_tokens_query=max_tokens_query,
+        max_tokens_key_value=max_tokens_key_value,
     )
 
     num_tokens = query_in.size(0)

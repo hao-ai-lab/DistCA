@@ -5,21 +5,7 @@ from typing import Optional
 
 import torch
 
-def dispatch(
-    query_out: torch.Tensor,
-    key_value_out: Optional[torch.Tensor],
-    query_in: torch.Tensor,
-    key_value_in: Optional[torch.Tensor],
-    query_dst_id: torch.Tensor,
-    query_dst_offset: torch.Tensor,
-    key_value_dst_id: Optional[torch.Tensor],
-    key_value_dst_offset: Optional[torch.Tensor],
-    token: int,
-    hidden_q: int,
-    hidden_kv: int,
-    cp_degree: int
-):
-    """Template"""
+from ..attn_kernels.ops import dispatch
 
 def dispatch_reverse(
     query_out: torch.Tensor,
@@ -30,12 +16,14 @@ def dispatch_reverse(
     query_dst_offset: torch.Tensor,
     key_value_dst_id: Optional[torch.Tensor],
     key_value_dst_offset: Optional[torch.Tensor],
-    token_query: int,
-    token_kv: int,
-    hidden_q: int,
-    hidden_kv: int,
 ):
-    """Template"""
+    dispatch(
+        query_out, None, query_in, None, query_dst_id, query_dst_offset, None, None
+    )
+    if key_value_in is not None:
+        dispatch(
+            key_value_out, None, key_value_in, None, key_value_dst_id, key_value_dst_offset, None, None
+        )
 
 def both_none_or_neither(a, b):
     return (a is None and b is None) or (a is not None and b is not None)
@@ -81,28 +69,24 @@ class n_to_n_dispatch(torch.autograd.Function):
             out_key_value = torch.empty(out_key_value_shape, device=key_value_in.device, dtype=key_value_in.dtype)
             key_value_dst_mask = (key_value_dst_id != -1).to(torch.bool)
             hidden_kv = out_key_value_shape[-1]
-            max_cp_degree = key_value_dst_id.shape[-1]
         else:
             out_key_value = None
             key_value_dst_mask = None
             hidden_kv = 0
-            max_cp_degree = 0
 
         if stream is not None:
             with torch.cuda.stream(stream):
                 dispatch(
                     out_query, out_key_value, query_in, key_value_in,
                     query_dst_id, query_dst_offset,
-                    key_value_dst_id, key_value_dst_offset,
-                    num_token, hidden_q, hidden_kv, max_cp_degree
+                    key_value_dst_id, key_value_dst_offset
                 )
                 event.record(stream)
         else:
             dispatch(
                 out_query, out_key_value, query_in, key_value_in,
                 query_dst_id, query_dst_offset,
-                key_value_dst_id, key_value_dst_offset,
-                num_token, hidden_q, hidden_kv, max_cp_degree
+                key_value_dst_id, key_value_dst_offset
             )
 
         ctx.save_for_backward(query_in.shape)

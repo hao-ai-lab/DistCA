@@ -10,7 +10,7 @@ Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT
 
 using namespace attn;
 
-TORCH_LIBRARY(attn_kernels, m) {
+TORCH_LIBRARY(dispatch_kernels, m) {
   register_nvshmem_ops(m);
   register_all_to_all_ops(m);
 }

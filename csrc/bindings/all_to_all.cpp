@@ -20,24 +20,25 @@ namespace {
     TORCH_CHECK(x.is_contiguous(), "tensor " #x " must be contiguous");
 
 fptr_t create_dispatch_helper(
-    size_t q_stride,
-    size_t kv_stride,
-    size_t max_tokens_query,
-    size_t max_tokens_key_value
+    int64_t q_stride,
+    int64_t kv_stride,
+    int64_t max_tokens_query,
+    int64_t max_tokens_key_value
 ) {
-    return new DispatchHelper(q_stride, kv_stride, max_tokens_query, max_tokens_key_value);
+    auto *ptr = new DispatchHelper(q_stride, kv_stride, max_tokens_query, max_tokens_key_value);
+    return (fptr_t)ptr;
 }
 
 void dispatch(
     fptr_t fptr,    // pointer to the dispatch helper function.
     at::Tensor &query_out,
-    std::optional<const at::Tensor> &key_value_out,
+    const std::optional<at::Tensor> &key_value_out,
     const at::Tensor &query_in,
-    std::optional<const at::Tensor> &key_value_in,
+    const std::optional<at::Tensor> &key_value_in,
     const at::Tensor &query_dst_id,
     const at::Tensor &query_dst_offset,
-    std::optional<const at::Tensor> &key_value_dst_id,
-    std::optional<const at::Tensor> &key_value_dst_offset,
+    const std::optional<at::Tensor> &key_value_dst_id,
+    const std::optional<at::Tensor> &key_value_dst_offset,
     int64_t num_tokens,
     int64_t num_recv_tokens_query,
     int64_t num_recv_tokens_key_value

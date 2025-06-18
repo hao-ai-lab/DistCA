@@ -212,14 +212,25 @@ void DispatchHelper::dispatch(
         &num_recv_tokens_query,
         &num_recv_tokens_key_value
     };
-    CUDACHECK(cudaLaunchCooperativeKernel(
-        (void *)&qkv_dispatch_kernel<has_key_value>,
-        dimGrid,
-        dimBlock,
-        args,
-        sharedMemory,
-        stream
-    ));
+    if (has_key_value) {
+        CUDACHECK(cudaLaunchCooperativeKernel(
+            (void *)&qkv_dispatch_kernel<true>,
+            dimGrid,
+            dimBlock,
+            args,
+            sharedMemory,
+            stream
+        ));
+    } else {
+        CUDACHECK(cudaLaunchCooperativeKernel(
+            (void *)&qkv_dispatch_kernel<false>,
+            dimGrid,
+            dimBlock,
+            args,
+            sharedMemory,
+            stream
+        ));
+    }
 }
 
 };  // namespace attn
