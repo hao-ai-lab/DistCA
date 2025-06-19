@@ -57,6 +57,11 @@ class AttnServerSolution:
 
     mlp_time: float
 
+    def get_parallel_plan(self):
+        return [plan for plan in self.worker2plan.values() if plan != (0, 0)]
+
+    def get_batch_assignment(self):
+        return self.batches
 
     def dump_object(self):
         return dict(
@@ -118,10 +123,7 @@ class AttnServerSolver:
         # TODO: The MLP time is not exactly correct...
         # latency += tm.get_mlp_time(total_length, mtp, mcp)
         
-        mlp_time = sum(
-            tm.get_mlp_time(doc_length, mtp, mcp)
-            for doc_length in batch
-        )
+        mlp_time = tm.get_mlp_time(sum(batch), mtp, mcp)
         print(f"[AttnServer] MLP(tp={mtp},cp={mcp}): {mlp_time:.2f} ms")
         # mlp_time = tm.get_mlp_time(batch[0], mtp, mcp)
         # mlp_time = tm.get_mlp_time(batch[0], 2, 2)

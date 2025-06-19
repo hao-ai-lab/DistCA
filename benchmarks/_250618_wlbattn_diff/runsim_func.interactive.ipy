@@ -1,0 +1,22 @@
+import contextlib
+from runsim_func import run_simulation
+import sys
+from contextlib import redirect_stdout
+import os
+
+os.makedirs("log", exist_ok=True)
+
+def dual_print(s, f):
+    print(s, flush=True)
+    f.write(s + "\n")
+    f.flush()
+
+K = 1024
+
+batch = [64 * K] * 2
+
+diff = run_simulation(
+    batch=batch, 
+    num_total_devices=8,
+    num_workers=2,
+)

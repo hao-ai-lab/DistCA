@@ -36,6 +36,9 @@ class WlbLlmSolution:
             print(f"- Worker {w:<2d}: docs {docs}  —  latency {self.lat_worker[w]} ms")
         print(f"- Maximum latency: {self.lat_max}\n")
 
+    def get_batch_assignment(self):
+        return self.batches
+
     def dump_object(self) -> Dict[str, Any]:
         return dict(
             batches=self.batches,
