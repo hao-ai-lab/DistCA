@@ -112,7 +112,7 @@ class WlbLlmSolver:
         costs = [
             int(
                 (
-                    attn_time(d, tp = tp, cp = cp) 
+                attn_time(d, tp = tp, cp = cp) 
                 + mlp_time(d, tp = tp, cp = cp) 
                 + network_time(d, tp = tp, cp = cp)
                 ) * 1000
