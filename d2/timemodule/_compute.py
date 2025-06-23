@@ -271,3 +271,52 @@ def get_attn_time_old(
     result = lower_time + (upper_time - lower_time) * (y - lower_key) / (upper_key - lower_key)
     return result
 
+
+
+def get_mlp_time(x: int, tp: int, cp: int) -> float:
+    # length -> time ms
+    unit_time = {
+        64:10.00,
+        128:10.50,
+        256:11.00,
+        512:11.46,
+        1024:12.31,
+        2048:12.56,
+        4096:13.87,
+        8192:17.79,
+        16384:25.86,
+        32768:44.25,
+        65536:76.6,
+        131072:153.2,
+        262144:306.4,
+        524288:612.8
+    }
+
+    
+    y = x / (tp * cp)
+    # Find the two closest keys to y
+    sorted_keys = list(unit_time.keys())
+    # This is guaranteed to be sorted anyways.
+
+    min_key = min(unit_time.keys())
+    if y < min_key:
+        return unit_time[min_key]
+    elif y > 524288:
+        return unit_time[524288] / 524288 * y
+    
+    # If y is an exact match, return immediately
+    if y in unit_time:
+        z = unit_time[y]
+    else:
+        # Find the two closest keys
+        lower_key = max(k for k in sorted_keys if k <= y)
+        upper_key = min(k for k in sorted_keys if k >= y)
+        
+        # Linear interpolation
+        lower_time = unit_time[lower_key]
+        upper_time = unit_time[upper_key]
+        
+        # Interpolate
+        z = lower_time + (upper_time - lower_time) * (y - lower_key) / (upper_key - lower_key)
+    return z
+
