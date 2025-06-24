@@ -23,9 +23,14 @@ fptr_t create_dispatch_helper(
     int64_t q_stride,
     int64_t kv_stride,
     int64_t max_tokens_query,
-    int64_t max_tokens_key_value
+    int64_t max_tokens_key_value,
+    int64_t rank,
+    int64_t world_size
 ) {
-    auto *ptr = new DispatchHelper(q_stride, kv_stride, max_tokens_query, max_tokens_key_value);
+    auto *ptr = new DispatchHelper(
+        q_stride, kv_stride, max_tokens_query, max_tokens_key_value,
+        rank, world_size
+    );
     return (fptr_t)ptr;
 }
 

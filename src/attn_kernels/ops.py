@@ -58,8 +58,13 @@ def create_dispatcher(
     kv_stride: int,
     max_tokens_query: int,
     max_tokens_key_value: int,
+    rank: int,
+    world_size: int,
 ):
-    return _ops.create_dispatch_helper(q_stride, kv_stride, max_tokens_query, max_tokens_key_value)
+    return _ops.create_dispatch_helper(
+        q_stride, kv_stride, max_tokens_query, max_tokens_key_value,
+        rank, world_size
+    )
 
 
 def destroy_dispatcher(dispatcher) -> None:
@@ -79,14 +84,19 @@ class DispatcherWrapper:
                  kv_stride: int,
                  max_tokens_query: int,
                  max_tokens_key_value: int,
+                 rank: int,
+                 world_size: int,
                  ):
         self.dispatcher = create_dispatcher(
-            q_stride, kv_stride, max_tokens_query, max_tokens_key_value
+            q_stride, kv_stride, max_tokens_query, max_tokens_key_value,
+            rank, world_size
         )
         self.q_stride = q_stride
         self.kv_stride = kv_stride
         self.max_tokens_query = max_tokens_query
         self.max_tokens_key_value = max_tokens_key_value
+        self.rank = rank
+        self.world_size = world_size
 
     def maybe_update(self,
                      q_stride: int,
@@ -105,7 +115,8 @@ class DispatcherWrapper:
             destroy_dispatcher(self.dispatcher)
             self.dispatcher = create_dispatcher(
                 self.q_stride, self.kv_stride,
-                self.max_tokens_query, self.max_tokens_key_value
+                self.max_tokens_query, self.max_tokens_key_value,
+                self.rank, self.world_size
             )
 
     def __del__(self):
@@ -117,6 +128,8 @@ class DispatcherStorage:
     def __init__(self):
         self._dispatcher_dict: Dict[Tuple[int, int], DispatcherWrapper] = {}
         self._current_dispatcher: Optional[DispatcherWrapper] = None
+        self.rank = None
+        self.world_size = None
 
     def get_dispatcher(
         self,
@@ -125,12 +138,18 @@ class DispatcherStorage:
         max_tokens_query: int,
         max_tokens_key_value: int,
     ):
+        if self.rank is None:
+            self.rank = nvshmem_my_pe()
+        if self.world_size is None:
+            self.world_size = nvshmem_n_pes()
+
         if self._current_dispatcher is None:
             # avoid allocating a buffer of size 0
             max_tokens_key_value = max(max_tokens_key_value, 1)
             kv_stride = max(kv_stride, 1)
             self._current_dispatcher = DispatcherWrapper(
-                q_stride, kv_stride, max_tokens_query, max_tokens_key_value
+                q_stride, kv_stride, max_tokens_query, max_tokens_key_value,
+                self.rank, self.world_size
             )
         else:
             self._current_dispatcher.maybe_update(

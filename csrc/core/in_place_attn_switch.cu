@@ -13,22 +13,26 @@ __global__ void qkv_dispatch_kernel(
     std::byte* key_value_out,
     const std::byte* query_in,
     const std::byte* key_value_in,
-    const int32_t* query_dst_id,
-    const int32_t* query_dst_offset,
-    const int32_t* key_value_dst_id,
-    const int32_t* key_value_dst_offset,
-    size_t num_tokens,
-    size_t q_stride,
-    size_t kv_stride,
-    uint32_t max_cp_degree,
+    const uint32_t* query_dst_id,
+    const uint32_t* query_dst_offset,
+    const uint32_t* key_value_dst_id,
+    const uint32_t* key_value_dst_offset,
+    const size_t num_tokens,
+    const size_t q_stride,
+    const size_t kv_stride,
+    const size_t max_cp_degree,
     // nvshmem buffers
     std::byte* q_send_buffer,
     std::byte* q_recv_buffer,
     std::byte* kv_send_buffer,
     std::byte* kv_recv_buffer,
+    std::byte* q_signal_buffer,
+    std::byte* kv_signal_buffer,
     // receive info
     int num_q_to_recv,
-    int num_kv_to_recv
+    int num_kv_to_recv,
+    unsigned rank,
+    unsigned world_size
 ) {
     // --- Calculate thread/warp IDs based on the new launch grid ---
     const unsigned WARP_SIZE = 32;
@@ -103,7 +107,10 @@ __global__ void qkv_dispatch_kernel(
                 std::byte* kv_out_buffer = key_value_out + kv_dest_offset * kv_stride;
 
                 // TODO(yonghao): use a nvshmemx_putmem_signal_nbi_warp to add a signal on the receiver.
-                nvshmem_putmem_nbi(kv_out_buffer, kv_send_buffer_token, kv_stride, kv_dest_rank);
+                nvshmem_putmem_nbi(
+                    kv_out_buffer, kv_send_buffer_token, kv_stride,
+                    kv_dest_rank
+                );
             }
         }
     }
@@ -144,13 +151,18 @@ DispatchHelper::DispatchHelper(
     size_t q_stride,
     size_t kv_stride,
     size_t max_tokens_query,
-    size_t max_tokens_key_value
-) : q_stride(q_stride), kv_stride(kv_stride), max_tokens_query(max_tokens_query), max_tokens_key_value(max_tokens_key_value) {
-
+    size_t max_tokens_key_value,
+    unsigned rank,
+    unsigned world_size
+) : q_stride(q_stride), kv_stride(kv_stride),
+    max_tokens_query(max_tokens_query), max_tokens_key_value(max_tokens_key_value),
+    rank(rank), world_size(world_size) {
     q_send_buffer = (std::byte *)nvshmem_malloc(max_tokens_query * q_stride);
     q_recv_buffer = (std::byte *)nvshmem_malloc(max_tokens_query * q_stride);
     kv_send_buffer = (std::byte *)nvshmem_malloc(max_tokens_key_value * kv_stride);
     kv_recv_buffer = (std::byte *)nvshmem_malloc(max_tokens_key_value * kv_stride);
+    q_signal_buffer = (std::byte *)nvshmem_malloc(world_size);
+    kv_signal_buffer = (std::byte *)nvshmem_malloc(world_size);
 }
 
 DispatchHelper::~DispatchHelper() {
@@ -158,6 +170,8 @@ DispatchHelper::~DispatchHelper() {
     nvshmem_free(q_recv_buffer);
     nvshmem_free(kv_send_buffer);
     nvshmem_free(kv_recv_buffer);
+    nvshmem_free(q_signal_buffer);
+    nvshmem_free(kv_signal_buffer);
 }
 
 void DispatchHelper::dispatch(
@@ -165,14 +179,14 @@ void DispatchHelper::dispatch(
     std::byte* key_value_out,
     const std::byte* query_in,
     const std::byte* key_value_in,
-    const int32_t* query_dst_id,
-    const int32_t* query_dst_offset,
-    const int32_t* key_value_dst_id,
-    const int32_t* key_value_dst_offset,
-    size_t num_send_tokens,
-    size_t num_recv_tokens_query,
-    size_t num_recv_tokens_key_value,
-    size_t max_cp_degree,
+    const uint32_t* query_dst_id,
+    const uint32_t* query_dst_offset,
+    const uint32_t* key_value_dst_id,
+    const uint32_t* key_value_dst_offset,
+    const size_t num_send_tokens,
+    const size_t num_recv_tokens_query,
+    const size_t num_recv_tokens_key_value,
+    const size_t max_cp_degree,
     cudaStream_t stream
 ) {
     int numSMs = get_sm_count();
@@ -195,22 +209,24 @@ void DispatchHelper::dispatch(
     void* args[] = {
         &query_out,
         &key_value_out,
-        &query_in,
-        &key_value_in,
-        &query_dst_id,
-        &query_dst_offset,
-        &key_value_dst_id,
-        &key_value_dst_offset,
-        &num_send_tokens,
-        &q_stride,
-        &kv_stride,
-        &max_cp_degree,
+        const_cast<std::byte **>(&query_in),
+        const_cast<std::byte **>(&key_value_in),
+        const_cast<uint32_t **>(&query_dst_id),
+        const_cast<uint32_t **>(&query_dst_offset),
+        const_cast<uint32_t **>(&key_value_dst_id),
+        const_cast<uint32_t **>(&key_value_dst_offset),
+        const_cast<size_t *>(&num_send_tokens),
+        const_cast<size_t *>(&q_stride),
+        const_cast<size_t *>(&kv_stride),
+        const_cast<size_t *>(&max_cp_degree),
         &q_send_buffer,
         &q_recv_buffer,
         &kv_send_buffer,
         &kv_recv_buffer,
-        &num_recv_tokens_query,
-        &num_recv_tokens_key_value
+        const_cast<size_t *>(&num_recv_tokens_query),
+        const_cast<size_t *>(&num_recv_tokens_key_value),
+        const_cast<unsigned *>(&rank),
+        const_cast<unsigned *>(&world_size)
     };
     if (has_key_value) {
         CUDACHECK(cudaLaunchCooperativeKernel(
