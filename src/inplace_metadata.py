@@ -66,7 +66,7 @@ def compute_dst_offsets(
     glob_dst_offset_flat = torch.where(valid_mask, glob_dst_offset_flat, -1 * torch.ones_like(glob_dst_offset_flat))
 
     # Reshape back to the original input shape
-    return glob_dst_offset_flat.reshape(original_shape)
+    return glob_dst_offset_flat.reshape(original_shape).to(torch.uint32)
 
 
 @torch.no_grad()
@@ -142,10 +142,31 @@ def compute_reverse_comm(
     rev_dst_offset.view(-1).scatter_(0, valid_fwd_d * max_received + valid_fwd_o, valid_src_t)
 
     # mask -1 based on num_received: those indices >= num_received should be masked
-    rev_dst_id = rev_dst_id.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1)
-    rev_dst_offset = rev_dst_offset.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1)
+    rev_dst_id = rev_dst_id.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1).to(torch.uint32)
+    rev_dst_offset = rev_dst_offset.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1).to(torch.uint32)
 
     return rev_dst_id, rev_dst_offset
+
+
+@torch.no_grad()
+def compute_num_recv_tokens(
+    dst_id: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Args:
+        dst_id: tensor of shape (world_size, num_tokens, ...). The dst rank for each token. -1 is padding.
+    Returns:
+        num_recv_tokens: tensor of shape (world_size, world_size + 1). The number of tokens received by from rank.
+        The last dimension is the total number of tokens received.
+    """
+    world_size = dst_id.shape[0]
+    dst_id = dst_id.reshape(world_size, -1)
+    one_hot_dst = torch.nn.functional.one_hot(dst_id + 1, num_classes=world_size + 1).long()[:, :, 1:]
+    num_recv_tokens = one_hot_dst.sum(dim=1).T
+    num_recv_tokens = torch.cat([num_recv_tokens, num_recv_tokens.sum(dim=1, keepdim=True)], dim=1)
+    return num_recv_tokens.long().to(torch.uint64)  # size_t
+
+
 
 # Example Usage:
 if __name__ == '__main__':

@@ -26,20 +26,20 @@ __global__ void qkv_dispatch_kernel(
     std::byte* q_recv_buffer,
     std::byte* kv_send_buffer,
     std::byte* kv_recv_buffer,
-    std::byte* q_signal_buffer,
-    std::byte* kv_signal_buffer,
+    uint64_t* q_signal_buffer,
+    uint64_t* kv_signal_buffer,
     // receive info
-    int num_q_to_recv,
-    int num_kv_to_recv,
-    unsigned rank,
-    unsigned world_size
+    const uint64_t* num_q_to_recv,   // array of size world_size. The number of tokens to recv from each rank. The last value is the sum.
+    const uint64_t* num_kv_to_recv,  // Same as above.
+    const unsigned rank,
+    const unsigned world_size
 ) {
     // --- Calculate thread/warp IDs based on the new launch grid ---
     const unsigned WARP_SIZE = 32;
     const unsigned NUM_WARPS = blockDim.x / WARP_SIZE;
 
     // NOTE(yonghao): a warp is the minimum unit of token-level communication.
-    const unsigned lane_id = threadIdx.x % WARP_SIZE;
+    // const unsigned lane_id = threadIdx.x % WARP_SIZE;
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     // NOTE(yonghao): a warp group is responsible for one token. (potentially multiple destinations)
     const unsigned warp_group_id = blockIdx.x;
@@ -85,10 +85,13 @@ __global__ void qkv_dispatch_kernel(
             std::byte* q_recv_buffer_token = q_recv_buffer + query_dest_offset * q_stride;
 
             // TODO(yonghao): use a nvshmemx_putmem_signal_nbi_warp to add a signal on the receiver.
-            nvshmem_putmem_nbi(
+            nvshmemx_putmem_signal_nbi_warp(
                 q_recv_buffer_token,
                 q_send_buffer_token,
                 q_stride,
+                &q_signal_buffer[query_dest_rank],
+                1,
+                NVSHMEM_SIGNAL_ADD,
                 query_dest_rank
             );
         }
@@ -107,8 +110,13 @@ __global__ void qkv_dispatch_kernel(
                 std::byte* kv_out_buffer = key_value_out + kv_dest_offset * kv_stride;
 
                 // TODO(yonghao): use a nvshmemx_putmem_signal_nbi_warp to add a signal on the receiver.
-                nvshmem_putmem_nbi(
-                    kv_out_buffer, kv_send_buffer_token, kv_stride,
+                nvshmemx_putmem_signal_nbi_warp(
+                    kv_out_buffer,
+                    kv_send_buffer_token,
+                    kv_stride,
+                    &kv_signal_buffer[kv_dest_rank],
+                    1,
+                    NVSHMEM_SIGNAL_ADD,
                     kv_dest_rank
                 );
             }
@@ -120,10 +128,19 @@ __global__ void qkv_dispatch_kernel(
 
     // --- RECEIVER-SIDE SYNCHRONIZATION ---
 
-    // FIXME(yonghao): add a sync signal to ensure that send is done. Only recv after that.
+    // sync to ensure that all recv are done.
+    for (size_t i = threadIdx.x; i < world_size; i += warp_group_size) {
+        const size_t num_recv_from_rank = num_q_to_recv[i];
+        nvshmem_uint64_wait_until(&q_signal_buffer[i], NVSHMEM_CMP_EQ, num_recv_from_rank);
+        if constexpr (KEY_VALUE) {
+            const size_t num_recv_from_rank = num_kv_to_recv[i];
+            nvshmem_uint64_wait_until(&kv_signal_buffer[i], NVSHMEM_CMP_EQ, num_recv_from_rank);
+        }
+    }
+    __syncthreads();
 
     // memcpy to the dst tensor. No need to have a metadata handler warp.
-    for (int token_idx = blockIdx.x; token_idx < num_q_to_recv; token_idx += gridDim.x) {
+    for (size_t token_idx = blockIdx.x; token_idx < num_q_to_recv[world_size]; token_idx += gridDim.x) {
         std::byte* q_recv_buffer_token = q_recv_buffer + token_idx * Q_BUFFER_STRIDE;
         int4* query_token = (int4*)(query_out + token_idx * q_stride);
 
@@ -133,7 +150,7 @@ __global__ void qkv_dispatch_kernel(
         }
     }
     if constexpr (KEY_VALUE) {
-        for (int token_idx = blockIdx.x; token_idx < num_kv_to_recv; token_idx += gridDim.x) {
+        for (size_t token_idx = blockIdx.x; token_idx < num_kv_to_recv[world_size]; token_idx += gridDim.x) {
             int4* key_value_token = (int4*)(key_value_out + token_idx * kv_stride);
             std::byte* kv_recv_buffer_token = kv_recv_buffer + token_idx * KV_BUFFER_STRIDE;
 
@@ -154,15 +171,15 @@ DispatchHelper::DispatchHelper(
     size_t max_tokens_key_value,
     unsigned rank,
     unsigned world_size
-) : q_stride(q_stride), kv_stride(kv_stride),
-    max_tokens_query(max_tokens_query), max_tokens_key_value(max_tokens_key_value),
-    rank(rank), world_size(world_size) {
+) : rank(rank), world_size(world_size) {
     q_send_buffer = (std::byte *)nvshmem_malloc(max_tokens_query * q_stride);
     q_recv_buffer = (std::byte *)nvshmem_malloc(max_tokens_query * q_stride);
     kv_send_buffer = (std::byte *)nvshmem_malloc(max_tokens_key_value * kv_stride);
     kv_recv_buffer = (std::byte *)nvshmem_malloc(max_tokens_key_value * kv_stride);
-    q_signal_buffer = (std::byte *)nvshmem_malloc(world_size);
-    kv_signal_buffer = (std::byte *)nvshmem_malloc(world_size);
+    q_signal_buffer = (uint64_t *)nvshmem_malloc(sizeof(uint64_t) * world_size);
+    kv_signal_buffer = (uint64_t *)nvshmem_malloc(sizeof(uint64_t) * world_size);
+    cudaMemset(q_signal_buffer, 0, sizeof(uint64_t) * world_size);
+    cudaMemset(kv_signal_buffer, 0, sizeof(uint64_t) * world_size);
 }
 
 DispatchHelper::~DispatchHelper() {
@@ -184,9 +201,11 @@ void DispatchHelper::dispatch(
     const uint32_t* key_value_dst_id,
     const uint32_t* key_value_dst_offset,
     const size_t num_send_tokens,
-    const size_t num_recv_tokens_query,
-    const size_t num_recv_tokens_key_value,
+    const uint64_t* num_recv_tokens_query,
+    const uint64_t* num_recv_tokens_key_value,
     const size_t max_cp_degree,
+    const size_t q_stride,
+    const size_t kv_stride,
     cudaStream_t stream
 ) {
     int numSMs = get_sm_count();
@@ -223,8 +242,10 @@ void DispatchHelper::dispatch(
         &q_recv_buffer,
         &kv_send_buffer,
         &kv_recv_buffer,
-        const_cast<size_t *>(&num_recv_tokens_query),
-        const_cast<size_t *>(&num_recv_tokens_key_value),
+        &q_signal_buffer,
+        &kv_signal_buffer,
+        const_cast<uint64_t **>(&num_recv_tokens_query),
+        const_cast<uint64_t **>(&num_recv_tokens_key_value),
         const_cast<unsigned *>(&rank),
         const_cast<unsigned *>(&world_size)
     };
@@ -246,7 +267,9 @@ void DispatchHelper::dispatch(
             sharedMemory,
             stream
         ));
+        cudaMemsetAsync(kv_signal_buffer, 0, sizeof(uint64_t) * world_size, stream);
     }
+    cudaMemsetAsync(q_signal_buffer, 0, sizeof(uint64_t) * world_size, stream);
 }
 
 };  // namespace attn

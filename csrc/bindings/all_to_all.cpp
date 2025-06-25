@@ -45,8 +45,8 @@ void dispatch(
     const std::optional<at::Tensor> &key_value_dst_id,
     const std::optional<at::Tensor> &key_value_dst_offset,
     int64_t num_tokens,
-    int64_t num_recv_tokens_query,
-    int64_t num_recv_tokens_key_value
+    const at::Tensor &num_recv_tokens_query,
+    const std::optional<at::Tensor> &num_recv_tokens_key_value
 ) {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
@@ -55,17 +55,11 @@ void dispatch(
     TORCH_CHECK(
         num_tokens == query_in.size(0), "Query tensor first dimension must be tokens"
     )
-    TORCH_CHECK(
-        num_recv_tokens_query == query_out.size(0), "Query dst tensor's first dimension must be tokens"
-    )
     if (key_value_out.has_value()) {
         TORCH_CHECK(key_value_dst_id.has_value(), 
             "key_value tensor, dst_id, dst_offset must be provided together");
         TORCH_CHECK(
             num_tokens == key_value_out.value().size(0), "Key value tensor first dimension must be tokens"
-        )
-        TORCH_CHECK(
-            num_recv_tokens_key_value == key_value_out.value().size(0), "Key value dst tensor's first dimension must be tokens"
         )
         max_cp_degree = key_value_dst_id.value().size(2);
     } else {
@@ -81,19 +75,25 @@ void dispatch(
     at::cuda::OptionalCUDAGuard const device_guard(device_of(query_out));
 
     auto* dispatch_helper = (DispatchHelper*)fptr;
+    const size_t q_stride = query_out.stride(0);
+    const size_t kv_stride = key_value_out.has_value() ? key_value_out.value().stride(0) : 0;
+
+    // TODO: use const_data_ptr?
     dispatch_helper->dispatch(
         (std::byte*)query_out.data_ptr(),
         key_value_out.has_value() ? (std::byte*)key_value_out.value().data_ptr() : nullptr,
         (const std::byte*)query_in.data_ptr(),
         key_value_in.has_value() ? (const std::byte*)key_value_in.value().data_ptr() : nullptr,
-        query_dst_id.data_ptr<int32_t>(),
-        query_dst_offset.data_ptr<int32_t>(),
-        key_value_dst_id.has_value() ? key_value_dst_id.value().data_ptr<int32_t>() : nullptr,
-        key_value_dst_offset.has_value() ? key_value_dst_offset.value().data_ptr<int32_t>() : nullptr,
+        query_dst_id.data_ptr<uint32_t>(),
+        query_dst_offset.data_ptr<uint32_t>(),
+        key_value_dst_id.has_value() ? key_value_dst_id.value().data_ptr<uint32_t>() : nullptr,
+        key_value_dst_offset.has_value() ? key_value_dst_offset.value().data_ptr<uint32_t>() : nullptr,
         num_tokens,
-        num_recv_tokens_query,
-        num_recv_tokens_key_value,
+        num_recv_tokens_query.data_ptr<uint64_t>(),
+        num_recv_tokens_key_value.has_value() ? num_recv_tokens_key_value.value().data_ptr<uint64_t>() : nullptr,
         max_cp_degree,
+        q_stride,
+        kv_stride,
         stream
     );
 }

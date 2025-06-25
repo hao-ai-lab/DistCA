@@ -105,9 +105,7 @@ class DispatcherWrapper:
                      max_tokens_key_value: int,
                      ):
         if (self.max_tokens_query * self.q_stride < max_tokens_query * q_stride or
-            self.max_tokens_key_value * self.kv_stride < max_tokens_key_value * kv_stride or
-            self.max_tokens_query < max_tokens_query or
-            self.max_tokens_key_value < max_tokens_key_value):
+            self.max_tokens_key_value * self.kv_stride < max_tokens_key_value * kv_stride):
             self.q_stride = q_stride
             self.kv_stride = kv_stride
             self.max_tokens_query = max_tokens_query
@@ -123,6 +121,7 @@ class DispatcherWrapper:
         destroy_dispatcher(self.dispatcher)
 
 
+# TODO: remove this class because we only have one dispatcher.
 class DispatcherStorage:
 
     def __init__(self):
@@ -170,6 +169,8 @@ def dispatch(
     query_dst_offset: torch.Tensor,
     key_value_dst_id: Optional[torch.Tensor],
     key_value_dst_offset: Optional[torch.Tensor],
+    num_recv_tokens_query: torch.Tensor,
+    num_recv_tokens_key_value: Optional[torch.Tensor],
     dispatcher = None,
 ):
     q_stride = query_in.stride(0) * query_in.element_size()
@@ -183,11 +184,17 @@ def dispatch(
         max_tokens_query=max_tokens_query,
         max_tokens_key_value=max_tokens_key_value,
     )
+    assert query_dst_id.dtype == torch.uint32
+    assert query_dst_offset.dtype == torch.uint32
+    assert num_recv_tokens_query.dtype == torch.uint64
+    assert query_out.dtype == query_in.dtype
+    if key_value_dst_id is not None:
+        assert key_value_dst_id.dtype == torch.uint32
+        assert key_value_dst_offset.dtype == torch.uint32
+        assert num_recv_tokens_key_value.dtype == torch.uint64
+        assert key_value_out.dtype == key_value_in.dtype
 
     num_tokens = query_in.size(0)
-    num_recv_tokens_query = query_out.size(0)
-    num_recv_tokens_key_value = key_value_out.size(0) if key_value_out is not None else 0
-
     return _ops.dispatch(
         dispatcher,
         query_out, key_value_out, query_in, key_value_in,
