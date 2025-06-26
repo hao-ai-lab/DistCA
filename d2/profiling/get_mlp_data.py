@@ -12,7 +12,7 @@ def get_mlp_data() -> "dict[tuple[int, int], dict[int, float]]":
         this_dir = Path(d2.profiling.__path__[0])
 
     this_dir = Path(this_dir)
-    filepath = this_dir / "data" / "compute-mlp-only.bs4.tsv"
+    filepath = this_dir / "data" / "compute-mlp-only.bs2.tsv"
     df = pd.read_csv(filepath, sep="\t")
 
     columns = [
@@ -37,10 +37,6 @@ def get_mlp_data() -> "dict[tuple[int, int], dict[int, float]]":
     }, inplace=True)
 
     df['latency(ms)'] = df['qkv'] + df['linear_proj'] + df['attn_bda'] + df['mlp'] + df['mlp_bda']
-    
-    # divide by 4 because data is of batch size 4
-    df['latency(ms)'] = df['latency(ms)']
-
 
     result = {}
     for _, row in df.iterrows():
@@ -49,7 +45,7 @@ def get_mlp_data() -> "dict[tuple[int, int], dict[int, float]]":
         if (tp, cp) not in result:
             result[(tp, cp)] = {}
         seq_len = int(row["seq_len"])
-        seq_len = seq_len * 4 # because data is of batch size 4
+        seq_len = seq_len * 2 # because the data is bs2
         latency = row["latency(ms)"].item()
         result[(tp, cp)][seq_len] = latency
 
