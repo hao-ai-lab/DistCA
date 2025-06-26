@@ -184,19 +184,19 @@ def dispatch(
         max_tokens_query=max_tokens_query,
         max_tokens_key_value=max_tokens_key_value,
     )
-    assert query_dst_id.dtype == torch.uint32
+    assert query_dst_id.dtype == torch.int32
     assert query_dst_offset.dtype == torch.uint32
     assert num_recv_tokens_query.dtype == torch.uint64
     assert query_out.dtype == query_in.dtype
     if key_value_dst_id is not None:
-        assert key_value_dst_id.dtype == torch.uint32
+        assert key_value_dst_id.dtype == torch.int32
         assert key_value_dst_offset.dtype == torch.uint32
         assert num_recv_tokens_key_value.dtype == torch.uint64
         assert key_value_out.dtype == key_value_in.dtype
 
     num_tokens = query_in.size(0)
     return _ops.dispatch(
-        dispatcher,
+        dispatcher.dispatcher,
         query_out, key_value_out, query_in, key_value_in,
         query_dst_id, query_dst_offset,
         key_value_dst_id, key_value_dst_offset,

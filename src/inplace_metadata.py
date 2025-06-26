@@ -36,7 +36,7 @@ def compute_dst_offsets(
     # `counts[d, s]` will be the number of tokens sent from rank `s` to rank `d`.
     # Add world_size to glob_dst_id to handle -1, then subtract later
     shifted_dst_id = glob_dst_id + 1
-    one_hot_dest = torch.nn.functional.one_hot(shifted_dst_id, num_classes=world_size + 1).long()
+    one_hot_dest = torch.nn.functional.one_hot(shifted_dst_id.long(), num_classes=world_size + 1).long()
     # Only keep the relevant classes (original 0 to world_size-1)
     one_hot_dest = one_hot_dest[:, :, 1:] * valid_mask.unsqueeze(-1)
     counts = torch.sum(one_hot_dest, dim=1).transpose(0, 1)
@@ -57,13 +57,13 @@ def compute_dst_offsets(
     # `base_offsets_gathered[s, t]` = base_offset at `dest_id[s,t]` for tokens from `s`
     src_rank_indices = torch.arange(world_size, device=glob_dst_id.device).unsqueeze(1)
     # For invalid tokens (padding), we'll gather from index 0 but mask it out later
-    gather_ids = torch.where(valid_mask, glob_dst_id, torch.zeros_like(glob_dst_id))
+    gather_ids = glob_dst_id * valid_mask
     base_offsets_gathered = base_offsets[gather_ids, src_rank_indices]
 
     glob_dst_offset_flat = base_offsets_gathered + intra_rank_offsets
     
     # Mask out offsets for padding tokens with -1
-    glob_dst_offset_flat = torch.where(valid_mask, glob_dst_offset_flat, -1 * torch.ones_like(glob_dst_offset_flat))
+    glob_dst_offset_flat = glob_dst_offset_flat * valid_mask
 
     # Reshape back to the original input shape
     return glob_dst_offset_flat.reshape(original_shape).to(torch.uint32)
@@ -106,7 +106,7 @@ def compute_reverse_comm(
     valid_mask = fwd_dst_id_flat != -1
 
     # 1. Determine the number of tokens received by each rank to size the reverse tensors.
-    one_hot_dest = torch.nn.functional.one_hot(torch.where(valid_mask, fwd_dst_id_flat, 0), num_classes=world_size).long()
+    one_hot_dest = torch.nn.functional.one_hot(torch.where(valid_mask, fwd_dst_id_flat, 0).long(), num_classes=world_size).long()
     one_hot_dest = one_hot_dest * valid_mask.unsqueeze(-1)  # Mask out padding tokens
     num_received = torch.sum(one_hot_dest, dim=(0, 1)) # Sum across both source and token dims
     max_received = torch.max(num_received)
@@ -116,10 +116,10 @@ def compute_reverse_comm(
     src_token_indices = torch.arange(num_tokens_per_rank, device=fwd_dst_id.device).unsqueeze(0).expand_as(fwd_dst_id_flat)
 
     # 3. Create flat tensors for all communication info.
-    fwd_d_flat = fwd_dst_id_flat.flatten()
-    fwd_o_flat = fwd_dst_offset_flat.flatten()
-    src_r_flat = src_rank_indices.flatten()
-    src_t_flat = src_token_indices.flatten()
+    fwd_d_flat = fwd_dst_id_flat.flatten().long()
+    fwd_o_flat = fwd_dst_offset_flat.flatten().long()
+    src_r_flat = src_rank_indices.flatten().long()
+    src_t_flat = src_token_indices.flatten().long()
     valid_mask_flat = valid_mask.flatten()
 
     # 4. Perform the scatter operation to build the reverse map.
@@ -142,8 +142,8 @@ def compute_reverse_comm(
     rev_dst_offset.view(-1).scatter_(0, valid_fwd_d * max_received + valid_fwd_o, valid_src_t)
 
     # mask -1 based on num_received: those indices >= num_received should be masked
-    rev_dst_id = rev_dst_id.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1).to(torch.uint32)
-    rev_dst_offset = rev_dst_offset.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1).to(torch.uint32)
+    rev_dst_id = rev_dst_id.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), -1).to(torch.int32)
+    rev_dst_offset = rev_dst_offset.masked_fill(num_received.unsqueeze(1) <= torch.arange(max_received, device=fwd_dst_id.device), 0).to(torch.uint32)
 
     return rev_dst_id, rev_dst_offset
 
@@ -161,7 +161,7 @@ def compute_num_recv_tokens(
     """
     world_size = dst_id.shape[0]
     dst_id = dst_id.reshape(world_size, -1)
-    one_hot_dst = torch.nn.functional.one_hot(dst_id + 1, num_classes=world_size + 1).long()[:, :, 1:]
+    one_hot_dst = torch.nn.functional.one_hot((dst_id + 1).long(), num_classes=world_size + 1).long()[:, :, 1:]
     num_recv_tokens = one_hot_dst.sum(dim=1).T
     num_recv_tokens = torch.cat([num_recv_tokens, num_recv_tokens.sum(dim=1, keepdim=True)], dim=1)
     return num_recv_tokens.long().to(torch.uint64)  # size_t
