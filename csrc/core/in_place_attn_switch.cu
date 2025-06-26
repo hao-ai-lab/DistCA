@@ -6,6 +6,8 @@
 #include "core/cuda_utils.h"
 #include "core/in_place_attn_switch.h"
 
+#include <iostream>
+
 namespace {
 template <bool KEY_VALUE>
 __global__ void qkv_dispatch_kernel(
@@ -47,8 +49,8 @@ __global__ void qkv_dispatch_kernel(
     const unsigned warp_group_size = NUM_WARPS * WARP_SIZE;
     const unsigned num_warp_groups = gridDim.x;
     // NOTE(yonghao): we may put some metadata for each token's send buffer.
-    const unsigned Q_BUFFER_STRIDE = q_stride;
-    const unsigned KV_BUFFER_STRIDE = kv_stride;
+    const unsigned Q_BUFFER_STRIDE = attn::round_up<unsigned>(q_stride, sizeof(int4));
+    const unsigned KV_BUFFER_STRIDE = attn::round_up<unsigned>(kv_stride, sizeof(int4));
 
     // --- SENDER-SIDE LOGIC with Warp-Level Grid-Stride Loop ---
     
@@ -80,16 +82,16 @@ __global__ void qkv_dispatch_kernel(
         // --- 1. Dispatch the query tensor ---
         // The first lane of the assigned warp is responsible for dispatching the query.
         if (warp_id == 0) {
-            int query_dest_rank = query_dst_id[token_idx];
-            int query_dest_offset = query_dst_offset[token_idx];
-            std::byte* q_recv_buffer_token = q_recv_buffer + query_dest_offset * q_stride;
+            int32_t query_dest_rank = query_dst_id[token_idx];
+            uint32_t query_dest_offset = query_dst_offset[token_idx];
+            std::byte* q_recv_buffer_token = q_recv_buffer + query_dest_offset * Q_BUFFER_STRIDE;
 
             // TODO(yonghao): use a nvshmemx_putmem_signal_nbi_warp to add a signal on the receiver.
             nvshmemx_putmem_signal_nbi_warp(
                 q_recv_buffer_token,
                 q_send_buffer_token,
-                q_stride,
-                &q_signal_buffer[query_dest_rank],
+                Q_BUFFER_STRIDE,
+                &q_signal_buffer[rank],
                 1,
                 NVSHMEM_SIGNAL_ADD,
                 query_dest_rank
@@ -113,8 +115,8 @@ __global__ void qkv_dispatch_kernel(
                 nvshmemx_putmem_signal_nbi_warp(
                     kv_out_buffer,
                     kv_send_buffer_token,
-                    kv_stride,
-                    &kv_signal_buffer[kv_dest_rank],
+                    KV_BUFFER_STRIDE,
+                    &kv_signal_buffer[rank],
                     1,
                     NVSHMEM_SIGNAL_ADD,
                     kv_dest_rank
@@ -129,11 +131,11 @@ __global__ void qkv_dispatch_kernel(
     // --- RECEIVER-SIDE SYNCHRONIZATION ---
 
     // sync to ensure that all recv are done.
-    for (size_t i = threadIdx.x; i < world_size; i += warp_group_size) {
-        const size_t num_recv_from_rank = num_q_to_recv[i];
+    for (size_t i = threadIdx.x; i < world_size; i += WARP_SIZE) {
+        const size_t num_recv_from_rank = __ldg(&num_q_to_recv[i]);
         nvshmem_uint64_wait_until(&q_signal_buffer[i], NVSHMEM_CMP_EQ, num_recv_from_rank);
         if constexpr (KEY_VALUE) {
-            const size_t num_recv_from_rank = num_kv_to_recv[i];
+            const size_t num_recv_from_rank = __ldg(&num_kv_to_recv[i]);
             nvshmem_uint64_wait_until(&kv_signal_buffer[i], NVSHMEM_CMP_EQ, num_recv_from_rank);
         }
     }
@@ -249,6 +251,12 @@ void DispatchHelper::dispatch(
         const_cast<unsigned *>(&rank),
         const_cast<unsigned *>(&world_size)
     };
+
+    if (rank == 0) {
+        std::cerr << "numSMs: " << numSMs << ", max_cp_degree: " << max_cp_degree
+                  << ", num blocks: " << numBlocks << ", num warps: " << NUM_WARPS << std::endl;
+    }
+
     if (has_key_value) {
         CUDACHECK(cudaLaunchCooperativeKernel(
             (void *)&qkv_dispatch_kernel<true>,

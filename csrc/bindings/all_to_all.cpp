@@ -55,13 +55,31 @@ void dispatch(
     TORCH_CHECK(
         num_tokens == query_in.size(0), "Query tensor first dimension must be tokens"
     )
+    TORCH_CHECK(
+        query_in.ndimension() == 2, "Query tensor must have 2 dimensions"
+    )
+    TORCH_CHECK(
+        query_in.size(1) == query_out.size(1), "Query input and output hidden size must match"
+    )
+    TORCH_CHECK(
+        query_dst_id.ndimension() == 1, "Query dst_id must have 1 dimension"
+    )
     if (key_value_out.has_value()) {
         TORCH_CHECK(key_value_dst_id.has_value(), 
             "key_value tensor, dst_id, dst_offset must be provided together");
         TORCH_CHECK(
-            num_tokens == key_value_out.value().size(0), "Key value tensor first dimension must be tokens"
+            num_tokens == key_value_dst_id.value().size(0)
         )
-        max_cp_degree = key_value_dst_id.value().size(2);
+        TORCH_CHECK(
+            key_value_dst_id.value().ndimension() == 2, "Key value dst_id must have 2 dimensions"
+        )
+        TORCH_CHECK(
+            key_value_dst_offset.has_value(), "Key value dst_offset must be provided when key value is sent"
+        )
+        TORCH_CHECK(
+            key_value_dst_offset.value().ndimension() == 2, "Key value dst_offset must have 2 dimensions"
+        )
+        max_cp_degree = key_value_dst_id.value().size(1);
     } else {
         max_cp_degree = 0;
     }
@@ -75,8 +93,10 @@ void dispatch(
     at::cuda::OptionalCUDAGuard const device_guard(device_of(query_out));
 
     auto* dispatch_helper = (DispatchHelper*)fptr;
-    const size_t q_stride = query_out.stride(0);
-    const size_t kv_stride = key_value_out.has_value() ? key_value_out.value().stride(0) : 0;
+    const size_t q_stride = query_out.stride(0) * query_out.element_size();
+    const size_t kv_stride = key_value_out.has_value() ?
+                             key_value_out.value().stride(0) * key_value_out.value().element_size() :
+                             0;
 
     // TODO: use const_data_ptr?
     dispatch_helper->dispatch(

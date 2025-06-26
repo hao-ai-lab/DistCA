@@ -171,19 +171,8 @@ def dispatch(
     key_value_dst_offset: Optional[torch.Tensor],
     num_recv_tokens_query: torch.Tensor,
     num_recv_tokens_key_value: Optional[torch.Tensor],
-    dispatcher = None,
+    dispatcher,
 ):
-    q_stride = query_in.stride(0) * query_in.element_size()
-    kv_stride = (key_value_in.stride(0) * key_value_in.element_size()
-                 if key_value_in is not None else 0)
-    max_tokens_query = query_in.size(0)
-    max_tokens_key_value = key_value_in.size(0) if key_value_in is not None else 0
-    dispatcher = dispatcher or _dispatcher_storage.get_dispatcher(
-        q_stride=q_stride,
-        kv_stride=kv_stride,
-        max_tokens_query=max_tokens_query,
-        max_tokens_key_value=max_tokens_key_value,
-    )
     assert query_dst_id.dtype == torch.int32
     assert query_dst_offset.dtype == torch.uint32
     assert num_recv_tokens_query.dtype == torch.uint64

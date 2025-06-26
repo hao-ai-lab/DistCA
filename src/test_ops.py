@@ -3,7 +3,7 @@ from typing import List
 import ray
 import torch
 
-from attn_kernels.ops import dispatch, nvshmem_finalize, nvshmem_init, nvshmem_my_pe, nvshmem_barrier_all, nvshmem_get_unique_id
+from attn_kernels.ops import dispatch, nvshmem_finalize, nvshmem_init, nvshmem_my_pe, nvshmem_barrier_all, nvshmem_get_unique_id, DispatcherWrapper
 from inplace_metadata import compute_dst_offsets, compute_reverse_comm, compute_num_recv_tokens
 
 @ray.remote(num_gpus=1)
@@ -13,22 +13,32 @@ class Worker:
         self.world_size = world_size
         self.nvshmem_initialized = False
         self.nvshmem_pe = None
+        self.dispatcher = None
 
-    def init_comm(self, uid: torch.Tensor):
+    def init_comm(self, uid: torch.Tensor, stride: int, max_tokens_query: int, max_tokens_key_value: int):
         nvshmem_init(uid, self.rank, self.world_size)
         self.nvshmem_initialized = True
         self.nvshmem_pe = nvshmem_my_pe()
+        self.dispatcher = DispatcherWrapper(
+            q_stride=stride,
+            kv_stride=stride,
+            max_tokens_query=max_tokens_query,
+            max_tokens_key_value=max_tokens_key_value,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
 
-    def test(self, seed: int, tensor,
-             dst_id, dst_offset, num_received_per_rank,
-             rev_dst_id, rev_dst_offset, rev_num_received_per_rank):
-        tensor = tensor.cuda()
-        dst_id = dst_id.cuda()
-        dst_offset = dst_offset.cuda().to(torch.uint32)
-        num_received_per_rank = num_received_per_rank.cuda().to(torch.uint64)
-        rev_dst_id = rev_dst_id.cuda()
-        rev_dst_offset = rev_dst_offset.cuda().to(torch.uint32)
-        rev_num_received_per_rank = rev_num_received_per_rank.cuda().to(torch.uint64)
+    def test(self, seed: int, tensor: torch.Tensor,
+             dst_id: torch.Tensor, dst_offset: torch.Tensor, num_received_per_rank: torch.Tensor,
+             rev_dst_id: torch.Tensor, rev_dst_offset: torch.Tensor, rev_num_received_per_rank: torch.Tensor):
+        tensor = tensor.cuda().contiguous()
+        dst_id = dst_id.cuda().contiguous()
+        dst_offset = dst_offset.cuda().to(torch.uint32).contiguous()
+        num_received_per_rank = num_received_per_rank.cuda().to(torch.uint64).contiguous()
+        rev_dst_id = rev_dst_id.cuda().contiguous()
+        rev_dst_offset = rev_dst_offset.cuda().to(torch.uint32).contiguous()
+        rev_num_received_per_rank = rev_num_received_per_rank.cuda().to(torch.uint64).contiguous()
+        hidden_size = tensor.shape[-1]
         torch.manual_seed(seed)
 
         cp_degree = dst_id.shape[2] if dst_id.dim() == 3 else 1
@@ -36,17 +46,18 @@ class Worker:
         # reverse communication
         back_tensor = torch.zeros_like(
             dst_id, dtype=tensor.dtype, device=tensor.device
-        )
+        ).unsqueeze(-1).repeat(*((1,)* dst_id.ndim), hidden_size)
         num_received = num_received_per_rank[self.world_size]
         # forward communication
         dst_tensor = torch.zeros(
-            (num_received,), dtype=tensor.dtype, device=tensor.device
+            (num_received, hidden_size), dtype=tensor.dtype, device=tensor.device
         )
         dst_tensor = self.orchestrate(
             tensor, dst_id, dst_offset,
             dst_tensor=dst_tensor,
             num_recv_tokens=num_received_per_rank
         )
+        return
         back_tensor = self.orchestrate(
             dst_tensor, rev_dst_id, rev_dst_offset,
             dst_tensor=back_tensor,
@@ -66,8 +77,8 @@ class Worker:
                     dst_offset: torch.Tensor,
                     dst_tensor: torch.Tensor,
                     num_recv_tokens: torch.Tensor):
-        print(f"rank {self.rank} orchestrate tensor {tensor[:, :2]=}, {dst_id=}, {dst_offset=}, {dst_tensor=}, {num_recv_tokens=}")
-        dispatch(dst_tensor, None, tensor, None, dst_id, dst_offset, None, None, num_recv_tokens, None)
+        # print(f"rank {self.rank} orchestrate tensor {tensor[:, :2]=}, {dst_id=}, {dst_offset=}, {dst_tensor.shape=}, {num_recv_tokens=}")
+        dispatch(dst_tensor, None, tensor, None, dst_id, dst_offset, None, None, num_recv_tokens, None, self.dispatcher)
         nvshmem_barrier_all()
 
     def __del__(self):
@@ -93,6 +104,7 @@ def orchestrate(tensor: torch.Tensor, dst_id: torch.Tensor, dst_offset: torch.Te
     else:
         orig_shape = dst_tensor.shape
         dst_tensor = dst_tensor.reshape(world_size, -1, tensor.shape[2])
+        assert dst_tensor.dtype == tensor.dtype and dst_tensor.device == tensor.device
 
     if dst_id.dim() == 3:
         sp_size = dst_id.shape[2]
@@ -123,7 +135,7 @@ def orchestrate(tensor: torch.Tensor, dst_id: torch.Tensor, dst_offset: torch.Te
 def create_testcase(seed: int, world_size: int, num_tokens: int, cp_degree: int, hidden_size):
     torch.manual_seed(seed)
     dst_id = torch.randint(
-        -1, world_size, (world_size, num_tokens, cp_degree), dtype=torch.int32
+        0, world_size, (world_size, num_tokens, cp_degree), dtype=torch.int32
     )
     if cp_degree == 1:
         dst_id = dst_id.reshape(world_size, num_tokens)
@@ -134,23 +146,24 @@ def create_testcase(seed: int, world_size: int, num_tokens: int, cp_degree: int,
     rev_num_recv_tokens = compute_num_recv_tokens(rev_dst_id)
     print(f"{dst_id=},\n{dst_offset=},\n{rev_dst_id=},\n{rev_dst_offset=},\n{num_recv_tokens=},\n{rev_num_recv_tokens=}\n" + "=" * 20)
 
-    tensor = torch.randn(world_size, num_tokens, hidden_size)
+    tensor = torch.randn(world_size, num_tokens, hidden_size, dtype=torch.float16)
     dst_tensor = orchestrate(tensor, dst_id, dst_offset)
     back_tensor = torch.zeros_like(dst_id, dtype=dst_tensor.dtype, device=tensor.device)
-    back_tensor = back_tensor.repeat(1, 1, hidden_size).reshape(back_tensor.shape + (hidden_size,))
+    back_tensor = back_tensor.unsqueeze(-1).repeat(*((1,) * dst_id.ndim), hidden_size)
     back_tensor = orchestrate(dst_tensor, rev_dst_id, rev_dst_offset, dst_tensor=back_tensor)
     back_tensor_dedup = back_tensor.sum(dim=2) / (back_tensor != 0).sum(dim=2)
-    return dst_id, dst_offset, rev_dst_id, rev_dst_offset, dst_tensor, back_tensor_dedup, num_recv_tokens, rev_num_recv_tokens
+    return dst_id, dst_offset, rev_dst_id, rev_dst_offset, tensor, dst_tensor, back_tensor_dedup, num_recv_tokens, rev_num_recv_tokens
 
+@torch.no_grad()
 def test(seed, world_size, num_tokens, cp_degree, workers: List[ray.ObjectRef], hidden_size: int=128):
     (dst_id, dst_offset, rev_dst_id, rev_dst_offset,
-     dst_tensor, back_tensor_dedup, num_recv_tokens, rev_num_recv_tokens) = create_testcase(seed, world_size, num_tokens, cp_degree, hidden_size)
+     tensor, dst_tensor, back_tensor_dedup, num_recv_tokens, rev_num_recv_tokens) = create_testcase(seed, world_size, num_tokens, cp_degree, hidden_size)
     assert len(workers) == world_size
     refs = []
 
     for rank, worker in enumerate(workers):
-        tensor_slice = dst_tensor[rank]
-        assert tensor_slice.shape == (num_tokens, hidden_size)
+        tensor_slice = tensor[rank]
+        assert tensor_slice.shape == (num_tokens, hidden_size), tensor_slice.shape
         dst_id_slice = dst_id[rank]
         dst_offset_slice = dst_offset[rank].long()
         rev_dst_id_slice = rev_dst_id[rank]
@@ -177,6 +190,7 @@ if __name__ == "__main__":
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--cp-degree", type=int, default=1)
+    parser.add_argument("--hidden-size", type=int, default=128)
     args = parser.parse_args()
     ray.init()
     workers = [
@@ -185,13 +199,16 @@ if __name__ == "__main__":
     ]
 
     uid = nvshmem_get_unique_id()
+    stride = args.hidden_size * torch.float16.itemsize
+    max_tokens_query = args.num_tokens * args.world_size
+    max_tokens_key_value = args.num_tokens * args.world_size
     ray.get([
-        worker.init_comm.remote(uid)
+        worker.init_comm.remote(uid, stride, max_tokens_query, max_tokens_key_value)
         for worker in workers
     ])
 
     print("init done")
-    test(0, args.world_size, args.num_tokens, args.cp_degree, workers)
+    test(0, args.world_size, args.num_tokens, args.cp_degree, workers, args.hidden_size)
     print("test done")
     ray.get([
         worker.shutdown.remote()
