@@ -57,17 +57,20 @@ class Worker:
             dst_tensor=dst_tensor,
             num_recv_tokens=num_received_per_rank
         )
-        return
         back_tensor = self.orchestrate(
             dst_tensor, rev_dst_id, rev_dst_offset,
             dst_tensor=back_tensor,
             num_recv_tokens=rev_num_received_per_rank
         )
-        back_tensor_dedup = back_tensor.sum(dim=2) / (back_tensor != 0).sum(dim=2)
-        assert torch.allclose(
-            back_tensor_dedup.unsqueeze(2).repeat(1, 1, cp_degree) * (back_tensor != 0), back_tensor
-        )
-        # assert torch.allclose(tensor, back_tensor_dedup)
+        if cp_degree > 1:
+            back_tensor_dedup = back_tensor.sum(dim=2) / (back_tensor != 0).sum(dim=2)
+            assert torch.allclose(
+                back_tensor_dedup.unsqueeze(2).repeat(1, 1, cp_degree) * (back_tensor != 0), back_tensor
+            )
+        else:
+            back_tensor_dedup = back_tensor
+        assert torch.allclose(tensor, back_tensor_dedup)
+        print(f"rank {self.rank} test done")
         return dst_tensor, back_tensor_dedup
 
     @torch.no_grad()
@@ -80,6 +83,7 @@ class Worker:
         # print(f"rank {self.rank} orchestrate tensor {tensor[:, :2]=}, {dst_id=}, {dst_offset=}, {dst_tensor.shape=}, {num_recv_tokens=}")
         dispatch(dst_tensor, None, tensor, None, dst_id, dst_offset, None, None, num_recv_tokens, None, self.dispatcher)
         nvshmem_barrier_all()
+        return dst_tensor
 
     def __del__(self):
         if getattr(self, "nvshmem_initialized", False):
@@ -151,7 +155,10 @@ def create_testcase(seed: int, world_size: int, num_tokens: int, cp_degree: int,
     back_tensor = torch.zeros_like(dst_id, dtype=dst_tensor.dtype, device=tensor.device)
     back_tensor = back_tensor.unsqueeze(-1).repeat(*((1,) * dst_id.ndim), hidden_size)
     back_tensor = orchestrate(dst_tensor, rev_dst_id, rev_dst_offset, dst_tensor=back_tensor)
-    back_tensor_dedup = back_tensor.sum(dim=2) / (back_tensor != 0).sum(dim=2)
+    if cp_degree > 1:
+        back_tensor_dedup = back_tensor.sum(dim=2) / (back_tensor != 0).sum(dim=2)
+    else:
+        back_tensor_dedup = back_tensor
     return dst_id, dst_offset, rev_dst_id, rev_dst_offset, tensor, dst_tensor, back_tensor_dedup, num_recv_tokens, rev_num_recv_tokens
 
 @torch.no_grad()
@@ -178,10 +185,19 @@ def test(seed, world_size, num_tokens, cp_degree, workers: List[ray.ObjectRef], 
         refs.append(ref)
 
     results = ray.get(refs)
-    dst_tensor_out = torch.cat([r[0] for r in results], dim=0)
-    back_tensor_out = torch.cat([r[1] for r in results], dim=0)
-    assert torch.allclose(dst_tensor_out, dst_tensor)
-    assert torch.allclose(back_tensor_out, back_tensor_dedup)
+    dst_tensor_outs = [r[0] for r in results]
+    # The first dimension of each value in the list should be padded to the same as dst_tensor's dim 1
+    max_dim1 = dst_tensor.shape[1]
+    dst_tensor_outs = [
+        torch.cat([r, torch.zeros(max_dim1 - r.shape[0], *r.shape[1:], dtype=r.dtype, device=r.device)], dim=0).unsqueeze(0)
+        for r in dst_tensor_outs
+    ]
+    dst_tensor_out = torch.cat(dst_tensor_outs, dim=0)
+    assert dst_tensor_out.shape == dst_tensor.shape
+    assert torch.allclose(dst_tensor_out, dst_tensor.to(dst_tensor_out.device))
+    back_tensor_out = torch.cat([r[1].unsqueeze(0) for r in results], dim=0)
+    # assert torch.allclose(dst_tensor_out, dst_tensor)
+    assert torch.allclose(back_tensor_out, back_tensor_dedup.to(back_tensor_out.device))
 
 
 if __name__ == "__main__":
