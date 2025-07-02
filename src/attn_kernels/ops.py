@@ -6,6 +6,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from inplace_metadata import Metadata
+
 _lib_path = os.path.join(os.path.dirname(__file__), "libas_comm.so")
 torch.ops.load_library(_lib_path)
 _ops = torch.ops.dispatch_kernels
@@ -190,4 +192,35 @@ def dispatch(
         query_dst_id, query_dst_offset,
         key_value_dst_id, key_value_dst_offset,
         num_tokens, num_recv_tokens_query, num_recv_tokens_key_value
+    )
+
+
+def dispatch_v1(
+    dispatcher: DispatcherWrapper,
+    tensor: torch.Tensor,
+    dst_tensor: torch.Tensor,
+    metadata: Metadata,
+    kv_tensor: Optional[torch.Tensor],
+    kv_dst_tensor: Optional[torch.Tensor],
+    kv_metadata: Optional[Metadata],
+):
+    assert metadata.dst_rank.dtype == torch.int32
+    assert metadata.dst_offset.dtype == torch.uint32
+    assert metadata.num_recv_tokens.dtype == torch.uint64
+    assert metadata.seq_len.dtype == torch.uint32
+    assert tensor.dtype == dst_tensor.dtype
+    if kv_metadata is not None:
+        assert kv_metadata.dst_rank.dtype == torch.int32
+        assert kv_metadata.dst_offset.dtype == torch.uint32
+        assert kv_metadata.num_recv_tokens.dtype == torch.uint64
+        assert kv_metadata.seq_len.dtype == torch.uint32
+        assert kv_tensor.dtype == kv_dst_tensor.dtype
+    else:
+        kv_metadata = Metadata(None, None, None, None, None)
+    return _ops.dispatch_v1(
+        dispatcher.dispatcher,
+        tensor, dst_tensor,
+        metadata.dst_rank, metadata.dst_offset, metadata.num_recv_tokens, metadata.seq_len,
+        kv_tensor, kv_dst_tensor,
+        kv_metadata.dst_rank, kv_metadata.dst_offset, kv_metadata.num_recv_tokens
     )

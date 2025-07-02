@@ -36,9 +36,41 @@ public:
         cudaStream_t stream
     );
 
+    void dispatch_v1(
+        // Input and output tensors
+        const std::byte *send_tensor,
+        std::byte *recv_tensor,
+        const std::byte *kv_send_tensor,
+        std::byte *kv_recv_tensor,
+        // Metadata tensors
+        const int32_t *dst_ranks,
+        const uint32_t *dst_offsets,
+        const uint64_t *num_recv_tokens,
+        const uint32_t *seq_lens,
+        //
+        const int32_t *kv_dst_ranks,
+        const uint32_t *kv_dst_offsets,
+        const uint64_t *kv_num_recv_tokens,
+        // Metadata
+        const size_t num_tokens,
+        const size_t num_sequence,
+        const size_t max_cp_degree,
+        const size_t stride,
+        const size_t kv_stride,
+        cudaStream_t stream
+    );
+
+    unsigned rank() const {
+        return _rank;
+    }
+
+    unsigned world_size() const {
+        return _world_size;
+    }
+
 private:
-    const unsigned rank;
-    const unsigned world_size;
+    const unsigned _rank;
+    const unsigned _world_size;
 
     std::byte *q_send_buffer;
     std::byte *q_recv_buffer;

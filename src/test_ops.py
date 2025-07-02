@@ -148,7 +148,7 @@ def create_testcase(seed: int, world_size: int, num_tokens: int, cp_degree: int,
     rev_dst_id, rev_dst_offset = compute_reverse_comm(dst_id, dst_offset)
     num_recv_tokens = compute_num_recv_tokens(dst_id)
     rev_num_recv_tokens = compute_num_recv_tokens(rev_dst_id)
-    print(f"{dst_id=},\n{dst_offset=},\n{rev_dst_id=},\n{rev_dst_offset=},\n{num_recv_tokens=},\n{rev_num_recv_tokens=}\n" + "=" * 20)
+    # print(f"{dst_id=},\n{dst_offset=},\n{rev_dst_id=},\n{rev_dst_offset=},\n{num_recv_tokens=},\n{rev_num_recv_tokens=}\n" + "=" * 20)
 
     tensor = torch.randn(world_size, num_tokens, hidden_size, dtype=torch.float16)
     dst_tensor = orchestrate(tensor, dst_id, dst_offset)

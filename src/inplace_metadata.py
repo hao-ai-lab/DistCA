@@ -9,6 +9,38 @@ class Metadata:
     dst_offset: torch.Tensor
     seq_len: torch.Tensor
     num_recv_tokens: torch.Tensor
+    world_size: int = None
+    normalized: bool = False
+
+    def get_slice(self, rank: int):
+        assert self.world_size is not None
+        return Metadata(
+            dst_rank=self.dst_rank[rank],
+            dst_offset=self.dst_offset[rank],
+            seq_len=self.seq_len[rank],
+            num_recv_tokens=self.num_recv_tokens[rank],
+            normalized=self.normalized,
+        )
+
+    def normalize_dtype(self):
+        return Metadata(
+            dst_rank=self.dst_rank.to(torch.int32),
+            dst_offset=self.dst_offset.to(torch.uint32),
+            seq_len=self.seq_len.to(torch.uint32),
+            num_recv_tokens=self.num_recv_tokens.to(torch.uint64),
+            world_size=self.world_size,
+            normalized=True,
+        )
+
+    def cuda(self):
+        return Metadata(
+            dst_rank=self.dst_rank.cuda().contiguous(),
+            dst_offset=self.dst_offset.cuda().contiguous(),
+            seq_len=self.seq_len.cuda().contiguous(),
+            num_recv_tokens=self.num_recv_tokens.cuda().contiguous(),
+            world_size=self.world_size,
+            normalized=self.normalized,
+        )
 
 
 # NOTE(yonghao): this file will be later offloaded to a cuda kernel in a decentralized paradigm.
@@ -279,25 +311,28 @@ def compute_metadata(
         num_received_seqs.unsqueeze(1) <= torch.arange(max_rev_seqs, device=rev_seq_len.device), 0)
     # number of tokens received in the reverse communication. This equals the number of tokens sent in the forward communication.
     rev_num_received_tokens = tokens_to_dst_per_dispatch.reshape(world_size, -1, world_size).sum(dim=1)
+    rev_num_received_tokens = torch.cat([rev_num_received_tokens, rev_num_received_tokens.sum(dim=1, keepdim=True)], dim=1)
 
     fwd_metadata = Metadata(
         dst_rank=global_dispatch.reshape(dispatch_shape),
         dst_offset=seq_begin_offset.reshape(dispatch_shape),
         seq_len=seq_len,
         num_recv_tokens=num_recv_tokens,
+        world_size=world_size,
     )
     rev_metadata = Metadata(
         dst_rank=rev_dst_rank,
         dst_offset=rev_dst_offset,
         seq_len=rev_seq_len,
         num_recv_tokens=rev_num_received_tokens,
+        world_size=world_size,
     )
     return fwd_metadata, rev_metadata
 
 
 ######## Correctness testing tools ########
 @torch.no_grad()
-def orchestrate_dummy(tensor: torch.Tensor, output_tensor: torch.Tensor, metadata: Metadata):
+def orchestrate_simulate(tensor: torch.Tensor, output_tensor: torch.Tensor, metadata: Metadata):
     assert tensor.dim() == 3    # (world_size, num_tokens, hidden_dim)
     world_size = tensor.shape[0]
     # handle sending rank-by-rank:
@@ -413,12 +448,12 @@ def test_v1():
     # forward
     max_recv_tokens = fwd_metadata.num_recv_tokens.max()
     output_tensor = torch.zeros((WORLD_SIZE, max_recv_tokens, HIDDEN_SIZE), device=DEVICE, dtype=tensor.dtype)
-    output_tensor = orchestrate_dummy(tensor, output_tensor, fwd_metadata)
+    output_tensor = orchestrate_simulate(tensor, output_tensor, fwd_metadata)
 
     # reverse
     rev_metadata.num_recv_tokens.max()
     rev_tensor = torch.zeros((WORLD_SIZE, TOTAL_SEQ_LEN * CP_DEGREE, HIDDEN_SIZE), device=DEVICE, dtype=output_tensor.dtype)
-    rev_tensor = orchestrate_dummy(output_tensor, rev_tensor, rev_metadata)
+    rev_tensor = orchestrate_simulate(output_tensor, rev_tensor, rev_metadata)
     rev_tensor = rev_tensor.reshape(WORLD_SIZE, CP_DEGREE, TOTAL_SEQ_LEN, HIDDEN_SIZE)
     rev_tensor_dedup = rev_tensor.sum(dim=1) / (rev_tensor != 0).sum(dim=1)
 
