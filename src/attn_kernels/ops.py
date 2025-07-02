@@ -163,39 +163,6 @@ _dispatcher_storage = DispatcherStorage()
 
 
 def dispatch(
-    query_out: torch.Tensor,
-    key_value_out: Optional[torch.Tensor],
-    query_in: torch.Tensor,
-    key_value_in: Optional[torch.Tensor],
-    query_dst_id: torch.Tensor,
-    query_dst_offset: torch.Tensor,
-    key_value_dst_id: Optional[torch.Tensor],
-    key_value_dst_offset: Optional[torch.Tensor],
-    num_recv_tokens_query: torch.Tensor,
-    num_recv_tokens_key_value: Optional[torch.Tensor],
-    dispatcher,
-):
-    assert query_dst_id.dtype == torch.int32
-    assert query_dst_offset.dtype == torch.uint32
-    assert num_recv_tokens_query.dtype == torch.uint64
-    assert query_out.dtype == query_in.dtype
-    if key_value_dst_id is not None:
-        assert key_value_dst_id.dtype == torch.int32
-        assert key_value_dst_offset.dtype == torch.uint32
-        assert num_recv_tokens_key_value.dtype == torch.uint64
-        assert key_value_out.dtype == key_value_in.dtype
-
-    num_tokens = query_in.size(0)
-    return _ops.dispatch(
-        dispatcher.dispatcher,
-        query_out, key_value_out, query_in, key_value_in,
-        query_dst_id, query_dst_offset,
-        key_value_dst_id, key_value_dst_offset,
-        num_tokens, num_recv_tokens_query, num_recv_tokens_key_value
-    )
-
-
-def dispatch_v1(
     dispatcher: DispatcherWrapper,
     tensor: torch.Tensor,
     dst_tensor: torch.Tensor,
@@ -217,7 +184,7 @@ def dispatch_v1(
         assert kv_tensor.dtype == kv_dst_tensor.dtype
     else:
         kv_metadata = Metadata(None, None, None, None, None)
-    return _ops.dispatch_v1(
+    return _ops.dispatch(
         dispatcher.dispatcher,
         tensor, dst_tensor,
         metadata.dst_rank, metadata.dst_offset, metadata.num_recv_tokens, metadata.seq_len,

@@ -30,12 +30,12 @@ int64_t init(at::Tensor uid, int64_t rank, int64_t world_size) {
   TORCH_CHECK(uid.device().is_cpu(), "uid must be a CPU tensor");
   TORCH_CHECK(uid.scalar_type() == at::kByte, "uid must be a byte tensor");
   TORCH_CHECK(
-      uid.numel() == sizeof(nvshmemx_uniqueid_t),
-      "Invalid unique id size (expected ",
-      sizeof(nvshmemx_uniqueid_t),
-      ", got ",
-      uid.numel(),
-      ")"
+    uid.numel() == sizeof(nvshmemx_uniqueid_t),
+    "Invalid unique id size (expected ",
+    sizeof(nvshmemx_uniqueid_t),
+    ", got ",
+    uid.numel(),
+    ")"
   );
   nvshmemx_uniqueid_t id;
   std::memcpy(&id, uid.data_ptr(), sizeof(id));
@@ -79,7 +79,7 @@ void alltoall(at::Tensor dest, at::Tensor source) {
   size_t nbytes = dest.numel() * dest.itemsize() / dest.size(0);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   NVSHMEMCHECK(nvshmemx_alltoallmem_on_stream(
-      NVSHMEM_TEAM_WORLD, (uint8_t *)dest.data_ptr(), (uint8_t *)source.data_ptr(), nbytes, stream
+    NVSHMEM_TEAM_WORLD, (uint8_t *)dest.data_ptr(), (uint8_t *)source.data_ptr(), nbytes, stream
   ));
 }
 
