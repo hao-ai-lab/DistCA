@@ -71,9 +71,8 @@ class Worker:
             )
         else:
             back_tensor_dedup = back_tensor
-        assert torch.allclose(tensor, back_tensor_dedup), self.rank
+        torch.testing.assert_close(tensor, back_tensor_dedup)
         torch.cuda.synchronize()
-        print(f"rank {self.rank} test done, {tensor.shape=}, {back_tensor_dedup.shape=}", flush=True)
         return dst_tensor, back_tensor_dedup
 
     @torch.no_grad()
@@ -112,16 +111,21 @@ def create_testcase(
 
     tensor = torch.randn(world_size, num_tokens, hidden_size, dtype=torch.float16)
     fwd_metadata, rev_metadata = compute_metadata(seq_lens, global_dispatch)
+
     max_recv_tokens = fwd_metadata.num_recv_tokens.max()
     output_tensor = torch.zeros((world_size, max_recv_tokens, hidden_size), dtype=tensor.dtype, device=tensor.device)
     output_tensor = orchestrate_simulate(tensor, output_tensor, fwd_metadata)
-    back_tensor = torch.zeros_like(output_tensor, dtype=output_tensor.dtype, device=output_tensor.device)
+
+    back_tensor = torch.zeros((world_size, num_tokens, cp_degree, hidden_size), dtype=output_tensor.dtype, device=output_tensor.device)
+    if cp_degree == 1:
+        back_tensor = back_tensor.squeeze(2)
     back_tensor = orchestrate_simulate(output_tensor, back_tensor, rev_metadata)
+
     if cp_degree > 1:
         back_tensor_dedup = back_tensor.sum(dim=2) / (back_tensor != 0).sum(dim=2)
     else:
         back_tensor_dedup = back_tensor
-    print(f"fwd_metadata={fwd_metadata}, rev_metadata={rev_metadata}")
+    # print(f"fwd_metadata={fwd_metadata}, rev_metadata={rev_metadata}")
     return fwd_metadata, rev_metadata, tensor, output_tensor, back_tensor_dedup
 
 @torch.no_grad()
@@ -150,10 +154,9 @@ def test(seed, world_size, num_tokens, cp_degree, num_seqs, workers: List[ray.Ob
     ]
     dst_tensor_out = torch.cat(dst_tensor_outs, dim=0)
     assert dst_tensor_out.shape == output_tensor.shape
-    # assert torch.allclose(dst_tensor_out, output_tensor.to(dst_tensor_out.device))
+    torch.testing.assert_close(dst_tensor_out, output_tensor.to(dst_tensor_out.device))
     back_tensor_out = torch.cat([r[1].unsqueeze(0) for r in results], dim=0)
-    # assert torch.allclose(dst_tensor_out, dst_tensor)
-    assert torch.allclose(back_tensor_out, back_tensor_dedup.to(back_tensor_out.device))
+    torch.testing.assert_close(back_tensor_out, back_tensor_dedup.to(back_tensor_out.device))
 
 
 if __name__ == "__main__":

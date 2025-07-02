@@ -221,8 +221,10 @@ __global__ void dispatch_kernel_v1(
 	size_t sequence_end = 0;
 	int32_t recv_rank = 0;
 	uint32_t recv_offset = 0;
+	uint32_t recv_sequence_begin_token_id = 0;
 	int32_t kv_recv_rank = 0;
 	uint32_t kv_recv_offset = 0;
+	uint32_t kv_recv_sequence_begin_token_id = 0;
 
 	for (int token_idx = warp_group_id; token_idx < num_tokens; token_idx += num_warp_groups) {
 
@@ -255,12 +257,14 @@ __global__ void dispatch_kernel_v1(
 			while (token_idx >= sequence_end) {
 				sequence_id += 1;
 				const size_t sequence_len = __ldg(&seq_lens[sequence_id]);
+				recv_sequence_begin_token_id = sequence_end;
 				sequence_end += sequence_len;
 				recv_rank = __ldg(&dst_ranks[sequence_id]);
 				recv_offset = __ldg(&dst_offsets[sequence_id]);
 			}
 			// dispatch the query.
-			std::byte* recv_buffer_token = q_recv_buffer + recv_offset * Q_BUFFER_STRIDE;
+			const uint32_t recv_token_offset = recv_offset + (token_idx - recv_sequence_begin_token_id);
+			std::byte* recv_buffer_token = q_recv_buffer + recv_token_offset * Q_BUFFER_STRIDE;
 			nvshmemx_putmem_signal_nbi_warp(
 				recv_buffer_token,
 				send_buffer_token,
@@ -270,7 +274,6 @@ __global__ void dispatch_kernel_v1(
 				NVSHMEM_SIGNAL_ADD,
 				recv_rank
 			);
-			recv_offset += 1;
 		} else {
 			if constexpr (KEY_VALUE) {
 				// warp 1...max_cp_degree dispatches to its own rank and recv_offset
@@ -279,13 +282,15 @@ __global__ void dispatch_kernel_v1(
 					while (token_idx >= sequence_end) {
 						sequence_id += 1;
 						const size_t sequence_len = __ldg(&seq_lens[sequence_id]);
+						kv_recv_sequence_begin_token_id = sequence_end;
 						sequence_end += sequence_len;
 						kv_recv_rank = __ldg(&kv_dst_ranks[sequence_id * max_cp_degree + warp_id - 1]);
 						kv_recv_offset = __ldg(&kv_dst_offsets[sequence_id * max_cp_degree + warp_id - 1]);
 					}
 					// dispatch the key_value.
 					if (kv_recv_rank != -1) {
-						std::byte* kv_recv_buffer_token = kv_recv_buffer + kv_recv_offset * KV_BUFFER_STRIDE;
+						const uint32_t kv_recv_token_offset = kv_recv_offset + (token_idx - kv_recv_sequence_begin_token_id);
+						std::byte* kv_recv_buffer_token = kv_recv_buffer + kv_recv_token_offset * KV_BUFFER_STRIDE;
 						nvshmemx_putmem_signal_nbi_warp(
 							kv_recv_buffer_token,
 							kv_send_buffer_token,
@@ -296,7 +301,6 @@ __global__ void dispatch_kernel_v1(
 							kv_recv_rank
 						);
 					}
-					kv_recv_offset += 1;
 				}
 			}
 		}
