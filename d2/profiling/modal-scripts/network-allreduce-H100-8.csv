@@ -1,0 +1,2 @@
+gpu_type,world_size,op,nelem,dtype,latency(ms),throughput(nelem_per_ms)
+H100,8,allreduce,134217728,fp16,1.15,116563809.5

@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Any
 
 import d2.timemodule as tm
 
-INF = int(1e15)
+INF = tm.INF
 # ————————————————————————————————————————————————————————————
 #  Dataclass to hold the results
 # ————————————————————————————————————————————————————————————
@@ -36,6 +36,9 @@ class WlbLlmSolution:
             print(f"- Worker {w:<2d}: docs {docs}  —  latency {self.lat_worker[w]} ms")
         print(f"- Maximum latency: {self.lat_max}\n")
 
+    def get_batch_assignment(self):
+        return self.batches
+
     def dump_object(self) -> Dict[str, Any]:
         return dict(
             batches=self.batches,
@@ -52,8 +55,7 @@ class WlbLlmSolution:
 class WlbLlmSolver:
     """Minimise the slowest worker's latency subject to length and assignment constraints."""
 
-    def get_attn_time(self, x: int, tp: int, cp: int) -> float:
-
+    def get_network_time(self, x: int, tp: int, cp: int) -> float:
         hqo = 64
         hkv = 4
         d = 128
@@ -61,12 +63,26 @@ class WlbLlmSolver:
         allreduce_perdevice_nelem = x * hqo * d // tp
         allgather_perdevice_nelem = x * d * max(1, hkv // cp)
 
-        
-        attn = tm.get_attn_time(x, tp, cp)
         allreduce_time = tm.get_allreduce_time(allreduce_perdevice_nelem, tp)
         allgather_time = tm.get_allgather_time(allgather_perdevice_nelem, cp)
+        # return allreduce_time + allgather_time
+        return allgather_time
+    
+    def get_attn_time(self, x: int, tp: int, cp: int) -> float:
 
-        return attn + allreduce_time + allgather_time
+        hqo = 64
+        hkv = 4
+        d = 128
+
+        # allreduce_perdevice_nelem = x * hqo * d // tp
+        # allgather_perdevice_nelem = x * d * max(1, hkv // cp)
+
+        attn = tm.get_attn_time(x, tp, cp)
+        # allreduce_time = tm.get_allreduce_time(allreduce_perdevice_nelem, tp)
+        # allgather_time = tm.get_allgather_time(allgather_perdevice_nelem, cp)
+
+        # return attn + allreduce_time + allgather_time
+        return attn
 
     
     def get_mlp_time(self, x: int, tp: int, cp: int) -> float:
@@ -87,8 +103,30 @@ class WlbLlmSolver:
         n_docs = len(doc_lengths)
         attn_time = self.get_attn_time
         mlp_time = self.get_mlp_time
+        network_time = self.get_network_time
 
-        costs = [int(attn_time(d, tp = tp, cp = cp) + mlp_time(d, tp = tp, cp = cp)) for d in doc_lengths]  # ms, cast to int
+        for d in doc_lengths:
+            _attn_time = self.get_attn_time(d, tp = tp, cp = cp)
+            _mlp_time = self.get_mlp_time(d, tp = tp, cp = cp)
+            _network_time = self.get_network_time(d, tp = tp, cp = cp)
+            # _lat = _attn_time + _mlp_time + _network_time
+            _lat = _attn_time + _mlp_time
+
+            print(f"[WLB-LLM] [{tp=}, {cp=}] d: {d}, latency: {(_lat * 1000):.1f} us, attn_time: {(_attn_time * 1000):.2f} us, mlp_time: {(_mlp_time * 1000):.2f} us")
+            pass
+
+        costs = [
+            int(
+                (
+                attn_time(d, tp = tp, cp = cp) 
+                + mlp_time(d, tp = tp, cp = cp) 
+                # + network_time(d, tp = tp, cp = cp)
+                ) * 1000
+            ) 
+            for d in doc_lengths
+        ]
+
+        # print(f"costs (tp={tp}, cp={cp}): {costs[0]}")
 
         # ——— CP-SAT model ——————————————————————————————————————————
         model = cp_model.CpModel()
@@ -147,11 +185,14 @@ class WlbLlmSolver:
                     batches[w].append(doc_lengths[d])
                     break
 
+        lat_max_value = solver.Value(lat_max) / 1000
+        lat_worker_values = [solver.Value(lw) / 1000 for lw in lat_worker]
+
         return WlbLlmSolution(
             doc2worker=doc2worker,
             batches=batches,
-            lat_worker=[solver.Value(lw) for lw in lat_worker],
-            lat_max=solver.Value(lat_max),
+            lat_worker=lat_worker_values,
+            lat_max=lat_max_value,
             parallel_plan=parallel_plan,
             model=model,
             solver=solver,

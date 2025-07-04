@@ -66,6 +66,7 @@ def attn_flash_attn(
     def test_flash_attn():
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
         start_event.record()
         output = flash_attn_varlen_func(
             q, k, v, 
@@ -79,7 +80,7 @@ def attn_flash_attn(
         return duration
     
     # warmup
-    for _ in range(5):
+    for _ in range(10):
         test_flash_attn()
     
     # benchmark
@@ -145,7 +146,67 @@ def run_single_sequence():
                             continue
 
 
+def run_amortized_batch_sequence():
+    model_configs = [
+        # Qwen3 235B activate attention data
+        dict(
+            num_qo_heads = 64,
+            num_kv_heads = 4,
+            head_dim = 128,
+        ),
+    ]
+
+    seq_lens = [
+        32, 64,
+        128, 256, 512, 
+        1*K, 2*K, 4*K,
+        8*K, 16*K, 32*K,
+        # 64*K, 128*K,
+    ]
+    max_seq_len = max(seq_lens)
+    # max_seq_len = 128*K
+    batches = [
+        f"[{s}] * ({max_seq_len // s})"
+        for s in seq_lens
+    ]
+
+    gpu_type = "H100"
+    
+    
+    if not os.path.exists(f"compute-attn-{gpu_type}.psv"):
+        with open(f"compute-attn-{gpu_type}.psv", "w") as f:
+            pass
+    
+    with open(f"compute-attn-{gpu_type}.psv", "a") as f:
+        def print_dual(*args):
+            print(*args, file=f, flush=True)
+            print(*args, flush=True)
+            return
+        
+        print_dual(f"gpu_type|op|total_len|batch_size|tp|cp|latency(ms)|total_latency(ms)|hqo|hkv|d|batch")
+
+        for model_config in model_configs:
+            hqo, hkv, d = model_config['num_qo_heads'], model_config['num_kv_heads'], model_config['head_dim']
+            for batch in batches:
+                total_len = sum(eval(batch))
+                batch_size = len(eval(batch))
+                for tp in [1, 2, 4, 8]:
+                    for cp in [1, 2, 4, 8]:
+                        try:
+                            total_avg_duration = attn_flash_attn.remote(
+                                batch = eval(batch),
+                                cp = cp, tp = tp,
+                                **model_config,
+                            )
+                            per_doc_avg_duration = total_avg_duration / batch_size
+                            print_dual(f"{gpu_type}|attn|{total_len}|{batch_size}|{tp}|{cp}|{per_doc_avg_duration}|{total_avg_duration}|{hqo}|{hkv}|{d}|{batch}")
+                        except Exception as e:
+                            print(f"Batch: {batch}, TP: {tp}, CP: {cp}, Model Config: {model_config} encountered error: {e}")
+                            continue
+
+
 
 @app.local_entrypoint()
 def main():
-    run_single_sequence()
+    # run_single_sequence()
+    run_amortized_batch_sequence()

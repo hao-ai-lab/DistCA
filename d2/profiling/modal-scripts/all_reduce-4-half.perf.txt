@@ -1,0 +1,27 @@
+$ /opt/nccl-tests/build/all_reduce_perf -t 1 -b 8M -e 8G -f 2 -d half -g 4
+# nThread 1 nGpus 4 minBytes 8388608 maxBytes 8589934592 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     25 on      modal device  0 [0000:73:00] NVIDIA H200
+#  Rank  1 Group  0 Pid     25 on      modal device  1 [0000:8b:00] NVIDIA H200
+#  Rank  2 Group  0 Pid     25 on      modal device  2 [0000:8c:00] NVIDIA H200
+#  Rank  3 Group  0 Pid     25 on      modal device  3 [0000:a4:00] NVIDIA H200
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)       
+     8388608       4194304      half     sum      -1    77.04  108.88  163.33      0    72.91  115.05  172.57      0
+    16777216       8388608      half     sum      -1    108.2  155.13  232.69      0    97.95  171.28  256.92      0
+    33554432      16777216      half     sum      -1    163.9  204.79  307.18      0    161.4  207.90  311.85      0
+    67108864      33554432      half     sum      -1    303.5  221.11  331.67      0    303.6  221.01  331.52      0
+   134217728      67108864      half     sum      -1    576.1  232.99  349.49      0    575.5  233.21  349.81      0
+   268435456     134217728      half     sum      -1   1121.9  239.28  358.92      0   1123.0  239.04  358.55      0
+   536870912     268435456      half     sum      -1   2214.2  242.47  363.70      0   2215.0  242.38  363.57      0
+  1073741824     536870912      half     sum      -1   4396.2  244.24  366.37      0   4393.5  244.40  366.59      0
+  2147483648    1073741824      half     sum      -1   8782.7  244.51  366.77      0   8767.3  244.94  367.42      0
+  4294967296    2147483648      half     sum      -1    17498  245.46  368.19      0    17496  245.49  368.23      0
+  8589934592    4294967296      half     sum      -1    34973  245.62  368.42      0    34957  245.73  368.59      0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 326.925 
+#
+

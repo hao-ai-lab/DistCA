@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    #vis.vega-embed {
+      width: 100%;
+      display: flex;
+    }
+
+    #vis.vega-embed details,
+    #vis.vega-embed details summary {
+      position: relative;
+    }
+  </style>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/vega-lite@5.20.1"></script>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+</head>
+<body>
+  <div id="vis"></div>
+  <script>
+    (function(vegaEmbed) {
+      var spec = {"config": {"view": {"continuousWidth": 300, "continuousHeight": 300}}, "data": {"name": "data-70eab57d5ffd0a0c9958c18d8da260e8"}, "mark": {"type": "bar"}, "encoding": {"color": {"field": "component", "scale": {"range": ["#2ecc71", "#3498db", "#e74c3c"]}, "type": "nominal"}, "tooltip": [{"field": "component", "type": "nominal"}, {"field": "time", "type": "quantitative"}, {"field": "seq_len", "type": "quantitative"}], "x": {"field": "seq_len", "scale": {"type": "log"}, "title": "Sequence Length", "type": "quantitative"}, "y": {"field": "time", "scale": {"type": "log"}, "title": "Time (ms)", "type": "quantitative"}}, "height": 800, "title": "Time Distribution (tp=2, cp=4)", "width": 1200, "$schema": "https://vega.github.io/schema/vega-lite/v5.20.1.json", "datasets": {"data-70eab57d5ffd0a0c9958c18d8da260e8": [{"seq_len": 256, "component": "mlp", "time": 0.08322550053708255}, {"seq_len": 512, "component": "mlp", "time": 0.1664510010741651}, {"seq_len": 1024, "component": "mlp", "time": 0.3329020021483302}, {"seq_len": 2048, "component": "mlp", "time": 0.6658040042966604}, {"seq_len": 4096, "component": "mlp", "time": 1.3316080085933208}, {"seq_len": 8192, "component": "mlp", "time": 2.6632160171866417}, {"seq_len": 16384, "component": "mlp", "time": 5.326432034373283}, {"seq_len": 32768, "component": "mlp", "time": 10.652864068746567}, {"seq_len": 65536, "component": "mlp", "time": 21.305728137493134}, {"seq_len": 131072, "component": "mlp", "time": 42.61145627498627}, {"seq_len": 256, "component": "attn", "time": 0.09944712574360885}, {"seq_len": 512, "component": "attn", "time": 0.1124010024796004}, {"seq_len": 1024, "component": "attn", "time": 0.139470502908807}, {"seq_len": 2048, "component": "attn", "time": 0.20453999837627623}, {"seq_len": 4096, "component": "attn", "time": 0.3806960007641463}, {"seq_len": 8192, "component": "attn", "time": 0.8666479820385575}, {"seq_len": 16384, "component": "attn", "time": 2.390447983518243}, {"seq_len": 32768, "component": "attn", "time": 7.603503971360624}, {"seq_len": 65536, "component": "attn", "time": 26.17280072160065}, {"seq_len": 131072, "component": "attn", "time": 95.93126338906586}, {"seq_len": 256, "component": "allgather", "time": 0.0031697500962764}, {"seq_len": 512, "component": "allgather", "time": 0.0063680000603199}, {"seq_len": 1024, "component": "allgather", "time": 0.012703999876976}, {"seq_len": 2048, "component": "allgather", "time": 0.0255210008472204}, {"seq_len": 4096, "component": "allgather", "time": 0.0508639998733997}, {"seq_len": 8192, "component": "allgather", "time": 0.1015520021319389}, {"seq_len": 16384, "component": "allgather", "time": 0.202904000878334}, {"seq_len": 32768, "component": "allgather", "time": 0.4059039950370788}, {"seq_len": 65536, "component": "allgather", "time": 0.8114879727363586}, {"seq_len": 131072, "component": "allgather", "time": 1.4790719747543335}]}};
+      var embedOpt = {"mode": "vega-lite"};
+
+      function showError(el, error){
+          el.innerHTML = ('<div style="color:red;">'
+                          + '<p>JavaScript Error: ' + error.message + '</p>'
+                          + "<p>This usually means there's a typo in your chart specification. "
+                          + "See the javascript console for the full traceback.</p>"
+                          + '</div>');
+          throw error;
+      }
+      const el = document.getElementById('vis');
+      vegaEmbed("#vis", spec, embedOpt)
+        .catch(error => showError(el, error));
+    })(vegaEmbed);
+
+  </script>
+</body>
+</html>

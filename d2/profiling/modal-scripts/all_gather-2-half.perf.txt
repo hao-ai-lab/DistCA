@@ -1,0 +1,25 @@
+$ /opt/nccl-tests/build/all_gather_perf -t 1 -b 8M -e 8G -f 2 -d half -g 2
+# nThread 1 nGpus 2 minBytes 8388608 maxBytes 8589934592 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     40 on      modal device  0 [0000:8b:00] NVIDIA H200
+#  Rank  1 Group  0 Pid     40 on      modal device  1 [0000:8c:00] NVIDIA H200
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)       
+     8388608       2097152      half    none      -1    44.13  190.08   95.04      0    51.20  163.84   81.92      0
+    16777216       4194304      half    none      -1    55.82  300.54  150.27      0    45.09  372.04  186.02      0
+    33554432       8388608      half    none      -1    72.87  460.45  230.23      0    68.80  487.68  243.84      0
+    67108864      16777216      half    none      -1    122.4  548.38  274.19      0    117.9  569.32  284.66      0
+   134217728      33554432      half    none      -1    218.5  614.36  307.18      0    212.2  632.40  316.20      0
+   268435456      67108864      half    none      -1    409.1  656.15  328.08      0    399.6  671.69  335.85      0
+   536870912     134217728      half    none      -1    793.5  676.58  338.29      0    764.4  702.32  351.16      0
+  1073741824     268435456      half    none      -1   1548.1  693.57  346.78      0   1495.2  718.14  359.07      0
+  2147483648     536870912      half    none      -1   3019.7  711.15  355.58      0   2999.0  716.06  358.03      0
+  4294967296    1073741824      half    none      -1   5938.3  723.26  361.63      0   5863.7  732.46  366.23      0
+  8589934592    2147483648      half    none      -1    11908  721.35  360.68      0    11706  733.79  366.90      0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 290.81 
+#
+

@@ -5,6 +5,7 @@ from typing import Deque, Iterable, List, Sequence
 from collections import deque
 from pathlib import Path
 
+
 def sample_random_docs(
     *,
     max_ctx_length: int,
@@ -107,6 +108,42 @@ def sample_wlbllm_docs(
     docpath = thisdir.parent / "data" / "dist_wlbllm.json"
     with open(docpath, "r") as f:
         docs = json.load(f)
+    rng = np.random.default_rng(seed)
+    docs = rng.choice(docs, size=size, replace=False)
+    return docs.tolist()
+
+
+def sample_wlbllm_docs_altered(
+    *,
+    size: int,
+    seed: int = 42,
+    filter_threshold: int = 10000,
+    filter_ratio: float = 0.1,
+) -> list[int]:
+    """
+    Sample `size` documents from the WLB-LLM distribution.
+
+    Parameters
+    ----------
+    size : int
+        Number of documents to sample.
+    seed : int, optional
+        RNG seed for reproducibility.
+
+    Returns
+    -------
+    list[int]
+        A list of document lengths.
+    """
+    thisdir = Path(os.path.dirname(__file__))
+    docpath = thisdir.parent / "data" / "dist_wlbllm.json"
+    with open(docpath, "r") as f:
+        docs = json.load(f)
+    shorter_docs = [doc for doc in docs if doc < filter_threshold]
+    longer_docs = [doc for doc in docs if doc >= filter_threshold]
+    
+    docs = shorter_docs[:int(filter_ratio * len(shorter_docs))] + longer_docs
+
     rng = np.random.default_rng(seed)
     docs = rng.choice(docs, size=size, replace=False)
     return docs.tolist()

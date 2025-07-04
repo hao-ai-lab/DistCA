@@ -6,27 +6,20 @@ from d2.simulator.optimizers.wlbllm import WlbLlmSolver
 
 # %%
 K = 1024
-batch = [64, 32]
-batch =  [i * K for i in batch]
+# batch = [64 * K, 64 * K]
+batch = [2030, 22, 5521, 2260, 4800, 5912, 4524, 4160, 2253, 2958, 3119, 3473, 1408, 579, 2887, 1793, 4614, 1369, 4687, 707, 5225, 816, 419]
+# batch = [64] * 64
+# batch =  [i * K for i in batch]
 
 num_workers = 4
-num_total_devices = 32
+num_total_devices = 16
 
 print("Qwen3-235B")
 
-
 # %%
-
-# %%
-# tm.get_attn_time(64 * 1024, 8, 2)
-print("Check attention time: ")
-for ctx_len in [1, 2, 4, 32, 64, 96]:
-    # a = tm.get_attn_time(ctx_len * 1024, 8, 2)
-    a = tm.get_attn_time(ctx_len * 1024, 8, 4)
-    print(f"ctx_len: {ctx_len}, attn: {a}ms")
-
-# %%
-best_solution = 1e15
+best_latency = 1e15
+best_solution = None
+best_plan = None
 from rich.console import Console
 from rich.table import Table
 
@@ -59,22 +52,26 @@ for tp in [8, 4, 2, 1]:
         )
         lat_max = solution.lat_max
         results[tp][cp] = lat_max
-        best_solution = min(best_solution, lat_max)
+        if lat_max < best_latency:
+            best_latency = lat_max
+            best_solution = solution
+            best_plan = parallel_plan
 
 # Populate the table
 for tp in [8, 4, 2, 1]:
     row = [str(tp)]
     for cp in [8, 4, 2, 1]:
         value = results[tp][cp]
-        if value == best_solution:
+        if value == best_latency:
             row.append(f"[bold spring_green2]{value}[/bold spring_green2]")
         else:
-            row.append(str(value) if value != float('inf') else 'inf')
+            row.append(f"{value:.2f}" if value < tm.INF else '-')
     table.add_row(*row)
 
-table.caption = f"Best Solution: {best_solution} ms\nPlan = {parallel_plan}"
+table.caption = f"Best Latency: {best_latency} ms\nPlan = {best_plan}"
 console.print(table)
-print(f"Best solution: {best_solution}")
+print(f"Best latency: {best_latency}")
+best_solution.print_solution()
 
 # %%
 
@@ -83,9 +80,14 @@ solution = solver.solve(
     batch, 
     num_workers=num_total_devices, 
     num_total_devices=num_total_devices,
+    timeout=30,
 )
 lat_max = solution.lat_max
 solution.print_solution()
 
+# 806186
+# 804746
 
+# %%
+len(batch)
 # %%
