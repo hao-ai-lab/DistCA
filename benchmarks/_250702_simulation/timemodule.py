@@ -19,11 +19,12 @@ INF = int(1e10)
 
 flops_per_ms = 989 * G # 1TFlops = 1e12 Flops/s
 
-def _get_mlp_time(tp, cp, total_tokens_across_all_gpus: int):
+def _get_mlp_time(tp, cp, total_tokens_across_all_gpus: int, return_extrainfo=False):
     if tp == 0 and cp == 0:
         return INF
     
     t = total_tokens_across_all_gpus
+
     q_proj_flops = dtype_size * t * hidden_size * num_qo_head * head_dim
     k_proj_flops = dtype_size * t * hidden_size * num_kv_head * head_dim
     v_proj_flops = dtype_size * t * hidden_size * num_kv_head * head_dim
@@ -40,7 +41,9 @@ def _get_mlp_time(tp, cp, total_tokens_across_all_gpus: int):
         + mlp_fc1_flops + mlp_gate_flops + mlp_activation_flops + mlp_fc2_flops
     )
 
-    linear_latency_ms = linear_flops / (tp * cp * flops_per_ms)
+    flops_per_ms_with_fundge = flops_per_ms * 1.0
+
+    linear_latency_ms = linear_flops / (tp * cp * flops_per_ms_with_fundge)
 
     component_flops = dict(
         q_proj_flops=q_proj_flops,
@@ -51,11 +54,22 @@ def _get_mlp_time(tp, cp, total_tokens_across_all_gpus: int):
         mlp_gate_flops=mlp_gate_flops,
         mlp_activation_flops=mlp_activation_flops,
         mlp_fc2_flops=mlp_fc2_flops,
-        linear_flops=linear_flops,
+        total_linear_flops=linear_flops,
     )
 
-    return linear_latency_ms, component_flops
+    component_time = {
+        name.replace("_flops", "_time_ms"): flops / (tp * cp * flops_per_ms_with_fundge)
+        for name, flops in component_flops.items()
+    }
+    if not return_extrainfo:
+        return linear_latency_ms
 
+    return linear_latency_ms, dict(
+        component_flops=component_flops,
+        component_time=component_time,
+    )
+
+# 1.8125
 def get_mlp_time(tp, cp, total_tokens_across_all_gpus: int, return_extrainfo=False):
     if tp == 0 and cp == 0:
         return INF
@@ -75,13 +89,12 @@ def get_mlp_time(tp, cp, total_tokens_across_all_gpus: int, return_extrainfo=Fal
         for name, flops in component_flops.items()
     }
     if not return_extrainfo:
-        return linear_latency_ms, None
+        return linear_latency_ms
 
     return linear_latency_ms, dict(
         component_flops=component_flops,
         component_time=component_time,
     )
-
 
 @lru_cache(maxsize=None)
 def setup_attn_time():
