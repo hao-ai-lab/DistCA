@@ -53,8 +53,41 @@ class TransformerLayer(MegatronTransformerLayer):
         hidden_dropout: Optional[float] = None,
     ):
         super().__init__(config, submodules, layer_number, hidden_dropout)
-        self.comm_stream = torch.cuda.Stream()
         self.comm_event = torch.cuda.Event()
+
+    def _layout_attn_to_mlp(
+            self, attn_out: torch.Tensor, attn_out_shape: torch.Size,
+            packed_seq_params: PingPangPackedSeqParams
+        ):
+        attn_out_mlp_layout = n_to_n_dispatch.apply(
+            query_in=attn_out,
+            query_metadata=packed_seq_params.attn_to_mlp_metadata,
+            key_value_in=None,
+            key_value_metadata=None,
+            rev_query_metadata=packed_seq_params.mlp_to_attn_metadata,
+            rev_key_value_metadata=None,
+            stream=packed_seq_params.stream,
+            event=self.comm_event,
+        )
+        return attn_out_mlp_layout
+
+    def _layout_mlp_to_attn(
+            self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+            packed_seq_params: PingPangPackedSeqParams
+        ):
+        key_value = torch.cat([key, value], dim=1)
+        query_attn_layout, key_value_attn_layout = n_to_n_dispatch.apply(
+            query_in=query,
+            query_metadata=packed_seq_params.mlp_to_attn_metadata,
+            key_value_in=key_value,
+            key_value_metadata=packed_seq_params.mlp_to_attn_kv_metadata,
+            rev_query_metadata=packed_seq_params.attn_to_mlp_metadata,
+            rev_key_value_metadata=packed_seq_params.mlp_to_attn_kv_grad_metadata,
+            stream=packed_seq_params.stream,
+            event=self.comm_event,
+        )
+        key_attn_layout, value_attn_layout = key_value_attn_layout.split(2, dim=1)
+        return query_attn_layout, key_attn_layout, value_attn_layout
 
     def ping_pang_forward(
         self,
@@ -85,39 +118,9 @@ class TransformerLayer(MegatronTransformerLayer):
         needs_split = debug or self.layer_number == 1
         needs_gather = debug    # NOTE: cannot infer if this is the last local layer or not.
 
-        # FIXME(yonghao): args shared by layers and used by attention should be preprocessed in advance.
-        comm_stream = torch.cuda.current_stream() if debug else self.comm_stream
-
-        def attn_to_mlp(attn_out: torch.Tensor, attn_out_shape: torch.Size, packed_seq_params: PingPangPackedSeqParams):
-            """
-            based on the plan, launch an all2all to redistribute the tensors across all data parallel, context parallel, and pipeline parallels devices.
-            """
-            attn_out_dispatched = n_to_n_dispatch.apply(
-                query_in=attn_out,
-                query_dst_id=packed_seq_params.out_dst_ids,
-                query_dst_offset=packed_seq_params.out_dst_offsets,
-                out_query_shape=attn_out_shape,
-                stream=comm_stream,
-                event=self.comm_event,
-            )
-            return attn_out_dispatched
-
-        def mlp_to_attn(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, packed_seq_params: PingPangPackedSeqParams):
-            # TODO: based on the plan, launch an all2all to redistribute the tensors across all data parallel, context parallel, and pipeline parallels devices.
-            key_value = torch.cat([key, value], dim=1)
-            query_out, key_value_out = n_to_n_dispatch.apply(
-                query_in=query,
-                query_dst_id=packed_seq_params.query_dst_ids,
-                query_dst_offset=packed_seq_params.query_dst_offsets,
-                out_query_shape=packed_seq_params.query_out_shape,
-                key_value_in=key_value,
-                key_value_dst_id=packed_seq_params.kv_dst_ids,
-                key_value_dst_offset=packed_seq_params.kv_dst_offsets,
-                out_key_value_shape=packed_seq_params.kv_out_shape,
-                stream=comm_stream,
-                event=self.comm_event,
-            )
-            return query_out, key_value_out
+        # FIXME(yonghao): args shared by layers and used by attention should be preprocessed in advance. We didn't add this yet.
+        if debug:
+            packed_seq_params.stream = torch.cuda.current_stream()
 
         # 1. split input into two microbatches
         args = [hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
@@ -148,7 +151,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
         # 3. pre-attention forward of microbatch 1, mlp2attn all2all of microbatch 0
         self.comm_event.wait(torch.cuda.current_stream())
-        query_0, key_0, value_0, rotary_pos_emb_0 = mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
+        query_0, key_0, value_0 = self._layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
         query_1, key_1, value_1, rotary_pos_emb_1, residual_1 = self._forward_pre_core_attn(
             hidden_states_1,
             attention_mask_1,
@@ -161,7 +164,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         self.comm_event.wait(torch.cuda.current_stream())
-        query_1, key_1, value_1, rotary_pos_emb_1 = mlp_to_attn(query_1, key_1, value_1, packed_seq_params_1)
+        query_1, key_1, value_1 = self._layout_mlp_to_attn(query_1, key_1, value_1, packed_seq_params_1)
         core_attn_out_0 = self._forward_core_attn(
             query_0,
             key_0,
@@ -177,7 +180,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         self.comm_event.wait(torch.cuda.current_stream())
-        core_attn_out_0 = attn_to_mlp(core_attn_out_0, hidden_states_0.shape, packed_seq_params_0)
+        core_attn_out_0 = self._layout_attn_to_mlp(core_attn_out_0, hidden_states_0.shape, packed_seq_params_0)
         core_attn_out_1 = self._forward_core_attn(
             query_1,
             key_1,
@@ -193,7 +196,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
         self.comm_event.wait(torch.cuda.current_stream())
-        core_attn_out_1 = attn_to_mlp(core_attn_out_1, hidden_states_1.shape, packed_seq_params_1)
+        core_attn_out_1 = self._layout_attn_to_mlp(core_attn_out_1, hidden_states_1.shape, packed_seq_params_1)
         mlp_output_0, context_0 = self._forward_post_core_attn(
             core_attn_out_0,
             residual_0,

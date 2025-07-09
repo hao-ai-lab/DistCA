@@ -76,6 +76,9 @@ def destroy_dispatcher(dispatcher) -> None:
 
 
 class DispatcherWrapper:
+
+    instance: Optional["DispatcherWrapper"] = None
+
     """
     Python wrapper for the dispatcher.
     A dispatcher is responsible for the MLP<->ATTN communication. It stores nvshmem
@@ -124,44 +127,23 @@ class DispatcherWrapper:
     def __del__(self):
         destroy_dispatcher(self.dispatcher)
 
-
-# TODO: remove this class because we only have one dispatcher.
-class DispatcherStorage:
-
-    def __init__(self):
-        self._dispatcher_dict: Dict[Tuple[int, int], DispatcherWrapper] = {}
-        self._current_dispatcher: Optional[DispatcherWrapper] = None
-        self.rank = None
-        self.world_size = None
-
-    def get_dispatcher(
-        self,
-        q_stride: int,
-        kv_stride: int,
-        max_tokens_query: int,
-        max_tokens_key_value: int,
+    
+    @staticmethod
+    def init(
+        q_stride: int, kv_stride: int, max_tokens_query: int, max_tokens_key_value: int,
+        rank: int, world_size: int, uid: torch.Tensor,
     ):
-        if self.rank is None:
-            self.rank = nvshmem_my_pe()
-        if self.world_size is None:
-            self.world_size = nvshmem_n_pes()
+        nvshmem_init(uid, rank, world_size)
+        DispatcherWrapper.instance = DispatcherWrapper(
+            q_stride, kv_stride, max_tokens_query, max_tokens_key_value,
+            rank, world_size
+        )
 
-        if self._current_dispatcher is None:
-            # avoid allocating a buffer of size 0
-            max_tokens_key_value = max(max_tokens_key_value, 1)
-            kv_stride = max(kv_stride, 1)
-            self._current_dispatcher = DispatcherWrapper(
-                q_stride, kv_stride, max_tokens_query, max_tokens_key_value,
-                self.rank, self.world_size
-            )
-        else:
-            self._current_dispatcher.maybe_update(
-                q_stride, kv_stride, max_tokens_query, max_tokens_key_value
-            )
-        return self._current_dispatcher
+    @staticmethod
+    def get_instance():
+        assert DispatcherWrapper.instance is not None, "DispatcherWrapper not initialized"
+        return DispatcherWrapper.instance
 
-
-_dispatcher_storage = DispatcherStorage()
 
 
 def dispatch(
