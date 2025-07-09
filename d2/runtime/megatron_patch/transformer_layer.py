@@ -14,8 +14,8 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 
-from packed_seq_params import PingPangPackedSeqParams
-from dispatcher_wrapper import n_to_n_dispatch
+from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
+from d2.runtime.megatron_patch.dispatcher_wrapper import n_to_n_dispatch
 
 #### Tool functions for splitting and gathering args ####
 def _split_tensor(x: Optional[torch.Tensor], num_splits: int):

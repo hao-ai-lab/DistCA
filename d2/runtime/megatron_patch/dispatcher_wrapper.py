@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from ..attn_kernels.ops import dispatch
+from d2.runtime.attn_kernels.ops import dispatch
 
 def dispatch_reverse(
     query_out: torch.Tensor,

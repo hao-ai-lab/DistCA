@@ -23,8 +23,8 @@ from megatron.training.utils import (
     get_batch_on_this_tp_rank,
 )
 
-from orig_pretrain import model_provider as orig_model_provider
-from model_patch import model_provider as ping_pang_model_provider
+from d2.runtime.megatron_patch.orig_pretrain import model_provider as orig_model_provider
+from d2.runtime.megatron_patch.model_patch import model_provider as ping_pang_model_provider
 
 stimer = StragglerDetector()
 

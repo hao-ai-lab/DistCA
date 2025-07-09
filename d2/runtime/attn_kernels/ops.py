@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from inplace_metadata import Metadata
+from d2.runtime.inplace_metadata import Metadata
 
 _lib_path = os.path.join(os.path.dirname(__file__), "libas_comm.so")
 torch.ops.load_library(_lib_path)
