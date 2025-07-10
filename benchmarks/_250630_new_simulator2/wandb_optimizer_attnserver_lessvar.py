@@ -258,6 +258,7 @@ def main(
         "batch_allreduce_time_us": batch_allreduce_time,
         "batch_total_time_us": batch_total_time,
         "solver_status": solver.StatusName(status),
+        "solver_status_code": (status),
         "solved_time_s": t1-t0,
         "num_vars": n_vars,
         "num_cons": n_cons,
@@ -274,7 +275,12 @@ def main(
                 'worker_plans': worker_plan_data,
                 'doc_assignments': doc_assignment_data,
                 'timing_breakdown': timing_breakdown,
-            }
+            },
+            "solver_status": solver.StatusName(status),
+            "solver_status_code": (status),
+            "solved_time_s": t1-t0,
+            "num_vars": n_vars,
+            "num_cons": n_cons,
         }
 
     return {
@@ -285,6 +291,10 @@ def main(
         'worker_plans': worker_plan_data,
         'doc_assignments': doc_assignment_data,
         'timing_breakdown': timing_breakdown,
+        "solver_status": solver.StatusName(status),
+        "solved_time_s": t1-t0,
+        "num_vars": n_vars,
+        "num_cons": n_cons,
     }
 
 
