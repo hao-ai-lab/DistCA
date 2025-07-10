@@ -14,10 +14,12 @@ class Worker:
         self.world_size = world_size
         self.dispatcher = None
 
-    def init_comm(self, uid: torch.Tensor, stride: int, max_tokens_query: int, max_tokens_key_value: int):
+    def init_comm(self,
+        uid: torch.Tensor, stride_q: int, stride_kv: int, max_tokens_query: int, max_tokens_key_value: int,
+    ):
         DispatcherWrapper.init(
-            q_stride=stride,
-            kv_stride=stride,
+            q_stride=stride_q,
+            kv_stride=stride_kv,
             max_tokens_query=max_tokens_query,
             max_tokens_key_value=max_tokens_key_value,
             rank=self.rank,
@@ -87,9 +89,21 @@ class Worker:
         )
         torch.cuda.synchronize()
         print(f"rank {self.rank} bwd communication done", flush=True)
-        back_tensor_kv_dedup = back_tensor_kv.sum(dim=1) / (back_tensor_kv != 0).sum(dim=1)
+
+        back_tensor_kv = back_tensor_kv.reshape(
+            (cp_degree, num_tokens, hidden_size_kv)
+        )
+        dedup_mask = torch.zeros_like(back_tensor_kv)
+        tot_tokens = 0
+        for j in range(fwd_kv_metadata.seq_len.shape[0]):
+            for k in range(cp_degree):
+                if fwd_kv_metadata.dst_rank[j, k] >= 0:
+                    dedup_mask[k, tot_tokens:tot_tokens+fwd_kv_metadata.seq_len[j, k]] = 1
+            tot_tokens += fwd_kv_metadata.seq_len[j, k]
+
+        back_tensor_kv_dedup = back_tensor_kv.sum(dim=1) / (dedup_mask != 0).sum(dim=1)
         assert torch.allclose(
-            back_tensor_kv_dedup.unsqueeze(1).repeat(1, cp_degree, 1) * (back_tensor_kv != 0), back_tensor_kv
+            back_tensor_kv_dedup.unsqueeze(1).repeat(1, cp_degree, 1) * (dedup_mask != 0), back_tensor_kv
         )
         torch.testing.assert_close(tensor_q, back_tensor_q)
         torch.testing.assert_close(tensor_kv, back_tensor_kv_dedup)
@@ -126,7 +140,8 @@ def create_testcase_qkv(
     log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
     cp_num = torch.pow(2, log_cp_num)
     # CP dst for each sequence. Masking by cp_num.
-    cp_dst = torch.randint(0, world_size, (world_size, num_seqs, max_cp_degree))
+    cp_dst_helper = torch.rand((world_size, num_seqs, world_size)).argsort(dim=2)
+    cp_dst = cp_dst_helper[:, :, :max_cp_degree]
     # For each (i, j), set cp_dst[i, j, cp_num[i, j]:] = -1
     mask = torch.arange(max_cp_degree).expand(world_size, num_seqs, max_cp_degree)
     cp_num_expanded = cp_num.unsqueeze(-1)
@@ -183,10 +198,28 @@ def create_testcase_qkv(
     back_tensor_q = orchestrate_simulate(output_tensor_q, back_tensor_q, rev_q_metadata)
     back_tensor_kv = orchestrate_simulate(output_tensor_kv, back_tensor_kv, rev_kv_metadata)
 
+    assert torch.allclose(back_tensor_q, tensor_q)
+
     assert max_cp_degree > 1
-    back_tensor_kv_dedup = back_tensor_kv.sum(dim=2) / (back_tensor_kv != 0).sum(dim=2)
-    assert torch.allclose(
-        back_tensor_kv_dedup.unsqueeze(2).repeat(1, 1, max_cp_degree) * (back_tensor_kv != 0), back_tensor_kv
+    back_tensor_kv = back_tensor_kv.reshape(
+        (world_size, max_cp_degree, num_tokens, hidden_size_kv)
+    )
+
+    back_tensor_mask = torch.zeros_like(back_tensor_kv)
+    for i in range(world_size):
+        tok = 0
+        for j in range(sp_kv_dst.shape[1]):
+            for k in range(max_cp_degree):
+                if sp_kv_dst[i, j, k] >= 0:
+                    back_tensor_mask[i, k, tok:tok+sp_seq_lens[i, j]] = 1
+            tok += sp_seq_lens[i, j]
+
+    back_tensor_kv_dedup = back_tensor_kv.sum(dim=1) / (back_tensor_mask != 0).sum(dim=1)
+
+    torch.testing.assert_close(back_tensor_kv_dedup, tensor_kv)
+
+    torch.testing.assert_close(
+        back_tensor_kv_dedup.unsqueeze(1).repeat(1, max_cp_degree, 1, 1) * (back_tensor_mask != 0), back_tensor_kv
     )
     return (
         fwd_q_metadata, rev_q_metadata, tensor_q, output_tensor_q, back_tensor_q,
@@ -258,9 +291,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--num-tokens", type=int, default=1024)
-    parser.add_argument("--cp-degree", type=int, default=1)
-    parser.add_argument("--hidden-size", type=int, default=128)
-    parser.add_argument("--num-seqs", type=int, default=4)
+    parser.add_argument("--max-cp-degree", type=int, default=2)
+    parser.add_argument("--hidden-size-query", type=int, default=256)
+    parser.add_argument("--hidden-size-kv", type=int, default=128)
+    parser.add_argument("--num-seqs", type=int, default=3)
     args = parser.parse_args()
     ray.init()
     workers = [
@@ -269,16 +303,20 @@ if __name__ == "__main__":
     ]
 
     uid = nvshmem_get_unique_id()
-    stride = args.hidden_size * torch.float16.itemsize
+    stride_q = args.hidden_size_query * torch.float16.itemsize
+    stride_kv = args.hidden_size_kv * torch.float16.itemsize
     max_tokens_query = args.num_tokens * args.world_size
     max_tokens_key_value = args.num_tokens * args.world_size
     ray.get([
-        worker.init_comm.remote(uid, stride, max_tokens_query, max_tokens_key_value)
+        worker.init_comm.remote(uid, stride_q, stride_kv, max_tokens_query, max_tokens_key_value)
         for worker in workers
     ])
 
     print("init done")
-    test_qkv(0, args.world_size, args.num_tokens, args.num_seqs, args.max_cp_degree, workers, args.hidden_size)
+    test_qkv(
+        0, args.world_size, args.num_tokens, args.num_seqs, args.max_cp_degree,
+        workers, args.hidden_size_query, args.hidden_size_kv,
+    )
     print("test done")
     ray.get([
         worker.shutdown.remote()

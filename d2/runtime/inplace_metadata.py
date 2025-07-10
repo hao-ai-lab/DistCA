@@ -209,7 +209,7 @@ def test():
     NUM_SEQS = 3
     CP_DEGREE = 2
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    HIDDEN_SIZE = 1
+    HIDDEN_SIZE = 4
     TOTAL_SEQ_LEN = 1024
     seq_len = gen_seq_lens(WORLD_SIZE, NUM_SEQS, TOTAL_SEQ_LEN).long()
     global_dispatch = torch.randint(-1, WORLD_SIZE, (WORLD_SIZE, NUM_SEQS, CP_DEGREE), device=DEVICE)
