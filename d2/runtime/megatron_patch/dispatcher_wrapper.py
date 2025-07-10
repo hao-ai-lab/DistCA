@@ -9,6 +9,7 @@ import torch
 from d2.runtime.attn_kernels.ops import DispatcherWrapper, dispatch
 from d2.runtime.inplace_metadata import Metadata
 
+
 def dispatch_reverse(
     q_input_grad: torch.Tensor,
     kv_input_grad: Optional[torch.Tensor],
@@ -27,11 +28,10 @@ def dispatch_reverse(
     if kv_input_grad is not None:
         dispatch(dispatcher, kv_output_grad, kv_input_grad, key_value_metadata, None, None, None)
 
-def both_none_or_neither(a, b):
+
+def _both_none_or_neither(a, b):
     return (a is None and b is None) or (a is not None and b is not None)
 
-def both_none_or_same_shape(a, b):
-    return (a is None and b is None) or (a is not None and b is not None and a.shape == b.shape)
 
 class n_to_n_dispatch(torch.autograd.Function):
     @staticmethod
@@ -49,8 +49,8 @@ class n_to_n_dispatch(torch.autograd.Function):
         # check key_value related tensors
         assert query_metadata.normalized
 
-        assert both_none_or_neither(key_value_in, key_value_metadata)
-        assert both_none_or_neither(event, stream)
+        assert _both_none_or_neither(key_value_in, key_value_metadata)
+        assert _both_none_or_neither(event, stream)
 
         # The num_head is folded into num_token.
         assert query_in.ndim == 2, "query_in is of shape (num_token, hidden_q)."
@@ -103,6 +103,9 @@ class n_to_n_dispatch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, out_query_grad, out_key_value_grad):
+        # NOTE(yonghao): in PP, the backward pass may not do the same thing
+        # as the forward. In this case, the whole layer is wrapped with
+        # a torch function and we do not run this part.
         (query_in_shape, key_value_in_shape,
          key_value_dst_mask, rev_query_metadata, rev_key_value_metadata,
          hidden_q, hidden_kv, stream, event) = ctx.saved_tensors

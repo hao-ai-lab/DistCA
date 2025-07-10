@@ -67,7 +67,7 @@ target_link_libraries(as_comm PUBLIC
     CUDA::cuda_driver
     CUDA::cudart
     nvshmem::nvshmem_host
-    nvshmem::nvshmem
+    nvshmem::nvshmem_device
 )
 set_target_properties(as_comm PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../d2/runtime/attn_kernels

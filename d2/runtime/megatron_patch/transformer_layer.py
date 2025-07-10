@@ -8,6 +8,7 @@ from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
 )
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer as MegatronTransformerLayer,
@@ -54,6 +55,12 @@ class TransformerLayer(MegatronTransformerLayer):
     ):
         super().__init__(config, submodules, layer_number, hidden_dropout)
         self.comm_event = torch.cuda.Event()
+
+        # TODO(yonghao): this is a dev annotation for type hinting. remove it later.
+        from megatron.core.transformer.attention import SelfAttention
+        from megatron.core.extensions.transformer_engine import TEDotProductAttention
+        self.self_attention: SelfAttention
+        assert self.self_attention.core_attention is TEDotProductAttention
 
     def _layout_attn_to_mlp(
             self, attn_out: torch.Tensor, attn_out_shape: torch.Size,
@@ -139,7 +146,7 @@ class TransformerLayer(MegatronTransformerLayer):
         # 2. pre-self-attention forward microbatch 0.
         # Ideally, this part should merge to the previous layer's post-self-attention to maximize
         # the communication-computation overlap.
-        query_0, key_0, value_0, rotary_pos_emb_0, residual_0 = self._forward_pre_core_attn(
+        query_0, key_0, value_0, rotary_pos_emb_0, residual_0, attn_mask_type_0 = self._forward_pre_core_attn(
             hidden_states_0,
             attention_mask_0,
             context_0,
@@ -147,12 +154,14 @@ class TransformerLayer(MegatronTransformerLayer):
             rotary_pos_emb_0,
             rotary_pos_cos_0,
             rotary_pos_sin_0,
+            packed_seq_params_0,
+            sequence_len_offset_0,
         )
 
         # 3. pre-attention forward of microbatch 1, mlp2attn all2all of microbatch 0
         self.comm_event.wait(torch.cuda.current_stream())
         query_0, key_0, value_0 = self._layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
-        query_1, key_1, value_1, rotary_pos_emb_1, residual_1 = self._forward_pre_core_attn(
+        query_1, key_1, value_1, rotary_pos_emb_1, residual_1, attn_mask_type_1 = self._forward_pre_core_attn(
             hidden_states_1,
             attention_mask_1,
             context_1,
@@ -160,6 +169,8 @@ class TransformerLayer(MegatronTransformerLayer):
             rotary_pos_emb_1,
             rotary_pos_cos_1,
             rotary_pos_sin_1,
+            packed_seq_params_1,
+            sequence_len_offset_1,
         )
 
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
@@ -170,12 +181,9 @@ class TransformerLayer(MegatronTransformerLayer):
             key_0,
             value_0,
             attention_mask_0,
-            rotary_pos_emb_0,
-            rotary_pos_cos_0,
-            rotary_pos_sin_0,
             attention_bias_0,
+            attn_mask_type_0,
             packed_seq_params_0,
-            sequence_len_offset_0,
         )
 
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
@@ -186,12 +194,8 @@ class TransformerLayer(MegatronTransformerLayer):
             key_1,
             value_1,
             attention_mask_1,
-            rotary_pos_emb_1,
-            rotary_pos_cos_1,
-            rotary_pos_sin_1,
-            attention_bias_1,
+            attn_mask_type_1,
             packed_seq_params_1,
-            sequence_len_offset_1,
         )
 
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
@@ -226,6 +230,8 @@ class TransformerLayer(MegatronTransformerLayer):
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        packed_seq_params: Optional[PingPangPackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -249,24 +255,9 @@ class TransformerLayer(MegatronTransformerLayer):
             rotary_pos_emb = (rotary_pos_emb,) * 2
         # q, k, v
         query, key, value = self.self_attention.get_query_key_value_tensors(input_layernorm_output, None)
-        return query, key, value, rotary_pos_emb, residual
 
-    def _forward_core_attn(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        packed_seq_params: Optional[PingPangPackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-    ):
-        """
-        Copied from megatron.core.transformer.attention.Attention.forward
-        """
+        #### Some code in core_attention. This is because we don't want the pos embedding
+        # being handled in the attention layout (the pos id will be hard to handle)
         inference_context = None
 
         query, key, value, rotary_pos_emb, attn_mask_type = self.self_attention._adjust_key_value_for_inference(
@@ -302,6 +293,7 @@ class TransformerLayer(MegatronTransformerLayer):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
+            # FIXME(yonghao): we need to fix this pos embedding for our layout.
             if q_pos_emb is not None:
                 # TODO VIJAY: simplify
                 query = apply_rotary_pos_emb(
@@ -316,6 +308,21 @@ class TransformerLayer(MegatronTransformerLayer):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+        return query, key, value, rotary_pos_emb, residual, attn_mask_type
+
+    def _forward_core_attn(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        attn_mask_type: Optional[AttnMaskType] = None,
+        packed_seq_params: Optional[PingPangPackedSeqParams] = None,
+    ):
+        """
+        Copied from megatron.core.transformer.attention.Attention.forward
+        """
 
         # ==================================
         # core attention computation

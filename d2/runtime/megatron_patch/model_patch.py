@@ -111,6 +111,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         ),
     )
 
+
 def get_gpt_decoder_block_spec(
     config: TransformerConfig,
     use_transformer_engine: bool,
