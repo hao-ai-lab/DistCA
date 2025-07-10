@@ -51,7 +51,8 @@ target_link_libraries(dispatch_kernels PUBLIC
     CUDA::cudart
 )
 target_link_libraries(dispatch_kernels PUBLIC
-    nvshmem::nvshmem
+    nvshmem::nvshmem_device
+    nvshmem::nvshmem_host
 )
 set_cuda_compile_options(dispatch_kernels)
 
