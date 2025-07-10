@@ -72,7 +72,7 @@ class Worker:
                     metadata: Metadata,
                     dst_tensor: torch.Tensor):
         # print(f"rank {self.rank} orchestrate tensor {tensor[:, :2]=}, {dst_id=}, {dst_offset=}, {dst_tensor.shape=}, {num_recv_tokens=}")
-        dispatch(self.dispatcher, tensor, dst_tensor, metadata, None, None, None)
+        dispatch(DispatcherWrapper.get_instance(), tensor, dst_tensor, metadata, None, None, None)
         nvshmem_barrier_all()
         return dst_tensor
 
