@@ -44,7 +44,8 @@ class Worker:
         hidden_size_kv = tensor_kv.shape[-1]
         torch.manual_seed(seed)
 
-        cp_degree = fwd_q_metadata.dst_rank.shape[2]
+        # of shape (num_seqs, cp_degree)
+        cp_degree = fwd_kv_metadata.dst_rank.shape[1]
         num_tokens_q = tensor_q.shape[0]
         num_tokens_kv = tensor_kv.shape[0]
         assert num_tokens_q == num_tokens_kv
@@ -57,33 +58,33 @@ class Worker:
             (num_received_tokens_q, hidden_size_q), dtype=tensor_q.dtype, device=tensor_q.device
         )
         torch.cuda.synchronize()
-        dst_tensor_q = self.orchestrate(
+        dst_tensor_kv = torch.zeros(
+            (num_received_tokens_kv, hidden_size_kv), dtype=tensor_kv.dtype, device=tensor_kv.device
+        )
+        dst_tensor_q, dst_tensor_kv = self.orchestrate(
             tensor_q, fwd_q_metadata,
             dst_tensor=dst_tensor_q,
             kv_tensor=tensor_kv,
             kv_metadata=fwd_kv_metadata,
             kv_dst_tensor=dst_tensor_kv,
         )
-        dst_tensor_kv = torch.zeros(
-            (num_received_tokens_kv, hidden_size_kv), dtype=tensor_kv.dtype, device=tensor_kv.device
-        )
         torch.cuda.synchronize()
         print(f"rank {self.rank} fwd done", flush=True)
 
         # reverse communication buffer
         back_tensor_shape_q = (num_tokens, hidden_size_q,)
-        back_tensor_shape_kv = (num_tokens, cp_degree, hidden_size_kv,)
+        back_tensor_shape_kv = (num_tokens * cp_degree, hidden_size_kv,)
         back_tensor_q = torch.zeros(
             back_tensor_shape_q, dtype=tensor_q.dtype, device=tensor_q.device
         )
         back_tensor_kv = torch.zeros(
             back_tensor_shape_kv, dtype=tensor_kv.dtype, device=tensor_kv.device
         )
-        back_tensor_q = self.orchestrate(
+        back_tensor_q, _ = self.orchestrate(
             dst_tensor_q, rev_q_metadata,
             dst_tensor=back_tensor_q,
         )
-        back_tensor_kv = self.orchestrate(
+        back_tensor_kv, _ = self.orchestrate(
             dst_tensor_kv, rev_kv_metadata,
             dst_tensor=back_tensor_kv,
         )
@@ -96,19 +97,25 @@ class Worker:
         dedup_mask = torch.zeros_like(back_tensor_kv)
         tot_tokens = 0
         for j in range(fwd_kv_metadata.seq_len.shape[0]):
+            seq_len = fwd_kv_metadata.seq_len[j].int()
             for k in range(cp_degree):
                 if fwd_kv_metadata.dst_rank[j, k] >= 0:
-                    dedup_mask[k, tot_tokens:tot_tokens+fwd_kv_metadata.seq_len[j, k]] = 1
-            tot_tokens += fwd_kv_metadata.seq_len[j, k]
+                    dedup_mask[k, tot_tokens:tot_tokens+seq_len] = 1
+            tot_tokens += seq_len
 
-        back_tensor_kv_dedup = back_tensor_kv.sum(dim=1) / (dedup_mask != 0).sum(dim=1)
-        assert torch.allclose(
-            back_tensor_kv_dedup.unsqueeze(1).repeat(1, cp_degree, 1) * (dedup_mask != 0), back_tensor_kv
+        back_tensor_kv_dedup = back_tensor_kv.sum(dim=0) / (dedup_mask != 0).sum(dim=0)
+        torch.testing.assert_close(
+            back_tensor_kv_dedup.unsqueeze(0).repeat(cp_degree, 1, 1) * (dedup_mask != 0), back_tensor_kv
         )
         torch.testing.assert_close(tensor_q, back_tensor_q)
         torch.testing.assert_close(tensor_kv, back_tensor_kv_dedup)
         torch.cuda.synchronize()
-        return dst_tensor_q, dst_tensor_kv, back_tensor_q, back_tensor_kv_dedup
+        return {
+            "dst_q": dst_tensor_q,
+            "dst_kv": dst_tensor_kv,
+            "rev_q": back_tensor_q,
+            "rev_kv": back_tensor_kv_dedup,
+        }
 
     @torch.no_grad()
     def orchestrate(self,
@@ -121,10 +128,10 @@ class Worker:
                     ):
         # print(f"rank {self.rank} orchestrate tensor {tensor[:, :2]=}, {dst_id=}, {dst_offset=}, {dst_tensor.shape=}, {num_recv_tokens=}")
         dispatch(
-            DispatcherWrapper.get_instance(), tensor, dst_tensor, metadata, kv_tensor, kv_metadata, kv_dst_tensor
+            DispatcherWrapper.get_instance(), tensor, dst_tensor, metadata, kv_tensor, kv_dst_tensor, kv_metadata,
         )
         nvshmem_barrier_all()
-        return dst_tensor
+        return dst_tensor, kv_dst_tensor
 
 
 def create_testcase_qkv(
@@ -248,9 +255,10 @@ def test_qkv(
         rev_q_metadata_slice = rev_q_metadata.get_slice(rank)
         rev_kv_metadata_slice = rev_kv_metadata.get_slice(rank)
         ref = worker.test_qkv.remote(
-            seed, tensor_q_slice, tensor_kv_slice,
-            fwd_q_metadata_slice, fwd_kv_metadata_slice,
-            rev_q_metadata_slice, rev_kv_metadata_slice,
+            seed,
+            fwd_q_metadata_slice, rev_q_metadata_slice,
+            fwd_kv_metadata_slice, rev_kv_metadata_slice,
+            tensor_q_slice, tensor_kv_slice,
         )
         refs.append(ref)
 
@@ -278,8 +286,8 @@ def test_qkv(
     torch.testing.assert_close(dst_kv_tensor_out, output_tensor_kv.to(dst_kv_tensor_out.device))
 
     ### Test backward reverse's correctness ###
-    back_q_tensor_outs = [r["rev_q"] for r in results]
-    back_kv_tensor_outs = [r["rev_kv"] for r in results]
+    back_q_tensor_outs = [r["rev_q"].unsqueeze(0) for r in results]
+    back_kv_tensor_outs = [r["rev_kv"].unsqueeze(0) for r in results]
     back_q_tensor_out = torch.cat(back_q_tensor_outs, dim=0)
     back_kv_tensor_out = torch.cat(back_kv_tensor_outs, dim=0)
     torch.testing.assert_close(back_q_tensor_out, back_tensor_q.to(back_q_tensor_out.device))
@@ -318,8 +326,3 @@ if __name__ == "__main__":
         workers, args.hidden_size_query, args.hidden_size_kv,
     )
     print("test done")
-    ray.get([
-        worker.shutdown.remote()
-        for worker in workers
-    ])
-
