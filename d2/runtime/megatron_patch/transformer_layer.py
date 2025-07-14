@@ -126,22 +126,23 @@ class TransformerLayer(MegatronTransformerLayer):
         needs_gather = debug    # NOTE: cannot infer if this is the last local layer or not.
 
         # FIXME(yonghao): args shared by layers and used by attention should be preprocessed in advance. We didn't add this yet.
+        packed_seq_params_0 = packed_seq_params.seq_params[0]
+        packed_seq_params_1 = packed_seq_params.seq_params[1]
         if debug:
-            packed_seq_params.stream = torch.cuda.current_stream()
+            setattr(packed_seq_params_0, "stream", torch.cuda.current_stream())
+            setattr(packed_seq_params_1, "stream", torch.cuda.current_stream())
 
         # 1. split input into two microbatches
         args = [hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
-                rotary_pos_cos, rotary_pos_sin, attention_bias, packed_seq_params, sequence_len_offset]
+                rotary_pos_cos, rotary_pos_sin, attention_bias, sequence_len_offset]
         if needs_split:
             args_0, args_1 = _splits_all(args, 2)
         else:
             args_0, args_1 = _repack_args(args, 2)
         (hidden_states_0, attention_mask_0, context_0, context_mask_0, rotary_pos_emb_0,
-            rotary_pos_cos_0, rotary_pos_sin_0, attention_bias_0, packed_seq_params_0,
-            sequence_len_offset_0) = args_0
+            rotary_pos_cos_0, rotary_pos_sin_0, attention_bias_0, sequence_len_offset_0) = args_0
         (hidden_states_1, attention_mask_1, context_1, context_mask_1, rotary_pos_emb_1,
-            rotary_pos_cos_1, rotary_pos_sin_1, attention_bias_1, packed_seq_params_1,
-            sequence_len_offset_1) = args_1
+            rotary_pos_cos_1, rotary_pos_sin_1, attention_bias_1, sequence_len_offset_1) = args_1
 
         # 2. pre-self-attention forward microbatch 0.
         # Ideally, this part should merge to the previous layer's post-self-attention to maximize
@@ -194,6 +195,7 @@ class TransformerLayer(MegatronTransformerLayer):
             key_1,
             value_1,
             attention_mask_1,
+            attention_bias_1,
             attn_mask_type_1,
             packed_seq_params_1,
         )
@@ -217,8 +219,8 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         # concatenate the two microbatches to one.
         if needs_gather:
-            output = _gather_tensor([mlp_output_0, mlp_output_1], 2)
-            context = _gather_tensor([context_0, context_1], 2)
+            output = _gather_tensor([mlp_output_0, mlp_output_1], num_splits=2)
+            context = _gather_tensor([context_0, context_1], num_splits=2)
         else:
             output = [mlp_output_0, mlp_output_1]
             context = [context_0, context_1]

@@ -3,8 +3,6 @@ from typing import Optional
 
 import torch
 
-from megatron.training import get_args, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.extensions.transformer_engine import (
     TENorm,
 )
@@ -195,6 +193,9 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     Returns:
         GPTModel: The returned model
     """
+    from megatron.training import get_args, print_rank_0
+    from megatron.training.arguments import core_transformer_config_from_args
+
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
     assert use_te
@@ -224,21 +225,43 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     if args.mtp_num_layers is not None:
         mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_transformer_engine=use_te)
 
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=True,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base,
-            rope_scaling=args.use_rope_scaling,
-            mtp_block_spec=mtp_block_spec,
-        )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=True,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        rotary_base=args.rotary_base,
+        rope_scaling=args.use_rope_scaling,
+        mtp_block_spec=mtp_block_spec,
+    )
 
     return model
+
+
+def get_gpt_config(
+    num_layers: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    ffn_hidden_size: int,
+    hidden_dropout: float = 0.,
+    attention_dropout: float = 0.,
+    normalization: str = "RMSNorm",
+    **kwargs,
+):
+    return TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        ffn_hidden_size=ffn_hidden_size,
+        hidden_dropout=hidden_dropout,
+        attention_dropout=attention_dropout,
+        normalization=normalization,
+        **kwargs,
+    )

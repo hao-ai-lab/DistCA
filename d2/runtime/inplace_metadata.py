@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 
@@ -47,16 +49,14 @@ class Metadata:
 def compute_metadata(
     seq_len: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
     global_dispatch: torch.Tensor,  # shape of (world_size, max_num_local_seqs, max_cp_degree)
-):
+) -> Tuple[Metadata, Metadata]:
     """
     Args:
-        length (Tensor): shape (world_size, max_num_local_seqs). The length of each sequence.
-        global_dispatch (Tensor): shape (world_size, max_num_local_seqs, max_cp_degree). value -1 is padding.
+        seq_len (Tensor): shape (world_size, max_num_local_seq_shards). The length of each sequence.
+        global_dispatch (Tensor): shape (world_size, max_num_local_seq_shards, max_cp_degree). value -1 is padding.
         The decision tensor. Recording the ranks that each sequence is dispatched to.
     Returns:
-        dst_offset (Tensor): dst begin offset of each sequence (send side).
-        rev_dst_rank (Tensor): dst ranks of each sequence (from recv side back to send side).
-        rev_dst_offset (Tensor): dst offsets of each sequence (from recv side back to send side).
+        fwd_metadata, rev_metadata: Metadata for forward and reverse communication.
     """
     world_size = global_dispatch.shape[0]
     max_num_local_seqs = global_dispatch.shape[1]
@@ -161,6 +161,53 @@ def compute_metadata(
         world_size=world_size,
     )
     return fwd_metadata, rev_metadata
+
+
+@torch.no_grad()
+def compute_attn_layout_seqlens(
+    seq_shard_len: torch.Tensor, seq_shard_cumsum: torch.Tensor,
+    dispatch: torch.Tensor,
+):
+    """
+    Compute the cu_seqlens_q and cu_seqlens_kv for the attention layout.
+    """
+    world_size = dispatch.shape[0]
+    max_num_local_seqs = dispatch.shape[1]
+    assert dispatch.dim() == 2
+    assert seq_shard_len.shape == (world_size, max_num_local_seqs)
+    assert seq_shard_cumsum.shape == (world_size, max_num_local_seqs + 1)
+    assert dispatch.dtype == torch.int64
+    assert seq_shard_len.dtype == torch.int64
+    assert seq_shard_cumsum.dtype == torch.int64
+    # dispatch[i, j] = the rank that sequence [i,j] is dispatched to.
+    flatten_dispatch = dispatch.flatten()
+
+    flatten_dispatch_one_hot = F.one_hot(flatten_dispatch, num_classes=world_size)
+    # shape: (world_size, seq_len, world_size)
+    local_indices_flat = (
+        # cumsum: the id of this sequence at the dst rank.
+        (flatten_dispatch_one_hot.cumsum(dim=0) - 1) *
+        # mask out those not at this rank.
+        (flatten_dispatch_one_hot != 0)
+    ).reshape(dispatch.shape + (world_size,))
+    # if dispatch[i, j] = k, then local_indices_flat[i, j, k] = l means sequence [i,j] is at out_sequence [k,l]
+    # out_seqlens_q[k, l] = seq_shard_len[i, j]
+    max_num_seq = int(local_indices_flat.max().item() + 1)
+    out_seqlens_q = torch.zeros(world_size * max_num_seq, dtype=torch.int64, device=dispatch.device)
+    out_seqlens_kv = torch.zeros(world_size * max_num_seq, dtype=torch.int64, device=dispatch.device)
+    # TODO: use scatter_ or gather_ to make it the correct value.
+    scatter_index = flatten_dispatch * max_num_seq + local_indices_flat
+    src_seqlens = seq_shard_len.flatten()
+    out_seqlens_q.scatter_(0, scatter_index, src_seqlens)
+    out_seqlens_kv.scatter_(0, scatter_index, src_seqlens)
+    out_seqlens_q = out_seqlens_q.reshape(world_size, max_num_local_seqs)
+    out_seqlens_kv = out_seqlens_kv.reshape(world_size, max_num_local_seqs)
+    num_local_seqs_recv = local_indices_flat.reshape(-1, world_size).max(dim=0)
+    cu_seqlens_q = out_seqlens_q.cumsum(dim=1)
+    cu_seqlens_kv = out_seqlens_kv.cumsum(dim=1)
+    max_seqlen_q = cu_seqlens_q.max(dim=1)
+    max_seqlen_kv = cu_seqlens_kv.max(dim=1)
+    return cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, num_local_seqs_recv
 
 
 ######## Correctness testing tools ########
