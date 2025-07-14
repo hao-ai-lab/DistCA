@@ -135,10 +135,19 @@ class Worker:
 
 
 def create_testcase_qkv(
-    seed: int, world_size: int, num_tokens: int, max_cp_degree: int, num_seqs: int, hidden_size_q: int, hidden_size_kv: int,
-) -> Tuple[Metadata, Metadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    seed: int, world_size: int, num_tokens: int, max_cp_degree: int, num_seqs: int,
+) -> Tuple[Metadata, Metadata, Metadata, Metadata, torch.Tensor, torch.Tensor]:
+    """
+    Create a random sequence parallel dispatch plan that:
+    - Generate sequences of different lengths. The total number of tokens at each rank
+      is the same.
+    - Generate a CP degree for each sequence (under a max_cp_degree).
+    - Generate CP ranks for each CP shard of a sequence.
+    - Create metadata accordingly.
+    """
     torch.manual_seed(seed)
     ### Init dispatch plan ###
+    assert num_tokens % max_cp_degree == 0
     _num_tokens_shard = num_tokens // max_cp_degree
     seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
     # make sure each sequence is divisible by max_cp_degree.
@@ -159,35 +168,67 @@ def create_testcase_qkv(
     sp_seq_lens = torch.zeros(world_size, pad_len, dtype=torch.int64)
     sp_query_dst = torch.ones(world_size, pad_len, dtype=torch.int64) * -1
     sp_kv_dst = torch.ones(world_size, pad_len, max_cp_degree, dtype=torch.int64) * -1
+    sp_dst_kv_len = torch.zeros(world_size, pad_len, dtype=torch.int64) * -1
     for i in range(world_size):
-        sp_seq_lens_rank = []
-        sp_query_dst_rank = []
-        sp_kv_dst_rank = []
+        sp_seq_lens_local = []
+        sp_query_dst_local = []
+        sp_kv_dst_local = []
+        sp_dst_kv_len_local = []
+
         for j in range(num_seqs):
-            sp_seq_lens_rank.append((seq_lens[i, j] // cp_num[i, j]).reshape(1,).repeat(cp_num[i, j]))
-            sp_query_dst_rank.append(cp_dst[i, j, :cp_num[i, j]].flatten())
-            seq_cp_dst_kv = cp_dst[i, j].reshape(1, -1).repeat(cp_num[i, j], 1)
-            sp_kv_dst_rank.append(seq_cp_dst_kv)
-        sp_seq_lens_rank = torch.cat(sp_seq_lens_rank, dim=0)
-        sp_query_dst_rank = torch.cat(sp_query_dst_rank, dim=0)
-        sp_kv_dst_rank = torch.cat(sp_kv_dst_rank, dim=0)
+            num_cp = cp_num[i, j]
+            seq_len = seq_lens[i, j]
+            seq_shard_len = seq_len // num_cp
+
+            sp_seq_lens_local.append(seq_shard_len.reshape(1,).repeat(num_cp))
+            sp_query_dst_local.append(cp_dst[i, j, :num_cp].flatten())
+            seq_cp_dst_kv = cp_dst[i, j].reshape(1, -1).repeat(num_cp, 1)
+            # kv total length of each CP shard.
+            sp_dst_kv_len_local.append(
+                seq_shard_len.reshape(1,) * torch.arange(
+                    1, num_cp + 1, device=seq_shard_len.device, dtype=seq_shard_len.dtype
+                )
+            )
+            # triangular mask of seq_cp_dst_kv. Mask value is always 0 but we want it -1.
+            # FIXME: the following line leads to a number mismatch here.
+            # seq_cp_dst_kv = (seq_cp_dst_kv + 1).tril() - 1
+            sp_kv_dst_local.append(seq_cp_dst_kv)
+        
+        sp_seq_lens_local = torch.cat(sp_seq_lens_local, dim=0)
+        sp_query_dst_local = torch.cat(sp_query_dst_local, dim=0)
+        sp_kv_dst_local = torch.cat(sp_kv_dst_local, dim=0)
+        sp_dst_kv_len_local = torch.cat(sp_dst_kv_len_local, dim=0)
         # shape check:
-        seq_shards = sp_seq_lens_rank.shape[0]
-        assert sp_seq_lens_rank.shape == (seq_shards,)
-        assert sp_query_dst_rank.shape == (seq_shards,)
-        assert sp_kv_dst_rank.shape == (seq_shards, max_cp_degree)
+        seq_shards = sp_seq_lens_local.shape[0]
+        assert sp_seq_lens_local.shape == (seq_shards,)
+        assert sp_query_dst_local.shape == (seq_shards,)
+        assert sp_kv_dst_local.shape == (seq_shards, max_cp_degree)
+        assert sp_dst_kv_len_local.shape == (seq_shards,)
 
-        sp_seq_lens[i, :seq_shards] = sp_seq_lens_rank
-        sp_query_dst[i, :seq_shards] = sp_query_dst_rank
-        sp_kv_dst[i, :seq_shards, :] = sp_kv_dst_rank
-
-    ### Init tensor ###
-    tensor_q = torch.randn(world_size, num_tokens, hidden_size_q, dtype=torch.float16)
-    tensor_kv = torch.randn(world_size, num_tokens, hidden_size_kv, dtype=torch.float16)
+        sp_seq_lens[i, :seq_shards] = sp_seq_lens_local
+        sp_query_dst[i, :seq_shards] = sp_query_dst_local
+        sp_kv_dst[i, :seq_shards, :] = sp_kv_dst_local
+        sp_dst_kv_len[i, :seq_shards] = sp_dst_kv_len_local
 
     ### Init metadata ###
     fwd_q_metadata, rev_q_metadata = compute_metadata(sp_seq_lens, sp_query_dst)
     fwd_kv_metadata, rev_kv_metadata = compute_metadata(sp_seq_lens, sp_kv_dst)
+
+    return (
+        fwd_q_metadata, rev_q_metadata, fwd_kv_metadata, rev_kv_metadata,
+        sp_kv_dst, sp_seq_lens, sp_dst_kv_len, seq_lens,
+    )
+
+
+def create_answer(
+    fwd_q_metadata: Metadata, fwd_kv_metadata: Metadata, rev_q_metadata: Metadata, rev_kv_metadata: Metadata,
+    sp_kv_dst: torch.Tensor, sp_seq_lens: torch.Tensor,
+    world_size: int, num_tokens: int, hidden_size_q: int, hidden_size_kv: int, max_cp_degree: int,
+):
+
+    ### Init tensor ###
+    tensor_q = torch.randn(world_size, num_tokens, hidden_size_q, dtype=torch.float16)
+    tensor_kv = torch.randn(world_size, num_tokens, hidden_size_kv, dtype=torch.float16)
 
     ### Init output tensor ###
     max_recv_tokens_q = fwd_q_metadata.num_recv_tokens.max()
@@ -228,10 +269,7 @@ def create_testcase_qkv(
     torch.testing.assert_close(
         back_tensor_kv_dedup.unsqueeze(1).repeat(1, max_cp_degree, 1, 1) * (back_tensor_mask != 0), back_tensor_kv
     )
-    return (
-        fwd_q_metadata, rev_q_metadata, tensor_q, output_tensor_q, back_tensor_q,
-        fwd_kv_metadata, rev_kv_metadata, tensor_kv, output_tensor_kv, back_tensor_kv_dedup,
-    )
+    return tensor_q, tensor_kv, output_tensor_q, output_tensor_kv, back_tensor_q, back_tensor_kv_dedup
 
 
 @torch.no_grad()
@@ -239,10 +277,16 @@ def test_qkv(
     seed, world_size, num_tokens, num_seqs, max_cp_degree, workers: List[ray.ObjectRef], hidden_size_q: int, hidden_size_kv: int,
 ):
     (
-        fwd_q_metadata, rev_q_metadata, tensor_q, output_tensor_q, back_tensor_q,
-        fwd_kv_metadata, rev_kv_metadata, tensor_kv, output_tensor_kv, back_tensor_kv_dedup,
+        fwd_q_metadata, rev_q_metadata,
+        fwd_kv_metadata, rev_kv_metadata,
+        sp_kv_dst, sp_seq_lens, sp_dst_kv_len, seq_lens,
     ) = create_testcase_qkv(
-        seed, world_size, num_tokens, max_cp_degree, num_seqs, hidden_size_q, hidden_size_kv
+        seed, world_size, num_tokens, max_cp_degree, num_seqs,
+    )
+    (tensor_q, tensor_kv, output_tensor_q, output_tensor_kv, back_tensor_q, back_tensor_kv_dedup) = create_answer(
+        fwd_q_metadata, fwd_kv_metadata, rev_q_metadata, rev_kv_metadata,
+        sp_kv_dst, sp_seq_lens,
+        world_size, num_tokens, hidden_size_q, hidden_size_kv, max_cp_degree
     )
     assert len(workers) == world_size
     refs = []
