@@ -18,8 +18,9 @@ import torch
 
 from d2.runtime.attn_kernels.ops import nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper
 from d2.runtime.inplace_metadata import compute_attn_layout_seqlens
-from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.model_patch import get_gpt_layer_with_transformer_engine_spec, get_gpt_config
+from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
+from d2.runtime.megatron_patch.transformer_layer import TransformerLayer as PingPangTransformerLayer
 
 from test_dispatch_qkv import create_testcase_qkv
 
@@ -148,7 +149,7 @@ class MegatronBaseWorker:
 class MegatronLayerWorker(MegatronBaseWorker):
     def __init__(self, rank: int, world_size: int):
         super().__init__(rank, world_size)
-        self.layer = None
+        self.layer: Optional[PingPangTransformerLayer] = None
 
     #### Megatron layer init and running functions
     def init_layer(self, config: TransformerConfig, spec: ModuleSpec,
@@ -163,6 +164,9 @@ class MegatronLayerWorker(MegatronBaseWorker):
     def forward_ping_pang(self, tensor_input: torch.Tensor, packed_seq_params: PingPangPackedSeqParams):
         return self.layer.ping_pang_forward(tensor_input, packed_seq_params=packed_seq_params)
 
+    def forward_ping_pang_one_stage(self, tensor_input: torch.Tensor, packed_seq_params: PingPangSingleStepPackedSeqParams):
+        packed_seq_params = packed_seq_params.to_device()
+        return self.layer.forward_one_stage(tensor_input, packed_seq_params=packed_seq_params)
 
 def get_seqlen_shard(cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor,
                      max_seqlen_q: torch.Tensor, max_seqlen_kv: torch.Tensor, num_local_seqs_recv: torch.Tensor, rank: int):
@@ -175,92 +179,172 @@ def get_seqlen_shard(cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor,
 
 
 @torch.no_grad()
-def test(worker, seed, rank,
-         world_size, num_tokens, max_cp_degree, num_seqs,
-         hidden_size):
+def test_dp(workers, seed, num_tokens, max_cp_degree, num_seqs, hidden_size):
+    world_size = len(workers)
     # Create two splits for ping-pong
     (
         fwd_q_metadata_0, rev_q_metadata_0,
         fwd_kv_metadata_0, rev_kv_metadata_0,
-        sp_kv_dst_0, sp_seq_lens_0, seq_lens_0,
+        sp_kv_dst_0, sp_seq_lens_0, cp_dst_kv_len_0, seq_lens_0,
     ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
     (
         fwd_q_metadata_1, rev_q_metadata_1,
         fwd_kv_metadata_1, rev_kv_metadata_1,
-        sp_kv_dst_1, sp_seq_lens_1, seq_lens_1,
+        sp_kv_dst_1, sp_seq_lens_1, cp_dst_kv_len_1, seq_lens_1,
     ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
+    (cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0) = compute_attn_layout_seqlens(
+        sp_seq_lens_0, cp_dst_kv_len_0, sp_kv_dst_0
+    )
+    (cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1) = compute_attn_layout_seqlens(
+        sp_seq_lens_1, cp_dst_kv_len_1, sp_kv_dst_1
+    )
 
     # Create tensor input
     tensor_input = torch.randn(world_size, num_tokens * 2, hidden_size, dtype=torch.float16)
-    tensor_input_local = tensor_input[rank]
-    fwd_q_metadata_0_local = fwd_q_metadata_0.get_slice(rank)
-    rev_q_metadata_0_local = rev_q_metadata_0.get_slice(rank)
-    fwd_kv_metadata_0_local = fwd_kv_metadata_0.get_slice(rank)
-    rev_kv_metadata_0_local = rev_kv_metadata_0.get_slice(rank)
-    fwd_q_metadata_1_local = fwd_q_metadata_1.get_slice(rank)
-    rev_q_metadata_1_local = rev_q_metadata_1.get_slice(rank)
-    fwd_kv_metadata_1_local = fwd_kv_metadata_1.get_slice(rank)
-    rev_kv_metadata_1_local = rev_kv_metadata_1.get_slice(rank)
+    ref_ans_handles = []
+    ans_handles = []
+    for rank in range(world_size):
+        tensor_input_local = tensor_input[rank]
+        fwd_q_metadata_0_local = fwd_q_metadata_0.get_slice(rank)
+        rev_q_metadata_0_local = rev_q_metadata_0.get_slice(rank)
+        fwd_kv_metadata_0_local = fwd_kv_metadata_0.get_slice(rank)
+        rev_kv_metadata_0_local = rev_kv_metadata_0.get_slice(rank)
+        fwd_q_metadata_1_local = fwd_q_metadata_1.get_slice(rank)
+        rev_q_metadata_1_local = rev_q_metadata_1.get_slice(rank)
+        fwd_kv_metadata_1_local = fwd_kv_metadata_1.get_slice(rank)
+        rev_kv_metadata_1_local = rev_kv_metadata_1.get_slice(rank)
 
-    # Create packed seq params metadata
-    # Normal forward. No layout switch. Batches are in the normal data parallel on each rank.
-    seq_lens_local_0 = seq_lens_0[rank]
-    seq_lens_local_1 = seq_lens_1[rank]
-    seq_lens_local = torch.cat([seq_lens_local_0, seq_lens_local_1], dim=0)
-    cu_seqlens_q = seq_lens_local.cuda().cumsum(dim=0)
-    cu_seqlens_kv = cu_seqlens_q.clone()
-    max_seqlen_q = seq_lens_local.max().cuda()
-    max_seqlen_kv = max_seqlen_q.clone()
-    packed_seq_params_normal = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_kv=cu_seqlens_kv,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_kv=max_seqlen_kv,
-    )
-    # Ping-pong forward. cu_seqlens is in a special layout.
-    (cu_seqlens_q_0, cu_seqlens_kv_0, max_seqlen_q_0, max_seqlen_kv_0) = get_seqlen_shard(*compute_attn_layout_seqlens(
-        seq_lens_0, sp_seq_lens_0, sp_kv_dst_0
-    ), rank)
-    (cu_seqlens_q_1, cu_seqlens_kv_1, max_seqlen_q_1, max_seqlen_kv_1) = get_seqlen_shard(*compute_attn_layout_seqlens(
-        seq_lens_1, sp_seq_lens_1, sp_kv_dst_1
-    ), rank)
-    packed_seq_params_stage_0 = PingPangSingleStepPackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_q_0,
-        cu_seqlens_kv=cu_seqlens_kv_0,
-        max_seqlen_q=max_seqlen_q_0,
-        max_seqlen_kv=max_seqlen_kv_0,
-        mlp_to_attn_metadata=fwd_q_metadata_0_local.normalize_dtype().cuda(),
-        attn_to_mlp_metadata=rev_q_metadata_0_local.normalize_dtype().cuda(),
-        mlp_to_attn_kv_metadata=fwd_kv_metadata_0_local.normalize_dtype().cuda(),
-        mlp_to_attn_kv_grad_metadata=rev_kv_metadata_0_local.normalize_dtype().cuda(),
-    )
-    packed_seq_params_stage_1 = PingPangSingleStepPackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_q_1,
-        cu_seqlens_kv=cu_seqlens_kv_1,
-        max_seqlen_q=max_seqlen_q_1,
-        max_seqlen_kv=max_seqlen_kv_1,
-        mlp_to_attn_metadata=fwd_q_metadata_1_local.normalize_dtype().cuda(),
-        attn_to_mlp_metadata=rev_q_metadata_1_local.normalize_dtype().cuda(),
-        mlp_to_attn_kv_metadata=fwd_kv_metadata_1_local.normalize_dtype().cuda(),
-        mlp_to_attn_kv_grad_metadata=rev_kv_metadata_1_local.normalize_dtype().cuda(),
-    )
-    packed_seq_params_ping_pang = PingPangPackedSeqParams(
-        debug=True,
-        seq_params=[packed_seq_params_stage_0, packed_seq_params_stage_1],
+        # Create packed seq params metadata
+        # Normal forward. No layout switch. Batches are in the normal data parallel on each rank.
+        seq_lens_local_0 = seq_lens_0[rank]
+        seq_lens_local_1 = seq_lens_1[rank]
+        seq_lens_local = torch.cat([seq_lens_local_0, seq_lens_local_1], dim=0)
+        cu_seqlens_q = seq_lens_local.cuda().cumsum(dim=0)
+        cu_seqlens_kv = cu_seqlens_q.clone()
+        max_seqlen_q = seq_lens_local.max().cuda()
+        max_seqlen_kv = max_seqlen_q.clone()
+        packed_seq_params_normal = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+        )
+        # Ping-pong forward. cu_seqlens is in a special layout.
+        (cu_seqlens_q_0, cu_seqlens_kv_0, max_seqlen_q_0, max_seqlen_kv_0, num_seq_0) = get_seqlen_shard(
+            cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0, rank
+        )
+        (cu_seqlens_q_1, cu_seqlens_kv_1, max_seqlen_q_1, max_seqlen_kv_1, num_seq_1) = get_seqlen_shard(
+            cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1, rank
+        )
+        packed_seq_params_stage_0 = PingPangSingleStepPackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q_0,
+            cu_seqlens_kv=cu_seqlens_kv_0,
+            max_seqlen_q=max_seqlen_q_0,
+            max_seqlen_kv=max_seqlen_kv_0,
+            mlp_to_attn_metadata=fwd_q_metadata_0_local,
+            attn_to_mlp_metadata=rev_q_metadata_0_local,
+            mlp_to_attn_kv_metadata=fwd_kv_metadata_0_local,
+            mlp_to_attn_kv_grad_metadata=rev_kv_metadata_0_local,
+        )
+        packed_seq_params_stage_1 = PingPangSingleStepPackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q_1,
+            cu_seqlens_kv=cu_seqlens_kv_1,
+            max_seqlen_q=max_seqlen_q_1,
+            max_seqlen_kv=max_seqlen_kv_1,
+            mlp_to_attn_metadata=fwd_q_metadata_1_local,
+            attn_to_mlp_metadata=rev_q_metadata_1_local,
+            mlp_to_attn_kv_metadata=fwd_kv_metadata_1_local,
+            mlp_to_attn_kv_grad_metadata=rev_kv_metadata_1_local,
+        )
+        packed_seq_params_ping_pang = PingPangPackedSeqParams(
+            debug=True,
+            seq_params=[packed_seq_params_stage_0, packed_seq_params_stage_1],
+        )
+
+        # Compute the reference answer and test result
+        ref_ans_handle = workers[rank].forward_normal.remote(
+            tensor_input_local, packed_seq_params_normal
+        )
+
+        ans_handle = workers[rank].forward_ping_pang.remote(
+            tensor_input_local, packed_seq_params_ping_pang
+        )
+        ref_ans_handles.append(ref_ans_handle)
+        ans_handles.append(ans_handle)
+
+    ref_ans = ray.get(ref_ans_handles)
+    ans = ray.get(ans_handles)
+    for r, a in zip(ref_ans, ans):
+        torch.testing.assert_close(ref_ans, ans)
+
+
+def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int, num_seqs: int, hidden_size: int):
+    world_size = len(workers)
+    # Create two splits for ping-pong
+    (
+        fwd_q_metadata, rev_q_metadata,
+        fwd_kv_metadata, rev_kv_metadata,
+        sp_kv_dst, sp_seq_lens, cp_dst_kv_len, seq_lens,
+    ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
+
+    (cu_seqlens_q_pp, cu_seqlens_kv_pp, max_seqlen_q_pp, max_seqlen_kv_pp, num_local_seqs_recv_pp) = compute_attn_layout_seqlens(
+        sp_seq_lens, cp_dst_kv_len, sp_kv_dst
     )
 
-    # Compute the reference answer and test result
-    ref_ans = worker.forward_normal(
-        tensor_input_local, packed_seq_params_normal
-    )
+    # Create tensor input
+    tensor_input = torch.randn(world_size, num_tokens, hidden_size, dtype=torch.float16)
+    ref_ans_handles = []
+    ans_handles = []
+    for rank in range(world_size):
+        tensor_input_local = tensor_input[rank]
+        fwd_q_metadata_local = fwd_q_metadata.get_slice(rank)
+        rev_q_metadata_local = rev_q_metadata.get_slice(rank)
+        fwd_kv_metadata_local = fwd_kv_metadata.get_slice(rank)
+        rev_kv_metadata_local = rev_kv_metadata.get_slice(rank)
 
-    ans = worker.forward_ping_pang(
-        tensor_input_local, packed_seq_params_ping_pang
-    ) 
-    torch.testing.assert_close(ref_ans, ans)
+        # Create packed seq params metadata
+        # Normal forward. No layout switch. Running data parallel
+        seq_lens_local = seq_lens[rank]
+        cu_seqlens_q = seq_lens_local.cuda().cumsum(dim=0)
+        cu_seqlens_kv = cu_seqlens_q.clone()
+        max_seqlen_q = seq_lens_local.max().cuda()
+        max_seqlen_kv = max_seqlen_q.clone()
+        packed_seq_params_normal = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+        )
+        # Ping-pong forward. cu_seqlens is in a special layout.
+        (cu_seqlens_q_pp_local, cu_seqlens_kv_pp_local, max_seqlen_q_pp_local, max_seqlen_kv_pp_local, num_seq_pp_local) = get_seqlen_shard(
+            cu_seqlens_q_pp, cu_seqlens_kv_pp, max_seqlen_q_pp, max_seqlen_kv_pp, num_local_seqs_recv_pp, rank
+        )
+        packed_seq_params_stage_0 = PingPangSingleStepPackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q_pp_local,
+            cu_seqlens_kv=cu_seqlens_kv_pp_local,
+            max_seqlen_q=max_seqlen_q_pp_local,
+            max_seqlen_kv=max_seqlen_kv_pp_local,
+            mlp_to_attn_metadata=fwd_q_metadata_local,
+            attn_to_mlp_metadata=rev_q_metadata_local,
+            mlp_to_attn_kv_metadata=fwd_kv_metadata_local,
+            mlp_to_attn_kv_grad_metadata=rev_kv_metadata_local,
+        )
+
+        # Compute the reference answer and test result
+        ref_ans_handle = workers[rank].forward_normal.remote(
+            tensor_input_local, packed_seq_params_normal
+        )
+
+        ans_handle = workers[rank].forward_ping_pang_one_stage.remote(
+            tensor_input_local, packed_seq_params_stage_0
+        )
+        ref_ans_handles.append(ref_ans_handle)
+        ans_handles.append(ans_handle)
 
 
 def init_test(args):

@@ -15,7 +15,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 
-from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
+from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.dispatcher_wrapper import n_to_n_dispatch
 
 #### Tool functions for splitting and gathering args ####
@@ -426,4 +426,63 @@ class TransformerLayer(MegatronTransformerLayer):
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         mlp_output = self._forward_mlp(pre_mlp_layernorm_output, residual)
+        return mlp_output, context
+
+    def forward_one_stage(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[Any] = None,
+        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[Any] = None,
+    ):
+        """Debug use. Single stage of Ping-Pang parallel."""
+        assert inference_params is None, "inference not supported yet"
+        assert inference_context is None, "inference not supported yet"
+        assert context is None, "cross-attention not supported yet"
+        assert context_mask is None, "cross-attention not supported yet"
+
+        setattr(packed_seq_params, "stream", torch.cuda.current_stream())
+
+        query, key, value, rotary_pos_emb, residual, attn_mask_type = self._forward_pre_core_attn(
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            packed_seq_params,
+            sequence_len_offset,
+        )
+
+        query, key, value = self._layout_mlp_to_attn(query, key, value, packed_seq_params)
+
+        core_attn_out = self._forward_core_attn(
+            query,
+            key,
+            value,
+            attention_mask,
+            attention_bias,
+            attn_mask_type,
+            packed_seq_params,
+        )
+
+        core_attn_out = self._layout_attn_to_mlp(core_attn_out, hidden_states.shape, packed_seq_params)
+
+        mlp_output, context = self._forward_post_core_attn(
+            core_attn_out,
+            residual,
+            context,
+            context_mask,
+        )
+
         return mlp_output, context

@@ -128,7 +128,7 @@ class Worker:
 
 def create_testcase_qkv(
     seed: int, world_size: int, num_tokens: int, max_cp_degree: int, num_seqs: int,
-) -> Tuple[Metadata, Metadata, Metadata, Metadata, torch.Tensor, torch.Tensor]:
+) -> Tuple[Metadata, Metadata, Metadata, Metadata, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create a random sequence parallel dispatch plan that:
     - Generate sequences of different lengths. The total number of tokens at each rank
