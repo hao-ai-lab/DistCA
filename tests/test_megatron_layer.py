@@ -390,3 +390,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     workers = init_test(args)
     print("Test env initialized.")
+    test_dp_single_split(workers, args.seed, args.num_tokens, args.cp_degree, args.num_seqs, args.hidden_size)

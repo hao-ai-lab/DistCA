@@ -50,6 +50,7 @@ class n_to_n_dispatch(torch.autograd.Function):
         assert query_metadata.normalized
 
         assert _both_none_or_neither(key_value_in, key_value_metadata)
+        assert _both_none_or_neither(key_value_in, rev_key_value_metadata)
         assert _both_none_or_neither(event, stream)
 
         # The num_head is folded into num_token.
@@ -76,16 +77,25 @@ class n_to_n_dispatch(torch.autograd.Function):
             ctx = torch.cuda.stream(stream)
         else:
             ctx = nullcontext()
+
         with ctx:
-            dispatch_qkv(
-                dispatcher=DispatcherWrapper.get_instance(),
-                tensor=query_in,
-                dst_tensor=out_query,
-                metadata=query_metadata,
-                kv_tensor=key_value_in,
-                kv_dst_tensor=out_key_value,
-                kv_metadata=key_value_metadata,
-            )
+            if key_value_in is not None:
+                dispatch_qkv(
+                    dispatcher=DispatcherWrapper.get_instance(),
+                    tensor=query_in,
+                    dst_tensor=out_query,
+                    metadata=query_metadata,
+                    kv_tensor=key_value_in,
+                    kv_dst_tensor=out_key_value,
+                    kv_metadata=key_value_metadata,
+                )
+            else:
+                dispatch_no_cp_tensor(
+                    dispatcher=DispatcherWrapper.get_instance(),
+                    tensor=query_in,
+                    dst_tensor=out_query,
+                    metadata=query_metadata,
+                )
             if event is not None:
                 event.record(stream)
 
@@ -127,15 +137,24 @@ class n_to_n_dispatch(torch.autograd.Function):
             ctx = torch.cuda.stream(stream)
         else:
             ctx = nullcontext()
+
         with ctx:
-            dispatch_reverse(
-                q_input_grad=query_in_grad,
-                kv_input_grad=key_value_in_grad,
-                q_output_grad=out_query_grad,
-                kv_output_grad=out_key_value_grad,
-                query_metadata=rev_query_metadata,
-                key_value_metadata=rev_key_value_metadata,
-            )
+            if out_key_value_grad is not None:
+                dispatch_reverse(
+                    q_input_grad=query_in_grad,
+                    kv_input_grad=key_value_in_grad,
+                    q_output_grad=out_query_grad,
+                    kv_output_grad=out_key_value_grad,
+                    query_metadata=rev_query_metadata,
+                    key_value_metadata=rev_key_value_metadata,
+                )
+            else:
+                dispatch_no_cp_tensor(
+                    dispatcher=DispatcherWrapper.get_instance(),
+                    tensor=out_query_grad,
+                    dst_tensor=query_in_grad,
+                    metadata=rev_query_metadata,
+                )
             if event is not None:
                 event.record(stream)
 

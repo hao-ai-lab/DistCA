@@ -63,9 +63,15 @@ class TransformerLayer(MegatronTransformerLayer):
         assert isinstance(self.self_attention.core_attention, TEDotProductAttention)
 
     def _layout_attn_to_mlp(
-            self, attn_out: torch.Tensor, attn_out_shape: torch.Size,
+            self, attn_out: torch.Tensor,
             packed_seq_params: PingPangPackedSeqParams
         ):
+        #### NOTE: this is a hack. We should fix this in the future.
+        num_heads = attn_out.shape[1]
+        head_dim = attn_out.shape[2]
+        attn_out = attn_out.reshape(attn_out.shape[0], num_heads * head_dim)
+        ####
+
         attn_out_mlp_layout = n_to_n_dispatch.apply(
             query_in=attn_out,
             query_metadata=packed_seq_params.attn_to_mlp_metadata,
@@ -76,12 +82,26 @@ class TransformerLayer(MegatronTransformerLayer):
             stream=packed_seq_params.stream,
             event=self.comm_event,
         )
+        #### switch layout back
+        attn_out_mlp_layout = attn_out_mlp_layout.reshape(attn_out_mlp_layout.shape[0], num_heads, head_dim)
+        ####
         return attn_out_mlp_layout
 
     def _layout_mlp_to_attn(
             self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
             packed_seq_params: PingPangPackedSeqParams
         ):
+        # FIXME: current we do a walk around: merge head dimension into hidden dimension
+        #### NOTE: this is a hack. We should fix this in the future.
+        num_q_heads = query.shape[1]
+        num_kv_heads = key.shape[1]
+        q_head_dim = query.shape[2]
+        kv_head_dim = key.shape[2]
+        query = query.reshape(query.shape[0], num_q_heads * q_head_dim)
+        key = key.reshape(key.shape[0], num_kv_heads * kv_head_dim)
+        value = value.reshape(value.shape[0], num_kv_heads * kv_head_dim)
+        ####
+
         key_value = torch.cat([key, value], dim=1)
         query_attn_layout, key_value_attn_layout = n_to_n_dispatch.apply(
             query_in=query,
@@ -94,6 +114,12 @@ class TransformerLayer(MegatronTransformerLayer):
             event=self.comm_event,
         )
         key_attn_layout, value_attn_layout = key_value_attn_layout.split(2, dim=1)
+
+        #### switch layout back
+        query_attn_layout = query_attn_layout.reshape(query_attn_layout.shape[0], num_q_heads, q_head_dim)
+        key_attn_layout = key_attn_layout.reshape(key_attn_layout.shape[0], num_kv_heads, kv_head_dim)
+        value_attn_layout = value_attn_layout.reshape(value_attn_layout.shape[0], num_kv_heads, kv_head_dim)
+
         return query_attn_layout, key_attn_layout, value_attn_layout
 
     def ping_pang_forward(
@@ -189,7 +215,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         self.comm_event.wait(torch.cuda.current_stream())
-        core_attn_out_0 = self._layout_attn_to_mlp(core_attn_out_0, hidden_states_0.shape, packed_seq_params_0)
+        core_attn_out_0 = self._layout_attn_to_mlp(core_attn_out_0, packed_seq_params_0)
         core_attn_out_1 = self._forward_core_attn(
             query_1,
             key_1,
@@ -202,7 +228,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
         self.comm_event.wait(torch.cuda.current_stream())
-        core_attn_out_1 = self._layout_attn_to_mlp(core_attn_out_1, hidden_states_1.shape, packed_seq_params_1)
+        core_attn_out_1 = self._layout_attn_to_mlp(core_attn_out_1, packed_seq_params_1)
         mlp_output_0, context_0 = self._forward_post_core_attn(
             core_attn_out_0,
             residual_0,
@@ -476,7 +502,7 @@ class TransformerLayer(MegatronTransformerLayer):
             packed_seq_params,
         )
 
-        core_attn_out = self._layout_attn_to_mlp(core_attn_out, hidden_states.shape, packed_seq_params)
+        core_attn_out = self._layout_attn_to_mlp(core_attn_out, packed_seq_params)
 
         mlp_output, context = self._forward_post_core_attn(
             core_attn_out,
