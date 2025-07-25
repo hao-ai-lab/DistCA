@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,7 @@ class Metadata:
     num_seqs: Optional[torch.Tensor] = None
     world_size: int = None
     normalized: bool = False
+    num_total_recv_tokens: Union[int, list[int]] = None
 
     def get_slice(self, rank: int):
         assert self.world_size is not None
@@ -30,6 +31,7 @@ class Metadata:
             seq_recv_mask=self.seq_recv_mask[rank] if self.seq_recv_mask is not None else None,
             recv_seq_lens=self.recv_seq_lens[rank] if self.recv_seq_lens is not None else None,
             normalized=self.normalized,
+            num_total_recv_tokens=self.num_total_recv_tokens[rank],
         )
 
     def normalize_dtype(self):
@@ -42,6 +44,7 @@ class Metadata:
             recv_seq_lens=self.recv_seq_lens.to(torch.uint32) if self.recv_seq_lens is not None else None,
             world_size=self.world_size,
             normalized=True,
+            num_total_recv_tokens=self.num_total_recv_tokens,
         )
 
     def cuda(self):
@@ -54,6 +57,7 @@ class Metadata:
             recv_seq_lens=self.recv_seq_lens.cuda().contiguous() if self.recv_seq_lens is not None else None,
             world_size=self.world_size,
             normalized=self.normalized,
+            num_total_recv_tokens=self.num_total_recv_tokens,
         )
 
 
@@ -172,6 +176,7 @@ def compute_metadata(
         num_recv_tokens=num_recv_tokens,
         num_seqs=num_seqs,
         world_size=world_size,
+        num_total_recv_tokens=num_recv_tokens[:, -1].tolist(),
     )
     rev_metadata = Metadata(
         dst_rank=rev_dst_rank,
@@ -182,6 +187,7 @@ def compute_metadata(
         recv_seq_lens=seq_len if seq_recv_mask is not None else None,
         num_seqs=num_seqs_rev,
         world_size=world_size,
+        num_total_recv_tokens=rev_num_received_tokens[:, -1].tolist(),
     )
     return fwd_metadata, rev_metadata
 

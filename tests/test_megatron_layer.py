@@ -3,9 +3,6 @@ Using ray to init processes. This makes multi process logging format cleaner and
 """
 
 import argparse
-from dataclasses import dataclass
-import os
-import socket
 from typing import Optional
 
 from megatron.core import parallel_state as mpu
@@ -16,13 +13,13 @@ import ray
 from ray.util.placement_group import placement_group
 import torch
 
-from d2.runtime.attn_kernels.ops import nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper
 from d2.runtime.inplace_metadata import compute_attn_layout_seqlens, orchestrate_simulate, Metadata
 from d2.runtime.megatron_patch.model_patch import get_gpt_layer_with_transformer_engine_spec, get_gpt_config
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.transformer_layer import TransformerLayer as PingPangTransformerLayer
 
 from test_dispatch_qkv import create_testcase_qkv
+from test_util import MegatronBaseWorker, ParallelConfig
 
 
 def create_pg(num_nodes: int, num_gpus_per_node: int, worker_cls):
@@ -73,79 +70,6 @@ def create_pg(num_nodes: int, num_gpus_per_node: int, worker_cls):
     return workers
 
 
-@dataclass
-class ParallelConfig:
-    tensor_model_parallel_size: int = 1
-    pipeline_model_parallel_size: int = 1
-    virtual_pipeline_model_parallel_size: Optional[int] = None
-    context_parallel_size: int = 1
-    expert_model_parallel_size: int = 1
-    expert_tensor_parallel_size: Optional[int] = None
-
-
-class MegatronBaseWorker:
-    """Worker base class to init communication groups (megatron and nvshmem)."""
-    def __init__(self, rank: int, world_size: int):
-        self.rank = rank
-        self.world_size = world_size
-        self.nvshmem_initialized = False
-        self.nvshmem_pe = None
-
-    #### General init functions
-    def get_node_ip_port(self):
-        host_ipv4 = os.getenv("MY_HOST_IP", None)
-        host_ipv6 = os.getenv("MY_HOST_IPV6", None)
-        host_ip_by_env = host_ipv4 or host_ipv6
-        host_ip_by_sdk = ray._private.services.get_node_ip_address()
-
-        host_ip = host_ip_by_env or host_ip_by_sdk
-
-        with socket.socket() as sock:
-            sock.bind(("", 0))
-            port = sock.getsockname()[1]
-        return host_ip, str(port)
-
-    def set_master_addr_port(self, master_addr: str, master_port: str):
-        os.environ["MASTER_ADDR"] = master_addr
-        os.environ["MASTER_PORT"] = master_port
-
-    def init_comm(self, stride_q: int, stride_kv: int, max_tokens_query: int, max_tokens_key_value: int,
-                  parallel_config: ParallelConfig):
-        # Init megatron communication.
-        if not torch.distributed.is_initialized():
-            local_rank = int(os.environ["LOCAL_RANK"])
-            torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size)
-        # NOTE: do not set to local_rank here because the cuda visible device is set by ray.
-
-        mpu.initialize_model_parallel(
-            tensor_model_parallel_size=parallel_config.tensor_model_parallel_size,
-            pipeline_model_parallel_size=parallel_config.pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size=parallel_config.virtual_pipeline_model_parallel_size,
-            pipeline_model_parallel_split_rank=None,
-            use_sharp=False,
-            context_parallel_size=parallel_config.context_parallel_size,
-            expert_model_parallel_size=parallel_config.expert_model_parallel_size,
-            expert_tensor_parallel_size=parallel_config.expert_tensor_parallel_size,
-            nccl_communicator_config_path=None,
-        )
-        # Init nvshmem.
-        if self.rank == 0:
-            uid = nvshmem_get_unique_id()
-        else:
-            uid = nvshmem_alloc_empty_unique_id()
-        torch.distributed.broadcast(uid, src=0)
-
-        DispatcherWrapper.init(
-            q_stride=stride_q,
-            kv_stride=stride_kv,
-            max_tokens_query=max_tokens_query,
-            max_tokens_key_value=max_tokens_key_value,
-            rank=self.rank,
-            world_size=self.world_size,
-            uid=uid,
-        )
-
-
 class MegatronLayerWorker(MegatronBaseWorker):
     def __init__(self, rank: int, world_size: int):
         super().__init__(rank, world_size)
@@ -172,12 +96,6 @@ class MegatronLayerWorker(MegatronBaseWorker):
         torch.cuda.synchronize()
         print(self.rank, "normal forward done")
         return (mlp_output, context), debug
-
-    def forward_ping_pang(self, tensor_input: torch.Tensor, packed_seq_params: PingPangPackedSeqParams):
-        packed_seq_params = packed_seq_params.to_device()
-        tensor_input = tensor_input.cuda()
-        self.layer.train()
-        return self.layer.ping_pang_forward(tensor_input, packed_seq_params=packed_seq_params)
 
     def forward_ping_pang_one_stage(self, tensor_input: torch.Tensor, packed_seq_params: PingPangSingleStepPackedSeqParams):
         packed_seq_params = packed_seq_params.to_device()
@@ -228,109 +146,6 @@ def simulate_communication(tensors: list[torch.Tensor], metadata: Metadata):
 
 
 @torch.no_grad()
-def test_dp(workers, seed, num_tokens, max_cp_degree, num_seqs, hidden_size):
-    world_size = len(workers)
-    # Create two splits for ping-pong
-    (
-        fwd_q_metadata_0, rev_q_metadata_0,
-        fwd_kv_metadata_0, rev_kv_metadata_0,
-        sp_kv_dst_0, sp_seq_lens_0, sp_query_dst_0, cp_dst_kv_len_0, seq_lens_0,
-    ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
-    (
-        fwd_q_metadata_1, rev_q_metadata_1,
-        fwd_kv_metadata_1, rev_kv_metadata_1,
-        sp_kv_dst_1, sp_seq_lens_1, sp_query_dst_1, cp_dst_kv_len_1, seq_lens_1,
-    ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
-    (cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0) = compute_attn_layout_seqlens(
-        sp_seq_lens_0, cp_dst_kv_len_0, sp_query_dst_0
-    )
-    (cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1) = compute_attn_layout_seqlens(
-        sp_seq_lens_1, cp_dst_kv_len_1, sp_query_dst_1
-    )
-
-    # Create tensor input
-    tensor_input = torch.randn(world_size, num_tokens * 2, hidden_size, dtype=torch.float16)
-    ref_ans_handles = []
-    ans_handles = []
-    for rank in range(world_size):
-        # of shape (1, num_tokens, hidden_size)
-        tensor_input_local = tensor_input[rank].unsqueeze(1)
-        fwd_q_metadata_0_local = fwd_q_metadata_0.get_slice(rank)
-        rev_q_metadata_0_local = rev_q_metadata_0.get_slice(rank)
-        fwd_kv_metadata_0_local = fwd_kv_metadata_0.get_slice(rank)
-        rev_kv_metadata_0_local = rev_kv_metadata_0.get_slice(rank)
-        fwd_q_metadata_1_local = fwd_q_metadata_1.get_slice(rank)
-        rev_q_metadata_1_local = rev_q_metadata_1.get_slice(rank)
-        fwd_kv_metadata_1_local = fwd_kv_metadata_1.get_slice(rank)
-        rev_kv_metadata_1_local = rev_kv_metadata_1.get_slice(rank)
-
-        # Create packed seq params metadata
-        # Normal forward. No layout switch. Batches are in the normal data parallel on each rank.
-        seq_lens_local_0 = seq_lens_0[rank]
-        seq_lens_local_1 = seq_lens_1[rank]
-        seq_lens_local = torch.cat([seq_lens_local_0, seq_lens_local_1], dim=0)
-        cu_seqlens_q = seq_lens_local.cuda().cumsum(dim=0)
-        cu_seqlens_kv = cu_seqlens_q.clone()
-        max_seqlen_q = seq_lens_local.max().cuda()
-        max_seqlen_kv = max_seqlen_q.clone()
-        packed_seq_params_normal = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=max_seqlen_kv,
-        )
-        # Ping-pong forward. cu_seqlens is in a special layout.
-        (cu_seqlens_q_0, cu_seqlens_kv_0, max_seqlen_q_0, max_seqlen_kv_0, num_seq_0) = get_seqlen_shard(
-            cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0, rank
-        )
-        (cu_seqlens_q_1, cu_seqlens_kv_1, max_seqlen_q_1, max_seqlen_kv_1, num_seq_1) = get_seqlen_shard(
-            cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1, rank
-        )
-        packed_seq_params_stage_0 = PingPangSingleStepPackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_q_0,
-            cu_seqlens_kv=cu_seqlens_kv_0,
-            max_seqlen_q=max_seqlen_q_0,
-            max_seqlen_kv=max_seqlen_kv_0,
-            mlp_to_attn_metadata=fwd_q_metadata_0_local,
-            attn_to_mlp_metadata=rev_q_metadata_0_local,
-            mlp_to_attn_kv_metadata=fwd_kv_metadata_0_local,
-            mlp_to_attn_kv_grad_metadata=rev_kv_metadata_0_local,
-        )
-        packed_seq_params_stage_1 = PingPangSingleStepPackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_q_1,
-            cu_seqlens_kv=cu_seqlens_kv_1,
-            max_seqlen_q=max_seqlen_q_1,
-            max_seqlen_kv=max_seqlen_kv_1,
-            mlp_to_attn_metadata=fwd_q_metadata_1_local,
-            attn_to_mlp_metadata=rev_q_metadata_1_local,
-            mlp_to_attn_kv_metadata=fwd_kv_metadata_1_local,
-            mlp_to_attn_kv_grad_metadata=rev_kv_metadata_1_local,
-        )
-        packed_seq_params_ping_pang = PingPangPackedSeqParams(
-            debug=True,
-            seq_params=[packed_seq_params_stage_0, packed_seq_params_stage_1],
-        )
-
-        # Compute the reference answer and test result
-        ref_ans_handle = workers[rank].forward_normal.remote(
-            tensor_input_local, packed_seq_params_normal
-        )
-
-        ans_handle = workers[rank].forward_ping_pang.remote(
-            tensor_input_local, packed_seq_params_ping_pang
-        )
-        ref_ans_handles.append(ref_ans_handle)
-        ans_handles.append(ans_handle)
-
-    ref_ans = ray.get(ref_ans_handles)
-    ans = ray.get(ans_handles)
-    for r, a in zip(ref_ans, ans):
-        torch.testing.assert_close(r, a)
-
-
 def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int, num_seqs: int, hidden_size: int):
     world_size = len(workers)
     # Create two splits for ping-pong
@@ -460,9 +275,9 @@ def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int
     torch.testing.assert_close(ref_ans, ans)
 
 
-def init_test(args):
+def init_test(args, worker_cls=MegatronLayerWorker):
     ray.init()
-    workers = create_pg(args.num_nodes, args.num_gpus_per_node, MegatronLayerWorker)
+    workers = create_pg(args.num_nodes, args.num_gpus_per_node, worker_cls)
     print("Workers created")
     stride_q = args.hidden_size * torch.float16.itemsize
     stride_kv = args.hidden_size * torch.float16.itemsize * 2

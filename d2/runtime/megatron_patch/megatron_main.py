@@ -30,9 +30,9 @@ stimer = StragglerDetector()
 
 def get_batch(data_iterator):
     """Generate a batch."""
-    # TODO: get a mock batch to test the performance
+    # TODO(yonghao): get a mock batch to test the performance
 
-    # TODO: this is pretty hacky, find a better way
+    # TODO(yonghao): this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
