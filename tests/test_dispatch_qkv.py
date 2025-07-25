@@ -128,7 +128,7 @@ class Worker:
 
 def create_testcase_qkv(
     seed: int, world_size: int, num_tokens: int, max_cp_degree: int, num_seqs: int,
-    seqlen_scale_factor: int=1,
+    seqlen_multiple: int=1,
 ) -> Tuple[Metadata, Metadata, Metadata, Metadata, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create a random sequence parallel dispatch plan that:
@@ -140,11 +140,11 @@ def create_testcase_qkv(
     """
     torch.manual_seed(seed)
     ### Init dispatch plan ###
-    assert num_tokens % (max_cp_degree * seqlen_scale_factor) == 0
-    _num_tokens_shard = num_tokens // (max_cp_degree * seqlen_scale_factor)
+    assert num_tokens % (max_cp_degree * seqlen_multiple) == 0
+    _num_tokens_shard = num_tokens // (max_cp_degree * seqlen_multiple)
     seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
     # make sure each sequence is divisible by max_cp_degree.
-    seq_lens *= max_cp_degree * seqlen_scale_factor
+    seq_lens *= max_cp_degree * seqlen_multiple
     # the CP for each sequence.
     log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
     cp_num = torch.pow(2, log_cp_num)

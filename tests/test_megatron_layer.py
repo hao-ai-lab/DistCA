@@ -146,7 +146,7 @@ def simulate_communication(tensors: list[torch.Tensor], metadata: Metadata):
 
 
 @torch.no_grad()
-def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int, num_seqs: int, hidden_size: int):
+def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int, num_seqs: int, hidden_size: int, seqlen_multiple: int=1):
     world_size = len(workers)
     # Create two splits for ping-pong
     (
@@ -155,7 +155,7 @@ def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int
         sp_kv_dst, sp_seq_lens, sp_query_dst, sp_dst_kv_len, seq_lens,
     ) = create_testcase_qkv(
         seed, world_size, num_tokens, max_cp_degree, num_seqs,
-        seqlen_scale_factor=64,
+        seqlen_multiple=seqlen_multiple,
     )
 
     (cu_seqlens_q_pp, cu_seqlens_kv_pp, max_seqlen_q_pp, max_seqlen_kv_pp, num_local_seqs_recv_pp) = compute_attn_layout_seqlens(
@@ -282,6 +282,8 @@ def init_test(args, worker_cls=MegatronLayerWorker):
     stride_q = args.hidden_size * torch.float16.itemsize
     stride_kv = args.hidden_size * torch.float16.itemsize * 2
     world_size = len(workers)
+    # NOTE: a reason very likely causing the hanging is that
+    # max_tokens_query and max_tokens_key_value are not large enough (nvshmem buffer not enough)
     max_tokens_query = args.num_tokens * world_size
     max_tokens_key_value = args.num_tokens * world_size
     parallel_config = ParallelConfig(

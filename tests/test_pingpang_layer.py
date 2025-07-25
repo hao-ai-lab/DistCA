@@ -123,7 +123,9 @@ def test_dp(workers, seed, num_tokens, max_cp_degree, num_seqs, hidden_size, deb
             (tensor_input_local, packed_seq_params_ping_pang)
         )
         ref_ans_handles.append(ref_ans_handle)
-    ref_ans = ray.get(ref_ans_handles)
+    ref_output = ray.get(ref_ans_handles)
+    ref_debug = [ref[1] for ref in ref_output]
+    ref_ans = [ref[0] for ref in ref_output]
 
     for rank in range(world_size):
         ans_handle = workers[rank].forward_ping_pang.remote(*args[rank])
