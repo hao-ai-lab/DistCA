@@ -57,8 +57,7 @@ class n_to_n_dispatch(torch.autograd.Function):
         assert query_in.ndim == 2, "query_in is of shape (num_token, hidden_q)."
 
         hidden_q = query_in.shape[-1]
-        # FIXME: remove this GPU-CPU transfer to avoid sync.
-        out_query_shape = (query_metadata.num_recv_tokens[-1].item(), hidden_q)
+        out_query_shape = (query_metadata.num_total_recv_tokens, hidden_q)
         out_query = torch.empty(out_query_shape, device=query_in.device, dtype=query_in.dtype)
 
         num_token = query_in.shape[0]
@@ -66,8 +65,7 @@ class n_to_n_dispatch(torch.autograd.Function):
         if key_value_in is not None:
             assert num_token == key_value_in.shape[0]
             hidden_kv = key_value_in.shape[-1]
-            # FIXME: remove this GPU-CPU transfer to avoid sync.
-            out_key_value_shape = (key_value_metadata.num_recv_tokens[-1].item(), hidden_kv)
+            out_key_value_shape = (key_value_metadata.num_total_recv_tokens, hidden_kv)
             out_key_value = torch.empty(out_key_value_shape, device=key_value_in.device, dtype=key_value_in.dtype)
             key_value_dst_mask = (key_value_metadata.dst_rank != -1).to(torch.bool)
         else:

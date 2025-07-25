@@ -63,9 +63,9 @@ class TransformerLayer(MegatronTransformerLayer):
         assert isinstance(self.self_attention.core_attention, TEDotProductAttention)
 
     def _layout_attn_to_mlp(
-            self, attn_out: torch.Tensor,
-            packed_seq_params: PingPangPackedSeqParams
-        ):
+        self, attn_out: torch.Tensor,
+        packed_seq_params: PingPangPackedSeqParams
+    ):
         #### NOTE: this is a hack. We should fix this in the future.
         num_heads = attn_out.shape[1]
         head_dim = attn_out.shape[2]
@@ -91,8 +91,9 @@ class TransformerLayer(MegatronTransformerLayer):
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
         packed_seq_params: PingPangPackedSeqParams
     ):
-        # FIXME: current we do a walk around: merge head dimension into hidden dimension
-        #### NOTE: this is a hack. We should fix this in the future.
+        # TODO(yonghao): current we do a walk around: merge head dimension
+        # into hidden dimension. In this way, we need the TP degree being
+        # kept for attention and other parts.
         assert query.dim() == 3, f"{query.shape=}, should be tnh layout"
         num_q_heads = query.shape[1]
         num_kv_heads = key.shape[1]
@@ -150,9 +151,8 @@ class TransformerLayer(MegatronTransformerLayer):
         debug = packed_seq_params.debug
         # NOTE: transformer_block.py sets layer_number to 1 for the first layer
         needs_split = debug or self.layer_number == 1
-        needs_gather = debug    # NOTE: cannot infer if this is the last local layer or not.
+        needs_gather = debug or packed_seq_params.do_gather   # NOTE: cannot infer if this is the last local layer or not.
 
-        # FIXME(yonghao): args shared by layers and used by attention should be preprocessed in advance. We didn't add this yet.
         packed_seq_params_0 = packed_seq_params.seq_params[0]
         packed_seq_params_1 = packed_seq_params.seq_params[1]
         if debug:
@@ -176,9 +176,6 @@ class TransformerLayer(MegatronTransformerLayer):
         # the communication-computation overlap.
         query_0, key_0, value_0, residual_0, attn_mask_type_0 = self._forward_pre_core_attn(
             hidden_states_0,
-            attention_mask_0,
-            context_0,
-            context_mask_0,
             rotary_pos_emb_0,
             rotary_pos_cos_0,
             rotary_pos_sin_0,
@@ -191,9 +188,6 @@ class TransformerLayer(MegatronTransformerLayer):
         query_0, key_0, value_0 = self._layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
         query_1, key_1, value_1, residual_1, attn_mask_type_1 = self._forward_pre_core_attn(
             hidden_states_1,
-            attention_mask_1,
-            context_1,
-            context_mask_1,
             rotary_pos_emb_1,
             rotary_pos_cos_1,
             rotary_pos_sin_1,
@@ -322,7 +316,6 @@ class TransformerLayer(MegatronTransformerLayer):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
-            # FIXME(yonghao): we need to fix this pos embedding for our layout.
             if q_pos_emb is not None:
                 # TODO VIJAY: simplify
                 query = apply_rotary_pos_emb(
