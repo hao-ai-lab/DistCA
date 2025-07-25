@@ -435,6 +435,7 @@ void DispatchHelper::dispatch(
       sharedMemory,
       stream
     ));
+    cudaMemsetAsync(kv_signal_buffer, 0, sizeof(uint64_t) * _world_size, stream);
   } else {
     CUDACHECK(cudaLaunchCooperativeKernel(
       (void *)&dispatch_kernel<false, false>,
@@ -444,7 +445,6 @@ void DispatchHelper::dispatch(
       sharedMemory,
       stream
     ));
-    cudaMemsetAsync(kv_signal_buffer, 0, sizeof(uint64_t) * _world_size, stream);
   }
   cudaMemsetAsync(q_signal_buffer, 0, sizeof(uint64_t) * _world_size, stream);
 }

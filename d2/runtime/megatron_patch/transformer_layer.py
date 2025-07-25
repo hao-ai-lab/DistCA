@@ -63,9 +63,9 @@ class TransformerLayer(MegatronTransformerLayer):
         assert isinstance(self.self_attention.core_attention, TEDotProductAttention)
 
     def _layout_attn_to_mlp(
-            self, attn_out: torch.Tensor,
-            packed_seq_params: PingPangPackedSeqParams
-        ):
+        self, attn_out: torch.Tensor,
+        packed_seq_params: PingPangPackedSeqParams
+    ):
         #### NOTE: this is a hack. We should fix this in the future.
         num_heads = attn_out.shape[1]
         head_dim = attn_out.shape[2]
