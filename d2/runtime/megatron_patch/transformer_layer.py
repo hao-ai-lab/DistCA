@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Union
+import types
 
 import torch
 import torch.distributed
@@ -10,6 +11,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
 )
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_block import (
     TransformerBlock as MegatronTransformerBlock
@@ -576,12 +578,11 @@ class TransformerLayer(MegatronTransformerLayer):
         return mlp_output, context, debug_tensors
 
 
-class PingPangTransformerBlock(MegatronTransformerBlock):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+def add_ping_pang_forward(block: MegatronTransformerBlock):
+    def init_ping_pang_communication_ctx(self):
         self.comm_stream = torch.cuda.Stream()
         self.comm_event = torch.cuda.Event()
-        self.layers: List[TransformerLayer]
+        self._ping_pang_debug = True
 
     def ping_pang_forward(
         self,
@@ -688,11 +689,6 @@ class PingPangTransformerBlock(MegatronTransformerBlock):
 
         return hidden_states
 
-    def _checkpointed_forward(self):
-        # TODO(yonghao): support this. Consider the PP case: attention recompute
-        # should follow the backward schedule's order.
-        raise NotImplementedError("Full recompute not supported yet")
-
     def forward_layers(
         self,
         l_no: int,
@@ -703,42 +699,42 @@ class PingPangTransformerBlock(MegatronTransformerBlock):
         layer = self.layers[l_no]
         prev_layer = self.layers[l_no - 1] if l_no > 0 else None
         # tick 0, second half
-        arg_group_0 = self._forward_pre_core_attn(layer, arg_group_0)
+        arg_group_0 = _forward_pre_core_attn(layer, arg_group_0)
 
         # tick 1
         # compute
         self.comm_event.wait(compute_stream)
         if l_no > 0:
             arg_group_1 = self._forward_post_core_attn(prev_layer, arg_group_1)
-        arg_group_1 = self._forward_pre_core_attn(layer, arg_group_1)
+        arg_group_1 = _forward_pre_core_attn(layer, arg_group_1)
         # communication
-        arg_group_0 = self._layout_mlp_to_attn(layer, arg_group_0)
+        arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
 
         # tick 2
         # compute
         self.comm_event.wait(compute_stream)
-        arg_group_0 = self._forward_core_attn(layer, arg_group_0)
+        arg_group_0 = _forward_core_attn(layer, arg_group_0)
         # communication
-        arg_group_1 = self._layout_mlp_to_attn(layer, arg_group_1)
+        arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
 
         # tick 3
         # compute
         self.comm_event.wait(compute_stream)
-        arg_group_1 = self._forward_core_attn(layer, arg_group_1)
+        arg_group_1 = _forward_core_attn(layer, arg_group_1)
         # communication
-        arg_group_0 = self._layout_attn_to_mlp(layer, arg_group_0)
+        arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
 
         # tick 4, also the tick 0 of the next layer
         # compute
         self.comm_event.wait(compute_stream)
-        arg_group_0 = self._forward_post_core_attn(layer, arg_group_0)
+        arg_group_0 = _forward_post_core_attn(layer, arg_group_0)
         # communication
-        arg_group_1 = self._layout_attn_to_mlp(layer, arg_group_1)
+        arg_group_1 = _layout_attn_to_mlp(layer, arg_group_1)
 
         # if the last layer, do the other half of tick 4 and tick 5
         if l_no == len(self.layers) - 1:
             self.comm_event.wait(compute_stream)
-            arg_group_1 = self._forward_post_core_attn(layer, arg_group_1)
+            arg_group_1 = _forward_post_core_attn(layer, arg_group_1)
             # gathering the result
             hidden_states = _gather_tensor([
                 arg_group_0["hidden_states"],
@@ -753,7 +749,6 @@ class PingPangTransformerBlock(MegatronTransformerBlock):
             context = None
         return arg_group_0, arg_group_1, hidden_states, context
 
-    @staticmethod
     def _forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         hidden_states = args.pop("hidden_states")
         query, key, value, residual, attn_mask_type = layer._forward_pre_core_attn(
@@ -771,7 +766,6 @@ class PingPangTransformerBlock(MegatronTransformerBlock):
         args["attn_mask_type"] = attn_mask_type
         return args
 
-    @staticmethod
     def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
         query = args.pop("query")
         key = args.pop("key")
@@ -786,7 +780,6 @@ class PingPangTransformerBlock(MegatronTransformerBlock):
         args["value"] = value
         return args
 
-    @staticmethod
     def _forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         # pop out to make sure the tensor is freed
         query = args.pop("query")
@@ -802,8 +795,7 @@ class PingPangTransformerBlock(MegatronTransformerBlock):
         )
         args["core_attn_out"] = core_attn_out
         return args
-    
-    @staticmethod
+
     def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
         core_attn_out = args.pop("core_attn_out")
         core_attn_out = layer._layout_attn_to_mlp(
@@ -812,7 +804,6 @@ class PingPangTransformerBlock(MegatronTransformerBlock):
         args["core_attn_out"] = core_attn_out
         return args
 
-    @staticmethod
     def _forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         core_attn_out = args.pop("core_attn_out")
         residual = args.pop("residual")
@@ -825,3 +816,22 @@ class PingPangTransformerBlock(MegatronTransformerBlock):
         args["hidden_states"] = mlp_output
         args["context"] = context
         return args
+
+    def forward(self, *args, **kwargs):
+        if self._ping_pang_debug:
+            return self._normal_forward(*args, **kwargs)
+        return self.ping_pang_forward(*args, **kwargs)
+
+    block.forward_layers = types.MethodType(forward_layers, block)
+    block.init_ping_pang_communication_ctx = types.MethodType(init_ping_pang_communication_ctx, block)
+    block.ping_pang_forward = types.MethodType(ping_pang_forward, block)
+    block._normal_forward = block.forward
+    block.forward = types.MethodType(forward, block)
+    block.init_ping_pang_communication_ctx()
+
+
+class PingPangGPTModel(GPTModel):
+    def __init__(self, *args, **kwargs):
+        print("PingPangGPTModel init")
+        super().__init__(*args, **kwargs)
+        add_ping_pang_forward(self.decoder)

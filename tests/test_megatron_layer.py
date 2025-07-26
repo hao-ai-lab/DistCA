@@ -275,7 +275,7 @@ def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int
     torch.testing.assert_close(ref_ans, ans)
 
 
-def init_test(args, worker_cls=MegatronLayerWorker):
+def init_test(args, worker_cls=MegatronLayerWorker, run_init_model: bool = True):
     ray.init()
     workers = create_pg(args.num_nodes, args.num_gpus_per_node, worker_cls)
     print("Workers created")
@@ -293,6 +293,9 @@ def init_test(args, worker_cls=MegatronLayerWorker):
         stride_q, stride_kv, max_tokens_query, max_tokens_key_value, parallel_config
     ) for worker in workers])
     print("Communication groups initialized")
+
+    if not run_init_model:
+        return workers
 
     seed = args.seed
     spec = get_gpt_layer_with_transformer_engine_spec()
