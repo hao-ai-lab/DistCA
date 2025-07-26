@@ -118,11 +118,8 @@ def get_gpt_decoder_block_spec(
     qk_l2_norm: Optional[bool] = False,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
-    if use_transformer_engine:
-        layer_norm_impl = TENorm
-    else:
-        layer_norm_impl = LNImpl
     assert use_transformer_engine
+    layer_norm_impl = TENorm
 
     # Layer specs.
     dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
