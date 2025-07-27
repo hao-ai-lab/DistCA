@@ -106,20 +106,22 @@ class n_to_n_dispatch(torch.autograd.Function):
         ctx.stream = stream
         ctx.event = event
         ctx.bwd_has_kv = key_value_in is not None
-        ctx.save_for_backward(key_value_dst_mask)
+        backward_tensors = []
+        backward_tensors.append(key_value_dst_mask)
         # Unpack rev query metadata
-        ctx.save_for_backward(rev_query_metadata.dst_rank)
-        ctx.save_for_backward(rev_query_metadata.dst_offset)
-        ctx.save_for_backward(rev_query_metadata.seq_len)
-        ctx.save_for_backward(rev_query_metadata.num_recv_tokens)
+        backward_tensors.append(rev_query_metadata.dst_rank)
+        backward_tensors.append(rev_query_metadata.dst_offset)
+        backward_tensors.append(rev_query_metadata.seq_len)
+        backward_tensors.append(rev_query_metadata.num_recv_tokens)
         # Unpack rev key value metadata
         if rev_key_value_metadata is not None:
-            ctx.save_for_backward(rev_key_value_metadata.dst_rank)
-            ctx.save_for_backward(rev_key_value_metadata.dst_offset)
-            ctx.save_for_backward(rev_key_value_metadata.seq_len)
-            ctx.save_for_backward(rev_key_value_metadata.num_recv_tokens)
-            ctx.save_for_backward(rev_key_value_metadata.seq_recv_mask)
-            ctx.save_for_backward(rev_key_value_metadata.recv_seq_lens)
+            backward_tensors.append(rev_key_value_metadata.dst_rank)
+            backward_tensors.append(rev_key_value_metadata.dst_offset)
+            backward_tensors.append(rev_key_value_metadata.seq_len)
+            backward_tensors.append(rev_key_value_metadata.num_recv_tokens)
+            backward_tensors.append(rev_key_value_metadata.seq_recv_mask)
+            backward_tensors.append(rev_key_value_metadata.recv_seq_lens)
+        ctx.save_for_backward(*backward_tensors)
 
         return out_query, out_key_value
 
@@ -128,23 +130,24 @@ class n_to_n_dispatch(torch.autograd.Function):
         # NOTE(yonghao): in PP, the backward pass may not do the same thing
         # as the forward. In this case, the whole layer is wrapped with
         # a torch function and we do not run this part.
-        key_value_dst_mask = ctx.saved_tensors[0]
+        saved_tensors = ctx.saved_tensors
+        key_value_dst_mask = saved_tensors[0]
         rev_query_metadata = Metadata(
-            dst_rank=ctx.saved_tensors[1],
-            dst_offset=ctx.saved_tensors[2],
-            seq_len=ctx.saved_tensors[3],
-            num_recv_tokens=ctx.saved_tensors[4],
+            dst_rank=saved_tensors[1],
+            dst_offset=saved_tensors[2],
+            seq_len=saved_tensors[3],
+            num_recv_tokens=saved_tensors[4],
         )
 
         if out_key_value_grad is not None:
             assert ctx.bwd_has_kv
             rev_key_value_metadata = Metadata(
-                dst_rank=ctx.saved_tensors[5],
-                dst_offset=ctx.saved_tensors[6],
-                seq_len=ctx.saved_tensors[7],
-                num_recv_tokens=ctx.saved_tensors[8],
-                seq_recv_mask=ctx.saved_tensors[9],
-                recv_seq_lens=ctx.saved_tensors[10],
+                dst_rank=saved_tensors[5],
+                dst_offset=saved_tensors[6],
+                seq_len=saved_tensors[7],
+                num_recv_tokens=saved_tensors[8],
+                seq_recv_mask=saved_tensors[9],
+                recv_seq_lens=saved_tensors[10],
             )
         else:
             assert not ctx.bwd_has_kv
