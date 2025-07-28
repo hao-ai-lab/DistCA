@@ -61,7 +61,7 @@ def create_pg(num_nodes: int, num_gpus_per_node: int, worker_cls, nsys_profile:b
                 placement_group_bundle_index=i,
                 num_gpus=1,
                 num_cpus=1,
-                runtime_env={"env_vars": env_vars},
+                runtime_env=runtime_env,
             ).remote(
                 world_size=world_size,
                 rank=n_id * num_gpus_per_node + i,
@@ -283,9 +283,9 @@ def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int
     torch.testing.assert_close(ref_ans, ans)
 
 
-def init_test(args, worker_cls=MegatronLayerWorker):
+def init_test(args, worker_cls=MegatronLayerWorker, nsys_profile: bool=False):
     ray.init()
-    workers = create_pg(args.num_nodes, args.num_gpus_per_node, worker_cls)
+    workers = create_pg(args.num_nodes, args.num_gpus_per_node, worker_cls, nsys_profile=nsys_profile)
     print("Workers created")
     stride_q = args.hidden_size * torch.float16.itemsize
     stride_kv = args.hidden_size * torch.float16.itemsize * 2
