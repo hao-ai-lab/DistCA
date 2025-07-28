@@ -4,6 +4,8 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.packed_seq_params import PackedSeqParams
+
 
 @dataclass
 class Metadata:
@@ -207,6 +209,14 @@ def compute_attn_layout_seqlens(
 ):
     """
     Compute the cu_seqlens_q and cu_seqlens_kv for the attention layout.
+    NOTE: both inputs and outputs are the global value, so it has `world_size` dimension.
+    Args:
+        seq_shard_len: shape (world_size, max_num_local_seqs), length of each sequence shard.
+          A sequence shard is the unit sending to a rank.
+        seq_shard_cumsum: shape (world_size, max_num_local_seqs). Cumulative number of tokens
+          for the sequence shard's context. This is to compute the KV seqlens of the shard.
+        dispatch: shape (world_size, max_num_local_seqs). The rank that each sequence
+          shard is dispatched to. The value is -1 for padding.
     """
     world_size = dispatch.shape[0]
     max_num_local_seqs = dispatch.shape[1]
@@ -248,6 +258,26 @@ def compute_attn_layout_seqlens(
     max_seqlen_kv = out_seqlens_kv.max(dim=1)[0]
 
     return cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, num_local_seqs_recv
+
+
+def mlp_layout_packed_params(seq_lens: torch.Tensor):
+    """
+    Compute the MLP layout packed_seq_params. MLP layout guarantees seqlens_q == seqlens_kv.
+    This is mainly for RoPE.
+    """
+    cu_seqlens = torch.cat([
+        torch.zeros((1,), dtype=seq_lens.dtype, device=seq_lens.device),
+        seq_lens.cumsum(dim=0)
+    ])
+    max_seqlen = seq_lens.max()
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
+    return packed_seq_params
 
 
 ######## Correctness testing tools ########

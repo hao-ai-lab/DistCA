@@ -115,6 +115,8 @@ def test_dp(workers, seed, num_tokens, max_cp_degree, num_seqs, hidden_size, deb
         packed_seq_params_ping_pang = PingPangPackedSeqParams(
             debug=debug,
             seq_params=[packed_seq_params_stage_0, packed_seq_params_stage_1],
+            # FIXME: this is wrong. However, we don't test RoPE here so it's fine yet.
+            mlp_layout_seq_params=[None, None],
             do_gather=True,
         )
 

@@ -14,10 +14,13 @@ import torch
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 
 from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
-from d2.runtime.inplace_metadata import test_local_proj_metadata
+from d2.runtime.inplace_metadata import (
+    compute_attn_layout_seqlens, mlp_layout_packed_params,
+)
 
 from test_util import MegatronBaseWorker, ParallelConfig
-from test_megatron_layer import create_pg
+from test_dispatch_qkv import create_testcase_qkv
+from test_megatron_layer import create_pg, get_seqlen_shard
 from test_megatron_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
@@ -275,6 +278,11 @@ def init_test(args, hidden_size_q, hidden_size_kv, worker_cls=MegatronE2eWorker)
 
 
 def test(args):
+    seed = args.seed
+    num_tokens = args.num_tokens
+    max_cp_degree = args.cp_degree
+    num_seqs = args.num_seqs
+
     model_path = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
     hf_config = AutoConfig.from_pretrained(model_path)
     hidden_size_q = hf_config.hidden_size
@@ -284,6 +292,7 @@ def test(args):
                           hf_config.num_attention_heads)
 
     workers = init_test(args, hidden_size_q, hidden_size_kv, worker_cls=MegatronE2eWorker)
+    world_size = len(workers)
     refs = []
     for worker in workers:
         # NOTE: gradient checkpointing is currently disabled
@@ -296,40 +305,82 @@ def test(args):
     seq_len = args.num_tokens
     refs = []
     # easiest case: all sequences run attention locally.
-    (mlp_to_attn_metadata, attn_to_mlp_metadata,
-     mlp_to_attn_kv_metadata, mlp_to_attn_kv_grad_metadata) = test_local_proj_metadata(
-        len(workers), seq_len, offset=0
+    (
+        fwd_q_metadata_0, rev_q_metadata_0,
+        fwd_kv_metadata_0, rev_kv_metadata_0,
+        sp_kv_dst_0, sp_seq_lens_0, sp_query_dst_0, cp_dst_kv_len_0, seq_lens_0,
+    ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
+    (
+        fwd_q_metadata_1, rev_q_metadata_1,
+        fwd_kv_metadata_1, rev_kv_metadata_1,
+        sp_kv_dst_1, sp_seq_lens_1, sp_query_dst_1, cp_dst_kv_len_1, seq_lens_1,
+    ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
+    (cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0) = compute_attn_layout_seqlens(
+        sp_seq_lens_0, cp_dst_kv_len_0, sp_query_dst_0
     )
-    for i, worker in enumerate(workers):
+    (cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1) = compute_attn_layout_seqlens(
+        sp_seq_lens_1, cp_dst_kv_len_1, sp_query_dst_1
+    )
+    input_ids = torch.randint(0, 100, (world_size, seq_len * 2))
+    position_ids = torch.arange(seq_len).repeat(world_size, 2)
+    for rank, worker in enumerate(workers):
+        input_ids_local = input_ids[rank]
+        position_ids_local = position_ids[rank]
+        fwd_q_metadata_0_local = fwd_q_metadata_0.get_slice(rank)
+        rev_q_metadata_0_local = rev_q_metadata_0.get_slice(rank)
+        fwd_kv_metadata_0_local = fwd_kv_metadata_0.get_slice(rank)
+        rev_kv_metadata_0_local = rev_kv_metadata_0.get_slice(rank)
+        fwd_q_metadata_1_local = fwd_q_metadata_1.get_slice(rank)
+        rev_q_metadata_1_local = rev_q_metadata_1.get_slice(rank)
+        fwd_kv_metadata_1_local = fwd_kv_metadata_1.get_slice(rank)
+        rev_kv_metadata_1_local = rev_kv_metadata_1.get_slice(rank)
+        (cu_seqlens_q_0, cu_seqlens_kv_0, max_seqlen_q_0, max_seqlen_kv_0, num_seq_0) = get_seqlen_shard(
+            cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0, rank
+        )
+        (cu_seqlens_q_1, cu_seqlens_kv_1, max_seqlen_q_1, max_seqlen_kv_1, num_seq_1) = get_seqlen_shard(
+            cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1, rank
+        )
+        packed_seq_params_stage_0 = PingPangSingleStepPackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q_0,
+            cu_seqlens_kv=cu_seqlens_kv_0,
+            max_seqlen_q=max_seqlen_q_0,
+            max_seqlen_kv=max_seqlen_kv_0,
+            mlp_to_attn_metadata=fwd_q_metadata_0_local,
+            attn_to_mlp_metadata=rev_q_metadata_0_local,
+            mlp_to_attn_kv_metadata=fwd_kv_metadata_0_local,
+            mlp_to_attn_kv_grad_metadata=rev_kv_metadata_0_local,
+        )
+        packed_seq_params_stage_1 = PingPangSingleStepPackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q_1,
+            cu_seqlens_kv=cu_seqlens_kv_1,
+            max_seqlen_q=max_seqlen_q_1,
+            max_seqlen_kv=max_seqlen_kv_1,
+            mlp_to_attn_metadata=fwd_q_metadata_1_local,
+            attn_to_mlp_metadata=rev_q_metadata_1_local,
+            mlp_to_attn_kv_metadata=fwd_kv_metadata_1_local,
+            mlp_to_attn_kv_grad_metadata=rev_kv_metadata_1_local,
+        )
+        # NOTE: we don't consider that seq_lens var has padding because our data generation
+        # guarantees so. However, in practice, this is not true.
+        mlp_seq_params_0 = mlp_layout_packed_params(seq_lens_0[rank])
+        mlp_seq_params_1 = mlp_layout_packed_params(seq_lens_1[rank])
+        packed_seq_params = PingPangPackedSeqParams(
+            seq_params=[packed_seq_params_stage_0, packed_seq_params_stage_1],
+            mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
+            debug=False, do_gather=False,
+            max_seqlen_q=torch.tensor([seq_len * 2], dtype=torch.int32)[0],
+            max_seqlen_kv=torch.tensor([seq_len * 2], dtype=torch.int32)[0],
+        )
         microbatch = {
-            "input_ids": torch.randint(0, 100, (seq_len * 2,)),
-            "position_ids": torch.arange(seq_len).repeat(2),
-            "packed_seq_params": PingPangPackedSeqParams(
-                seq_params=[
-                    PingPangSingleStepPackedSeqParams(
-                        qkv_format="thd",
-                        cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32),
-                        cu_seqlens_kv=torch.tensor([0, seq_len], dtype=torch.int32),
-                        max_seqlen_q=torch.tensor([seq_len], dtype=torch.int32)[0],
-                        max_seqlen_kv=torch.tensor([seq_len], dtype=torch.int32)[0],
-                        mlp_to_attn_metadata=mlp_to_attn_metadata.get_slice(i),
-                        attn_to_mlp_metadata=attn_to_mlp_metadata.get_slice(i),
-                        mlp_to_attn_kv_metadata=mlp_to_attn_kv_metadata.get_slice(i),
-                        mlp_to_attn_kv_grad_metadata=mlp_to_attn_kv_grad_metadata.get_slice(i),
-                    )
-                ] * 2,
-                debug=False,
-                do_gather=False,
-                # FIXME: this value is related to the arg "rotary_pos_emb",
-                # which is incorrectly halved when entering ping-pang part
-                # because we splits all args there.
-                # TODO: check the rotary_pos_emb value correctness.
-                max_seqlen_q=torch.tensor([seq_len * 2], dtype=torch.int32)[0],
-                max_seqlen_kv=torch.tensor([seq_len * 2], dtype=torch.int32)[0],
-            )
+            "input_ids": input_ids_local,
+            "position_ids": position_ids_local,
+            "packed_seq_params": packed_seq_params,
         }
-        print(i, microbatch["packed_seq_params"])
+        # print(rank, microbatch["packed_seq_params"])
         microbatches = [microbatch]
+        print(f"worker {rank} microbatch: {microbatch["packed_seq_params"]}")
         ref = worker.forward_backward_batch.remote(
             microbatches=microbatches,
             normal_forward_fn=False,

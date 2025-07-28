@@ -109,6 +109,10 @@ class MegatronLayerWorker(MegatronBaseWorker):
 
 def get_seqlen_shard(cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor,
                      max_seqlen_q: torch.Tensor, max_seqlen_kv: torch.Tensor, num_local_seqs_recv: torch.Tensor, rank: int):
+    """
+    Get the seqlen related arguments for a specific rank.
+    This removes padding at the num_sequence dimension.
+    """
     num_seq = num_local_seqs_recv[rank].item()
     max_seqlen_q = max_seqlen_q[rank]
     max_seqlen_kv = max_seqlen_kv[rank]

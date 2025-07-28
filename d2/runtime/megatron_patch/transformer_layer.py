@@ -177,6 +177,8 @@ class TransformerLayer(MegatronTransformerLayer):
 
         packed_seq_params_0 = packed_seq_params.seq_params[0]
         packed_seq_params_1 = packed_seq_params.seq_params[1]
+        mlp_packed_seq_params_0 = packed_seq_params.mlp_layout_seq_params[0]
+        mlp_packed_seq_params_1 = packed_seq_params.mlp_layout_seq_params[1]
         if debug:
             setattr(packed_seq_params_0, "stream", torch.cuda.current_stream())
             setattr(packed_seq_params_1, "stream", torch.cuda.current_stream())
@@ -201,7 +203,7 @@ class TransformerLayer(MegatronTransformerLayer):
             rotary_pos_emb_0,
             rotary_pos_cos_0,
             rotary_pos_sin_0,
-            packed_seq_params_0,
+            mlp_packed_seq_params_0,
             sequence_len_offset_0,
         )
 
@@ -213,7 +215,7 @@ class TransformerLayer(MegatronTransformerLayer):
             rotary_pos_emb_1,
             rotary_pos_cos_1,
             rotary_pos_sin_1,
-            packed_seq_params_1,
+            mlp_packed_seq_params_1,
             sequence_len_offset_1,
         )
 
@@ -548,6 +550,8 @@ class TransformerLayer(MegatronTransformerLayer):
 
         setattr(packed_seq_params, "stream", torch.cuda.current_stream())
 
+        # FIXME: support RoPE
+        assert rotary_pos_emb is None, "RoPE needs the MLP layout packed seq params."
         query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
             hidden_states,
             rotary_pos_emb,
@@ -592,7 +596,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         self._ping_pang_debug = True
 
     def ping_pang_forward(
-        self,
+        self: MegatronTransformerBlock,
         hidden_states: Union[Tensor, WrappedTensor],
         attention_mask: Optional[Tensor],
         context: Optional[Tensor] = None,
@@ -668,6 +672,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                 setattr(packed_seq_params_1, "stream", self.comm_stream)
                 arg_group_0["packed_seq_params"] = packed_seq_params_0
                 arg_group_1["packed_seq_params"] = packed_seq_params_1
+                arg_group_0["mlp_packed_seq_params"] = packed_seq_params.mlp_layout_seq_params[0]
+                arg_group_1["mlp_packed_seq_params"] = packed_seq_params.mlp_layout_seq_params[1]
 
                 for l_no in range(len(self.layers)):
                     inner_fp8_context = nullcontext()
@@ -762,7 +768,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             args["rotary_pos_emb"],
             args["rotary_pos_cos"],
             args["rotary_pos_sin"],
-            args["packed_seq_params"],
+            args["mlp_packed_seq_params"],
             args["sequence_len_offset"],
         )
         args["query"] = query
