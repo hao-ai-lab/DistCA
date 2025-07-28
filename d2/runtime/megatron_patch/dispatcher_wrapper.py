@@ -41,6 +41,45 @@ def _both_none_or_neither(a, b):
     return (a is None and b is None) or (a is not None and b is not None)
 
 
+class TickSync(torch.autograd.Function):
+    """
+    Synchronize compute and communication streams. This enables a sync at the backward stage.
+    Timeline:
+    ------------------------------------------->
+    Compute i | TickSync i | Compute | ...
+    Comm    i | TickSync i | Comm    | ...
+
+    Backward
+    <-------------------------------------------
+    Compute_grad | TickSync | Compute_grad | ...
+    Comm_grad    | TickSync | Comm_grad    | ...
+    """
+    @staticmethod
+    def forward(ctx, compute_stream: torch.cuda.Stream, comm_stream: torch.cuda.Stream,
+                *tensors):
+        if comm_stream is not None:
+            assert compute_stream is not None
+            # sync the previous step
+            compute_stream.wait_stream(comm_stream)
+            comm_stream.wait_stream(compute_stream)
+
+        ctx.compute_stream = compute_stream
+        ctx.comm_stream = comm_stream
+        return tensors
+
+    @staticmethod
+    def backward(ctx, *grads):
+        compute_stream = ctx.compute_stream
+        comm_stream = ctx.comm_stream
+
+        if comm_stream is not None:
+            # sync the previous step
+            compute_stream.wait_stream(comm_stream)
+            comm_stream.wait_stream(compute_stream)
+
+        return (None, None, *grads,)
+
+
 class n_to_n_dispatch(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -51,7 +90,6 @@ class n_to_n_dispatch(torch.autograd.Function):
         key_value_metadata: Optional[Metadata]=None,
         rev_key_value_metadata: Optional[Metadata]=None,
         stream: Optional[torch.cuda.Stream]=None,
-        event: Optional[torch.cuda.Event]=None,
     ):
 
         # check key_value related tensors
@@ -59,7 +97,6 @@ class n_to_n_dispatch(torch.autograd.Function):
 
         assert _both_none_or_neither(key_value_in, key_value_metadata)
         assert _both_none_or_neither(key_value_in, rev_key_value_metadata)
-        assert _both_none_or_neither(event, stream)
 
         # The num_head is folded into num_token.
         assert query_in.ndim == 2, "query_in is of shape (num_token, hidden_q)."
@@ -111,15 +148,12 @@ class n_to_n_dispatch(torch.autograd.Function):
                     dst_tensor=out_query,
                     metadata=query_metadata,
                 )
-            if event is not None:
-                event.record(stream)
 
         ctx.query_in_shape = query_in.shape
         ctx.key_value_in_shape = key_value_in.shape if key_value_in is not None else None
         ctx.hidden_q = hidden_q
         ctx.hidden_kv = hidden_kv
         ctx.stream = stream
-        ctx.event = event
         ctx.bwd_has_kv = key_value_in is not None
         backward_tensors = []
         backward_tensors.append(key_value_dst_mask)
@@ -173,7 +207,6 @@ class n_to_n_dispatch(torch.autograd.Function):
         hidden_q = ctx.hidden_q
         hidden_kv = ctx.hidden_kv
         stream = ctx.stream
-        event = ctx.event
 
         query_in_grad = torch.empty(query_in_shape, device=out_query_grad.device, dtype=out_query_grad.dtype)
 
@@ -236,11 +269,8 @@ class n_to_n_dispatch(torch.autograd.Function):
                 key_value_in_grad = (key_value_in_grad.reshape(key_value_grad_in_shape)).sum(dim=0)
                 assert key_value_in_grad.shape == key_value_in_shape
 
-            if event is not None:
-                event.record(stream)
-
         return (
             query_in_grad, None, None,
             key_value_in_grad, None, None,
-            None, None, # stream and event
+            None, # stream
         )

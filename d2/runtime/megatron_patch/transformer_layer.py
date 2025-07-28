@@ -24,7 +24,7 @@ from megatron.core.transformer.transformer_layer import (
 from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
-from d2.runtime.megatron_patch.dispatcher_wrapper import n_to_n_dispatch
+from d2.runtime.megatron_patch.dispatcher_wrapper import n_to_n_dispatch, TickSync
 
 
 #### Tool functions for splitting and gathering args ####
@@ -74,7 +74,6 @@ class TransformerLayer(MegatronTransformerLayer):
         hidden_dropout: Optional[float] = None,
     ):
         super().__init__(config, submodules, layer_number, hidden_dropout)
-        self.comm_event = torch.cuda.Event()
 
         # TODO(yonghao): this is a dev annotation for type hinting. remove it later.
         from megatron.core.transformer.attention import SelfAttention
@@ -85,8 +84,11 @@ class TransformerLayer(MegatronTransformerLayer):
     def _layout_attn_to_mlp(
         self, attn_out: torch.Tensor,
         packed_seq_params: PingPangPackedSeqParams,
-        comm_event: torch.cuda.Event=None,
     ):
+        """
+        Communication between attention layout and mlp layout.
+        This operation runs on the stream `packed_seq_params.stream`.
+        """
         #### NOTE: this is a hack. We should fix this in the future.
         num_heads = attn_out.shape[1]
         head_dim = attn_out.shape[2]
@@ -101,7 +103,6 @@ class TransformerLayer(MegatronTransformerLayer):
             None, # key_value_metadata
             None, # rev_key_value_metadata
             packed_seq_params.stream, # stream
-            comm_event or self.comm_event, # event
         )
         #### switch layout back
         attn_out_mlp_layout = attn_out_mlp_layout.reshape(-1, num_heads, head_dim)
@@ -111,8 +112,11 @@ class TransformerLayer(MegatronTransformerLayer):
     def _layout_mlp_to_attn(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
         packed_seq_params: PingPangPackedSeqParams,
-        comm_event: torch.cuda.Event=None,
     ):
+        """
+        Communication between attention layout and mlp layout.
+        This operation runs on the stream `packed_seq_params.stream`.
+        """
         # TODO(yonghao): current we do a walk around: merge head dimension
         # into hidden dimension. In this way, we need the TP degree being
         # kept for attention and other parts.
@@ -126,6 +130,9 @@ class TransformerLayer(MegatronTransformerLayer):
         value = value.reshape(value.shape[0], num_kv_heads * kv_head_dim)
         ####
 
+        # FIXME(yonghao): I'd expect this to be wrong, because the concat and split are
+        # on the compute stream instead of the communication stream, but changing it
+        # will instead causing to an numerical error. Should fix it.
         key_value = torch.cat([key, value], dim=-1).contiguous()
         query_attn_layout, key_value_attn_layout = n_to_n_dispatch.apply(
             query,  # query_in
@@ -135,7 +142,6 @@ class TransformerLayer(MegatronTransformerLayer):
             packed_seq_params.mlp_to_attn_kv_metadata, # key_value_metadata
             packed_seq_params.mlp_to_attn_kv_grad_metadata, # rev_key_value_metadata
             packed_seq_params.stream, # stream
-            comm_event or self.comm_event, # event
         )
         key_attn_layout, value_attn_layout = key_value_attn_layout.split(key_value_attn_layout.shape[1] // 2, dim=1)
 
@@ -194,6 +200,9 @@ class TransformerLayer(MegatronTransformerLayer):
             rotary_pos_cos_0, rotary_pos_sin_0, attention_bias_0, sequence_len_offset_0) = args_0
         (hidden_states_1, attention_mask_1, context_1, context_mask_1, rotary_pos_emb_1,
             rotary_pos_cos_1, rotary_pos_sin_1, attention_bias_1, sequence_len_offset_1) = args_1
+        compute_stream = torch.cuda.current_stream()
+        # TODO: confirm this is equal to the stream of packed_seq_params_1
+        comm_stream = packed_seq_params_0.stream
 
         # 2. pre-self-attention forward microbatch 0.
         # Ideally, this part should merge to the previous layer's post-self-attention to maximize
@@ -206,9 +215,11 @@ class TransformerLayer(MegatronTransformerLayer):
             mlp_packed_seq_params_0,
             sequence_len_offset_0,
         )
+        query_0, hidden_states_1 = TickSync.apply(
+            compute_stream, comm_stream, query_0, hidden_states_1
+        )
 
         # 3. pre-attention forward of microbatch 1, mlp2attn all2all of microbatch 0
-        self.comm_event.wait(torch.cuda.current_stream())
         query_0, key_0, value_0 = self._layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
         query_1, key_1, value_1, residual_1, attn_mask_type_1 = self._forward_pre_core_attn(
             hidden_states_1,
@@ -218,9 +229,11 @@ class TransformerLayer(MegatronTransformerLayer):
             mlp_packed_seq_params_1,
             sequence_len_offset_1,
         )
+        query_0, key_0, value_0, query_1 = TickSync.apply(
+            compute_stream, comm_stream, query_0, key_0, value_0, query_1
+        )
 
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
-        self.comm_event.wait(torch.cuda.current_stream())
         query_1, key_1, value_1 = self._layout_mlp_to_attn(query_1, key_1, value_1, packed_seq_params_1)
         core_attn_out_0 = self._forward_core_attn(
             query_0,
@@ -231,9 +244,11 @@ class TransformerLayer(MegatronTransformerLayer):
             attn_mask_type_0,
             packed_seq_params_0,
         )
+        query_1, key_1, value_1, core_attn_out_0 = TickSync.apply(
+            compute_stream, comm_stream, query_1, key_1, value_1, core_attn_out_0
+        )
 
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
-        self.comm_event.wait(torch.cuda.current_stream())
         core_attn_out_0 = self._layout_attn_to_mlp(core_attn_out_0, packed_seq_params_0)
         core_attn_out_1 = self._forward_core_attn(
             query_1,
@@ -244,9 +259,9 @@ class TransformerLayer(MegatronTransformerLayer):
             attn_mask_type_1,
             packed_seq_params_1,
         )
+        core_attn_out_0, core_attn_out_1 = TickSync.apply(compute_stream, comm_stream, core_attn_out_0, core_attn_out_1)
 
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
-        self.comm_event.wait(torch.cuda.current_stream())
         core_attn_out_1 = self._layout_attn_to_mlp(core_attn_out_1, packed_seq_params_1)
         mlp_output_0, context_0 = self._forward_post_core_attn(
             core_attn_out_0,
@@ -254,8 +269,8 @@ class TransformerLayer(MegatronTransformerLayer):
             context_0,
             context_mask_0,
         )
+        core_attn_out_1, mlp_output_0 = TickSync.apply(compute_stream, comm_stream, core_attn_out_1, mlp_output_0)
 
-        self.comm_event.wait(torch.cuda.current_stream())
         mlp_output_1, context_1 = self._forward_post_core_attn(
             core_attn_out_1,
             residual_1,
@@ -592,7 +607,6 @@ class TransformerLayer(MegatronTransformerLayer):
 def add_ping_pang_forward(block: MegatronTransformerBlock):
     def init_ping_pang_communication_ctx(self):
         self.comm_stream = torch.cuda.Stream()
-        self.comm_event = torch.cuda.Event()
         self._ping_pang_debug = True
 
     def ping_pang_forward(
@@ -662,8 +676,6 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                     "sequence_len_offset": sequence_len_offset,
                 }
                 arg_group_0, arg_group_1 = _split_all_dict(arg_group, 2)
-                arg_group_0["comm_event"] = self.comm_event
-                arg_group_1["comm_event"] = self.comm_event
                 del arg_group
 
                 packed_seq_params_0 = packed_seq_params.seq_params[0]
@@ -712,40 +724,63 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         prev_layer = self.layers[l_no - 1] if l_no > 0 else None
         # tick 0, second half
         arg_group_0 = _forward_pre_core_attn(layer, arg_group_0)
+        if l_no > 0:
+            _tick_sync(
+                compute_stream, self.comm_stream,
+                arg_group_0, "query",           # compute out
+                arg_group_1, "core_attn_out",   # prev layer's comm out,
+            )
 
         # tick 1
         # compute
-        self.comm_event.wait(compute_stream)
         if l_no > 0:
             arg_group_1 = _forward_post_core_attn(prev_layer, arg_group_1)
         arg_group_1 = _forward_pre_core_attn(layer, arg_group_1)
         # communication
         arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
+        _tick_sync(
+            compute_stream, self.comm_stream,
+            arg_group_0, "query",   # comm out
+            arg_group_1, "query",   # compute out
+        )
 
         # tick 2
         # compute
-        self.comm_event.wait(compute_stream)
         arg_group_0 = _forward_core_attn(layer, arg_group_0)
         # communication
         arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
+        _tick_sync(
+            compute_stream, self.comm_stream,
+            arg_group_0, "core_attn_out",   # compute out
+            arg_group_1, "query",           # comm out.
+        )
 
         # tick 3
         # compute
-        self.comm_event.wait(compute_stream)
         arg_group_1 = _forward_core_attn(layer, arg_group_1)
         # communication
         arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
+        _tick_sync(
+            compute_stream, self.comm_stream,
+            arg_group_0, "core_attn_out",   # comm out
+            arg_group_1, "core_attn_out",   # compute out
+        )
 
         # tick 4, also the tick 0 of the next layer
         # compute
-        self.comm_event.wait(compute_stream)
         arg_group_0 = _forward_post_core_attn(layer, arg_group_0)
         # communication
         arg_group_1 = _layout_attn_to_mlp(layer, arg_group_1)
+        # NOTE: communication of this tick is at the next layer.
 
         # if the last layer, do the other half of tick 4 and tick 5
         if l_no == len(self.layers) - 1:
-            self.comm_event.wait(compute_stream)
+            # No next layer, do the sync here.
+            _tick_sync(
+                compute_stream, self.comm_stream,
+                arg_group_0, "hidden_states",   # place holder
+                arg_group_1, "core_attn_out",   # comm out
+            )
             arg_group_1 = _forward_post_core_attn(layer, arg_group_1)
             # gathering the result
             hidden_states = _gather_tensor([
@@ -785,7 +820,6 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         query, key, value = layer._layout_mlp_to_attn(
             query, key, value,
             args["packed_seq_params"],
-            args["comm_event"],
         )
         args["query"] = query
         args["key"] = key
@@ -812,7 +846,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
     def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
         core_attn_out = args.pop("core_attn_out")
         core_attn_out = layer._layout_attn_to_mlp(
-            core_attn_out, args["packed_seq_params"], args["comm_event"]
+            core_attn_out, args["packed_seq_params"]
         )
         args["core_attn_out"] = core_attn_out
         return args
@@ -829,6 +863,25 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         args["hidden_states"] = mlp_output
         args["context"] = context
         return args
+
+    def _tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, keys_1):
+        if isinstance(keys_0, str):
+            keys_0 = [keys_0]
+        if isinstance(keys_1, str):
+            keys_1 = [keys_1]
+        tensors_0 = [arg_group_0[key] for key in keys_0]
+        tensors_1 = [arg_group_1[key] for key in keys_1]
+        tensors = tensors_0 + tensors_1
+        out_tensors = TickSync.apply(
+            compute_stream, comm_stream,
+            *tensors
+        )
+        out_tensors_0 = out_tensors[:len(tensors_0)]
+        out_tensors_1 = out_tensors[len(tensors_0):]
+        for key, out_tensor in zip(keys_0, out_tensors_0):
+            arg_group_0[key] = out_tensor
+        for key, out_tensor in zip(keys_1, out_tensors_1):
+            arg_group_1[key] = out_tensor
 
     def forward(self, *args, **kwargs):
         if self._ping_pang_debug:

@@ -23,6 +23,9 @@ class PingPangLayerWorker(MegatronLayerWorker):
         if not packed_seq_params.debug:
             for params in packed_seq_params.seq_params:
                 setattr(params, "stream", self.stream)
+        else:
+            for params in packed_seq_params.seq_params:
+                setattr(params, "stream", torch.cuda.current_stream())
         return self.layer.ping_pang_forward(tensor_input, packed_seq_params=packed_seq_params)
 
 
@@ -138,6 +141,7 @@ def test_dp(workers, seed, num_tokens, max_cp_degree, num_seqs, hidden_size, deb
         ans_handles.append(ans_handle)
     ans = ray.get(ans_handles)
     torch.testing.assert_close(ref_ans, ans)
+    print("test done.")
 
 
 if __name__ == "__main__":
