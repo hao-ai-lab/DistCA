@@ -384,7 +384,30 @@ items = plan_relocation(
     # verbose=True
 )
 # %%
+import time
+start_time = time.time()
 items = plan_relocation(
     items, 
-    # verbose=True
+    verbose=False,
+    plot=False,
 )
+end_time = time.time()
+print(f"Time taken: {((end_time - start_time) * 1000):.2f} ms")
+# %%
+items
+# %%
+
+items = batch_to_items([
+    # [16 * K] * 4,
+    [4 * K], 
+    [2 * K] * 2,
+    [1 * K] * 4,
+])
+items = plan_relocation(
+    items, 
+    verbose=False, 
+    plot=True,
+)
+items
+
+# %%
