@@ -231,13 +231,13 @@ class n_to_n_dispatch(torch.autograd.Function):
                     dst_tensor=query_in_grad,
                     metadata=rev_query_metadata,
                 )
+            if key_value_in_grad is not None:
+                # gather gradients from all copies along the cp_degree dimension
+                key_value_in_grad = (key_value_in_grad.reshape(key_value_grad_in_shape)).sum(dim=0)
+                assert key_value_in_grad.shape == key_value_in_shape
+
             if event is not None:
                 event.record(stream)
-
-        if key_value_in_grad is not None:
-            # gather gradients from all copies along the cp_degree dimension
-            key_value_in_grad = (key_value_in_grad.reshape(key_value_grad_in_shape)).sum(dim=0)
-            assert key_value_in_grad.shape == key_value_in_shape
 
         return (
             query_in_grad, None, None,
