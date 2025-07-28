@@ -109,6 +109,10 @@ class MegatronLayerWorker(MegatronBaseWorker):
 
 def get_seqlen_shard(cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor,
                      max_seqlen_q: torch.Tensor, max_seqlen_kv: torch.Tensor, num_local_seqs_recv: torch.Tensor, rank: int):
+    """
+    Get the seqlen related arguments for a specific rank.
+    This removes padding at the num_sequence dimension.
+    """
     num_seq = num_local_seqs_recv[rank].item()
     max_seqlen_q = max_seqlen_q[rank]
     max_seqlen_kv = max_seqlen_kv[rank]
@@ -275,7 +279,7 @@ def test_dp_single_split(workers, seed: int, num_tokens: int, max_cp_degree: int
     torch.testing.assert_close(ref_ans, ans)
 
 
-def init_test(args, worker_cls=MegatronLayerWorker, run_init_model: bool = True):
+def init_test(args, worker_cls=MegatronLayerWorker):
     ray.init()
     workers = create_pg(args.num_nodes, args.num_gpus_per_node, worker_cls)
     print("Workers created")
@@ -293,9 +297,6 @@ def init_test(args, worker_cls=MegatronLayerWorker, run_init_model: bool = True)
         stride_q, stride_kv, max_tokens_query, max_tokens_key_value, parallel_config
     ) for worker in workers])
     print("Communication groups initialized")
-
-    if not run_init_model:
-        return workers
 
     seed = args.seed
     spec = get_gpt_layer_with_transformer_engine_spec()

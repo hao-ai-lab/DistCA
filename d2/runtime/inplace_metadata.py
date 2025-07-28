@@ -4,6 +4,8 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.packed_seq_params import PackedSeqParams
+
 
 @dataclass
 class Metadata:
@@ -11,8 +13,16 @@ class Metadata:
     dst_offset: torch.Tensor
     seq_len: torch.Tensor
     num_recv_tokens: torch.Tensor
+    # NOTE: used for kv gradient communication.
+    # This is a sequence-scale mask, recording the number of sequences received
+    # from each rank.
     seq_recv_mask: Optional[torch.Tensor] = None
+    # NOTE: used for kv gradient communication.
+    # This records the length of all sequences received to this rank.
     recv_seq_lens: Optional[torch.Tensor] = None
+    # Number of sequences on each rank. This is used when this Metadata
+    # describes all ranks in the world, and thus is padded to the one with
+    # the most sequences. Otherwise, this should be None.
     num_seqs: Optional[torch.Tensor] = None
     world_size: int = None
     normalized: bool = False
@@ -199,6 +209,14 @@ def compute_attn_layout_seqlens(
 ):
     """
     Compute the cu_seqlens_q and cu_seqlens_kv for the attention layout.
+    NOTE: both inputs and outputs are the global value, so it has `world_size` dimension.
+    Args:
+        seq_shard_len: shape (world_size, max_num_local_seqs), length of each sequence shard.
+          A sequence shard is the unit sending to a rank.
+        seq_shard_cumsum: shape (world_size, max_num_local_seqs). Cumulative number of tokens
+          for the sequence shard's context. This is to compute the KV seqlens of the shard.
+        dispatch: shape (world_size, max_num_local_seqs). The rank that each sequence
+          shard is dispatched to. The value is -1 for padding.
     """
     world_size = dispatch.shape[0]
     max_num_local_seqs = dispatch.shape[1]
@@ -242,7 +260,93 @@ def compute_attn_layout_seqlens(
     return cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, num_local_seqs_recv
 
 
+def mlp_layout_packed_params(seq_lens: torch.Tensor):
+    """
+    Compute the MLP layout packed_seq_params. MLP layout guarantees seqlens_q == seqlens_kv.
+    This is mainly for RoPE.
+    """
+    cu_seqlens = torch.cat([
+        torch.zeros((1,), dtype=seq_lens.dtype, device=seq_lens.device),
+        seq_lens.cumsum(dim=0)
+    ])
+    max_seqlen = seq_lens.max()
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
+    return packed_seq_params
+
+
 ######## Correctness testing tools ########
+def test_local_proj_metadata(world_size: int, seq_len: int, offset: int):
+    """
+    Test tool generating the easiest case: Each rank holds a sequence,
+    and is sent to a rank with an offset. (0 means sending to itself)
+    """
+    num_recv_tokens = torch.zeros((world_size, world_size + 1), dtype=torch.int64)
+    num_recv_tokens[:, -1] = seq_len
+    i_diag = torch.arange(world_size, dtype=torch.int64)
+    j_diag = (i_diag + offset) % world_size
+    # the diagonal of num_recv_tokens is the seq_len
+    fwd_recv_tokens = num_recv_tokens.clone()
+    fwd_recv_tokens[j_diag, i_diag] = seq_len
+
+    bwd_j_diag = (i_diag - offset) % world_size
+    bwd_recv_tokens = num_recv_tokens.clone()
+    bwd_recv_tokens[bwd_j_diag, i_diag] = seq_len
+
+    mlp_to_attn_metadata = Metadata(
+        dst_rank=torch.tensor(
+            [(i + offset) % world_size for i in range(world_size)]
+        ).reshape(world_size, 1),
+        dst_offset=torch.tensor(
+            [0] * world_size
+        ).reshape(world_size, 1),
+        seq_len=torch.tensor(
+            [seq_len] * world_size
+        ).reshape(world_size, 1),
+        num_recv_tokens=fwd_recv_tokens,
+        num_seqs=torch.tensor([1] * world_size).reshape(world_size, 1),
+        world_size=world_size,
+        num_total_recv_tokens=[seq_len] * world_size,
+    )
+    attn_to_mlp_metadata = Metadata(
+        dst_rank=torch.tensor(
+            [(i - offset) % world_size for i in range(world_size)]
+        ).reshape(world_size, 1),
+        dst_offset=mlp_to_attn_metadata.dst_offset.clone(),
+        seq_len=mlp_to_attn_metadata.seq_len.clone(),
+        num_recv_tokens=bwd_recv_tokens,
+        num_seqs=mlp_to_attn_metadata.num_seqs.clone(),
+        world_size=world_size,
+        num_total_recv_tokens=[seq_len] * world_size,
+    )
+    mlp_to_attn_kv_metadata = Metadata(
+        dst_rank=mlp_to_attn_metadata.dst_rank.clone().unsqueeze(-1),
+        dst_offset=mlp_to_attn_metadata.dst_offset.clone().unsqueeze(-1),
+        seq_len=mlp_to_attn_metadata.seq_len.clone(),
+        num_recv_tokens=fwd_recv_tokens.clone(),
+        num_seqs=mlp_to_attn_metadata.num_seqs.clone(),
+        world_size=world_size,
+        num_total_recv_tokens=[seq_len] * world_size,
+    )
+    mlp_to_attn_kv_grad_metadata = Metadata(
+        dst_rank=attn_to_mlp_metadata.dst_rank.clone(),
+        dst_offset=attn_to_mlp_metadata.dst_offset.clone(),
+        seq_len=attn_to_mlp_metadata.seq_len.clone(),
+        num_recv_tokens=bwd_recv_tokens.clone(),
+        num_seqs=attn_to_mlp_metadata.num_seqs.clone(),
+        world_size=world_size,
+        seq_recv_mask=torch.ones(world_size, 1, 1),
+        recv_seq_lens=mlp_to_attn_metadata.seq_len.clone(),
+        num_total_recv_tokens=[seq_len] * world_size,
+    )
+    return mlp_to_attn_metadata, attn_to_mlp_metadata, mlp_to_attn_kv_metadata, mlp_to_attn_kv_grad_metadata
+
+
 @torch.no_grad()
 def orchestrate_simulate(tensor: torch.Tensor, output_tensor: torch.Tensor, metadata: Metadata):
     assert tensor.dim() == 3    # (world_size, num_tokens, hidden_dim)
