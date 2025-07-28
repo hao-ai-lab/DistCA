@@ -130,10 +130,13 @@ class TransformerLayer(MegatronTransformerLayer):
         value = value.reshape(value.shape[0], num_kv_heads * kv_head_dim)
         ####
 
-        # FIXME(yonghao): I'd expect this to be wrong, because the concat and split are
-        # on the compute stream instead of the communication stream, but changing it
-        # will instead causing to an numerical error. Should fix it.
-        key_value = torch.cat([key, value], dim=-1).contiguous()
+        if packed_seq_params.stream is not None:
+            context = torch.cuda.stream(packed_seq_params.stream)
+        else:
+            context = nullcontext()
+
+        with context:
+            key_value = torch.cat([key, value], dim=-1).contiguous()
         query_attn_layout, key_value_attn_layout = n_to_n_dispatch.apply(
             query,  # query_in
             packed_seq_params.mlp_to_attn_metadata, # query_metadata
@@ -143,12 +146,13 @@ class TransformerLayer(MegatronTransformerLayer):
             packed_seq_params.mlp_to_attn_kv_grad_metadata, # rev_key_value_metadata
             packed_seq_params.stream, # stream
         )
-        key_attn_layout, value_attn_layout = key_value_attn_layout.split(key_value_attn_layout.shape[1] // 2, dim=1)
+        with context:
+            key_attn_layout, value_attn_layout = key_value_attn_layout.split(key_value_attn_layout.shape[1] // 2, dim=1)
 
-        #### switch layout back
-        query_attn_layout = query_attn_layout.reshape(-1, num_q_heads, q_head_dim)
-        key_attn_layout = key_attn_layout.reshape(-1, num_kv_heads, kv_head_dim)
-        value_attn_layout = value_attn_layout.reshape(-1, num_kv_heads, kv_head_dim)
+            #### switch layout back
+            query_attn_layout = query_attn_layout.reshape(-1, num_q_heads, q_head_dim).contiguous()
+            key_attn_layout = key_attn_layout.reshape(-1, num_kv_heads, kv_head_dim).contiguous()
+            value_attn_layout = value_attn_layout.reshape(-1, num_kv_heads, kv_head_dim).contiguous()
 
         return query_attn_layout, key_attn_layout, value_attn_layout
 
@@ -185,9 +189,10 @@ class TransformerLayer(MegatronTransformerLayer):
         packed_seq_params_1 = packed_seq_params.seq_params[1]
         mlp_packed_seq_params_0 = packed_seq_params.mlp_layout_seq_params[0]
         mlp_packed_seq_params_1 = packed_seq_params.mlp_layout_seq_params[1]
+        compute_stream = torch.cuda.current_stream()
         if debug:
-            setattr(packed_seq_params_0, "stream", torch.cuda.current_stream())
-            setattr(packed_seq_params_1, "stream", torch.cuda.current_stream())
+            setattr(packed_seq_params_0, "stream", compute_stream)
+            setattr(packed_seq_params_1, "stream", compute_stream)
 
         # 1. split input into two microbatches
         args = [hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
@@ -200,7 +205,6 @@ class TransformerLayer(MegatronTransformerLayer):
             rotary_pos_cos_0, rotary_pos_sin_0, attention_bias_0, sequence_len_offset_0) = args_0
         (hidden_states_1, attention_mask_1, context_1, context_mask_1, rotary_pos_emb_1,
             rotary_pos_cos_1, rotary_pos_sin_1, attention_bias_1, sequence_len_offset_1) = args_1
-        compute_stream = torch.cuda.current_stream()
         # TODO: confirm this is equal to the stream of packed_seq_params_1
         comm_stream = packed_seq_params_0.stream
 
@@ -215,8 +219,8 @@ class TransformerLayer(MegatronTransformerLayer):
             mlp_packed_seq_params_0,
             sequence_len_offset_0,
         )
-        query_0, hidden_states_1 = TickSync.apply(
-            compute_stream, comm_stream, query_0, hidden_states_1
+        query_0, key_0, value_0, hidden_states_1 = TickSync.apply(
+            compute_stream, comm_stream, query_0, key_0, value_0, hidden_states_1
         )
 
         # 3. pre-attention forward of microbatch 1, mlp2attn all2all of microbatch 0
@@ -229,8 +233,8 @@ class TransformerLayer(MegatronTransformerLayer):
             mlp_packed_seq_params_1,
             sequence_len_offset_1,
         )
-        query_0, key_0, value_0, query_1 = TickSync.apply(
-            compute_stream, comm_stream, query_0, key_0, value_0, query_1
+        query_0, key_0, value_0, query_1, key_1, value_1 = TickSync.apply(
+            compute_stream, comm_stream, query_0, key_0, value_0, query_1, key_1, value_1
         )
 
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1

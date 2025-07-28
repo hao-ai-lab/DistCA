@@ -44,6 +44,7 @@ class PingPangPackedSeqParams:
     seq_params: List[PingPangSingleStepPackedSeqParams]
     # The seq params for mlp layout. This is mainly used for the RoPE.
     mlp_layout_seq_params: List[PackedSeqParams]
+    # NOTE: within a TransformerLayer, this will make sure all communications run on the compute stream.
     debug: bool = False
     do_gather: bool = False
     # NOTE: These attributes are used for rotary seq len's max length.

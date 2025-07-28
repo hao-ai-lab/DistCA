@@ -8,9 +8,11 @@ num_gpus=1,
 runtime_env={ "nsight": "default"})
 class RayActor:
     def run(self,):
-        a = torch.tensor([1.0, 2.0, 3.0]).cuda()
-        b = torch.tensor([4.0, 5.0, 6.0]).cuda()
-        c = a * b
+        hidden = 10240
+        a = torch.rand((hidden, hidden)).cuda()
+        b = torch.rand((hidden, hidden)).cuda()
+        for _ in range(10):
+            c = a @ b
         print("Result on GPU:", c)
 
 ray_actor = RayActor.remote()
