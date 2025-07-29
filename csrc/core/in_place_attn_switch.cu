@@ -328,6 +328,7 @@ DispatchHelper::DispatchHelper(
   kv_signal_buffer = (uint64_t *)nvshmem_malloc(sizeof(uint64_t) * world_size);
   cudaMemset(q_signal_buffer, 0, sizeof(uint64_t) * world_size);
   cudaMemset(kv_signal_buffer, 0, sizeof(uint64_t) * world_size);
+  _numSMs = get_sm_count();
 }
 
 DispatchHelper::~DispatchHelper() {
@@ -339,6 +340,10 @@ DispatchHelper::~DispatchHelper() {
   nvshmem_free(kv_signal_buffer);
 }
 
+void DispatchHelper::set_num_sms(const size_t num_sms) {
+  const size_t total_sms = get_sm_count();
+  _numSMs = std::min(num_sms, total_sms);
+}
 
 void DispatchHelper::dispatch(
   // Input and output tensors
@@ -367,7 +372,7 @@ void DispatchHelper::dispatch(
   const uint32_t *recv_seq_lens,
   const size_t kv_backward_num_tokens
 ) {
-  int numSMs = get_sm_count();
+  const int numSMs = _numSMs || get_sm_count();
   const bool has_key_value = kv_send_tensor != nullptr;
   const bool is_kv_backward = seq_recv_mask != nullptr;
   constexpr unsigned NUM_WARPS = 10;

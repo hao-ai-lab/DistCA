@@ -167,6 +167,11 @@ void destroy_dispatch_helper(fptr_t fptr) {
   delete (DispatchHelper*)fptr;
 }
 
+void set_num_sms(fptr_t fptr, const int64_t num_sms) {
+  auto* dispatch_helper = (DispatchHelper*)fptr;
+  dispatch_helper->set_num_sms(num_sms);
+}
+
 }; // namespace
 
 
@@ -175,5 +180,6 @@ void register_all_to_all_ops(torch::Library &m) {
   m.def("dispatch_core", &dispatch_core);
   m.def("create_dispatch_helper", &create_dispatch_helper);
   m.def("destroy_dispatch_helper", &destroy_dispatch_helper);
+  m.def("set_num_sms", &set_num_sms);
 }
 }; // namespace attn

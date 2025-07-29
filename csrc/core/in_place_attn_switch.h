@@ -18,6 +18,8 @@ public:
 
   ~DispatchHelper();
 
+  void set_num_sms(const size_t num_sms);
+
   void dispatch(
     // Input and output tensors
     const std::byte *send_tensor,
@@ -64,5 +66,6 @@ private:
   std::byte *kv_recv_buffer;
   uint64_t *q_signal_buffer;
   uint64_t *kv_signal_buffer;
+  int _numSMs;
 };
 };  // namespace attn

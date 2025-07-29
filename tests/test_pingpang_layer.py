@@ -19,7 +19,7 @@ class PingPangLayerWorker(MegatronLayerWorker):
         packed_seq_params = packed_seq_params.to_device()
         tensor_input = tensor_input.cuda()
         self.layer.train()
-        # TODO: if not debug, add communication stream here.
+        # if not debug, add communication stream here.
         if not packed_seq_params.debug:
             for params in packed_seq_params.seq_params:
                 setattr(params, "stream", self.stream)
@@ -165,5 +165,5 @@ if __name__ == "__main__":
     parser.add_argument("--num-gpus-per-node", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=1)
     args = parser.parse_args()
-    workers = init_test(args, worker_cls=PingPangLayerWorker)
+    workers = init_test(args, worker_cls=PingPangLayerWorker, nsys_profile=False)
     test_dp(workers, args.seed, args.num_tokens, args.cp_degree, args.num_seqs, args.hidden_size)

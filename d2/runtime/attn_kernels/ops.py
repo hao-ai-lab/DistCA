@@ -93,6 +93,7 @@ class DispatcherWrapper:
                  max_tokens_key_value: int,
                  rank: int,
                  world_size: int,
+                 num_sms: int = 20,
                  ):
         self.dispatcher = create_dispatcher(
             q_stride, kv_stride, max_tokens_query, max_tokens_key_value,
@@ -104,6 +105,8 @@ class DispatcherWrapper:
         self.max_tokens_key_value = max_tokens_key_value
         self.rank = rank
         self.world_size = world_size
+        self.num_sms = num_sms
+        self.set_num_sms(num_sms)
 
     def maybe_update(self,
                      q_stride: int,
@@ -123,6 +126,7 @@ class DispatcherWrapper:
                 self.max_tokens_query, self.max_tokens_key_value,
                 self.rank, self.world_size
             )
+            self.set_num_sms(self.num_sms)
 
     def __del__(self):
         destroy_dispatcher(self.dispatcher)
@@ -145,6 +149,9 @@ class DispatcherWrapper:
         assert DispatcherWrapper.instance is not None, "DispatcherWrapper not initialized"
         return DispatcherWrapper.instance
 
+    def set_num_sms(self, num_sms: int) -> None:
+        self.num_sms = num_sms
+        _ops.set_num_sms(self.dispatcher, num_sms)
 
 
 def dispatch_qkv(
@@ -175,6 +182,7 @@ def dispatch_qkv(
         kv_metadata.dst_rank, kv_metadata.dst_offset, kv_metadata.num_recv_tokens,
         None, None,
     )
+
 
 def dispatch_no_cp_tensor(
     dispatcher: DispatcherWrapper,
