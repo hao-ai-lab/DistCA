@@ -217,6 +217,7 @@ class TransformerLayer(MegatronTransformerLayer):
         # 2. pre-self-attention forward microbatch 0.
         # Ideally, this part should merge to the previous layer's post-self-attention to maximize
         # the communication-computation overlap.
+        torch.cuda.nvtx.range_push("pre_core_attn.0")
         query_0, key_0, value_0, residual_0, attn_mask_type_0 = self._forward_pre_core_attn(
             hidden_states_0,
             rotary_pos_emb_0,
@@ -225,12 +226,14 @@ class TransformerLayer(MegatronTransformerLayer):
             mlp_packed_seq_params_0,
             sequence_len_offset_0,
         )
+        torch.cuda.nvtx.range_pop()
         query_0, key_0, value_0, hidden_states_1 = TickSync.apply(
             compute_stream, comm_stream, query_0, key_0, value_0, hidden_states_1
         )
 
         # 3. pre-attention forward of microbatch 1, mlp2attn all2all of microbatch 0
         query_0, key_0, value_0 = self._layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
+        torch.cuda.nvtx.range_push("pre_core_attn.1")
         query_1, key_1, value_1, residual_1, attn_mask_type_1 = self._forward_pre_core_attn(
             hidden_states_1,
             rotary_pos_emb_1,
@@ -239,12 +242,14 @@ class TransformerLayer(MegatronTransformerLayer):
             mlp_packed_seq_params_1,
             sequence_len_offset_1,
         )
+        torch.cuda.nvtx.range_pop()
         query_0, key_0, value_0, query_1, key_1, value_1 = TickSync.apply(
             compute_stream, comm_stream, query_0, key_0, value_0, query_1, key_1, value_1
         )
 
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         query_1, key_1, value_1 = self._layout_mlp_to_attn(query_1, key_1, value_1, packed_seq_params_1)
+        torch.cuda.nvtx.range_push("core_attn.0")
         core_attn_out_0 = self._forward_core_attn(
             query_0,
             key_0,
@@ -254,12 +259,14 @@ class TransformerLayer(MegatronTransformerLayer):
             attn_mask_type_0,
             packed_seq_params_0,
         )
+        torch.cuda.nvtx.range_pop()
         query_1, key_1, value_1, core_attn_out_0 = TickSync.apply(
             compute_stream, comm_stream, query_1, key_1, value_1, core_attn_out_0
         )
 
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         core_attn_out_0 = self._layout_attn_to_mlp(core_attn_out_0, packed_seq_params_0)
+        torch.cuda.nvtx.range_push("core_attn.1")
         core_attn_out_1 = self._forward_core_attn(
             query_1,
             key_1,
@@ -269,24 +276,29 @@ class TransformerLayer(MegatronTransformerLayer):
             attn_mask_type_1,
             packed_seq_params_1,
         )
+        torch.cuda.nvtx.range_pop()
         core_attn_out_0, core_attn_out_1 = TickSync.apply(compute_stream, comm_stream, core_attn_out_0, core_attn_out_1)
 
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
         core_attn_out_1 = self._layout_attn_to_mlp(core_attn_out_1, packed_seq_params_1)
+        torch.cuda.nvtx.range_push("post_core_attn.0")
         mlp_output_0, context_0 = self._forward_post_core_attn(
             core_attn_out_0,
             residual_0,
             context_0,
             context_mask_0,
         )
+        torch.cuda.nvtx.range_pop()
         core_attn_out_1, mlp_output_0 = TickSync.apply(compute_stream, comm_stream, core_attn_out_1, mlp_output_0)
 
+        torch.cuda.nvtx.range_push("post_core_attn.1")
         mlp_output_1, context_1 = self._forward_post_core_attn(
             core_attn_out_1,
             residual_1,
             context_1,
             context_mask_1,
         )
+        torch.cuda.nvtx.range_pop()
         # concatenate the two microbatches to one.
         if needs_gather:
             output = _gather_tensor([mlp_output_0, mlp_output_1], num_splits=2)

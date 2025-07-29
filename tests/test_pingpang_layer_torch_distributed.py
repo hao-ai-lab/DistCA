@@ -1,0 +1,210 @@
+"""
+Launch command:
+
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+    nsys profile -o pingpang_layer.nsys-rep -t cuda,nvtx \
+torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer_torch_distributed.py \
+    --num-tokens 10240 --hidden-size 4096 --num-heads=32
+"""
+
+import argparse
+import os
+
+import torch
+
+from d2.runtime.inplace_metadata import compute_attn_layout_seqlens
+from d2.runtime.megatron_patch.model_patch import get_gpt_layer_with_transformer_engine_spec, get_gpt_config
+from d2.runtime.megatron_patch.packed_seq_params import PackedSeqParams, PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
+
+from test_dispatch_qkv import create_testcase_qkv
+from test_util import ParallelConfig
+from test_megatron_layer import MegatronLayerWorker, get_seqlen_shard
+
+
+class PingPangLayerWorker(MegatronLayerWorker):
+    def __init__(self, rank: int, world_size: int):
+        super().__init__(rank, world_size)
+        local_rank = int(os.getenv("LOCAL_RANK"))
+        torch.cuda.set_device(local_rank)
+        torch.set_default_device(torch.device("cuda", local_rank))
+        self.stream = torch.cuda.Stream()
+
+    def forward_ping_pang(self, tensor_input: torch.Tensor, packed_seq_params: PingPangPackedSeqParams):
+        packed_seq_params = packed_seq_params.to_device()
+        tensor_input = tensor_input.cuda()
+        self.layer.train()
+        # if not debug, add communication stream here.
+        if not packed_seq_params.debug:
+            for params in packed_seq_params.seq_params:
+                setattr(params, "stream", self.stream)
+        else:
+            for params in packed_seq_params.seq_params:
+                setattr(params, "stream", torch.cuda.current_stream())
+        return self.layer.ping_pang_forward(tensor_input, packed_seq_params=packed_seq_params)
+
+
+def init_test(args, worker_cls=MegatronLayerWorker):
+    world_size = int(os.getenv("WORLD_SIZE"))
+    rank = int(os.getenv("RANK"))
+    worker = worker_cls(rank, world_size)
+    print("Workers created")
+
+    stride_q = args.hidden_size * torch.float16.itemsize
+    stride_kv = args.hidden_size * torch.float16.itemsize * 2
+    # NOTE: a reason very likely causing the hanging is that
+    # max_tokens_query and max_tokens_key_value are not large enough (nvshmem buffer not enough)
+    max_tokens_query = args.num_tokens * world_size
+    max_tokens_key_value = args.num_tokens * world_size
+    parallel_config = ParallelConfig(
+        tensor_model_parallel_size=args.tp_size
+    )
+    worker.init_comm(
+        stride_q, stride_kv, max_tokens_query, max_tokens_key_value, parallel_config
+    )
+    print("Communication groups initialized")
+
+    seed = args.seed
+    spec = get_gpt_layer_with_transformer_engine_spec()
+    config = get_gpt_config(
+        num_layers=1,
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_heads,
+        ffn_hidden_size=args.hidden_size * 4,
+        fp16=True,
+        deterministic_mode=True,
+        params_dtype=torch.float16,
+    )
+    worker.init_layer(config, spec, seed)
+    return worker
+
+
+@torch.no_grad()
+def test_dp(worker: PingPangLayerWorker, seed, num_tokens, max_cp_degree, num_seqs, hidden_size, debug=False):
+    world_size = worker.world_size
+    rank = worker.rank
+
+    # All ranks create the same metadata because they share the same seed.
+    # Create two splits for ping-pong
+    (
+        fwd_q_metadata_0, rev_q_metadata_0,
+        fwd_kv_metadata_0, rev_kv_metadata_0,
+        sp_kv_dst_0, sp_seq_lens_0, sp_query_dst_0, cp_dst_kv_len_0, seq_lens_0,
+    ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
+    (
+        fwd_q_metadata_1, rev_q_metadata_1,
+        fwd_kv_metadata_1, rev_kv_metadata_1,
+        sp_kv_dst_1, sp_seq_lens_1, sp_query_dst_1, cp_dst_kv_len_1, seq_lens_1,
+    ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
+
+    # Create tensor input
+    tensor_input = torch.randn(world_size, num_tokens * 2, hidden_size, dtype=torch.float16)
+
+    (cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0) = compute_attn_layout_seqlens(
+        sp_seq_lens_0, cp_dst_kv_len_0, sp_query_dst_0
+    )
+    (cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1) = compute_attn_layout_seqlens(
+        sp_seq_lens_1, cp_dst_kv_len_1, sp_query_dst_1
+    )
+
+    args = []
+
+    ######## Prepare hyper-parameters ########
+    # of shape (num_tokens, 1, hidden_size)
+    tensor_input_local = tensor_input[rank].unsqueeze(1)
+    fwd_q_metadata_0_local = fwd_q_metadata_0.get_slice(rank)
+    rev_q_metadata_0_local = rev_q_metadata_0.get_slice(rank)
+    fwd_kv_metadata_0_local = fwd_kv_metadata_0.get_slice(rank)
+    rev_kv_metadata_0_local = rev_kv_metadata_0.get_slice(rank)
+    fwd_q_metadata_1_local = fwd_q_metadata_1.get_slice(rank)
+    rev_q_metadata_1_local = rev_q_metadata_1.get_slice(rank)
+    fwd_kv_metadata_1_local = fwd_kv_metadata_1.get_slice(rank)
+    rev_kv_metadata_1_local = rev_kv_metadata_1.get_slice(rank)
+
+    # Create packed seq params metadata
+    # Normal forward. No layout switch. Batches are in the normal data parallel on each rank.
+    seq_lens_local_0 = seq_lens_0[rank]
+    seq_lens_local_1 = seq_lens_1[rank]
+    seq_lens_local = torch.cat([seq_lens_local_0, seq_lens_local_1], dim=0)
+    cu_seqlens_q = torch.cat([
+        torch.zeros((1,), dtype=seq_lens_local.dtype, device=seq_lens_local.device),
+        seq_lens_local.cumsum(dim=0)
+    ])
+    cu_seqlens_kv = cu_seqlens_q.clone()
+    max_seqlen_q = seq_lens_local.max()
+    max_seqlen_kv = max_seqlen_q.clone()
+    packed_seq_params_normal = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+    )
+    # Ping-pong forward. cu_seqlens is in a special layout.
+    (cu_seqlens_q_0, cu_seqlens_kv_0, max_seqlen_q_0, max_seqlen_kv_0, num_seq_0) = get_seqlen_shard(
+        cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0, rank
+    )
+    (cu_seqlens_q_1, cu_seqlens_kv_1, max_seqlen_q_1, max_seqlen_kv_1, num_seq_1) = get_seqlen_shard(
+        cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1, rank
+    )
+    packed_seq_params_stage_0 = PingPangSingleStepPackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_q_0,
+        cu_seqlens_kv=cu_seqlens_kv_0,
+        max_seqlen_q=max_seqlen_q_0,
+        max_seqlen_kv=max_seqlen_kv_0,
+        mlp_to_attn_metadata=fwd_q_metadata_0_local,
+        attn_to_mlp_metadata=rev_q_metadata_0_local,
+        mlp_to_attn_kv_metadata=fwd_kv_metadata_0_local,
+        mlp_to_attn_kv_grad_metadata=rev_kv_metadata_0_local,
+    )
+    packed_seq_params_stage_1 = PingPangSingleStepPackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_q_1,
+        cu_seqlens_kv=cu_seqlens_kv_1,
+        max_seqlen_q=max_seqlen_q_1,
+        max_seqlen_kv=max_seqlen_kv_1,
+        mlp_to_attn_metadata=fwd_q_metadata_1_local,
+        attn_to_mlp_metadata=rev_q_metadata_1_local,
+        mlp_to_attn_kv_metadata=fwd_kv_metadata_1_local,
+        mlp_to_attn_kv_grad_metadata=rev_kv_metadata_1_local,
+    )
+    packed_seq_params_ping_pang = PingPangPackedSeqParams(
+        debug=debug,
+        seq_params=[packed_seq_params_stage_0, packed_seq_params_stage_1],
+        # FIXME: this is wrong. However, we don't test RoPE here so it's fine yet.
+        mlp_layout_seq_params=[None, None],
+        do_gather=True,
+    )
+    print("metadata created. begin forward normal.")
+
+    ref_ans, ref_debug = worker.forward_normal(
+        tensor_input_local, packed_seq_params_normal
+    )
+    print("forward normal done.")
+
+    args = (tensor_input_local, packed_seq_params_ping_pang)
+
+    for _ in range(10):
+        # warmup
+        ans = worker.forward_ping_pang(*args)
+    for i in range(20):
+        ans = worker.forward_ping_pang(*args)
+        torch.testing.assert_close(ref_ans, ans)
+        print(f"Iteration {i} passed.")
+    print("test done.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-tokens", type=int, default=1024)
+    parser.add_argument("--cp-degree", type=int, default=2)
+    parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--num-heads", type=int, default=2)
+    parser.add_argument("--num-seqs", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-nodes", type=int, default=1)
+    parser.add_argument("--num-gpus-per-node", type=int, default=2)
+    parser.add_argument("--tp-size", type=int, default=1)
+    args = parser.parse_args()
+    worker = init_test(args, worker_cls=PingPangLayerWorker)
+    test_dp(worker, args.seed, args.num_tokens, args.cp_degree, args.num_seqs, args.hidden_size)
