@@ -95,6 +95,7 @@ class TransformerLayer(MegatronTransformerLayer):
             context = torch.cuda.stream(packed_seq_params.stream)
 
         with context:
+            torch.cuda.nvtx.range_push("attn_to_mlp")
             #### NOTE: this is a hack. We should fix this in the future.
             num_heads = attn_out.shape[-2]
             head_dim = attn_out.shape[-1]
@@ -112,6 +113,7 @@ class TransformerLayer(MegatronTransformerLayer):
             #### switch layout back
             attn_out_mlp_layout = attn_out_mlp_layout.view(-1, num_heads, head_dim)
             ####
+            torch.cuda.nvtx.range_pop()
         return attn_out_mlp_layout
 
     def _layout_mlp_to_attn(
@@ -128,6 +130,7 @@ class TransformerLayer(MegatronTransformerLayer):
             context = nullcontext()
 
         with context:
+            torch.cuda.nvtx.range_push("mlp_to_attn")
             # TODO(yonghao): current we do a walk around: merge head dimension
             # into hidden dimension. In this way, we need the TP degree being
             # kept for attention and other parts.
@@ -159,6 +162,7 @@ class TransformerLayer(MegatronTransformerLayer):
             query_attn_layout = query_attn_layout.view(-1, num_q_heads, q_head_dim).contiguous()
             key_attn_layout = key_attn_layout.reshape(-1, num_kv_heads, kv_head_dim).contiguous()
             value_attn_layout = value_attn_layout.reshape(-1, num_kv_heads, kv_head_dim).contiguous()
+            torch.cuda.nvtx.range_pop()
 
         return query_attn_layout, key_attn_layout, value_attn_layout
 
@@ -200,6 +204,12 @@ class TransformerLayer(MegatronTransformerLayer):
             setattr(packed_seq_params_0, "stream", compute_stream)
             setattr(packed_seq_params_1, "stream", compute_stream)
 
+
+        # NOTE: DO NOT REMOVE THIS DEBUG TENSOR! Torch seems to have some
+        # liveness issue, that deallocates the tensors too early before
+        # communication kernels on the customized stream is done.
+        # This list help increasing the tensor's liveness a bit.
+        debug_tensors = None
         # 1. split input into two microbatches
         args = [hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
                 rotary_pos_cos, rotary_pos_sin, attention_bias, sequence_len_offset]
@@ -232,6 +242,9 @@ class TransformerLayer(MegatronTransformerLayer):
         )
 
         # 3. pre-attention forward of microbatch 1, mlp2attn all2all of microbatch 0
+        # NOTE: do not remove this debug tensor. see above.
+        debug_tensors = (query_0, key_0, value_0)
+
         query_0, key_0, value_0 = self._layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
         torch.cuda.nvtx.range_push("pre_core_attn.1")
         query_1, key_1, value_1, residual_1, attn_mask_type_1 = self._forward_pre_core_attn(
@@ -246,6 +259,8 @@ class TransformerLayer(MegatronTransformerLayer):
         query_0, key_0, value_0, query_1, key_1, value_1 = TickSync.apply(
             compute_stream, comm_stream, query_0, key_0, value_0, query_1, key_1, value_1
         )
+        # NOTE: do not remove this debug tensor. see above.
+        debug_tensors = (query_1, key_1, value_1)
 
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         query_1, key_1, value_1 = self._layout_mlp_to_attn(query_1, key_1, value_1, packed_seq_params_1)
@@ -263,6 +278,8 @@ class TransformerLayer(MegatronTransformerLayer):
         query_1, key_1, value_1, core_attn_out_0 = TickSync.apply(
             compute_stream, comm_stream, query_1, key_1, value_1, core_attn_out_0
         )
+        # NOTE: do not remove this debug tensor. see above.
+        debug_tensors = core_attn_out_0
 
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
         core_attn_out_0 = self._layout_attn_to_mlp(core_attn_out_0, packed_seq_params_0)
@@ -278,6 +295,8 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         torch.cuda.nvtx.range_pop()
         core_attn_out_0, core_attn_out_1 = TickSync.apply(compute_stream, comm_stream, core_attn_out_0, core_attn_out_1)
+        # NOTE: do not remove this debug tensor. see above.
+        debug_tensors = core_attn_out_1
 
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
         core_attn_out_1 = self._layout_attn_to_mlp(core_attn_out_1, packed_seq_params_1)
@@ -290,6 +309,8 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         torch.cuda.nvtx.range_pop()
         core_attn_out_1, mlp_output_0 = TickSync.apply(compute_stream, comm_stream, core_attn_out_1, mlp_output_0)
+        # NOTE: do not remove this debug tensor. see above.
+        debug_tensors = None
 
         torch.cuda.nvtx.range_push("post_core_attn.1")
         mlp_output_1, context_1 = self._forward_post_core_attn(

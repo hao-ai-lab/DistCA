@@ -5,6 +5,11 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
     nsys profile -o pingpang_layer.nsys-rep -t cuda,nvtx \
 torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer_torch_distributed.py \
     --num-tokens 10240 --hidden-size 4096 --num-heads=32
+
+no nsys:
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer_torch_distributed.py \
+    --num-tokens 10240 --hidden-size 4096 --num-heads=32
 """
 
 import argparse
