@@ -40,11 +40,11 @@ if(NOT DEFINED CMAKE_PREFIX_PATH)
         message(FATAL_ERROR "Could not find torch installation. Tried paths: ${TORCH_SEARCH_PATHS}")
     endif()
 endif()
+
 message(STATUS "CMAKE_PREFIX_PATH is set to: ${CMAKE_PREFIX_PATH}")
 if(NOT EXISTS ${CMAKE_PREFIX_PATH})
     message(FATAL_ERROR "CMAKE_PREFIX_PATH does not exist: ${CMAKE_PREFIX_PATH}")
 endif()
-
 
 
 
@@ -58,6 +58,13 @@ find_package(NVSHMEM REQUIRED HINTS
     /usr/local/nvshmem/lib 
     $ENV{NVSHMEM_DIR}/lib
 )
+
+# Print the path that is selected to use as nvshmem path
+if(NVSHMEM_FOUND)
+    get_target_property(NVSHMEM_PATH nvshmem::nvshmem INTERFACE_INCLUDE_DIRECTORIES)
+    message(STATUS "Using NVSHMEM path: ${NVSHMEM_PATH}")
+endif()
+
 
 # Created imported target for PyTorch
 add_library(torch_imported INTERFACE)
