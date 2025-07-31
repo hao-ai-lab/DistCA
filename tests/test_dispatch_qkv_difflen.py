@@ -219,6 +219,381 @@ def create_testcase_qkv(
     )
 
 
+def create_testcase_qkv_annotated(
+    seed: int, world_size: int, num_tokens: int, max_cp_degree: int, num_seqs: int,
+    seqlen_multiple: int=1,
+) -> Tuple[Metadata, Metadata, Metadata, Metadata, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create a random sequence parallel dispatch plan that:
+    - Generate sequences of different lengths. The total number of tokens at each rank
+      is the same.
+    - Generate a CP degree for each sequence (under a max_cp_degree).
+    - Generate CP ranks for each CP shard of a sequence.
+    - Create metadata accordingly.
+    """
+    import rich
+    torch.manual_seed(seed)
+    ### Init dispatch plan ###
+    assert num_tokens % (max_cp_degree * seqlen_multiple) == 0
+    _num_tokens_shard = num_tokens // (max_cp_degree * seqlen_multiple)
+    seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
+    assert seq_lens.shape == (world_size, num_seqs)
+    # seq_lens = 
+    #      0,   1,   2,   3,   4,   5,  # seq id
+    # ---------------------------------------------
+    #   [206, 310,  50,  66, 134, 258], # rank 0
+    #   [156, 276, 146, 198, 116, 132], # rank 1
+    # 
+    
+    
+    # TODO: Change this to a CP destination matrix
+    #   - [src_rank]'s [seq_id]'s [slice_st, slice_ed] should go to [dst_rank] for sequence paralleism (which should include q and kv)
+    
+    # make sure each sequence is divisible by max_cp_degree.
+    seq_lens *= max_cp_degree * seqlen_multiple
+    # the CP for each sequence.
+    log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
+    cp_num = torch.pow(2, log_cp_num)
+    # cp_num = 
+    #    0, 1, 2, 3, 4, 5    # seq id
+    # ---------------------------------------------
+    #   [1, 2, 1, 1, 1, 1],  # rank 0
+    #   [1, 2, 1, 2, 2, 1],  # rank 1
+
+    # CP dst for each sequence. Masking by cp_num.
+    cp_dst_helper = torch.rand((world_size, num_seqs, world_size)).argsort(dim=2)
+    cp_dst = cp_dst_helper[:, :, :max_cp_degree]
+    assert cp_dst.shape == (world_size, num_seqs, max_cp_degree)
+    
+    breakpoint()
+    # For each (i, j), set cp_dst[i, j, cp_num[i, j]:] = -1
+    #   this masks out the things that beyond the cp shard.
+    #   but this can be generalized to any CP destination / degree.
+    mask = torch.arange(max_cp_degree).expand(world_size, num_seqs, max_cp_degree)
+    assert mask.shape == (world_size, num_seqs, max_cp_degree)
+    
+    cp_num_expanded = cp_num.unsqueeze(-1)
+    assert cp_num_expanded.shape == (world_size, num_seqs, 1)
+
+    mask = mask >= cp_num_expanded
+    cp_dst[mask] = -1
+    # 
+    # cp_dst = 
+    # 
+    #    [[[ 0, -1],
+    #      [ 1,  0],
+    #      [ 0, -1],
+    #      [ 0, -1],
+    #      [ 0, -1],
+    #      [ 1, -1]],
+    #     [[ 0, -1],
+    #      [ 0,  1],
+    #      [ 1, -1],
+    #      [ 1,  0],
+    #      [ 0,  1],
+    #      [ 1, -1]]]
+    # 
+    # Now, after the masking, 
+    #   cp_dst[src_rank, seq_id, dst_rank] == -1 --> means this dst_rank does not involve in the CP group.
+    #   cp_dst[src_rank, seq_id, dst_rank] =>  0 --> a valid dst rank that a part of the sequence will move towards.
+
+    
+    # NOTE(Ginda): Why do we need the pad_len?
+    pad_len = torch.max(cp_num.sum(dim=1))
+    # pad_len = tensor(9)
+    cp_seq_lens = torch.zeros(world_size, pad_len, dtype=torch.int64)
+    cp_query_dst = torch.ones(world_size, pad_len, dtype=torch.int64) * -1
+    cp_kv_dst = torch.ones(world_size, pad_len, max_cp_degree, dtype=torch.int64) * -1
+    cp_dst_kv_len = torch.zeros(world_size, pad_len, dtype=torch.int64) * -1
+    breakpoint()
+    for i in range(world_size):
+        cp_seq_lens_local = []
+        cp_query_dst_local = []
+        cp_kv_dst_local = []
+        cp_dst_kv_len_local = []
+
+        for j in range(num_seqs):
+            # Handle rank i's sequence j
+            # - num_cp: (scaler) number of cp group for this sequence
+            # - seq_len: (scaler) length of this sequence
+            # - seq_shard_len: (scaler) length of each cp group. 
+            # NOTE: This is where we should inject how we want to split the sequence.
+            #       We can pass in the CP sharding for balanced paralleism here!!
+            # - cp_seq_lens_local: 
+            # - cp_query_dst_local
+            # - seq_cp_dst_kv
+            # - cp_dst_kv_len_local
+            # - kv_dst_mask
+            # - seq_cp_dst_kv_tril
+            # - cp_kv_dst_local
+
+            # suppose (i, j) = (0, 1)
+            num_cp = cp_num[i, j]
+            # num_cp = tensor(2)
+            seq_len = seq_lens[i, j]
+            # seq_len = tensor(310)
+            seq_shard_len = seq_len // num_cp
+            # seq_shard_len = tensor(310) / 2 = tensor(155)
+
+            cp_seq_lens_local.append(seq_shard_len.reshape(1,).repeat(num_cp))
+            # appending item: 
+            #       tensor([155, 155])
+            cp_query_dst_local.append(cp_dst[i, j, :num_cp].flatten())
+            # appending item:
+            #       tensor([1, 0])
+            seq_cp_dst_kv = cp_dst[i, j].reshape(1, -1).repeat(num_cp, 1)
+            # seq_cp_dst_kv = 
+            #     tensor([
+            #               [1, 0],
+            #               [1, 0]
+            #            ])
+            
+            # kv total length of each CP shard.
+            # TODO: Change this so we can inject different KV lengths for the CP groups.
+            __cp_dst_kv_len_local = seq_shard_len.reshape(1,) * torch.arange(
+                1, num_cp + 1, device=seq_shard_len.device, dtype=seq_shard_len.dtype
+            )
+            # __cp_dst_kv_len_local = tensor([155, 310])
+            # 
+            # Calculate the KV length for each shard
+            # Equivalent Python native code:
+            #         unit = seq_len // num_cp
+            #         __cp_dst_kv_len_local = [ i * unit for i in range(1, num_cp + 1) ]
+            #
+            cp_dst_kv_len_local.append(__cp_dst_kv_len_local)
+
+            # triangular mask of seq_cp_dst_kv. Mask value is always 0 but we want it -1.
+            # FIXME: the following line leads to a number mismatch.
+            # NOTE(Question): Absolutely no idea why this is needed????
+            kv_dst_mask = ((
+                # keep j > i and j <= a
+                torch.arange(max_cp_degree).view(1, -1) 
+                >= torch.arange(num_cp.item()).view(-1, 1)
+            ) & (
+                # bound within the max cp degree for this sequence.
+                torch.arange(max_cp_degree).view(1, -1) < num_cp
+            ))
+            seq_cp_dst_kv_tril = (seq_cp_dst_kv + 1) * kv_dst_mask - 1
+            cp_kv_dst_local.append(seq_cp_dst_kv_tril)
+            breakpoint()
+        breakpoint()
+        
+        cp_seq_lens_local = torch.cat(cp_seq_lens_local, dim=0)
+        cp_query_dst_local = torch.cat(cp_query_dst_local, dim=0)
+        cp_kv_dst_local = torch.cat(cp_kv_dst_local, dim=0)
+        cp_dst_kv_len_local = torch.cat(cp_dst_kv_len_local, dim=0)
+        # shape check:
+        seq_shards = cp_seq_lens_local.shape[0]
+        assert cp_seq_lens_local.shape == (seq_shards,)
+        assert cp_query_dst_local.shape == (seq_shards,)
+        assert cp_kv_dst_local.shape == (seq_shards, max_cp_degree)
+        assert cp_dst_kv_len_local.shape == (seq_shards,)
+
+        cp_seq_lens[i, :seq_shards] = cp_seq_lens_local
+        cp_query_dst[i, :seq_shards] = cp_query_dst_local
+        cp_kv_dst[i, :seq_shards, :] = cp_kv_dst_local
+        cp_dst_kv_len[i, :seq_shards] = cp_dst_kv_len_local
+        breakpoint()
+
+
+    ### Init metadata ###
+    breakpoint()
+    fwd_q_metadata, rev_q_metadata = compute_metadata(cp_seq_lens, cp_query_dst)
+    fwd_kv_metadata, rev_kv_metadata = compute_metadata(cp_seq_lens, cp_kv_dst)
+
+    return (
+        fwd_q_metadata, rev_q_metadata, fwd_kv_metadata, rev_kv_metadata,
+        cp_kv_dst, cp_seq_lens, cp_query_dst, cp_dst_kv_len, seq_lens,
+    )
+
+def create_testcase_qkv_uneven_context_parallel(
+    seed: int, world_size: int, num_tokens: int, max_cp_degree: int, num_seqs: int,
+    seqlen_multiple: int=1,
+) -> Tuple[Metadata, Metadata, Metadata, Metadata, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create a random sequence parallel dispatch plan that:
+    - Generate sequences of different lengths. The total number of tokens at each rank
+      is the same.
+    - Generate a CP degree for each sequence (under a max_cp_degree).
+    - Generate CP ranks for each CP shard of a sequence.
+    - Create metadata accordingly.
+    """
+    import rich
+    torch.manual_seed(seed)
+    ### Init dispatch plan ###
+    assert num_tokens % (max_cp_degree * seqlen_multiple) == 0
+    _num_tokens_shard = num_tokens // (max_cp_degree * seqlen_multiple)
+    seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
+    assert seq_lens.shape == (world_size, num_seqs)
+    # seq_lens = 
+    #      0,   1,   2,   3,   4,   5,  # seq id
+    # ---------------------------------------------
+    #   [206, 310,  50,  66, 134, 258], # rank 0
+    #   [156, 276, 146, 198, 116, 132], # rank 1
+    # 
+    
+    
+    # TODO: Change this to a CP destination matrix
+    #   - [src_rank]'s [seq_id]'s [slice_st, slice_ed] should go to [dst_rank] for sequence paralleism (which should include q and kv)
+    
+    # make sure each sequence is divisible by max_cp_degree.
+    seq_lens *= max_cp_degree * seqlen_multiple
+    # the CP for each sequence.
+    log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
+    cp_num = torch.pow(2, log_cp_num)
+    # cp_num = 
+    #    0, 1, 2, 3, 4, 5    # seq id
+    # ---------------------------------------------
+    #   [1, 2, 1, 1, 1, 1],  # rank 0
+    #   [1, 2, 1, 2, 2, 1],  # rank 1
+
+    # CP dst for each sequence. Masking by cp_num.
+    cp_dst_helper = torch.rand((world_size, num_seqs, world_size)).argsort(dim=2)
+    cp_dst = cp_dst_helper[:, :, :max_cp_degree]
+    assert cp_dst.shape == (world_size, num_seqs, max_cp_degree)
+    
+    breakpoint()
+    # For each (i, j), set cp_dst[i, j, cp_num[i, j]:] = -1
+    #   this masks out the things that beyond the cp shard.
+    #   but this can be generalized to any CP destination / degree.
+    mask = torch.arange(max_cp_degree).expand(world_size, num_seqs, max_cp_degree)
+    assert mask.shape == (world_size, num_seqs, max_cp_degree)
+    
+    cp_num_expanded = cp_num.unsqueeze(-1)
+    assert cp_num_expanded.shape == (world_size, num_seqs, 1)
+
+    mask = mask >= cp_num_expanded
+    cp_dst[mask] = -1
+    # 
+    # cp_dst = 
+    # 
+    #    [[[ 0, -1],
+    #      [ 1,  0],
+    #      [ 0, -1],
+    #      [ 0, -1],
+    #      [ 0, -1],
+    #      [ 1, -1]],
+    #     [[ 0, -1],
+    #      [ 0,  1],
+    #      [ 1, -1],
+    #      [ 1,  0],
+    #      [ 0,  1],
+    #      [ 1, -1]]]
+    # 
+    # Now, after the masking, 
+    #   cp_dst[src_rank, seq_id, dst_rank] == -1 --> means this dst_rank does not involve in the CP group.
+    #   cp_dst[src_rank, seq_id, dst_rank] =>  0 --> a valid dst rank that a part of the sequence will move towards.
+
+    
+    # NOTE(Ginda): Why do we need the pad_len?
+    pad_len = torch.max(cp_num.sum(dim=1))
+    # pad_len = tensor(9)
+    cp_seq_lens = torch.zeros(world_size, pad_len, dtype=torch.int64)
+    cp_query_dst = torch.ones(world_size, pad_len, dtype=torch.int64) * -1
+    cp_kv_dst = torch.ones(world_size, pad_len, max_cp_degree, dtype=torch.int64) * -1
+    cp_dst_kv_len = torch.zeros(world_size, pad_len, dtype=torch.int64) * -1
+    breakpoint()
+    for i in range(world_size):
+        cp_seq_lens_local = []
+        cp_query_dst_local = []
+        cp_kv_dst_local = []
+        cp_dst_kv_len_local = []
+
+        for j in range(num_seqs):
+            # Handle rank i's sequence j
+            # - num_cp: (scaler) number of cp group for this sequence
+            # - seq_len: (scaler) length of this sequence
+            # - seq_shard_len: (scaler) length of each cp group. 
+            # NOTE: This is where we should inject how we want to split the sequence.
+            #       We can pass in the CP sharding for balanced paralleism here!!
+            # - cp_seq_lens_local: 
+            # - cp_query_dst_local
+            # - seq_cp_dst_kv
+            # - cp_dst_kv_len_local
+            # - kv_dst_mask
+            # - seq_cp_dst_kv_tril
+            # - cp_kv_dst_local
+
+            # suppose (i, j) = (0, 1)
+            num_cp = cp_num[i, j]
+            # num_cp = tensor(2)
+            seq_len = seq_lens[i, j]
+            # seq_len = tensor(310)
+            seq_shard_len = seq_len // num_cp
+            # seq_shard_len = tensor(310) / 2 = tensor(155)
+
+            cp_seq_lens_local.append(seq_shard_len.reshape(1,).repeat(num_cp))
+            # appending item: 
+            #       tensor([155, 155])
+            cp_query_dst_local.append(cp_dst[i, j, :num_cp].flatten())
+            # appending item:
+            #       tensor([1, 0])
+            seq_cp_dst_kv = cp_dst[i, j].reshape(1, -1).repeat(num_cp, 1)
+            # seq_cp_dst_kv = 
+            #     tensor([
+            #               [1, 0],
+            #               [1, 0]
+            #            ])
+            
+            # kv total length of each CP shard.
+            # TODO: Change this so we can inject different KV lengths for the CP groups.
+            __cp_dst_kv_len_local = seq_shard_len.reshape(1,) * torch.arange(
+                1, num_cp + 1, device=seq_shard_len.device, dtype=seq_shard_len.dtype
+            )
+            # __cp_dst_kv_len_local = tensor([155, 310])
+            # 
+            # Calculate the KV length for each shard
+            # Equivalent Python native code:
+            #         unit = seq_len // num_cp
+            #         __cp_dst_kv_len_local = [ i * unit for i in range(1, num_cp + 1) ]
+            #
+            cp_dst_kv_len_local.append(__cp_dst_kv_len_local)
+
+            # triangular mask of seq_cp_dst_kv. Mask value is always 0 but we want it -1.
+            # FIXME: the following line leads to a number mismatch.
+            # NOTE(Question): Absolutely no idea why this is needed????
+            kv_dst_mask = ((
+                # keep j > i and j <= a
+                torch.arange(max_cp_degree).view(1, -1) 
+                >= torch.arange(num_cp.item()).view(-1, 1)
+            ) & (
+                # bound within the max cp degree for this sequence.
+                torch.arange(max_cp_degree).view(1, -1) < num_cp
+            ))
+            seq_cp_dst_kv_tril = (seq_cp_dst_kv + 1) * kv_dst_mask - 1
+            cp_kv_dst_local.append(seq_cp_dst_kv_tril)
+            breakpoint()
+        breakpoint()
+        
+        cp_seq_lens_local = torch.cat(cp_seq_lens_local, dim=0)
+        cp_query_dst_local = torch.cat(cp_query_dst_local, dim=0)
+        cp_kv_dst_local = torch.cat(cp_kv_dst_local, dim=0)
+        cp_dst_kv_len_local = torch.cat(cp_dst_kv_len_local, dim=0)
+        # shape check:
+        seq_shards = cp_seq_lens_local.shape[0]
+        assert cp_seq_lens_local.shape == (seq_shards,)
+        assert cp_query_dst_local.shape == (seq_shards,)
+        assert cp_kv_dst_local.shape == (seq_shards, max_cp_degree)
+        assert cp_dst_kv_len_local.shape == (seq_shards,)
+
+        cp_seq_lens[i, :seq_shards] = cp_seq_lens_local
+        cp_query_dst[i, :seq_shards] = cp_query_dst_local
+        cp_kv_dst[i, :seq_shards, :] = cp_kv_dst_local
+        cp_dst_kv_len[i, :seq_shards] = cp_dst_kv_len_local
+        breakpoint()
+
+
+    ### Init metadata ###
+    breakpoint()
+    fwd_q_metadata, rev_q_metadata = compute_metadata(cp_seq_lens, cp_query_dst)
+    fwd_kv_metadata, rev_kv_metadata = compute_metadata(cp_seq_lens, cp_kv_dst)
+
+    return (
+        fwd_q_metadata, rev_q_metadata, fwd_kv_metadata, rev_kv_metadata,
+        cp_kv_dst, cp_seq_lens, cp_query_dst, cp_dst_kv_len, seq_lens,
+    )
+
+
 def create_answer(
     fwd_q_metadata: Metadata, fwd_kv_metadata: Metadata, rev_q_metadata: Metadata, rev_kv_metadata: Metadata,
     cp_kv_dst: torch.Tensor, cp_seq_lens: torch.Tensor,
@@ -337,7 +712,7 @@ def test_qkv(
     torch.testing.assert_close(back_kv_tensor_out, back_tensor_kv_dedup.to(back_kv_tensor_out.device))
 
 
-if __name__ == "__main__":
+def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--world-size", type=int, default=4)
@@ -345,8 +720,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-cp-degree", type=int, default=4)
     parser.add_argument("--hidden-size-query", type=int, default=256)
     parser.add_argument("--hidden-size-kv", type=int, default=128)
-    parser.add_argument("--num-seqs", type=int, default=3)
+    parser.add_argument("--num-seqs", type=int, default=4)
     args = parser.parse_args()
+    import rich
+    rich.print(f"Running {__file__} with args:")
+    rich.print(args)
     ray.init()
     workers = [
         Worker.remote(i, args.world_size)
@@ -370,6 +748,23 @@ if __name__ == "__main__":
     )
     print("test done")
 
+
+def test_qkv_test_case():
+    breakpoint()
+    item = create_testcase_qkv_uneven_context_parallel(
+        seed=0,
+        world_size=2,
+        num_tokens=1024,
+        max_cp_degree=2,
+        num_seqs=6,
+        seqlen_multiple=1,
+    )
+    pass
+
+
+if __name__ == "__main__":
+    # main()
+    test_qkv_test_case()
 
 
 # if __name__ == "__main__":

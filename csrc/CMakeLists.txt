@@ -16,14 +16,48 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
-set(CMAKE_PREFIX_PATH /mnt/weka/home/yonghao.zhuang/miniconda3/envs/attn/lib/python3.12/site-packages/torch/share/cmake)
+
+if(NOT DEFINED CMAKE_PREFIX_PATH)
+    # List of potential torch paths to try in order of preference
+    set(TORCH_SEARCH_PATHS
+        /usr/local/lib/python3.12/dist-packages/torch/share/cmake
+        /mnt/weka/home/yonghao.zhuang/miniconda3/envs/attn/lib/python3.12/site-packages/torch/share/cmake
+        $ENV{TORCH_DIR}/share/cmake
+        $ENV{CONDA_PREFIX}/lib/python3.12/site-packages/torch/share/cmake
+    )
+    
+    # Try each path until we find one that exists
+    foreach(TORCH_PATH ${TORCH_SEARCH_PATHS})
+        if(EXISTS ${TORCH_PATH})
+            set(CMAKE_PREFIX_PATH ${TORCH_PATH})
+            message(STATUS "Found torch at: ${CMAKE_PREFIX_PATH}")
+            break()
+        endif()
+    endforeach()
+    
+    # If no path was found, error out
+    if(NOT DEFINED CMAKE_PREFIX_PATH)
+        message(FATAL_ERROR "Could not find torch installation. Tried paths: ${TORCH_SEARCH_PATHS}")
+    endif()
+endif()
+message(STATUS "CMAKE_PREFIX_PATH is set to: ${CMAKE_PREFIX_PATH}")
+if(NOT EXISTS ${CMAKE_PREFIX_PATH})
+    message(FATAL_ERROR "CMAKE_PREFIX_PATH does not exist: ${CMAKE_PREFIX_PATH}")
+endif()
+
+
+
 
 # Dependencies
 include(FetchContent)
 find_package(CUDAToolkit REQUIRED)
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(Torch REQUIRED)
-find_package(NVSHMEM REQUIRED HINTS /mnt/sharefs/software/DeepEP/nvshmem/lib)
+find_package(NVSHMEM REQUIRED HINTS 
+    /workspace/opt/nvshmem/lib 
+    /usr/local/nvshmem/lib 
+    $ENV{NVSHMEM_DIR}/lib
+)
 
 # Created imported target for PyTorch
 add_library(torch_imported INTERFACE)

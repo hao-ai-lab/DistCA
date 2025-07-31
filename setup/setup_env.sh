@@ -33,3 +33,10 @@ pip install -e .
 cd hopper
 python setup.py install
 cd ..
+
+# Build d2 csrc
+cd d2/csrc
+rm -rf build CMakeCache.txt
+cmake -B build -S . -G Ninja
+cmake --build build
+cd ../..
