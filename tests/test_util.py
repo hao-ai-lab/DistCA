@@ -166,6 +166,11 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
     seq_len[:, -1] -= seq_len_total_error
     return seq_len
 
+import rich
+VERBOSE = True
+def print_if_verbose(*args, **kwargs):
+    if VERBOSE:
+        rich.print(*args, **kwargs)
 
 def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int):
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
@@ -275,3 +280,118 @@ def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_
     return (
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
     )
+
+
+def create_qkv_dispatch_2cp(world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int):
+    """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
+    # init sequence
+    assert total_seq_len % (max_cp_degree) == 0
+    _num_tokens_shard = total_seq_len // (max_cp_degree)
+    seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
+    # make sure each sequence is divisible by max_cp_degree.
+    seq_lens *= max_cp_degree
+
+    # init cp degree for each sequence
+    log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
+    cp_num = torch.pow(2, log_cp_num)
+
+    # init cp send dstination.
+    cp_dst_helper = torch.rand((world_size, num_seqs, world_size)).argsort(dim=2)
+    cp_dst = cp_dst_helper[:, :, :max_cp_degree]
+    mask = torch.arange(max_cp_degree).expand(world_size, num_seqs, max_cp_degree)
+    cp_num_expanded = cp_num.unsqueeze(-1)
+    mask = mask >= cp_num_expanded
+    cp_dst[mask] = -1
+
+    # q_global_dispatch tensor:
+    num_cp_shards = cp_num.sum(dim=1)
+    pad_len = torch.max(num_cp_shards)
+    cp_seq_lens = torch.zeros(world_size, pad_len, dtype=torch.int64)
+    cp_query_dst = torch.ones(world_size, pad_len, dtype=torch.int64) * -1
+    kv_to_q_mapping = torch.ones((world_size, pad_len, max_cp_degree, 2), dtype=torch.int64) * -1
+    kv_to_q_rank = torch.ones((world_size, pad_len, max_cp_degree), dtype=torch.int64) * -1
+    kv_context_size = torch.zeros((world_size, pad_len), dtype=torch.int64)
+    num_kv_to_q = torch.zeros((world_size, pad_len), dtype=torch.int64)
+
+    # cumulative number of cp shards before this one.
+    num_cul_cp_shards = exclusive_cumsum(cp_num, dim=1)
+
+    for i in range(world_size):
+        cp_seq_lens_local = []
+        cp_query_dst_local = []
+        kv_to_q_mapping_local = []
+        kv_to_q_rank_local = []
+        kv_context_size_local = []
+        num_kv_to_q_local = []
+
+        for j in range(num_seqs):
+            num_cp = int((cp_num[i, j]).item())
+            seq_len = seq_lens[i, j]
+            seq_shard_len = seq_len // num_cp
+
+            cp_seq_lens_local.append(seq_shard_len.reshape(1,).repeat(num_cp))
+            cp_query_dst_local.append(cp_dst[i, j, :num_cp].flatten())
+            #### Compute kv_to_q_mapping.
+            row_indices = torch.arange(num_cp).view(-1, 1)
+            col_indices = torch.arange(max_cp_degree).view(1, -1)
+            mask = col_indices < (num_cp - row_indices)
+            kv_to_q_mapping_seq = torch.empty((num_cp, max_cp_degree, 2), dtype=torch.int64)
+            # All q shards are on this node (TODO: we are testing MLP-DP. For MLP-CP, this is different).
+            kv_to_q_mapping_seq[..., 0] = torch.where(mask, i, -1)
+            vals_ch1 = row_indices + col_indices + num_cul_cp_shards[i, j]
+            kv_to_q_mapping_seq[..., 1] = torch.where(mask, vals_ch1, -1)
+            kv_to_q_mapping_local.append(kv_to_q_mapping_seq)
+            #### Compute kv_to_q_rank (Index of this KV to the query's dst).
+            kv_to_q_rank_seq = torch.arange(num_cp).view(-1, 1).repeat(1, max_cp_degree) * mask + (mask.int() - 1)
+            kv_to_q_rank_local.append(kv_to_q_rank_seq)
+            #### Compute kv context size (For this kv, how many tokens are in the context).
+            kv_context_size_seq = torch.arange(num_cp) * seq_shard_len
+            kv_context_size_local.append(kv_context_size_seq)
+            #### Compute num_kv_to_q (For this kv, how many shards are in the context).
+            num_kv_to_q_seq = torch.arange(num_cp) + 1
+            num_kv_to_q_local.append(num_kv_to_q_seq)
+
+        cp_seq_lens_local = torch.cat(cp_seq_lens_local, dim=0)
+        cp_query_dst_local = torch.cat(cp_query_dst_local, dim=0)
+        kv_to_q_mapping_local = torch.cat(kv_to_q_mapping_local, dim=0)
+        kv_to_q_rank_local = torch.cat(kv_to_q_rank_local, dim=0)
+        kv_context_size_local = torch.cat(kv_context_size_local, dim=0)
+        num_kv_to_q_local = torch.cat(num_kv_to_q_local, dim=0)
+        # shape check:
+        seq_shards = cp_seq_lens_local.shape[0]
+        assert cp_seq_lens_local.shape == (seq_shards,)
+        assert cp_query_dst_local.shape == (seq_shards,)
+        assert kv_to_q_mapping_local.shape == (seq_shards, max_cp_degree, 2)
+        assert kv_to_q_rank_local.shape == (seq_shards, max_cp_degree)
+        assert kv_context_size_local.shape == (seq_shards,)
+        assert num_kv_to_q_local.shape == (seq_shards,)
+
+        cp_seq_lens[i, :seq_shards] = cp_seq_lens_local
+        cp_query_dst[i, :seq_shards] = cp_query_dst_local
+        kv_to_q_mapping[i, :seq_shards] = kv_to_q_mapping_local
+        kv_to_q_rank[i, :seq_shards] = kv_to_q_rank_local
+        kv_context_size[i, :seq_shards] = kv_context_size_local
+        num_kv_to_q[i, :seq_shards] = num_kv_to_q_local
+
+    num_total_kv_to_q = kv_context_size + cp_seq_lens
+
+    fwd_q_metadata, rev_q_metadata, intermediates = compute_metadata(
+        cp_seq_lens, cp_query_dst, return_intermediate=True
+    )
+    _, q_seq_to_dst, _ = intermediates
+    fwd_k_metadata, rev_k_metadata = compute_metadata_kv(
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size, num_kv_to_q,
+        num_total_kv_to_q, cp_seq_lens, num_cp_shards, cp_query_dst,
+        q_seq_to_dst.squeeze(2), pad_len
+    )
+    attention_metadata = compute_attn_layout_seqlens(
+        cp_seq_lens, num_total_kv_to_q, cp_query_dst
+    )
+    return (
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
+    )
+
+
+
+if __name__ == "__main__":
+    create_qkv_dispatch(world_size=4, total_seq_len=1024, num_seqs=2, max_cp_degree=8)
