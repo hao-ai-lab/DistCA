@@ -4,7 +4,7 @@ from typing import List, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from d2.runtime.inplace_metadata import Metadata, exclusive_cumsum, index_put_with_neg_padding_1d
+from d2.runtime.inplace_metadata import compute_e2e_metadata, exclusive_cumsum, index_put_with_neg_padding_1d
 
 
 @dataclass
@@ -205,7 +205,7 @@ def compute_forward_qkv_a2a_layout_meatadata(
     )
 
 
-def compute_backward_qkv_a2a_layout_metadata(
+def compute_reverse_a2a_layout_metadata(
     fwd_metadata: FastAlltoAllMetadata
 ):
     # during backward, the tensor is copied back to the original location.
@@ -236,12 +236,19 @@ def compute_backward_attn_out_a2a_layout_metadata(
     tokens_to_dst_per_dispatch_q: torch.Tensor,
     seq_to_dst_mask_q: torch.Tensor,
     recver_transfer_sz_q: torch.Tensor,
-    bytes_q: int, world_size: int,
-    seq_q_shape: torch.Size
+    num_recv_seqs_q: torch.Tensor,
+    bytes_q: int,
 ):
     """
     Unlike qkv, the backward is easier to compute. We do it first, then the forward.
     """
+    assert tokens_to_dst_per_dispatch_q.ndim == 3
+    world_size = tokens_to_dst_per_dispatch_q.shape[0]
+    max_num_send_seq = tokens_to_dst_per_dispatch_q.shape[1]
+    assert tokens_to_dst_per_dispatch_q.shape == (world_size, max_num_send_seq, world_size)
+    assert num_recv_seqs_q.shape == (world_size,)
+    seq_q_shape = (world_size, max_num_send_seq)
+
     bytes_to_dst_per_dispatch_q = tokens_to_dst_per_dispatch_q * bytes_q
     bytes_to_dst_q = bytes_to_dst_per_dispatch_q.reshape(world_size, -1, world_size).sum(dim=1)
     bytes_to_dst = bytes_to_dst_q
@@ -259,62 +266,98 @@ def compute_backward_attn_out_a2a_layout_metadata(
     )
     seq_offset_q = seq_intra_dst_rank_offset_q + sender_send_disp.unsqueeze(1)
     seq_offset_q = (seq_offset_q * seq_dispatch_mask_q).sum(dim=-1).reshape(seq_q_shape)
+    bwd_send_memcpy_metadata = (
+        tuple(t.squeeze(0) for t in torch.split(seq_offset_q, 1, dim=0)),
+    )
+
+    seq_intra_src_rank_offset_q = seq_intra_dst_rank_offset_q.permute(2, 0, 1)
+    seq_inter_src_rank_offset = exclusive_cumsum(recver_transfer_sz, dim=1)
+    seq_recv_offset_q = (
+        seq_intra_src_rank_offset_q +
+        seq_inter_src_rank_offset.unsqueeze(-1)
+    )
+
+    seq_dispatch_mask_recv_q = seq_dispatch_mask_q.permute(2, 0, 1)
+
+    seq_recv_offset_q = _filter_nonzero_by_mask(
+        seq_recv_offset_q, seq_dispatch_mask_recv_q, num_recv_seqs_q
+    )
+
+    bwd_recv_memcpy_metadata = (seq_recv_offset_q,)
+    return FastAlltoAllMetadata(
+        bwd_fa2a_metadata, bwd_send_memcpy_metadata, bwd_recv_memcpy_metadata
+    )
 
 
-# FIXME: fix below.
-def compute_a2a_layout_metadata(
-    fwd_metadata_q: Metadata, fwd_metadata_kv: Metadata,
-    hidden_size_q: int, hidden_size_kv: int, itemsize: int,
-    tokens_to_dst_per_dispatch_q: torch.Tensor,
-    tokens_to_dst_per_dispatch_kv: torch.Tensor,
-    seq_to_dst_mask_q: torch.Tensor,
-    seq_to_dst_mask_kv: torch.Tensor,
-    num_rev_seqs_q: int, num_rev_seqs_kv: int
+def compute_e2e_fa2a_metadata(
+    mlp_seq_len: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    mlp_num_seqs: torch.Tensor,
+    mlp_q_dispatch: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    kv_to_q_mapping: torch.Tensor,
+    kv_to_q_rank: torch.Tensor,
+    kv_context_size: torch.Tensor,
+    q_to_num_kv_seq: torch.Tensor,
+    q_to_num_kv_token: torch.Tensor,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    element_size: int,  # dtype's size
 ):
-    """
-    FastAlltoAll layout on both send and receive side is as:
-    | q_seq_0_rank_0, q_seq_1_rank_0 ... | k_seq_0_rank_0, ... | v_seq_0_rank_0, ...
-    | q_seq_0_rank_1, ...
-    (This enables a higher send throughput, as the data is contiguous.)
-    This function compute:
-    1. the begin offset of each sequence in this layout, on the send side;
-    2. the begin offset of each sequence in this layout, on the receive side;
-
-    NOTE: hidden_size_kv is the hidden size for tensor K or V, so there is an extra *2 factor
-    """
-    bytes_q = hidden_size_q * itemsize
-    bytes_kv = hidden_size_kv * itemsize
-
-    world_size = fwd_metadata_q.world_size
-
-    seq_mask = fwd_metadata_q.seq_len > 0
-    seq_mask_kv = fwd_metadata_kv.seq_len > 0
-    assert torch.allclose(seq_mask, seq_mask_kv)
-    assert fwd_metadata_kv.dst_rank.ndim == 3
-    assert fwd_metadata_kv.world_size == world_size
-
-    dst_rank = fwd_metadata_q.dst_rank.unsqueeze(-1)
-    dst_rank_kv = fwd_metadata_kv.dst_rank
-    assert dst_rank.ndim == 3
-
-    #### QKV Forward/backward metadata
-    qkv_fwd_metadata = compute_forward_qkv_a2a_layout_meatadata(
-        tokens_to_dst_per_dispatch_q,
-        tokens_to_dst_per_dispatch_kv,
-        seq_to_dst_mask_q,
-        seq_to_dst_mask_kv,
-        (fwd_metadata_q.num_recv_tokens * bytes_q)[:, :-1],
-        (fwd_metadata_kv.num_recv_tokens * bytes_kv)[:, :-1],
-        fwd_metadata_q.dst_offset * bytes_q,
-        fwd_metadata_kv.dst_offset * bytes_kv,
-        bytes_q, bytes_kv, world_size,
-        num_rev_seqs_q, num_rev_seqs_kv,
-        dst_rank.shape, dst_rank_kv.shape
+    (
+        fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params, intermediates
+    ) = compute_e2e_metadata(
+        mlp_seq_len, mlp_num_seqs,
+        mlp_q_dispatch,
+        kv_to_q_mapping,
+        kv_to_q_rank,
+        kv_context_size,
+        q_to_num_kv_seq,
+        q_to_num_kv_token,
+        return_intermediate=True
     )
-    qkv_bwd_metadata = compute_backward_qkv_a2a_layout_metadata(
-        qkv_fwd_metadata
+    (
+        tokens_to_dst_per_dispatch_q, q_seq_to_dst,
+        num_received_seqs_q, kv_dst_global_seq_id
+    ) = intermediates
+
+    bytes_q = element_size * hidden_size_q
+    bytes_k = element_size * hidden_size_k
+
+    recver_transfer_sz_q = (
+        fwd_metadata_q.num_recv_tokens * bytes_q
+    )[..., :-1]
+    recver_transfer_sz_kv = (
+        fwd_metadata_kv.num_recv_tokens * bytes_k
+    )[..., :-1]
+
+    num_recv_seqs_q = rev_metadata_q.num_seqs
+    num_recv_seqs_kv = rev_metadata_kv.num_seqs
+
+    num_send_tokens_kv = rev_metadata_kv.num_recv_tokens[..., :-1]
+
+    qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
+        tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
+        recver_transfer_sz_q, recver_transfer_sz_kv,
+        num_recv_seqs_q, num_recv_seqs_kv,
+        fwd_metadata_kv.dst_rank, fwd_metadata_kv.seq_len,
+        kv_dst_global_seq_id, num_send_tokens_kv,
+        bytes_q, bytes_k
     )
-
-    #### attn_out Forward/backward metadata
-
-    # now dst_offset is the offset of each sequence to copy data back
+    qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
+        qkv_fwd_fa2a_metadata,
+    )
+    attn_out_rev_fa2a_metadata = compute_backward_attn_out_a2a_layout_metadata(
+        tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
+        recver_transfer_sz_q, num_recv_seqs_q, bytes_q,
+    )
+    attn_out_fwd_fa2a_metadata = compute_reverse_a2a_layout_metadata(
+        attn_out_rev_fa2a_metadata
+    )
+    fa2a_metadata = (
+        qkv_fwd_fa2a_metadata,
+        qkv_rev_fa2a_metadata,
+        attn_out_fwd_fa2a_metadata,
+        attn_out_rev_fa2a_metadata,
+    )
+    return (
+        fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params, fa2a_metadata
+    )

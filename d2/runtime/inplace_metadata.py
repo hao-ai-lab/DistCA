@@ -520,20 +520,22 @@ def compute_e2e_metadata(
     kv_context_size: torch.Tensor,
     q_to_num_kv_seq: torch.Tensor,
     q_to_num_kv_token: torch.Tensor,
+    return_intermediate: bool = False
 ):
     """
     High level functions to compute all required metadata.
     """
-    fwd_metadata_q, rev_metadata_q, intermediates = compute_metadata(
+    fwd_metadata_q, rev_metadata_q, q_intermediates = compute_metadata(
         mlp_seq_len, mlp_q_dispatch, return_intermediate=True
     )
 
     max_num_local_seqs = mlp_q_dispatch.shape[1]
-    _, q_seq_to_dst, num_received_seqs_q = intermediates
-    fwd_metadata_kv, rev_metadata_kv = compute_metadata_kv(
+    _, q_seq_to_dst, num_received_seqs_q = q_intermediates
+    fwd_metadata_kv, rev_metadata_kv, kv_intermediates = compute_metadata_kv(
         kv_to_q_mapping, kv_to_q_rank, kv_context_size,
         q_to_num_kv_seq, q_to_num_kv_token, mlp_seq_len, mlp_num_seqs,
-        mlp_q_dispatch, q_seq_to_dst, max_num_local_seqs
+        mlp_q_dispatch, q_seq_to_dst, max_num_local_seqs,
+        return_intermediate=True
     )
 
     (
@@ -543,5 +545,9 @@ def compute_e2e_metadata(
         mlp_seq_len, q_to_num_kv_token, mlp_q_dispatch, shard_to_tuple=True
     )
     fa_params = (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-    return fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params
+
+    ret = fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params
+    if return_intermediate:
+        ret += (q_intermediates + kv_intermediates,)
+    return ret
 

@@ -6,7 +6,7 @@ from torch import Tensor
 from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.fast_alltoall_metadata import (
     compute_forward_qkv_a2a_layout_meatadata,
-    compute_backward_qkv_a2a_layout_metadata,
+    compute_reverse_a2a_layout_metadata,
     FastAlltoAllMetadata
 )
 
@@ -373,7 +373,7 @@ def test(args):
         bytes_q, bytes_k,
     )
 
-    qkv_rev_fa2a_metadata = compute_backward_qkv_a2a_layout_metadata(
+    qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
         qkv_fwd_fa2a_metadata,
     )
 
