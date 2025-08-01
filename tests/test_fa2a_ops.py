@@ -1,6 +1,3 @@
-"""
-NOTE: this is not well maintained.
-"""
 import torch
 from torch import Tensor
 

@@ -193,7 +193,10 @@ void launch_memcpy_cp_send(
   cudaStream_t stream
 ) {
   const int num_blocks = std::max(total_num_tokens / 128, 128);
-  constexpr unsigned NUM_WARPS = 10;
+  // As a kv token's hidden can be as small as 128 elements (256 Bytes)
+  // we do not need that much of threads.
+  // 256 / 16(int4 size) / 32 = 1
+  constexpr unsigned NUM_WARPS = 2;
   dim3 dimGrid(num_blocks, 1, 1);
   dim3 dimBlock(NUM_WARPS * 32, 1, 1);
   const size_t sharedMemory = 0;

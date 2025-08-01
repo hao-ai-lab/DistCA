@@ -329,6 +329,53 @@ void fast_a2a_memcpy_cp_debug(
 }
 
 
+void fast_a2a(
+  fptr_t fptr,
+  const at::Tensor &sender_send_disp_tensor,
+  const at::Tensor &sender_transfer_sz_tensor,
+  const at::Tensor &sender_recv_disp_tensor,
+  const at::Tensor &recver_transfer_sz_tensor
+) {
+  auto dispatch_helper = (FastA2aDispatchHelper*)fptr;
+  _CHECK_TENSOR(1, sender_send_disp_tensor);
+  _CHECK_TENSOR(1, sender_transfer_sz_tensor);
+  _CHECK_TENSOR(1, sender_recv_disp_tensor);
+  _CHECK_TENSOR(1, recver_transfer_sz_tensor);
+  const size_t world_size = dispatch_helper->_world_size;
+  TORCH_CHECK(sender_send_disp_tensor.size(0) == world_size,
+              "sender_send_disp must be of shape (world_size)");
+  TORCH_CHECK(sender_transfer_sz_tensor.size(0) == world_size,
+              "sender_transfer_sz must be of shape (world_size)");
+  TORCH_CHECK(sender_recv_disp_tensor.size(0) == world_size,
+              "sender_recv_disp must be of shape (world_size)");
+  TORCH_CHECK(recver_transfer_sz_tensor.size(0) == world_size,
+              "recver_transfer_sz must be of shape (world_size)");
+
+  uint64_t *sender_send_disp = sender_send_disp_tensor.data_ptr<uint64_t>();
+  uint64_t *sender_transfer_sz = sender_transfer_sz_tensor.data_ptr<uint64_t>();
+  uint64_t *sender_recv_disp = sender_recv_disp_tensor.data_ptr<uint64_t>();
+  uint64_t *recver_transfer_sz = recver_transfer_sz_tensor.data_ptr<uint64_t>();
+
+  at::cuda::OptionalCUDAGuard const device_guard(device_of(sender_send_disp_tensor));
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  internode_transfer_params_t param {
+    .sender_send_disp = sender_send_disp,
+    .sender_transfer_sz = sender_transfer_sz,
+    .sender_recv_disp = sender_recv_disp,
+    .recver_transfer_sz = recver_transfer_sz
+  };
+
+  launch_alltoallv(
+    dispatch_helper->_rank,
+    1,
+    world_size,
+    &dispatch_helper->buffer,
+    &param,
+    stream
+  );
+}
+
+
 }; // namespace
 
 
@@ -344,5 +391,6 @@ void register_all_to_all_ops(torch::Library &m) {
   m.def("fast_a2a_memcpy_non_cp_debug", &fast_a2a_memcpy_non_cp_debug);
   m.def("fast_a2a_memcpy_cp", &fast_a2a_memcpy_cp);
   m.def("fast_a2a_memcpy_cp_debug", &fast_a2a_memcpy_cp_debug);
+  m.def("fast_a2a", &fast_a2a);
 }
 }; // namespace attn
