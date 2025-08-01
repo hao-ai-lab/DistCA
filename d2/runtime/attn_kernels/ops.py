@@ -228,10 +228,28 @@ def dispatch_kv_backward(
 def fast_a2a_memcpy_non_cp(
     tensor: torch.Tensor, nvshmem_offset: torch.Tensor,
     seq_tokens: torch.Tensor, to_nvshmem: bool,
-    buffer: torch.Tensor, use_buffer: bool = False,
+    buffer: Optional[torch.Tensor]=None
 ):
+    if buffer is not None:
+        return _ops.fast_a2a_memcpy_non_cp_debug(
+            tensor, nvshmem_offset, seq_tokens, to_nvshmem, buffer
+        )
     # FIXME: pass the handle, or only use it by a dispatch helper.
     return _ops.fast_a2a_memcpy_non_cp(
-        0, tensor, nvshmem_offset, seq_tokens, to_nvshmem,
-        use_buffer, buffer
+        0, tensor, nvshmem_offset, seq_tokens, to_nvshmem
+    )
+
+
+def fast_a2a_memcpy_cp(
+    tensor: torch.Tensor, do_shard: torch.Tensor,
+    nvshmem_offset: torch.Tensor, seq_tokens: torch.Tensor,
+    to_nvshmem: bool, buffer: Optional[torch.Tensor]=None
+):
+    if buffer is not None:
+        return _ops.fast_a2a_memcpy_cp_debug(
+            tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem, buffer
+        )
+    # FIXME: pass the handle, or only use it by a dispatch helper.
+    return _ops.fast_a2a_memcpy_cp(
+        0, tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem
     )

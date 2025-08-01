@@ -48,6 +48,7 @@ def compute_forward_qkv_a2a_layout_meatadata(
     # num_recv sequences
     num_recv_seqs_q: torch.Tensor,
     num_recv_seqs_kv: torch.Tensor,
+    num_seqs: torch.Tensor,
     # kv dispatch metadata
     kv_dst_rank: torch.Tensor,  # shape (world_size, num_local_seqs, cp_degree)
     kv_seq_len: torch.Tensor,  # shape (world_size, num_local_seqs)
@@ -136,8 +137,12 @@ def compute_forward_qkv_a2a_layout_meatadata(
     seq_offset_k = (seq_offset_k * seq_dispatch_mask_kv).sum(dim=-1).reshape(seq_kv_shape_T)
     seq_offset_v = (seq_offset_v * seq_dispatch_mask_kv).sum(dim=-1).reshape(seq_kv_shape_T)
     # offset to copy each data to their destination.
+    # FIXME: trim by num_seqs.
     fwd_send_memcpy_metadata = tuple(
-        tuple(tt.squeeze(0) for tt in torch.split(t, 1, dim=0))
+        tuple(
+            tt.squeeze(0)[..., :num_seqs[i]]
+            for i, tt in enumerate(torch.split(t, 1, dim=0))
+        )
         for t in (seq_offset_q, seq_offset_k, seq_offset_v)
     )
 
@@ -331,13 +336,14 @@ def compute_e2e_fa2a_metadata(
 
     num_recv_seqs_q = rev_metadata_q.num_seqs
     num_recv_seqs_kv = rev_metadata_kv.num_seqs
+    num_seqs = fwd_metadata_q.num_seqs
 
     num_send_tokens_kv = rev_metadata_kv.num_recv_tokens[..., :-1]
 
     qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
         recver_transfer_sz_q, recver_transfer_sz_kv,
-        num_recv_seqs_q, num_recv_seqs_kv,
+        num_recv_seqs_q, num_recv_seqs_kv, num_seqs,
         fwd_metadata_kv.dst_rank, fwd_metadata_kv.seq_len,
         kv_dst_global_seq_id, num_send_tokens_kv,
         bytes_q, bytes_k

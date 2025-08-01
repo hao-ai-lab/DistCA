@@ -77,7 +77,7 @@ def simulate_fa2a_recv_copy_non_cp(
 
 def simulate_fa2a_recv_copy_kv_grad(
     k: Tensor, src_tensor: Tensor,
-    k_offset: Tensor, k_seqlen: Tensor,
+    k_offsets: Tensor, k_seqlen: Tensor,
     hidden_size_k: int, element_size: int, max_cp: int,
     send_mask: Tensor
 ):
@@ -92,7 +92,7 @@ def simulate_fa2a_recv_copy_kv_grad(
             if not send_mask[seq_id, cp_id]:
                 k_seq_offset += k_size
                 continue
-            k_offset_bytes = k_offset[cp_id, seq_id]
+            k_offset_bytes = k_offsets[cp_id, seq_id]
             k_dst_offset = k_offset_bytes // element_size
             k[cp_id, k_seq_offset:k_seq_offset + k_size] = (
                 src_tensor[k_dst_offset:k_dst_offset + k_size]
@@ -268,13 +268,12 @@ def simulate_qkv_a2a(
             (world_size, max_num_recv_tokens_k * hidden_k),
             device=k.device, dtype=k.dtype
         )
-        dst_v = dst_k.clone()
     else:
         dst_k = torch.zeros(
             (world_size, max_cp, max_num_recv_tokens_q * hidden_k),
             device=k.device, dtype=k.dtype
         )
-        dst_v = dst_k.clone()
+    dst_v = dst_k.clone()
     for rank in range(world_size):
         metadata_slice = metadata.get_slice(rank)
         q_recv_offsets, k_recv_offsets, v_recv_offsets = metadata_slice.recv_memcpy_metadata
@@ -362,12 +361,13 @@ def test(args):
     )[..., :-1]
     num_recv_seqs_q = rev_q_metadata.num_seqs
     num_recv_seqs_kv = rev_k_metadata.num_seqs
+    num_seqs_fwd = fwd_k_metadata.num_seqs
     num_send_tokens_kv = rev_k_metadata.num_recv_tokens[..., :-1]
 
     qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
         q_tokens_to_dst_per_dispatch.squeeze(2), q_seq_to_dst,
         recver_transfer_sz_q, recver_transfer_sz_kv,
-        num_recv_seqs_q, num_recv_seqs_kv,
+        num_recv_seqs_q, num_recv_seqs_kv, num_seqs_fwd,
         fwd_k_metadata.dst_rank, fwd_k_metadata.seq_len,
         kv_dst_global_seq_id, num_send_tokens_kv,
         bytes_q, bytes_k,

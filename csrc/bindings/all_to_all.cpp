@@ -191,31 +191,18 @@ void destroy_fast_a2a_dispatch_helper(fptr_t fptr) {
   delete (FastA2aDispatchHelper*)fptr;
 }
 
-void fast_a2a_memcpy_non_cp(
-  fptr_t fptr,
+
+void _fast_a2a_memcpy_non_cp_core(
   at::Tensor &tensor,
+  uint8_t *buffer_ptr,
   const at::Tensor &seq_nvshmem_offset,
   const at::Tensor &seq_tokens,
-  const bool to_nvshmem,
-  // FIXME: temporary for debug use. Remove it later.
-  const bool use_buffer,
-  at::Tensor &buffer
+  const bool to_nvshmem
 ) {
   TORCH_CHECK(tensor.ndimension() == 2, "Input tensor is of dimension (token, hidden_size)");
   const int64_t token_bytes = tensor.size(1) * tensor.element_size();
   const int64_t num_tokens = tensor.size(0);
   uint8_t *tensor_ptr = (uint8_t *)tensor.data_ptr();
-  uint8_t *buffer_ptr;
-  if (use_buffer) {
-    // This is the debug branch.
-    buffer_ptr = (uint8_t *)buffer.data_ptr();
-  } else if (to_nvshmem) {
-    // If it goes to nvshmem, then it's a send side memcpy
-    buffer_ptr = ((FastA2aDispatchHelper*)fptr)->buffer.send_buffer;
-  } else {
-    // Otherwise, it's a recv side memcpy
-    buffer_ptr = ((FastA2aDispatchHelper*)fptr)->buffer.recv_buffer;
-  }
 
   at::cuda::OptionalCUDAGuard const device_guard(device_of(tensor));
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -225,6 +212,120 @@ void fast_a2a_memcpy_non_cp(
     seq_tokens.const_data_ptr<int64_t>(),
     token_bytes, num_tokens, to_nvshmem, stream
   );
+}
+
+
+void fast_a2a_memcpy_non_cp(
+  fptr_t fptr,
+  at::Tensor &tensor,
+  const at::Tensor &seq_nvshmem_offset,
+  const at::Tensor &seq_tokens,
+  const bool to_nvshmem
+) {
+  // This is the non-buffer branch.
+  uint8_t *buffer_ptr;
+  if (to_nvshmem) {
+    // If it goes to nvshmem, then it's a send side memcpy
+    buffer_ptr = ((FastA2aDispatchHelper*)fptr)->buffer.send_buffer;
+  } else {
+    // Otherwise, it's a recv side memcpy
+    buffer_ptr = ((FastA2aDispatchHelper*)fptr)->buffer.recv_buffer;
+  }
+  _fast_a2a_memcpy_non_cp_core(tensor, buffer_ptr,
+                        seq_nvshmem_offset, seq_tokens, to_nvshmem);
+}
+
+
+void fast_a2a_memcpy_non_cp_debug(
+  at::Tensor &tensor,
+  const at::Tensor &seq_nvshmem_offset,
+  const at::Tensor &seq_tokens,
+  const bool to_nvshmem,
+  at::Tensor &buffer
+) {
+  uint8_t *buffer_ptr = (uint8_t *)buffer.data_ptr();
+  _fast_a2a_memcpy_non_cp_core(tensor, buffer_ptr,
+                        seq_nvshmem_offset, seq_tokens, to_nvshmem);
+}
+
+
+void _fast_a2a_memcpy_cp_core(
+  at::Tensor &tensor,
+  uint8_t *buffer_ptr,
+  const at::Tensor &do_shard,
+  const at::Tensor &seq_nvshmem_offset,
+  const at::Tensor &seq_tokens,
+  const bool to_nvshmem
+) {
+  if (to_nvshmem) {
+    _CHECK_TENSOR(2, tensor);
+  } else {
+    _CHECK_TENSOR(3, tensor);
+  }
+  const int64_t token_bytes = (
+    (to_nvshmem ? tensor.size(1) : tensor.size(2)) *
+    tensor.element_size()
+  );
+  const int64_t num_tokens = to_nvshmem ? tensor.size(0) : tensor.size(1);
+  const int64_t num_seq = seq_nvshmem_offset.size(1);
+  const int64_t cp_degree = seq_nvshmem_offset.size(0);
+
+  // Some shape check here
+  _CHECK_TENSOR(1, seq_tokens);
+  TORCH_CHECK(seq_tokens.size(0) == num_seq,
+              "seq_tokens must be of dimension (num_sequence)");
+  _CHECK_TENSOR(2, do_shard);
+  TORCH_CHECK((do_shard.size(0) == num_seq) && (do_shard.size(1) == cp_degree),
+              "do_shard must be of dimension (num_sequence, cp_degree)");
+
+  uint8_t *tensor_ptr = (uint8_t *)tensor.data_ptr();
+
+  at::cuda::OptionalCUDAGuard const device_guard(device_of(tensor));
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  launch_memcpy_cp_send(
+    tensor_ptr, buffer_ptr,
+    do_shard.const_data_ptr<int8_t>(),
+    seq_nvshmem_offset.const_data_ptr<int64_t>(),
+    seq_tokens.const_data_ptr<int64_t>(),
+    token_bytes, num_tokens, cp_degree, num_seq,
+    to_nvshmem, stream
+  );
+}
+
+
+void fast_a2a_memcpy_cp(
+  fptr_t fptr,
+  at::Tensor &tensor,
+  const at::Tensor &do_shard,
+  const at::Tensor &seq_nvshmem_offset,
+  const at::Tensor &seq_tokens,
+  const bool to_nvshmem
+) {
+  // This is the non-buffer branch.
+  uint8_t *buffer_ptr;
+  if (to_nvshmem) {
+    // If it goes to nvshmem, then it's a send side memcpy
+    buffer_ptr = ((FastA2aDispatchHelper*)fptr)->buffer.send_buffer;
+  } else {
+    // Otherwise, it's a recv side memcpy
+    buffer_ptr = ((FastA2aDispatchHelper*)fptr)->buffer.recv_buffer;
+  }
+  _fast_a2a_memcpy_cp_core(tensor, buffer_ptr, do_shard, seq_nvshmem_offset,
+                           seq_tokens, to_nvshmem);
+}
+
+
+void fast_a2a_memcpy_cp_debug(
+  at::Tensor &tensor,
+  const at::Tensor &do_shard,
+  const at::Tensor &seq_nvshmem_offset,
+  const at::Tensor &seq_tokens,
+  const bool to_nvshmem,
+  at::Tensor &buffer
+) {
+  uint8_t *buffer_ptr = (uint8_t *)buffer.data_ptr();
+  _fast_a2a_memcpy_cp_core(tensor, buffer_ptr, do_shard, seq_nvshmem_offset,
+                           seq_tokens, to_nvshmem);
 }
 
 
@@ -240,5 +341,8 @@ void register_all_to_all_ops(torch::Library &m) {
   m.def("create_fast_a2a_dispatch_helper", &create_fast_a2a_dispatch_helper);
   m.def("destroy_fast_a2a_dispatch_helper", &destroy_fast_a2a_dispatch_helper);
   m.def("fast_a2a_memcpy_non_cp", &fast_a2a_memcpy_non_cp);
+  m.def("fast_a2a_memcpy_non_cp_debug", &fast_a2a_memcpy_non_cp_debug);
+  m.def("fast_a2a_memcpy_cp", &fast_a2a_memcpy_cp);
+  m.def("fast_a2a_memcpy_cp_debug", &fast_a2a_memcpy_cp_debug);
 }
 }; // namespace attn

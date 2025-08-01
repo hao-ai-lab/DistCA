@@ -485,6 +485,7 @@ def compute_metadata_kv(
         recv_seq_lens=fwd_metadata.seq_len,
         num_seqs=num_seq_bwd,
         world_size=world_size,
+        num_total_recv_tokens=rev_total_recv_tokens.flatten().tolist()
     )
     if return_intermediate:
         return fwd_metadata, bwd_metadata, (
