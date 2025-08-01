@@ -34,6 +34,10 @@ int launch_alltoallv(
   uint32_t rank_n,
   struct fanout_nvshmem_buffer_t * buf,
   struct internode_transfer_params_t * inter_params,
+  // This is a simplified intranode params ("node" is just myself)
+  int64_t my_rank_send_offset,
+  int64_t my_rank_recv_offset,
+  int64_t my_rank_send_sz,
   cudaStream_t stream
 );
 

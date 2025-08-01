@@ -192,6 +192,14 @@ void destroy_fast_a2a_dispatch_helper(fptr_t fptr) {
 }
 
 
+void update_buffer_size(
+  fptr_t fptr, int64_t target_size
+) {
+  auto* dispatch_helper = (FastA2aDispatchHelper*)fptr;
+  dispatch_helper->update_buffer_size(target_size);
+}
+
+
 void _fast_a2a_memcpy_non_cp_core(
   at::Tensor &tensor,
   uint8_t *buffer_ptr,
@@ -334,7 +342,10 @@ void fast_a2a(
   const at::Tensor &sender_send_disp_tensor,
   const at::Tensor &sender_transfer_sz_tensor,
   const at::Tensor &sender_recv_disp_tensor,
-  const at::Tensor &recver_transfer_sz_tensor
+  const at::Tensor &recver_transfer_sz_tensor,
+  int64_t my_rank_send_offset,
+  int64_t my_rank_recv_offset,
+  int64_t my_rank_send_sz
 ) {
   auto dispatch_helper = (FastA2aDispatchHelper*)fptr;
   _CHECK_TENSOR(1, sender_send_disp_tensor);
@@ -371,6 +382,9 @@ void fast_a2a(
     world_size,
     &dispatch_helper->buffer,
     &param,
+    my_rank_send_offset,
+    my_rank_recv_offset,
+    my_rank_send_sz,
     stream
   );
 }
@@ -387,6 +401,7 @@ void register_all_to_all_ops(torch::Library &m) {
   m.def("set_num_sms", &set_num_sms);
   m.def("create_fast_a2a_dispatch_helper", &create_fast_a2a_dispatch_helper);
   m.def("destroy_fast_a2a_dispatch_helper", &destroy_fast_a2a_dispatch_helper);
+  m.def("fast_a2a_update_buffer_size", &update_buffer_size);
   m.def("fast_a2a_memcpy_non_cp", &fast_a2a_memcpy_non_cp);
   m.def("fast_a2a_memcpy_non_cp_debug", &fast_a2a_memcpy_non_cp_debug);
   m.def("fast_a2a_memcpy_cp", &fast_a2a_memcpy_cp);

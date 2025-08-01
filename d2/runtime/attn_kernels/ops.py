@@ -225,6 +225,37 @@ def dispatch_kv_backward(
 
 
 #### FIXME: Fast dispatch
+class FastDispatcherWrapper:
+    instance: Optional["FastDispatcherWrapper"] = None
+    def __init__(self, rank, local_rank, world_size, buffer_size):
+        self.rank = rank
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.buffer_size = buffer_size
+        self.handle = _ops.create_fast_dispatch_helper(
+            rank, local_rank, world_size, buffer_size
+        )
+
+    def __del__(self):
+        _ops.destroy_fast_dispatch_helper(self.handle)
+
+    def update_buffer_size(self, buffer_size):
+        if self.buffer_size < buffer_size:
+            _ops.fast_a2a_update_buffer_size(self.handle, buffer_size)
+            self.buffer_size = buffer_size
+
+    @staticmethod
+    def init(
+        rank: int, local_rank: int, world_size: int, buffer_size: int,
+        uid: torch.Tensor
+    ):
+        # NOTE: local_rank here is currently disabled, because we don't
+        # consider intra-rank communication here.
+        nvshmem_init(uid, rank, world_size, local_rank)
+        FastDispatcherWrapper.instance = FastDispatcherWrapper(
+            rank, local_rank, world_size, buffer_size
+        )
+
 def fast_a2a_memcpy_non_cp(
     tensor: torch.Tensor, nvshmem_offset: torch.Tensor,
     seq_tokens: torch.Tensor, to_nvshmem: bool,
