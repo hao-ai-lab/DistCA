@@ -266,9 +266,9 @@ void _fast_a2a_memcpy_cp_core(
     (to_nvshmem ? tensor.size(1) : tensor.size(2)) *
     tensor.element_size()
   );
-  const int64_t num_tokens = to_nvshmem ? tensor.size(0) : tensor.size(1);
+  const int32_t num_tokens = to_nvshmem ? tensor.size(0) : tensor.size(1);
   const int64_t num_seq = seq_nvshmem_offset.size(1);
-  const int64_t cp_degree = seq_nvshmem_offset.size(0);
+  const int32_t cp_degree = seq_nvshmem_offset.size(0);
 
   // Some shape check here
   _CHECK_TENSOR(1, seq_tokens);

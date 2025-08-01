@@ -144,8 +144,15 @@ void launch_memcpy_non_cp(
   const bool to_nvshmem,
   cudaStream_t stream
 ) {
-  const int num_blocks = std::max(total_num_tokens / 128, 128);
-  constexpr unsigned NUM_WARPS = 10;
+  const int num_blocks = std::max(total_num_tokens / 32, 128);
+  constexpr int WARP_SIZE = 32;
+  int NUM_WARPS = std::min(
+    10,  // at most 10 warps
+    std::max( // at least one warp. at most each thread only transfer one int4
+      1, (int)(token_bytes / sizeof(int4) / WARP_SIZE)
+    )
+  );
+
   dim3 dimGrid(num_blocks, 1, 1);
   dim3 dimBlock(NUM_WARPS * 32, 1, 1);
   const size_t sharedMemory = 0;
@@ -187,18 +194,24 @@ void launch_memcpy_cp_send(
   const int64_t *seq_tokens,
   const int64_t token_bytes,
   const int32_t total_num_tokens,
-  const int64_t max_num_cp,
+  const int32_t max_num_cp,
   const int64_t num_seq,
   const bool to_nvshmem,
   cudaStream_t stream
 ) {
-  const int num_blocks = std::max(total_num_tokens / 128, 128);
+  const int num_blocks = std::max(total_num_tokens * max_num_cp / 32, 128);
   // As a kv token's hidden can be as small as 128 elements (256 Bytes)
   // we do not need that much of threads.
   // 256 / 16(int4 size) / 32 = 1
-  constexpr unsigned NUM_WARPS = 2;
+  constexpr int WARP_SIZE = 32;
+  int NUM_WARPS = std::min(
+    10,  // at most 10 warps
+    std::max( // at least one warp. at most each thread only transfer one int4
+      1, (int)(token_bytes / sizeof(int4) / WARP_SIZE)
+    )
+  );
   dim3 dimGrid(num_blocks, 1, 1);
-  dim3 dimBlock(NUM_WARPS * 32, 1, 1);
+  dim3 dimBlock(NUM_WARPS * WARP_SIZE, 1, 1);
   const size_t sharedMemory = 0;
 
   void *args[] = {
@@ -209,7 +222,7 @@ void launch_memcpy_cp_send(
     const_cast<int64_t **>(&seq_tokens),
     const_cast<int64_t *>(&token_bytes),
     const_cast<int32_t *>(&total_num_tokens),
-    const_cast<int64_t *>(&max_num_cp),
+    const_cast<int32_t *>(&max_num_cp),
     const_cast<int64_t *>(&num_seq)
   };
   if (to_nvshmem) {
