@@ -10,6 +10,7 @@ from d2.runtime.fast_alltoall_metadata import (
     FastAlltoAllMetadata
 )
 
+from test_comm_metadata import orchestrate_simulate
 from test_util import create_qkv_dispatch
 
 
@@ -32,7 +33,7 @@ def simulate_fa2a_send_copy_non_cp(
 
 def simulate_fa2a_send_copy_cp(
     k: Tensor, dst_tensor: Tensor,
-    k_offset: Tensor, k_seqlen: Tensor,
+    k_offsets: Tensor, k_seqlen: Tensor,
     hidden_size_k: int, element_size: int, max_cp: int,
     send_dst: Tensor
 ):
@@ -41,15 +42,14 @@ def simulate_fa2a_send_copy_cp(
     MLP layout (CP) is in form of: (seq_len,), but has multiple copies
     to the a2a layout.
     """
-    k_offset = 0
     for cp_id in range(max_cp):
         k_seq_offset = 0
         for seq_id, seq_len in enumerate(k_seqlen):
             k_size = seq_len * hidden_size_k
-            if send_dst[cp_id, seq_id] >= 0:
+            if send_dst[seq_id, cp_id] >= 0:
                 k_seq_offset += k_size
                 continue
-            k_offset_bytes = k_offset[cp_id, seq_id]
+            k_offset_bytes = k_offsets[seq_id, cp_id]
             k_dst_offset = k_offset_bytes // element_size
             dst_tensor[k_dst_offset:k_dst_offset + k_size] = (
                 k[k_seq_offset:k_seq_offset + k_size]
@@ -109,9 +109,6 @@ def simulate_fa2a_send_qkv_copy(
     hidden_size_q: int, hidden_size_k: int, element_size: int, max_cp: int,
     kv_send_dst: Tensor,
 ):
-    q = q.view(-1)
-    k = k.view(-1)
-    v = v.view(-1)
     dst_tensor = simulate_fa2a_send_copy_non_cp(
         q, dst_tensor, q_offset, q_seqlen, hidden_size_q, element_size
     )
@@ -132,9 +129,6 @@ def simulate_fa2a_recv_copy_qkv(
     q_seqlen: Tensor, k_seqlen: Tensor,
     hidden_size_q: int, hidden_size_k: int, element_size: int
 ):
-    q = q.view(-1)
-    k = k.view(-1)
-    v = v.view(-1)
     q = simulate_fa2a_recv_copy_non_cp(
         q, src_tensor, q_offset, q_seqlen, hidden_size_q, element_size
     )
@@ -168,6 +162,7 @@ def simulate_qkv_a2a_fwd(
     q: Tensor, k: Tensor, v: Tensor,
     metadata: FastAlltoAllMetadata,
     q_metadata: Metadata, kv_metadata: Metadata,
+    rev_seqlen_q: Tensor, rev_seqlen_kv: Tensor,
     element_size: int, hidden_q: int, hidden_k: int
 ):
     world_size = q.shape[0]
@@ -178,6 +173,9 @@ def simulate_qkv_a2a_fwd(
     max_send_bytes = int(torch.max(tot_send_bytes).item())
     tot_recv_bytes = metadata.fa2a_metadata[3].sum(dim=1) // element_size
     max_recv_bytes = int(torch.max(tot_recv_bytes).item())
+
+    # Flatten the tensors
+    q, k, v = (t.flatten(start_dim=1) for t in (q, k, v))
 
     src_buffer = torch.zeros(
         (world_size, max_send_bytes), dtype=q.dtype, device=q.device
@@ -224,14 +222,104 @@ def simulate_qkv_a2a_fwd(
         q_metadata_slice = q_metadata.get_slice(rank)
         kv_metadata_slice = kv_metadata.get_slice(rank)
         q_recv_offsets, k_recv_offsets, v_recv_offsets = metadata_slice.recv_memcpy_metadata
+        assert all(t.ndim == 1 for t in (q_recv_offsets, k_recv_offsets, v_recv_offsets))
         max_cp = kv_metadata_slice.dst_rank.shape[1]
 
         q_slice, k_slice, v_slice = simulate_fa2a_recv_copy_qkv(
             dst_q[rank], dst_k[rank], dst_v[rank],
             dst_buffer[rank], q_recv_offsets, k_recv_offsets, v_recv_offsets,
-            recv_seq_lens_q, recv_seq_lens_kv,
+            rev_seqlen_q[rank], rev_seqlen_kv[rank],
             hidden_q, hidden_k, element_size
         )
         dst_q[rank] = q_slice
         dst_k[rank] = k_slice
         dst_v[rank] = v_slice
+    dst_q = dst_q.reshape(world_size, -1, hidden_q)
+    dst_k = dst_k.reshape(world_size, -1, hidden_k)
+    dst_v = dst_v.reshape(world_size, -1, hidden_k)
+    return dst_q, dst_k, dst_v
+
+
+def test(args):
+    world_size = args.world_size
+    num_seqs = args.num_seqs
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    hidden_size_q = args.hidden_size_q
+    hidden_size_k = args.hidden_size_k
+    total_seq_len = args.num_tokens
+    max_cp_degree: int = args.max_seq_shard
+    torch.manual_seed(args.seed)
+    (fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+     _, intermediates
+     ) = create_qkv_dispatch(
+        world_size, total_seq_len, num_seqs, max_cp_degree, return_intermediate=True
+    )
+
+    tensor_q = torch.rand((world_size, total_seq_len, hidden_size_q), device=device) + 1    # + 1 to avoid zeros
+    tensor_k = torch.rand((world_size, total_seq_len, hidden_size_k), device=device) + 1
+    tensor_v = torch.rand((world_size, total_seq_len, hidden_size_k), device=device) + 1
+    max_recv_tokens_q = int(fwd_q_metadata.num_recv_tokens.max().item())
+    max_recv_tokens_k = int(fwd_k_metadata.num_recv_tokens.max().item())
+    output_tensor_q = torch.zeros((world_size, max_recv_tokens_q, hidden_size_q),
+                                device=device, dtype=tensor_q.dtype)
+    output_tensor_k = torch.zeros((world_size, max_recv_tokens_k, hidden_size_k),
+                                device=device, dtype=tensor_k.dtype)
+    output_tensor_v = output_tensor_k.clone()
+
+    # ground truth.
+    output_tensor_q = orchestrate_simulate(tensor_q, output_tensor_q, fwd_q_metadata)
+    output_tensor_k = orchestrate_simulate(tensor_k, output_tensor_k, fwd_k_metadata)
+    output_tensor_v = orchestrate_simulate(tensor_v, output_tensor_v, fwd_k_metadata)
+    print("correct answer done.")
+
+    (q_tokens_to_dst_per_dispatch, q_seq_to_dst,
+     _, kv_dst_global_seq_id) = intermediates
+    element_size = 1
+    bytes_q = element_size * hidden_size_q
+    bytes_k = element_size * hidden_size_k
+    recver_transfer_sz_q = (
+        fwd_q_metadata.num_recv_tokens * bytes_q
+    )[..., :-1]
+    recver_transfer_sz_kv = (
+        fwd_k_metadata.num_recv_tokens * bytes_k
+    )[..., :-1]
+    num_recv_seqs_q = rev_q_metadata.num_seqs
+    num_recv_seqs_kv = rev_k_metadata.num_seqs
+    num_send_tokens_kv = rev_k_metadata.num_recv_tokens[..., :-1]
+
+    qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
+        q_tokens_to_dst_per_dispatch.squeeze(2), q_seq_to_dst,
+        recver_transfer_sz_q, recver_transfer_sz_kv,
+        num_recv_seqs_q, num_recv_seqs_kv,
+        fwd_k_metadata.dst_rank, fwd_k_metadata.seq_len,
+        kv_dst_global_seq_id, num_send_tokens_kv,
+        bytes_q, bytes_k,
+    )
+    qkv_rev_fa2a_metadata = compute_backward_qkv_a2a_layout_metadata(
+        qkv_fwd_fa2a_metadata,
+    )
+
+    fa2a_q, fa2a_k, fa2a_v = simulate_qkv_a2a_fwd(
+        tensor_q, tensor_k, tensor_v,
+        qkv_fwd_fa2a_metadata, fwd_q_metadata, fwd_k_metadata,
+        rev_q_metadata.seq_len, rev_k_metadata.seq_len,
+        element_size, hidden_size_q, hidden_size_k
+    )
+    torch.testing.assert_close(output_tensor_q, fa2a_q)
+    torch.testing.assert_close(output_tensor_k, fa2a_k)
+    torch.testing.assert_close(output_tensor_v, fa2a_v)
+    print("pass forward send qkv")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--world_size', type=int, default=2)
+    parser.add_argument('--num_seqs', type=int, default=3)
+    parser.add_argument('--num_tokens', type=int, default=16)
+    parser.add_argument('--hidden_size_q', type=int, default=4)
+    parser.add_argument('--hidden_size_k', type=int, default=2)
+    parser.add_argument('--max_seq_shard', type=int, default=2)
+    parser.add_argument('--seed', type=int, default=0)
+    args = parser.parse_args()
+    test(args)

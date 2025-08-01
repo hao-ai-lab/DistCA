@@ -53,8 +53,7 @@ def compute_forward_qkv_a2a_layout_meatadata(
     kv_seq_len: torch.Tensor,  # shape (world_size, num_local_seqs)
     kv_dst_global_seq_id: torch.Tensor,  # shape (world_size, num_local_seqs, cp_degree)
     num_send_tokens_kv: torch.Tensor,
-    bytes_q: int, bytes_kv: int, world_size: int,
-    seq_q_shape: torch.Size, seq_kv_shape: torch.Size,
+    bytes_q: int, bytes_kv: int,
 ):
     """
     Returns:
@@ -63,6 +62,7 @@ def compute_forward_qkv_a2a_layout_meatadata(
     3. fwd_recv_memcpy_metadata: metadata for memcpy on the receiver side.
     """
     assert tokens_to_dst_per_dispatch_q.ndim == 3
+    world_size = tokens_to_dst_per_dispatch_q.shape[0]
     max_num_send_seq = tokens_to_dst_per_dispatch_q.shape[1]
     assert tokens_to_dst_per_dispatch_q.shape == (world_size, max_num_send_seq, world_size)
     assert kv_dst_rank.ndim == 3
@@ -72,8 +72,8 @@ def compute_forward_qkv_a2a_layout_meatadata(
     assert kv_dst_global_seq_id.shape == (world_size, max_num_send_seq, max_cp_degree)
     assert num_recv_seqs_q.shape == (world_size,)
     assert num_recv_seqs_kv.shape == (world_size,)
-    assert seq_q_shape == (world_size, max_num_send_seq)
-    assert seq_kv_shape == (world_size, max_num_send_seq, max_cp_degree)
+    seq_q_shape = (world_size, max_num_send_seq)
+    seq_kv_shape_T = (world_size, max_cp_degree, max_num_send_seq)
 
     # For each sequence, the bytes to copy to the destination.
     # shape: (world_size, max_num_local_seqs, max_cp_degree, world_size)
@@ -89,6 +89,7 @@ def compute_forward_qkv_a2a_layout_meatadata(
     dst_per_dispatch_kv = F.one_hot(
         kv_dst_rank + 1, num_classes=world_size + 1
     )[..., 1:].permute(0, 2, 1, 3)
+    # NOTE: sequence index here is (cp_id, seq_id)
     seq_dispatch_mask_kv = dst_per_dispatch_kv.reshape(world_size, -1, world_size)
     bytes_to_dst_per_dispatch_kv = (
         dst_per_dispatch_kv * kv_seq_len.view(world_size, 1, -1, 1) * bytes_kv
@@ -109,8 +110,12 @@ def compute_forward_qkv_a2a_layout_meatadata(
     # sequence index on the sender side.
     # shape: (world_size, max_num_local_seqs, world_size)
     seq_dispatch_mask_q = seq_to_dst_mask_q.reshape(world_size, -1, world_size).bool()
-    # seq_dispatch_mask_kv = seq_to_dst_mask_kv.reshape(world_size, -1, world_size).bool()
-    # [i][k][j]: at rank i, the dispatch k's intra-recv-rank offset (rank j).
+
+    # intra_dst_rank_offset [src][k][dst]: at rank src, the dispatch k's intra-recv-rank offset (rank dst).
+    # rank i: | send to rank 0 | send to rank 1 | ... 
+    #         | send to rank j: seq j0, seq j1, seq j2, ... |
+    # for seq j2, this offset equals size(seq j0) + size(seq j1)
+    # sequence index here is (cp_id, seq_id)
     seq_intra_dst_rank_offset_q = exclusive_cumsum(
         bytes_to_dst_per_dispatch_q.reshape(world_size, -1, world_size), dim=1
     )
@@ -123,24 +128,38 @@ def compute_forward_qkv_a2a_layout_meatadata(
     # the same looping logic applies to recv memcpy as well.
 
     # NOTE: this does not compress padding values.
+    # shape (src_rank, cp_degree * num_local_seqs, dst_rank(onehot))
     seq_offset_k = seq_intra_dst_rank_offset_kv + (sender_send_disp + bytes_to_dst_q).unsqueeze(1)
     seq_offset_v = seq_intra_dst_rank_offset_kv + (sender_send_disp + bytes_to_dst_q + bytes_to_dst_kv).unsqueeze(1)
+    # shrink the dst_rank dimension (one_hot, so add after mask)
     seq_offset_q = (seq_offset_q * seq_dispatch_mask_q).sum(dim=-1).reshape(seq_q_shape)
-    seq_offset_k = (seq_offset_k * seq_dispatch_mask_kv).sum(dim=-1).reshape(seq_kv_shape)
-    seq_offset_v = (seq_offset_v * seq_dispatch_mask_kv).sum(dim=-1).reshape(seq_kv_shape)
+    seq_offset_k = (seq_offset_k * seq_dispatch_mask_kv).sum(dim=-1).reshape(seq_kv_shape_T)
+    seq_offset_v = (seq_offset_v * seq_dispatch_mask_kv).sum(dim=-1).reshape(seq_kv_shape_T)
     # offset to copy each data to their destination.
     fwd_send_memcpy_metadata = tuple(
-        torch.split(t, 1, dim=0) for t in (seq_offset_q, seq_offset_k, seq_offset_v)
+        tuple(tt.squeeze(0) for tt in torch.split(t, 1, dim=0))
+        for t in (seq_offset_q, seq_offset_k, seq_offset_v)
     )
 
     #### Forward layout transfer metadata - Receiver side
-    # [i][k][j]: at rank i, for all tensors coming from j, the dispatch k's offset on the attention receiver buffer.
+    # [dst][src][k]: at rank dst, for all tensors coming from src,
+    # the dispatch k's intra-src-rank offset on the attention receiver buffer.
+    # rank i: | recv from rank 0 | recv from rank 1 | ... 
+    #         | recv from rank j: seq j0, seq j1, seq j2, ... |
+    # for seq j2, this offset equals size(seq j0) + size(seq j1)
     seq_intra_src_rank_offset_q = seq_intra_dst_rank_offset_q.permute(2, 0, 1)
     seq_intra_src_rank_offset_kv = seq_intra_dst_rank_offset_kv.permute(2, 0, 1)
-    seq_recv_offset_q = seq_intra_src_rank_offset_q + recver_transfer_sz.unsqueeze(-1)
-    # shape (world_size, max_num_local_seqs * max_cp_degree, world_size)
-    seq_recv_offset_k = seq_intra_src_rank_offset_kv + (recver_transfer_sz + recver_transfer_sz_q).unsqueeze(-1)
-    seq_recv_offset_v = seq_intra_src_rank_offset_kv + (recver_transfer_sz + recver_transfer_sz_q + recver_transfer_sz_kv).unsqueeze(-1)
+    seq_inter_src_rank_offset = exclusive_cumsum(recver_transfer_sz, dim=1)
+    seq_recv_offset_q = (
+        seq_intra_src_rank_offset_q +
+        seq_inter_src_rank_offset.unsqueeze(-1)
+    )
+    # shape (world_size(onehot), world_size, max_num_local_seqs * max_cp_degree)
+    seq_recv_offset_k = seq_intra_src_rank_offset_kv + (
+        seq_inter_src_rank_offset + recver_transfer_sz_q).unsqueeze(-1)
+    seq_recv_offset_v = seq_intra_src_rank_offset_kv + (
+        seq_inter_src_rank_offset + recver_transfer_sz_q + recver_transfer_sz_kv
+    ).unsqueeze(-1)
 
     seq_dispatch_mask_recv_q = seq_dispatch_mask_q.permute(2, 0, 1)
     seq_dispatch_mask_recv_kv = seq_dispatch_mask_kv.permute(2, 0, 1)
@@ -148,14 +167,14 @@ def compute_forward_qkv_a2a_layout_meatadata(
     seq_recv_offset_q = _filter_nonzero_by_mask(
         seq_recv_offset_q, seq_dispatch_mask_recv_q, num_recv_seqs_q
     )
-    # NOTE: for q, this order is the same as the final output sequence order. (i.e. the (src_rank, seq_id) order)
-    # However, for kv, this is not the order we need. The current order is (world_id, cp_id, seq_id),
+    # NOTE: for q, this order is the same as the final output sequence order. (i.e. the (dst_rank, (src_rank, seq_id)) order)
+    # However, for kv, this is not the order we need. The current order is (world_id, cp_id, seq_id) on the src side,
     # we should pick it by the correct order using kv_dst_seq_id
     # shape: (world_size, cp_degree * num_recv_seqs_kv)
-    seq_recv_offset_k = (seq_recv_offset_k * seq_dispatch_mask_recv_kv).sum(dim=-1)
-    seq_recv_offset_v = (seq_recv_offset_v * seq_dispatch_mask_recv_kv).sum(dim=-1)
+    seq_recv_offset_k = (seq_recv_offset_k * seq_dispatch_mask_recv_kv).sum(dim=0)
+    seq_recv_offset_v = (seq_recv_offset_v * seq_dispatch_mask_recv_kv).sum(dim=0)
 
-    max_num_recv_seqs_kv = num_recv_seqs_kv.max().item()
+    max_num_recv_seqs_kv = int(num_recv_seqs_kv.max().item())
     kv_dst_global_seq_id_cp_sq = kv_dst_global_seq_id.permute(0, 2, 1)
     seq_recv_offset_k_compact = torch.zeros(
         (world_size, max_num_recv_seqs_kv),
@@ -165,13 +184,13 @@ def compute_forward_qkv_a2a_layout_meatadata(
     seq_recv_offset_v_compact = seq_recv_offset_k_compact.clone()
     # recv_offset_k.flatten()[i] <= kv_dst_global_seq_id_cp_sq[]
     seq_recv_offset_k_compact = index_put_with_neg_padding_1d(
-        seq_recv_offset_k_compact, kv_dst_global_seq_id_cp_sq, seq_recv_offset_k
+        seq_recv_offset_k_compact, seq_recv_offset_k, kv_dst_global_seq_id_cp_sq
     )
     seq_recv_offset_k_compact = tuple(
         seq_recv_offset_k_compact[rank, :num_recv_seqs_kv[rank]] for rank in range(world_size)
     )
     seq_recv_offset_v_compact = index_put_with_neg_padding_1d(
-        seq_recv_offset_v_compact, kv_dst_global_seq_id_cp_sq, seq_recv_offset_v
+        seq_recv_offset_v_compact, seq_recv_offset_v, kv_dst_global_seq_id_cp_sq
     )
     seq_recv_offset_v_compact = tuple(
         seq_recv_offset_v_compact[rank, :num_recv_seqs_kv[rank]] for rank in range(world_size)
@@ -193,7 +212,7 @@ def compute_backward_qkv_a2a_layout_metadata(
     send_memcpy_metadata = fwd_metadata.recv_memcpy_metadata
     recv_memcpy_metadata = fwd_metadata.send_memcpy_metadata
     # the tensor is sent back to the original location
-    fwd_sender_send_disp, fwd_sender_transfer_sz, fwd_sender_recv_disp, fwd_recver_transfer_sz = send_memcpy_metadata
+    fwd_sender_send_disp, fwd_sender_transfer_sz, fwd_sender_recv_disp, fwd_recver_transfer_sz = fwd_metadata.fa2a_metadata
 
     # fwd bytes received from each rank -> bwd bytes sent to each rank
     bwd_sender_transfer_sz = fwd_recver_transfer_sz
@@ -242,6 +261,7 @@ def compute_backward_attn_out_a2a_layout_metadata(
     seq_offset_q = (seq_offset_q * seq_dispatch_mask_q).sum(dim=-1).reshape(seq_q_shape)
 
 
+# FIXME: fix below.
 def compute_a2a_layout_metadata(
     fwd_metadata_q: Metadata, fwd_metadata_kv: Metadata,
     hidden_size_q: int, hidden_size_kv: int, itemsize: int,

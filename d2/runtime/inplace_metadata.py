@@ -125,7 +125,7 @@ def compute_metadata(
     seq_len: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
     global_dispatch: torch.Tensor,  # shape of (world_size, max_num_local_seqs, max_cp_degree)
     return_intermediate: bool = False,
-) -> Tuple[Metadata, Metadata]:
+):
     """
     Given a dispatch plan, this function assigns the query tensor's attention layout.
     Args:
@@ -347,6 +347,7 @@ def compute_metadata_kv(
     q_dispatch: torch.Tensor,
     q_seq_to_dst: torch.Tensor,
     max_num_local_seqs: int,
+    return_intermediate: bool=False
 ):
     """
     Given the query's dispatch plan and a mapping from key-value to query,
@@ -470,6 +471,10 @@ def compute_metadata_kv(
     )
     # num_token_to_dst is the forward size tokens sent to the dst, which equals token received during backward.
     rev_kv_num_recv_tokens = num_send_tokens
+    rev_total_recv_tokens = rev_kv_num_recv_tokens.sum(dim=1, keepdim=True)
+    rev_kv_num_recv_tokens = torch.cat(
+        [rev_kv_num_recv_tokens, rev_total_recv_tokens], dim=1
+    )
 
     bwd_metadata = Metadata(
         rev_kv_dst_rank,
@@ -481,6 +486,10 @@ def compute_metadata_kv(
         num_seqs=num_seq_bwd,
         world_size=world_size,
     )
+    if return_intermediate:
+        return fwd_metadata, bwd_metadata, (
+            kv_dst_global_seq_id,
+        )
     return fwd_metadata, bwd_metadata
 
 
