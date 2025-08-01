@@ -6,6 +6,7 @@ from d2.runtime.fast_alltoall_metadata import (
     compute_forward_qkv_a2a_layout_meatadata,
     compute_reverse_a2a_layout_metadata,
     SeqLens,
+    LogicalShape,
     FastAlltoAllMetadata
 )
 
@@ -67,6 +68,10 @@ def test(args):
         SeqLens.get_seqlens(fwd_q_metadata, rev_q_metadata),
         SeqLens.get_seqlens(fwd_k_metadata, rev_k_metadata)
     ]
+    tensor_shape = [
+        LogicalShape.get_shape(fwd_q_metadata, hidden_size_q, total_seq_len),
+        LogicalShape.get_shape(fwd_k_metadata, hidden_size_k, total_seq_len),
+    ]
 
     qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
         q_tokens_to_dst_per_dispatch.squeeze(2), q_seq_to_dst,
@@ -74,7 +79,7 @@ def test(args):
         num_recv_seqs_q, num_recv_seqs_kv, num_seqs_fwd,
         fwd_k_metadata.dst_rank, fwd_k_metadata.seq_len,
         kv_dst_global_seq_id, num_send_tokens_kv,
-        bytes_q, bytes_k, seq_lens
+        bytes_q, bytes_k, seq_lens, tensor_shape
     )
 
     qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(

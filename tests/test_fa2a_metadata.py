@@ -8,6 +8,7 @@ from d2.runtime.fast_alltoall_metadata import (
     compute_forward_qkv_a2a_layout_meatadata,
     compute_reverse_a2a_layout_metadata,
     SeqLens,
+    LogicalShape,
     FastAlltoAllMetadata
 )
 
@@ -238,6 +239,8 @@ def simulate_qkv_a2a(
         q_src_offsets, k_src_offsets, v_src_offsets = metadata_slice.send_memcpy_metadata
         q_src_seqlen = get_seq_len_slice(fwd_q_metadata, rank)
         kv_src_seqlen = get_seq_len_slice(fwd_kv_metadata, rank)
+        torch.testing.assert_close(q_src_seqlen, metadata_slice.seq_lens[0].send_seqlens)
+        torch.testing.assert_close(kv_src_seqlen, metadata_slice.seq_lens[1].send_seqlens)
 
         args = (
             q[rank], k[rank], v[rank], src_buffer[rank],
@@ -278,8 +281,20 @@ def simulate_qkv_a2a(
     for rank in range(world_size):
         metadata_slice = metadata.get_slice(rank)
         q_recv_offsets, k_recv_offsets, v_recv_offsets = metadata_slice.recv_memcpy_metadata
+
         rev_seqlen_q = get_seq_len_slice(rev_q_metadata, rank)
         rev_seqlen_kv = get_seq_len_slice(rev_kv_metadata, rank)
+
+        if is_fwd:
+            expected_shape_q = (num_recv_tokens_q[rank], hidden_q)
+            expected_shape_k = (num_recv_tokens_k[rank], hidden_k)
+        else:
+            expected_shape_q = (max_num_recv_tokens_q, hidden_q)
+            expected_shape_k = (max_cp, max_num_recv_tokens_q, hidden_k)
+        assert expected_shape_q == metadata_slice.tensor_shape[0].recv_shape
+        assert expected_shape_k == metadata_slice.tensor_shape[1].recv_shape, f"{rank} {expected_shape_k} != {metadata_slice.tensor_shape[1].recv_shape}"
+        torch.testing.assert_close(rev_seqlen_q, metadata_slice.seq_lens[0].recv_seqlens)
+        torch.testing.assert_close(rev_seqlen_kv, metadata_slice.seq_lens[1].recv_seqlens)
 
         args = (
             dst_q[rank], dst_k[rank], dst_v[rank],
@@ -368,6 +383,10 @@ def test(args):
         SeqLens.get_seqlens(fwd_q_metadata, rev_q_metadata),
         SeqLens.get_seqlens(fwd_k_metadata, rev_k_metadata)
     ]
+    tensor_shape = [
+        LogicalShape.get_shape(fwd_q_metadata, hidden_size_q, total_seq_len),
+        LogicalShape.get_shape(fwd_k_metadata, hidden_size_k, total_seq_len),
+    ]
 
     qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
         q_tokens_to_dst_per_dispatch.squeeze(2), q_seq_to_dst,
@@ -375,7 +394,7 @@ def test(args):
         num_recv_seqs_q, num_recv_seqs_kv, num_seqs_fwd,
         fwd_k_metadata.dst_rank, fwd_k_metadata.seq_len,
         kv_dst_global_seq_id, num_send_tokens_kv,
-        bytes_q, bytes_k, seq_lens
+        bytes_q, bytes_k, seq_lens, tensor_shape
     )
 
     qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(

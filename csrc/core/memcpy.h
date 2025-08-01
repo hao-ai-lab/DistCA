@@ -21,7 +21,7 @@ void launch_memcpy_cp_send(
   const int64_t *seq_tokens,
   const int64_t token_bytes,
   const int32_t total_num_tokens,
-  const int64_t max_num_cp,
+  const int32_t max_num_cp,
   const int64_t num_seq,
   const bool to_nvshmem,
   cudaStream_t stream

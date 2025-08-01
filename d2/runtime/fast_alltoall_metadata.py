@@ -25,8 +25,7 @@ class SeqLens:
 
     def get_slice(self, rank):
         return SeqLens(
-            self.send_seqlens[rank],
-            self.recv_seqlens[rank],
+            self.send_seqlens[rank], self.recv_seqlens[rank],
         )
 
     @staticmethod
@@ -43,7 +42,50 @@ class SeqLens:
 
 
 @dataclass
+class LogicalShape:
+    """
+    Logical shape for input and output tensors. By logical,
+    KV send shape is (cp_degree, num_tokens, hidden_size);
+    Other tensors have the same shape as physical shape.
+    """
+    send_shape: Union[torch.Size, Sequence[torch.Size]]
+    recv_shape: Union[torch.Size, Sequence[torch.Size]]
+    def get_slice(self, rank):
+        return LogicalShape(
+            self.send_shape[rank], self.recv_shape[rank],
+        )
+
+    @staticmethod
+    def get_shape(
+        mlp_to_attn_metadata: Metadata, hidden_size: int,
+        mlp_num_tokens: int
+    ):
+        world_size = mlp_to_attn_metadata.world_size
+        assert mlp_to_attn_metadata.dst_rank.shape[0] == world_size
+        if mlp_to_attn_metadata.dst_rank.ndim == 2:
+            token_layout = (mlp_num_tokens,)
+        else:
+            assert mlp_to_attn_metadata.dst_rank.ndim == 3
+            max_cp = mlp_to_attn_metadata.dst_rank.shape[2]
+            token_layout = (max_cp, mlp_num_tokens)
+
+        send_shape = tuple(
+            token_layout + (hidden_size,)
+            for _ in range(world_size)
+        )
+        recv_shape = tuple(
+            (nt, hidden_size)
+            for nt in mlp_to_attn_metadata.num_total_recv_tokens
+        )
+        return LogicalShape(send_shape, recv_shape)
+
+
+@dataclass
 class FastAlltoAllMetadata:
+    """
+    NOTE: FastAlltoAllMetadata has some duplicated fields with Metadata.
+    With FastAlltoAll enabled, the original Metadata is not used. Instead, we use FastAlltoAll so that 
+    """
     fa2a_metadata: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     # List of (world_size,) tensors, each of shape (num_sequences,). If a slice, no world_size dimension.
     # metadata on the sender side:
@@ -57,6 +99,10 @@ class FastAlltoAllMetadata:
     my_rank_recv_offset: Union[int, List[int]]
     my_rank_send_sz: Union[int, List[int]]
     seq_lens: Sequence[SeqLens]
+    # Num received / send tokens for each tensor (i.e. (q,k) or (attn,))/
+    # This is to construct the recv buffer size.
+    # NOTE: for Q/KV backward, this is just a placeholder and we don't use it.
+    tensor_shape: Sequence[LogicalShape]
     def get_slice(self, rank):
         """
         Returns the metadata for the given rank.
@@ -67,12 +113,16 @@ class FastAlltoAllMetadata:
         seq_lens = tuple(
             sl.get_slice(rank) for sl in self.seq_lens
         )
+        tensor_shape = tuple(
+            ts.get_slice(rank) for ts in self.tensor_shape
+        )
         return FastAlltoAllMetadata(
             fa2a_metadata, send_memcpy_metadata, recv_memcpy_metadata,
             self.my_rank_send_offset[rank],
             self.my_rank_recv_offset[rank],
             self.my_rank_send_sz[rank],
             seq_lens,
+            tensor_shape
         )
 
 
@@ -92,10 +142,11 @@ def _get_diag(tensor: torch.Tensor, world_size: int):
 def _get_my_rank_from_metadata(fa2a_metadata: Sequence[torch.Tensor]):
     (sender_send_disp, sender_transfer_sz,
         sender_recv_disp, recver_transfer_sz) = fa2a_metadata
+    world_size = sender_send_disp.shape[0]
     return {
-        "my_rank_send_offset": _get_diag(sender_send_disp),
-        "my_rank_recv_offset": _get_diag(sender_recv_disp),
-        "my_rank_send_sz": _get_diag(sender_transfer_sz)
+        "my_rank_send_offset": _get_diag(sender_send_disp, world_size),
+        "my_rank_recv_offset": _get_diag(sender_recv_disp, world_size),
+        "my_rank_send_sz": _get_diag(sender_transfer_sz, world_size)
     }
 
 
@@ -116,7 +167,8 @@ def compute_forward_qkv_a2a_layout_meatadata(
     kv_dst_global_seq_id: torch.Tensor,  # shape (world_size, num_local_seqs, cp_degree)
     num_send_tokens_kv: torch.Tensor,
     bytes_q: int, bytes_kv: int,
-    seqlens: Sequence[SeqLens]
+    seqlens: Sequence[SeqLens],
+    tensor_shape: Sequence[LogicalShape],
 ):
     """
     Returns:
@@ -271,7 +323,7 @@ def compute_forward_qkv_a2a_layout_meatadata(
 
     return FastAlltoAllMetadata(
         fwd_fa2a_metadata, fwd_send_memcpy_metadata, fwd_recv_memcpy_metadata, **my_rank_vals,
-        seq_lens=seqlens
+        seq_lens=seqlens, tensor_shape=tensor_shape
     )
 
 
@@ -305,11 +357,15 @@ def compute_reverse_a2a_layout_metadata(
         SeqLens(seq_len.recv_seqlens, seq_len.send_seqlens)
         for seq_len in fwd_metadata.seq_lens
     )
+    bwd_tensor_shape = tuple(
+        LogicalShape(ts.recv_shape, ts.send_shape)
+        for ts in fwd_metadata.tensor_shape
+    )
 
     my_rank_vals = _get_my_rank_from_metadata(bwd_fa2a_metadata)
     return FastAlltoAllMetadata(
         bwd_fa2a_metadata, send_memcpy_metadata, recv_memcpy_metadata,
-        **my_rank_vals, seq_lens=bwd_seqlens
+        **my_rank_vals, seq_lens=bwd_seqlens, tensor_shape=bwd_tensor_shape
     )
 
 
@@ -320,6 +376,7 @@ def compute_backward_attn_out_a2a_layout_metadata(
     num_recv_seqs_q: torch.Tensor,
     bytes_q: int,
     seq_lens: Sequence[SeqLens],
+    tensor_shape: Sequence[LogicalShape],
 ):
     """
     Unlike qkv, the backward is easier to compute. We do it first, then the forward.
@@ -369,7 +426,7 @@ def compute_backward_attn_out_a2a_layout_metadata(
     my_rank_vals = _get_my_rank_from_metadata(bwd_fa2a_metadata)
     return FastAlltoAllMetadata(
         bwd_fa2a_metadata, bwd_send_memcpy_metadata, bwd_recv_memcpy_metadata
-        **my_rank_vals, seq_lens=seq_lens
+        **my_rank_vals, seq_lens=seq_lens, tensor_shape=tensor_shape,
     )
 
 
@@ -412,6 +469,8 @@ def compute_e2e_fa2a_metadata(
     recver_transfer_sz_kv = (
         fwd_metadata_kv.num_recv_tokens * bytes_k
     )[..., :-1]
+    # NOTE: this is a walk-around. Should directly give this input.
+    mlp_num_tokens = int(mlp_seq_len.sum(dim=1).max().item())
 
     num_recv_seqs_q = rev_metadata_q.num_seqs
     num_recv_seqs_kv = rev_metadata_kv.num_seqs
@@ -420,6 +479,10 @@ def compute_e2e_fa2a_metadata(
     num_send_tokens_kv = rev_metadata_kv.num_recv_tokens[..., :-1]
     seqlens = [SeqLens.get_seqlens(fwd_metadata_q, rev_metadata_q),
                SeqLens.get_seqlens(fwd_metadata_kv, rev_metadata_kv)]
+    tensor_shape = [
+        LogicalShape.get_shape(fwd_metadata_q, hidden_size_q, mlp_num_tokens),
+        LogicalShape.get_shape(fwd_metadata_kv, hidden_size_k, mlp_num_tokens),
+    ]
 
     qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
@@ -427,17 +490,19 @@ def compute_e2e_fa2a_metadata(
         num_recv_seqs_q, num_recv_seqs_kv, num_seqs,
         fwd_metadata_kv.dst_rank, fwd_metadata_kv.seq_len,
         kv_dst_global_seq_id, num_send_tokens_kv,
-        bytes_q, bytes_k, seqlens
+        bytes_q, bytes_k, seqlens, tensor_shape
     )
     qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
         qkv_fwd_fa2a_metadata,
     )
 
     # the backward seqlens of attn out equals that of forward q.
-    seqlens = seqlens[0]
+    seqlens = [seqlens[0]]
+    tensor_shape = [tensor_shape[0]]
     attn_out_rev_fa2a_metadata = compute_backward_attn_out_a2a_layout_metadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
         recver_transfer_sz_q, num_recv_seqs_q, bytes_q,
+        seq_lens=seqlens, tensor_shape=tensor_shape,
     )
     attn_out_fwd_fa2a_metadata = compute_reverse_a2a_layout_metadata(
         attn_out_rev_fa2a_metadata,
