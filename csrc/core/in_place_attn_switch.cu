@@ -38,17 +38,6 @@ __forceinline__ __device__ void _dispatch_recv_impl_kv_backward(
   for (size_t token_idx = blockIdx.x; token_idx < num_tokens * max_cp_degree; token_idx += gridDim.x) {
     // Move to a new sequence if necessary.
     while (token_idx >= current_seq_end) {
-      // This is for the case that recv buffer layout is also (num_sequence, max_cp_degree).
-      // seq_is_pad_idx += 1;
-      // skip_current_seq = __ldg(&seq_recv_mask[seq_is_pad_idx]);
-      // if (current_cp < max_cp_degree - 1) {
-      //   current_cp += 1;
-      // } else {
-      //   current_cp = 0;
-      //   current_seq += 1;
-      //   current_seq_len = __ldg(&seq_lens[current_seq]);
-      // }
-      // current_seq_end += current_seq_len;
       if (current_seq_end % num_tokens == 0) {
         current_cp += 1;
         current_seq = 0;

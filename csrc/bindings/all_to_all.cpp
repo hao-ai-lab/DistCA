@@ -1,4 +1,6 @@
 #include "bindings/all_to_all.h"
+#include "core/fastalltoall.h"
+#include "core/memcpy.h"
 #include "core/in_place_attn_switch.h"
 
 #include <ATen/ATen.h>
@@ -46,6 +48,7 @@ void dispatch_core(
   const at::Tensor &seq_len,
   //
   const std::optional<at::Tensor> &kv_send_tensor,
+  // FIXME: this "const" is wrong! this tensor will be write.
   const std::optional<at::Tensor> &kv_recv_tensor,
   const std::optional<at::Tensor> &kv_dst_rank,
   const std::optional<at::Tensor> &kv_dst_offset,
@@ -172,6 +175,59 @@ void set_num_sms(fptr_t fptr, const int64_t num_sms) {
   dispatch_helper->set_num_sms(num_sms);
 }
 
+/* ---------------- FastAlltoAll ----------------*/
+// TODO
+
+fptr_t create_fast_a2a_dispatch_helper(
+  int64_t rank, int64_t local_rank, int64_t world_size,
+  int64_t buffer_size
+) {
+  auto *ptr = new FastA2aDispatchHelper(
+    rank, local_rank, world_size, buffer_size);
+  return (fptr_t)ptr;
+}
+
+void destroy_fast_a2a_dispatch_helper(fptr_t fptr) {
+  delete (FastA2aDispatchHelper*)fptr;
+}
+
+void fast_a2a_memcpy_non_cp(
+  fptr_t fptr,
+  at::Tensor &tensor,
+  const at::Tensor &seq_nvshmem_offset,
+  const at::Tensor &seq_tokens,
+  const bool to_nvshmem,
+  // FIXME: temporary for debug use. Remove it later.
+  const bool use_buffer,
+  at::Tensor &buffer
+) {
+  TORCH_CHECK(tensor.ndimension() == 2, "Input tensor is of dimension (token, hidden_size)");
+  const int64_t token_bytes = tensor.size(1) * tensor.element_size();
+  const int64_t num_tokens = tensor.size(0);
+  uint8_t *tensor_ptr = (uint8_t *)tensor.data_ptr();
+  uint8_t *buffer_ptr;
+  if (use_buffer) {
+    // This is the debug branch.
+    buffer_ptr = (uint8_t *)buffer.data_ptr();
+  } else if (to_nvshmem) {
+    // If it goes to nvshmem, then it's a send side memcpy
+    buffer_ptr = ((FastA2aDispatchHelper*)fptr)->buffer.send_buffer;
+  } else {
+    // Otherwise, it's a recv side memcpy
+    buffer_ptr = ((FastA2aDispatchHelper*)fptr)->buffer.recv_buffer;
+  }
+
+  at::cuda::OptionalCUDAGuard const device_guard(device_of(tensor));
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  launch_memcpy_non_cp(
+    tensor_ptr, buffer_ptr,
+    seq_nvshmem_offset.const_data_ptr<int64_t>(),
+    seq_tokens.const_data_ptr<int64_t>(),
+    token_bytes, num_tokens, to_nvshmem, stream
+  );
+}
+
+
 }; // namespace
 
 
@@ -181,5 +237,8 @@ void register_all_to_all_ops(torch::Library &m) {
   m.def("create_dispatch_helper", &create_dispatch_helper);
   m.def("destroy_dispatch_helper", &destroy_dispatch_helper);
   m.def("set_num_sms", &set_num_sms);
+  m.def("create_fast_a2a_dispatch_helper", &create_fast_a2a_dispatch_helper);
+  m.def("destroy_fast_a2a_dispatch_helper", &destroy_fast_a2a_dispatch_helper);
+  m.def("fast_a2a_memcpy_non_cp", &fast_a2a_memcpy_non_cp);
 }
 }; // namespace attn

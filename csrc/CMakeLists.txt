@@ -56,6 +56,19 @@ target_link_libraries(dispatch_kernels PUBLIC
 )
 set_cuda_compile_options(dispatch_kernels)
 
+add_library(fast_a2a_kernels STATIC
+    core/fastalltoall.cu
+    core/memcpy.cu
+)
+target_link_libraries(fast_a2a_kernels PUBLIC
+    CUDA::cudart
+)
+target_link_libraries(fast_a2a_kernels PUBLIC
+    nvshmem::nvshmem_device
+    nvshmem::nvshmem_host
+)
+set_cuda_compile_options(fast_a2a_kernels)
+
 add_library(as_comm SHARED
     bindings/bindings.cpp
     bindings/nvshmem.cpp
@@ -63,6 +76,7 @@ add_library(as_comm SHARED
 )
 target_link_libraries(as_comm PUBLIC
     dispatch_kernels
+    fast_a2a_kernels
     torch::py_limited
     Python::Module
     CUDA::cuda_driver

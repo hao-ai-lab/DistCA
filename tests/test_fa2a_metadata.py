@@ -351,7 +351,7 @@ def test(args):
 
     (q_tokens_to_dst_per_dispatch, q_seq_to_dst,
      _, kv_dst_global_seq_id) = intermediates
-    element_size = 1
+    element_size = tensor_q.element_size()
     bytes_q = element_size * hidden_size_q
     bytes_k = element_size * hidden_size_k
     recver_transfer_sz_q = (
@@ -407,10 +407,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--world_size', type=int, default=2)
-    parser.add_argument('--num_seqs', type=int, default=3)
-    parser.add_argument('--num_tokens', type=int, default=16)
-    parser.add_argument('--hidden_size_q', type=int, default=4)
-    parser.add_argument('--hidden_size_k', type=int, default=2)
+    parser.add_argument('--num_seqs', type=int, default=4)
+    parser.add_argument('--num_tokens', type=int, default=1024)
+    parser.add_argument('--hidden_size_q', type=int, default=256)
+    parser.add_argument('--hidden_size_k', type=int, default=128)
     parser.add_argument('--max_seq_shard', type=int, default=2)
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()

@@ -14,6 +14,7 @@ Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT
 #include <vector>
 
 #include "bindings/nvshmem.h"
+#include "core/cuda_utils.h"
 #include "core/nvshmem_utils.h"
 
 namespace {
@@ -26,7 +27,10 @@ at::Tensor get_unique_id() {
 
 int64_t unique_id_size() { return sizeof(nvshmemx_uniqueid_t); }
 
-int64_t init(at::Tensor uid, int64_t rank, int64_t world_size) {
+int64_t init(at::Tensor uid, int64_t rank, int64_t world_size, int64_t local_rank) {
+  if (local_rank >= 0) {
+    CUDACHECK(cudaSetDevice(local_rank));
+  }
   TORCH_CHECK(uid.device().is_cpu(), "uid must be a CPU tensor");
   TORCH_CHECK(uid.scalar_type() == at::kByte, "uid must be a byte tensor");
   TORCH_CHECK(

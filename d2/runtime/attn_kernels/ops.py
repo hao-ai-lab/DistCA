@@ -23,10 +23,10 @@ def nvshmem_unique_id_size() -> int:
 def nvshmem_alloc_empty_unique_id() -> torch.Tensor:
     return torch.zeros(nvshmem_unique_id_size(), dtype=torch.uint8, device="cpu")
 
-def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int) -> int:
+def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int=-1) -> int:
     # NOTE: this is because we set device in python. Should move it to the cpp end.
     torch.cuda.synchronize()
-    status = _ops.nvshmem_init(uid, rank, world_size)
+    status = _ops.nvshmem_init(uid, rank, world_size, local_rank)
     torch.cuda.synchronize()
     return status
 
@@ -221,4 +221,17 @@ def dispatch_kv_backward(
         metadata.dst_rank, metadata.dst_offset, metadata.num_recv_tokens, metadata.seq_len,
         None, None, None, None, None,
         metadata.seq_recv_mask, metadata.recv_seq_lens
+    )
+
+
+#### FIXME: Fast dispatch
+def fast_a2a_memcpy_non_cp(
+    tensor: torch.Tensor, nvshmem_offset: torch.Tensor,
+    seq_tokens: torch.Tensor, to_nvshmem: bool,
+    buffer: torch.Tensor, use_buffer: bool = False,
+):
+    # FIXME: pass the handle, or only use it by a dispatch helper.
+    return _ops.fast_a2a_memcpy_non_cp(
+        0, tensor, nvshmem_offset, seq_tokens, to_nvshmem,
+        use_buffer, buffer
     )
