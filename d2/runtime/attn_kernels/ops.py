@@ -224,7 +224,7 @@ def dispatch_kv_backward(
     )
 
 
-#### FIXME: Fast dispatch
+#### Fast dispatch
 class FastDispatcherWrapper:
     instance: Optional["FastDispatcherWrapper"] = None
     def __init__(self, rank, local_rank, world_size, buffer_size):
@@ -256,18 +256,25 @@ class FastDispatcherWrapper:
             rank, local_rank, world_size, buffer_size
         )
 
+    @staticmethod
+    def get_instance():
+        assert FastDispatcherWrapper.instance is not None, "DispatcherWrapper not initialized"
+        return FastDispatcherWrapper.instance
+
+
 def fast_a2a_memcpy_non_cp(
     tensor: torch.Tensor, nvshmem_offset: torch.Tensor,
     seq_tokens: torch.Tensor, to_nvshmem: bool,
     buffer: Optional[torch.Tensor]=None
 ):
     if buffer is not None:
+        # Debug mode, explicitly pass the "nvshmem" buffer.
         return _ops.fast_a2a_memcpy_non_cp_debug(
             tensor, nvshmem_offset, seq_tokens, to_nvshmem, buffer
         )
-    # FIXME: pass the handle, or only use it by a dispatch helper.
     return _ops.fast_a2a_memcpy_non_cp(
-        0, tensor, nvshmem_offset, seq_tokens, to_nvshmem
+        FastDispatcherWrapper.get_instance().handle,
+        tensor, nvshmem_offset, seq_tokens, to_nvshmem
     )
 
 
@@ -277,10 +284,25 @@ def fast_a2a_memcpy_cp(
     to_nvshmem: bool, buffer: Optional[torch.Tensor]=None
 ):
     if buffer is not None:
+        # Debug mode, explicitly pass the "nvshmem" buffer.
         return _ops.fast_a2a_memcpy_cp_debug(
             tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem, buffer
         )
-    # FIXME: pass the handle, or only use it by a dispatch helper.
+
     return _ops.fast_a2a_memcpy_cp(
-        0, tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem
+        FastDispatcherWrapper.get_instance().handle,
+        tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem
+    )
+
+
+def fast_a2a(
+    sender_send_disp: torch.Tensor, sender_transfer_sz: torch.Tensor,
+    sender_recv_disp: torch.Tensor, recver_transfer_sz: torch.Tensor,
+    my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int
+):
+    return _ops.fast_a2a(
+        FastDispatcherWrapper.get_instance().handle,
+        sender_send_disp, sender_transfer_sz,
+        sender_recv_disp, recver_transfer_sz,
+        my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz
     )

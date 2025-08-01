@@ -16,6 +16,7 @@ from d2.runtime.inplace_metadata import compute_metadata, Metadata
 from test_util import gen_seq_lens
 from test_comm_metadata import orchestrate_simulate
 
+
 @ray.remote(num_gpus=1)
 class Worker:
     def __init__(self, rank: int, world_size: int):

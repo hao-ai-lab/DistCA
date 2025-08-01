@@ -1,3 +1,8 @@
+"""
+Metadata about dispatching strategy.
+NOTE: with fast all2all display, this strategy is only logical.
+"""
+
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 

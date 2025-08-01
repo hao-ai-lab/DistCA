@@ -4,7 +4,42 @@ from typing import List, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from d2.runtime.inplace_metadata import compute_e2e_metadata, exclusive_cumsum, index_put_with_neg_padding_1d
+from d2.runtime.inplace_metadata import compute_e2e_metadata, exclusive_cumsum, index_put_with_neg_padding_1d, Metadata
+
+
+_Tensor_Or_Tensor_List = Union[torch.Tensor, Sequence[torch.Tensor]]
+
+
+def _get_ragged_seqlen(seq_len: torch.Tensor, num_seqs: torch.Tensor):
+    world_size = seq_len.shape[0]
+    assert num_seqs.shape == (world_size,)
+    return tuple(
+        seq_len[i, :num_seqs[i]] for i in range(world_size)
+    )
+
+
+@dataclass
+class SeqLens:
+    send_seqlens: _Tensor_Or_Tensor_List
+    recv_seqlens: _Tensor_Or_Tensor_List
+
+    def get_slice(self, rank):
+        return SeqLens(
+            self.send_seqlens[rank],
+            self.recv_seqlens[rank],
+        )
+
+    @staticmethod
+    def get_seqlens(
+        fwd_metadata: Metadata, rev_metadata: Metadata
+    ):
+        fwd_seq_lens = _get_ragged_seqlen(
+            fwd_metadata.seq_len, fwd_metadata.num_seqs
+        )
+        rev_seq_lens = _get_ragged_seqlen(
+            rev_metadata.seq_len, rev_metadata.num_seqs
+        )
+        return SeqLens(fwd_seq_lens, rev_seq_lens)
 
 
 @dataclass
@@ -16,8 +51,12 @@ class FastAlltoAllMetadata:
     #       NOTE: for kv sender's sequence idx, to make it directly available to the reverse operation,
     #         we use the (cp_id, seq_idx) order instead of the (seq_idx, cp_id) order
     #   the offset to copy each sequence from the buffer, ordered by the recver's sequence idx
-    send_memcpy_metadata: Sequence[Union[torch.Tensor, List[torch.Tensor]]]
-    recv_memcpy_metadata: Sequence[Union[torch.Tensor, List[torch.Tensor]]]
+    send_memcpy_metadata: Sequence[_Tensor_Or_Tensor_List]
+    recv_memcpy_metadata: Sequence[_Tensor_Or_Tensor_List]
+    my_rank_send_offset: Union[int, List[int]]
+    my_rank_recv_offset: Union[int, List[int]]
+    my_rank_send_sz: Union[int, List[int]]
+    seq_lens: Sequence[SeqLens]
     def get_slice(self, rank):
         """
         Returns the metadata for the given rank.
@@ -25,8 +64,15 @@ class FastAlltoAllMetadata:
         fa2a_metadata = tuple(t[rank] for t in self.fa2a_metadata)
         send_memcpy_metadata = tuple(t[rank] for t in self.send_memcpy_metadata)
         recv_memcpy_metadata = tuple(t[rank] for t in self.recv_memcpy_metadata)
+        seq_lens = tuple(
+            sl.get_slice(rank) for sl in self.seq_lens
+        )
         return FastAlltoAllMetadata(
             fa2a_metadata, send_memcpy_metadata, recv_memcpy_metadata,
+            self.my_rank_send_offset[rank],
+            self.my_rank_recv_offset[rank],
+            self.my_rank_send_sz[rank],
+            seq_lens,
         )
 
 
@@ -36,6 +82,21 @@ def _filter_nonzero_by_mask(tensor: torch.Tensor, mask: torch.Tensor, num_receiv
     condensed = tensor[mask]
     output_tuple = torch.split(condensed, num_received.tolist())
     return output_tuple
+
+
+def _get_diag(tensor: torch.Tensor, world_size: int):
+    assert tensor.shape == (world_size, world_size)
+    return torch.diagonal(tensor).flatten().cpu().tolist()
+
+
+def _get_my_rank_from_metadata(fa2a_metadata: Sequence[torch.Tensor]):
+    (sender_send_disp, sender_transfer_sz,
+        sender_recv_disp, recver_transfer_sz) = fa2a_metadata
+    return {
+        "my_rank_send_offset": _get_diag(sender_send_disp),
+        "my_rank_recv_offset": _get_diag(sender_recv_disp),
+        "my_rank_send_sz": _get_diag(sender_transfer_sz)
+    }
 
 
 def compute_forward_qkv_a2a_layout_meatadata(
@@ -55,6 +116,7 @@ def compute_forward_qkv_a2a_layout_meatadata(
     kv_dst_global_seq_id: torch.Tensor,  # shape (world_size, num_local_seqs, cp_degree)
     num_send_tokens_kv: torch.Tensor,
     bytes_q: int, bytes_kv: int,
+    seqlens: Sequence[SeqLens]
 ):
     """
     Returns:
@@ -137,7 +199,7 @@ def compute_forward_qkv_a2a_layout_meatadata(
     seq_offset_k = (seq_offset_k * seq_dispatch_mask_kv).sum(dim=-1).reshape(seq_kv_shape_T)
     seq_offset_v = (seq_offset_v * seq_dispatch_mask_kv).sum(dim=-1).reshape(seq_kv_shape_T)
     # offset to copy each data to their destination.
-    # FIXME: trim by num_seqs.
+    # trim by num_seqs.
     fwd_send_memcpy_metadata = tuple(
         tuple(
             tt.squeeze(0)[..., :num_seqs[i]]
@@ -205,14 +267,20 @@ def compute_forward_qkv_a2a_layout_meatadata(
         seq_recv_offset_q, seq_recv_offset_k_compact, seq_recv_offset_v_compact
     )
 
+    my_rank_vals = _get_my_rank_from_metadata(fwd_fa2a_metadata)
+
     return FastAlltoAllMetadata(
-        fwd_fa2a_metadata, fwd_send_memcpy_metadata, fwd_recv_memcpy_metadata
+        fwd_fa2a_metadata, fwd_send_memcpy_metadata, fwd_recv_memcpy_metadata, **my_rank_vals,
+        seq_lens=seqlens
     )
 
 
 def compute_reverse_a2a_layout_metadata(
     fwd_metadata: FastAlltoAllMetadata
 ):
+    # TODO: as bwd values are mainly the same as fwd values
+    # we should only store those that are different.
+
     # during backward, the tensor is copied back to the original location.
     send_memcpy_metadata = fwd_metadata.recv_memcpy_metadata
     recv_memcpy_metadata = fwd_metadata.send_memcpy_metadata
@@ -232,8 +300,16 @@ def compute_reverse_a2a_layout_metadata(
         bwd_sender_send_disp, bwd_sender_transfer_sz, bwd_sender_recv_disp,
         bwd_recver_transfer_sz
     )
+
+    bwd_seqlens = tuple(
+        SeqLens(seq_len.recv_seqlens, seq_len.send_seqlens)
+        for seq_len in fwd_metadata.seq_lens
+    )
+
+    my_rank_vals = _get_my_rank_from_metadata(bwd_fa2a_metadata)
     return FastAlltoAllMetadata(
-        bwd_fa2a_metadata, send_memcpy_metadata, recv_memcpy_metadata
+        bwd_fa2a_metadata, send_memcpy_metadata, recv_memcpy_metadata,
+        **my_rank_vals, seq_lens=bwd_seqlens
     )
 
 
@@ -243,6 +319,7 @@ def compute_backward_attn_out_a2a_layout_metadata(
     recver_transfer_sz_q: torch.Tensor,
     num_recv_seqs_q: torch.Tensor,
     bytes_q: int,
+    seq_lens: Sequence[SeqLens],
 ):
     """
     Unlike qkv, the backward is easier to compute. We do it first, then the forward.
@@ -289,8 +366,10 @@ def compute_backward_attn_out_a2a_layout_metadata(
     )
 
     bwd_recv_memcpy_metadata = (seq_recv_offset_q,)
+    my_rank_vals = _get_my_rank_from_metadata(bwd_fa2a_metadata)
     return FastAlltoAllMetadata(
         bwd_fa2a_metadata, bwd_send_memcpy_metadata, bwd_recv_memcpy_metadata
+        **my_rank_vals, seq_lens=seq_lens
     )
 
 
@@ -339,6 +418,8 @@ def compute_e2e_fa2a_metadata(
     num_seqs = fwd_metadata_q.num_seqs
 
     num_send_tokens_kv = rev_metadata_kv.num_recv_tokens[..., :-1]
+    seqlens = [SeqLens.get_seqlens(fwd_metadata_q, rev_metadata_q),
+               SeqLens.get_seqlens(fwd_metadata_kv, rev_metadata_kv)]
 
     qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
@@ -346,17 +427,20 @@ def compute_e2e_fa2a_metadata(
         num_recv_seqs_q, num_recv_seqs_kv, num_seqs,
         fwd_metadata_kv.dst_rank, fwd_metadata_kv.seq_len,
         kv_dst_global_seq_id, num_send_tokens_kv,
-        bytes_q, bytes_k
+        bytes_q, bytes_k, seqlens
     )
     qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
         qkv_fwd_fa2a_metadata,
     )
+
+    # the backward seqlens of attn out equals that of forward q.
+    seqlens = seqlens[0]
     attn_out_rev_fa2a_metadata = compute_backward_attn_out_a2a_layout_metadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
         recver_transfer_sz_q, num_recv_seqs_q, bytes_q,
     )
     attn_out_fwd_fa2a_metadata = compute_reverse_a2a_layout_metadata(
-        attn_out_rev_fa2a_metadata
+        attn_out_rev_fa2a_metadata,
     )
     fa2a_metadata = (
         qkv_fwd_fa2a_metadata,
