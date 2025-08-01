@@ -29,6 +29,11 @@ class SeqLens:
         )
 
     def normalize(self):
+        if isinstance(self.send_seqlens, torch.Tensor):
+            return SeqLens(
+                self.send_seqlens.cuda().to(torch.int64).contiguous(),
+                self.recv_seqlens.cuda().to(torch.int64).contiguous()
+            )
         return SeqLens(
             tuple(t.cuda().to(torch.int64).contiguous() for t in self.send_seqlens),
             tuple(t.cuda().to(torch.int64).contiguous() for t in self.recv_seqlens)
@@ -92,7 +97,7 @@ class FastAlltoAllMetadata:
     NOTE: FastAlltoAllMetadata has some duplicated fields with Metadata.
     With FastAlltoAll enabled, the original Metadata is not used. Instead, we use FastAlltoAll so that 
     """
-    fa2a_metadata: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    fa2a_metadata: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     # List of (world_size,) tensors, each of shape (num_sequences,). If a slice, no world_size dimension.
     # metadata on the sender side:
     #   the offset to copy each sequence to the buffer, ordered by the sender's sequence idx
@@ -341,8 +346,8 @@ def compute_forward_qkv_a2a_layout_meatadata(
     my_rank_vals = _get_my_rank_from_metadata(fwd_fa2a_metadata)
 
     return FastAlltoAllMetadata(
-        fwd_fa2a_metadata, fwd_send_memcpy_metadata, fwd_recv_memcpy_metadata, **my_rank_vals,
-        seq_lens=seqlens, tensor_shape=tensor_shape
+        fwd_fa2a_metadata, fwd_send_memcpy_metadata, fwd_recv_memcpy_metadata,
+        **my_rank_vals, seq_lens=seqlens, tensor_shape=tensor_shape
     )
 
 
@@ -444,7 +449,7 @@ def compute_backward_attn_out_a2a_layout_metadata(
     bwd_recv_memcpy_metadata = (seq_recv_offset_q,)
     my_rank_vals = _get_my_rank_from_metadata(bwd_fa2a_metadata)
     return FastAlltoAllMetadata(
-        bwd_fa2a_metadata, bwd_send_memcpy_metadata, bwd_recv_memcpy_metadata
+        bwd_fa2a_metadata, bwd_send_memcpy_metadata, bwd_recv_memcpy_metadata,
         **my_rank_vals, seq_lens=seq_lens, tensor_shape=tensor_shape,
     )
     
@@ -454,7 +459,6 @@ def compute_fa2a_metadata_from_logical_metadata(
     rev_metadata_q: Metadata,
     fwd_metadata_kv: Metadata,
     rev_metadata_kv: Metadata,
-    fa_params,
     intermediates,
     mlp_seq_len: torch.Tensor,
     hidden_size_q: int,
@@ -549,8 +553,7 @@ def compute_e2e_fa2a_metadata(
     )
     fa2a_metadata = compute_fa2a_metadata_from_logical_metadata(
         fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv,
-        fa_params, intermediates,
-        mlp_seq_len, hidden_size_q, hidden_size_k,
+        intermediates, mlp_seq_len, hidden_size_q, hidden_size_k,
         element_size
     )
     return (

@@ -91,7 +91,7 @@ int launch_alltoallv(
   struct internode_transfer_params_t * inter_params,
   // NOTE: this is a partial intra-node send.
   // Because we don't do optimizations for intra-node send,
-  // in this function, we have rank_n_per_node == 0.
+  // in this function, we have rank_n_per_node == 1.
   // However, we need to memcpy locally (from send_nvshmem to recv_nvshmem on local rank).
   // To achieve this, we launch a memcpy from the host because
   // it utilizes DMA and is faster.

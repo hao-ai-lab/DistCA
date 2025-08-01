@@ -216,6 +216,7 @@ def test_qkv(
     seed, world_size, total_seq_len, num_seqs, max_cp_degree,
     worker: Worker, hidden_size_q: int, hidden_size_k: int,
 ):
+    torch.manual_seed(seed)
     (fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
      _, intermediates
      ) = create_qkv_dispatch(
@@ -225,7 +226,7 @@ def test_qkv(
     # create answers:
     (
         tensor_q, tensor_kv, output_tensor_q, output_tensor_kv,
-        back_tensor_q, back_tensor_kv_dedup
+        back_tensor_q, back_tensor_kv
     ) = create_answer(
         fwd_q_metadata, fwd_k_metadata,
         rev_q_metadata, rev_k_metadata,
@@ -248,15 +249,17 @@ def test_qkv(
     kv_slice = tensor_kv[rank]
     k_slice = kv_slice[:, :hidden_size_k]
     v_slice = kv_slice[:, hidden_size_k:]
-    num_tokens_q_dst = fwd_q_metadata.num_recv_tokens[rank]
-    num_tokens_kv_dst = fwd_k_metadata.num_recv_tokens[rank]
+    num_tokens_q_dst = fwd_q_metadata.num_total_recv_tokens[rank]
+    num_tokens_kv_dst = fwd_k_metadata.num_total_recv_tokens[rank]
     dispatch_mask = (
         fwd_k_metadata.get_slice(rank).dst_rank >= 0
     ).to(torch.int8)
+    fa2a_metadata_fwd_slice = fa2a_metadata_fwd.get_slice(rank)
+    fa2a_metadata_rev_slice = fa2a_metadata_rev.get_slice(rank)
 
     # run this communication
     out_dict = worker.test_qkv(
-        fa2a_metadata_fwd, fa2a_metadata_rev,
+        fa2a_metadata_fwd_slice, fa2a_metadata_rev_slice,
         q_slice, kv_slice, dispatch_mask
     )
     dst_q = out_dict["dst_q"]
@@ -266,12 +269,12 @@ def test_qkv(
     rev_q = out_dict["rev_q"]
     rev_q_shard = back_tensor_q[rank]
     rev_kv = out_dict["rev_kv"]
-    rev_kv_shard = back_tensor_kv_dedup[rank]
+    rev_kv_shard = back_tensor_kv[rank]
 
-    torch.testing.assert_close(dst_q, out_q_shard)
-    torch.testing.assert_close(out_kv, out_kv_shard)
-    torch.testing.assert_close(rev_q, rev_q_shard)
-    torch.testing.assert_close(rev_kv, rev_kv_shard)
+    torch.testing.assert_close(dst_q, out_q_shard.to(dst_q.device))
+    torch.testing.assert_close(out_kv, out_kv_shard.to(dst_q.device))
+    torch.testing.assert_close(rev_q, rev_q_shard.to(dst_q.device))
+    torch.testing.assert_close(rev_kv, rev_kv_shard.to(dst_q.device))
 
 
 def init_worker_torch_distributed(world_size, buffer_size):
