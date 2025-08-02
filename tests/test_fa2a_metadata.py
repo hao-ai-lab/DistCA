@@ -5,15 +5,13 @@ from torch import Tensor
 
 from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.fast_alltoall_metadata import (
-    compute_forward_qkv_a2a_layout_meatadata,
-    compute_reverse_a2a_layout_metadata,
-    SeqLens,
-    LogicalShape,
     FastAlltoAllMetadata
 )
 
 from test_comm_metadata import orchestrate_simulate
-from test_util import create_qkv_dispatch
+from test_util import (
+    create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch
+)
 
 
 def simulate_fa2a_copy_non_cp(
@@ -348,45 +346,12 @@ def test(args):
     (q_tokens_to_dst_per_dispatch, q_seq_to_dst,
      _, kv_dst_global_seq_id) = intermediates
     element_size = tensor_q.element_size()
-    bytes_q = element_size * hidden_size_q
-    bytes_k = element_size * hidden_size_k
-    recver_transfer_sz_q = (
-        fwd_q_metadata.num_recv_tokens * bytes_q
-    )[..., :-1]
-    recver_transfer_sz_kv = (
-        fwd_k_metadata.num_recv_tokens * bytes_k
-    )[..., :-1]
-    num_recv_seqs_q = rev_q_metadata.num_seqs
-    num_recv_seqs_kv = rev_k_metadata.num_seqs
-    num_seqs_fwd = fwd_k_metadata.num_seqs
-    num_send_tokens_kv = rev_k_metadata.num_recv_tokens[..., :-1]
-    seq_lens = [
-        SeqLens.get_seqlens(fwd_q_metadata, rev_q_metadata),
-        SeqLens.get_seqlens(fwd_k_metadata, rev_k_metadata)
-    ]
-    tensor_shape = [
-        LogicalShape.get_shape(fwd_q_metadata, hidden_size_q, total_seq_len),
-        LogicalShape.get_shape(fwd_k_metadata, hidden_size_k, total_seq_len),
-    ]
-    kv_replica_mask = fwd_k_metadata.dst_rank >= 0
-    kv_replica_mask = tuple(
-        kv_replica_mask[i][:num_seq].to(torch.int8)
-        for i, num_seq in enumerate(num_seqs_fwd)
-    )
-
-    qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
-        q_tokens_to_dst_per_dispatch.squeeze(2), q_seq_to_dst,
-        recver_transfer_sz_q, recver_transfer_sz_kv,
-        num_recv_seqs_q, num_recv_seqs_kv, num_seqs_fwd,
-        fwd_k_metadata.dst_rank, fwd_k_metadata.seq_len,
-        kv_dst_global_seq_id, num_send_tokens_kv,
-        bytes_q, bytes_k,
-        seq_lens, tensor_shape, kv_replica_mask,
-    )
-
-    qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
-        qkv_fwd_fa2a_metadata,
-    )
+    qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata = \
+        create_fast_a2a_metadata_from_qkv_dispatch(
+            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+            intermediates, element_size, hidden_size_q, hidden_size_k,
+            total_seq_len,
+        )
 
     fa2a_q, fa2a_k, fa2a_v = simulate_qkv_a2a(
         tensor_q, tensor_k, tensor_v,

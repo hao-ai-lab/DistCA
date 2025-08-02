@@ -479,7 +479,7 @@ def compute_fa2a_metadata_from_logical_metadata(
     fwd_metadata_kv: Metadata,
     rev_metadata_kv: Metadata,
     intermediates,
-    mlp_seq_len: torch.Tensor,
+    mlp_num_tokens: int,
     hidden_size_q: int,
     hidden_size_k: int,
     element_size: int,  # dtype's size
@@ -498,8 +498,6 @@ def compute_fa2a_metadata_from_logical_metadata(
     recver_transfer_sz_kv = (
         fwd_metadata_kv.num_recv_tokens * bytes_k
     )[..., :-1]
-    # NOTE: this is a walk-around. Should directly give this input.
-    mlp_num_tokens = int(mlp_seq_len.sum(dim=1).max().item())
 
     num_recv_seqs_q = rev_metadata_q.num_seqs
     num_recv_seqs_kv = rev_metadata_kv.num_seqs
@@ -576,9 +574,10 @@ def compute_e2e_fa2a_metadata(
         q_to_num_kv_token,
         return_intermediate=True
     )
+    mlp_num_tokens = mlp_seq_len.sum(dim=1).max().item()
     fa2a_metadata = compute_fa2a_metadata_from_logical_metadata(
         fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv,
-        intermediates, mlp_seq_len, hidden_size_q, hidden_size_k,
+        intermediates, mlp_num_tokens, hidden_size_q, hidden_size_k,
         element_size
     )
     return (

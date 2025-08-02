@@ -9,8 +9,6 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 2 test_dispatch_fast.py \
     --world-size 2
 """
-import os
-
 import torch
 
 from d2.runtime.attn_kernels.ops import (
@@ -18,13 +16,13 @@ from d2.runtime.attn_kernels.ops import (
 )
 # TODO: test fast_a2a_attn_out and its metadata by sending q_attn_layout back to q_mlp_layout via attn_out metadata.
 from d2.runtime.attn_kernels.dispatch import (
-    fast_a2a_qkv, fast_a2a_attn_out
+    fast_a2a_qkv
 )
 from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata, compute_fa2a_metadata_from_logical_metadata
 
 from test_comm_metadata import orchestrate_simulate
-from test_util import BaseWorker, create_qkv_dispatch
+from test_util import BaseWorker, create_qkv_dispatch, init_worker_torch_distributed
 
 
 class Worker(BaseWorker):
@@ -207,11 +205,10 @@ def create_test_case(world_size: int, total_seq_len: int, num_seqs: int,
         hidden_size_q, hidden_size_k,
     )
     element_size = tensor_q.dtype.itemsize
-    mlp_seq_len = fwd_q_metadata.seq_len
 
     fa2a_metadata = compute_fa2a_metadata_from_logical_metadata(
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        intermediates, mlp_seq_len, hidden_size_q, hidden_size_k,
+        intermediates, total_seq_len, hidden_size_q, hidden_size_k,
         element_size
     )
     (fa2a_metadata_qkv_fwd, fa2a_metadata_qkv_rev,
@@ -276,17 +273,6 @@ def test_qkv(
     torch.testing.assert_close(rev_kv, rev_kv_shard.to(dst_q.device))
 
 
-def init_worker_torch_distributed(world_size, buffer_size):
-    assert world_size == int(os.environ.get("WORLD_SIZE"))
-    rank = int(os.environ.get("RANK"))
-    local_rank = int(os.environ.get("LOCAL_RANK"))
-    worker = Worker(
-        rank, world_size
-    )
-    worker.init_comm(buffer_size, local_rank)
-    return worker
-
-
 def test(args):
     stride_q = args.hidden_size_query * torch.float16.itemsize
     stride_kv = args.hidden_size_kv * torch.float16.itemsize
@@ -300,7 +286,7 @@ def test(args):
         stride_kv * max_tokens_key_value * max_cp_degree * 2
     )
     worker = init_worker_torch_distributed(
-        world_size, buffer_size
+        world_size, buffer_size, Worker
     )
     print("init done.")
     test_qkv(

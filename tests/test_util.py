@@ -14,6 +14,7 @@ from d2.runtime.inplace_metadata import (
     Metadata, compute_attn_layout_seqlens, compute_metadata, compute_metadata_kv,
     exclusive_cumsum
 )
+from d2.runtime.fast_alltoall_metadata import  compute_fa2a_metadata_from_logical_metadata
 
 
 ######## Workers
@@ -89,6 +90,15 @@ class MegatronBaseWorker(BaseWorker):
         )
 
 
+def init_worker_torch_distributed(world_size, buffer_size, worker_cls=BaseWorker):
+    assert world_size == int(os.environ.get("WORLD_SIZE"))
+    rank = int(os.environ.get("RANK"))
+    local_rank = int(os.environ.get("LOCAL_RANK"))
+    worker = worker_cls(
+        rank, world_size
+    )
+    worker.init_comm(buffer_size, local_rank)
+    return worker
 ######## Data construction
 def test_local_proj_metadata(world_size: int, seq_len: int, offset: int):
     """
@@ -284,3 +294,19 @@ def create_qkv_dispatch(
     return (
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
     )
+
+
+def create_fast_a2a_metadata_from_qkv_dispatch(
+    fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, intermediates, element_size: int, hidden_size_q: int, hidden_size_k: int, mlp_total_token: int,
+    create_attn_outs: bool=False
+):
+    (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
+     attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
+    ) = compute_fa2a_metadata_from_logical_metadata(
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+        intermediates, mlp_total_token, hidden_size_q, hidden_size_k, element_size,
+    )
+    if create_attn_outs:
+        return (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
+                attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,)
+    return (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata)
