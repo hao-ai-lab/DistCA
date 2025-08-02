@@ -1,0 +1,287 @@
+from dataclasses import dataclass
+import os
+import socket
+from typing import Optional
+import math
+
+
+from megatron.core import parallel_state as mpu
+import ray
+import torch
+
+from d2.runtime.attn_kernels.ops import nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper
+from d2.runtime.inplace_metadata import (
+    Metadata, compute_attn_layout_seqlens, compute_metadata, compute_metadata_kv,
+    exclusive_cumsum
+)
+from test_util import (ParallelConfig, MegatronBaseWorker, gen_seq_lens)
+
+import rich
+# VERBOSE = True
+VERBOSE = False
+def print_if_verbose(*args, **kwargs):
+    if VERBOSE:
+        rich.print(*args, **kwargs)
+
+def create_qkv_dispatch_2cp_with_explicit_sharding(
+    world_size: int,
+
+    # seq_lens[src_rank, seq_id] = sequence length
+    #      Make a sequence of (src_rank, seq_id) to (sequence length)
+    #      shape: (world_size, num_seqs)
+    seq_lens: torch.Tensor,
+
+    # cp_dst[src_rank, seq_id, shard_id] = dst_rank
+    #      Make a sequence of (src_rank, seq_id)'s (shard_id) to (dst_rank)
+    #      dst_rank == -1 then it is a mask
+    #      shape: (world_size, num_seqs, max_cp_degree)
+    cp_dst: torch.Tensor,
+
+    # cp_shards[src_rank, seq_id, shard_id] = length 
+    #      (length of the shard to send to `cp_dst[src_rank, seq_id, shard_id]`)
+    #      shape: (world_size, num_seqs, max_cp_degree)
+    #      value == -1 then it is a mask
+    cp_shards: torch.Tensor,
+):
+    """Create qkv with explicit sharding passing from the outside."""
+    # init sequence    
+    num_seqs: torch.Tensor = (seq_lens > 0).sum(dim=1).max()
+    # max_num_seqs = num_seqs.max()
+    
+    cp_num = (cp_dst > -1).sum(dim=2)
+    max_cp_degree: int = max(cp_num.max(), 1)
+    
+    # assert on seq_lens[rank, seq_id] = sequence length
+    assert seq_lens.shape == (world_size, num_seqs)
+    assert seq_lens.dtype == torch.int64
+
+    # assert on cp_dst
+    assert cp_dst.shape == (world_size, num_seqs, max_cp_degree)
+    assert cp_shards.shape == (world_size, num_seqs, max_cp_degree)
+
+
+    num_cp_shards = cp_num.sum(dim=1)
+    pad_len = torch.max(num_cp_shards)
+    cp_seq_lens = torch.zeros(world_size, pad_len, dtype=torch.int64)
+    cp_query_dst = torch.ones(world_size, pad_len, dtype=torch.int64) * -1
+    kv_to_q_mapping = torch.ones((world_size, pad_len, max_cp_degree, 2), dtype=torch.int64) * -1
+    kv_to_q_rank = torch.ones((world_size, pad_len, max_cp_degree), dtype=torch.int64) * -1
+    kv_context_size = torch.zeros((world_size, pad_len), dtype=torch.int64)
+    num_kv_to_q = torch.zeros((world_size, pad_len), dtype=torch.int64)
+
+    num_cul_cp_shards = exclusive_cumsum(cp_num, dim=1)
+
+
+    for i in range(world_size):
+        cp_seq_lens_local = []
+        cp_query_dst_local = []
+        kv_to_q_mapping_local = []
+        kv_to_q_rank_local = []
+        kv_context_size_local = []
+        num_kv_to_q_local = []
+
+        for j in range(num_seqs):
+            num_cp = int((cp_num[i, j]).item())
+
+            if num_cp <= 1:
+                seq_len = seq_lens[i, j]
+                if seq_len <= 0:
+                    continue
+                
+                seq_shard_len = seq_len // num_cp
+                _seq_shard_len = seq_shard_len.reshape(1,).repeat(num_cp)
+            else:
+                _seq_shard_len = cp_shards[i, j, :num_cp]
+
+            # else:
+            #     _seq_shard_len = seq_shard_len.reshape(1,).repeat(num_cp)
+            #     unit_to_transfer = _seq_shard_len[0] // 2
+            #     _seq_shard_len[0] -= unit_to_transfer
+            #     _seq_shard_len[-1] += unit_to_transfer
+            #     pass
+
+            cp_seq_lens_local.append(_seq_shard_len)
+            print_if_verbose(f"_seq_shard_len\n", _seq_shard_len, "\n")
+            
+            cp_query_dst_local.append(cp_dst[i, j, :num_cp].flatten())
+            print_if_verbose(f"cp_dst[i, j, :num_cp].flatten():\n", cp_dst[i, j, :num_cp].flatten(), "\n")
+            
+            row_indices = torch.arange(num_cp).view(-1, 1)
+            print_if_verbose(f"row_indices:\n", row_indices, "\n")
+            
+            col_indices = torch.arange(max_cp_degree).view(1, -1)
+            print_if_verbose(f"col_indices:\n", col_indices, "\n")
+            
+            mask = col_indices < (num_cp - row_indices)
+            print_if_verbose(f"mask:\n", mask, "\n")
+            
+            kv_to_q_mapping_seq = torch.empty((num_cp, max_cp_degree, 2), dtype=torch.int64)
+            kv_to_q_mapping_seq[..., 0] = torch.where(mask, i, -1)
+            print_if_verbose(f"kv_to_q_mapping_seq[..., 0]:\n", kv_to_q_mapping_seq[..., 0], "\n")
+            
+            vals_ch1 = row_indices + col_indices + num_cul_cp_shards[i, j]
+            print_if_verbose(f"vals_ch1:\n", vals_ch1, "\n")
+            
+            kv_to_q_mapping_seq[..., 1] = torch.where(mask, vals_ch1, -1)
+            print_if_verbose(f"kv_to_q_mapping_seq[..., 1]:\n", kv_to_q_mapping_seq[..., 1], "\n")
+            
+            kv_to_q_mapping_local.append(kv_to_q_mapping_seq)
+            
+            #### Compute kv_to_q_rank (Index of this KV to the query's dst).
+            # < In: num_cp, max_cp_degree, mask
+            # > Out: rank indices for KV to query communication with masking
+            kv_to_q_rank_seq = torch.arange(num_cp).view(-1, 1).repeat(1, max_cp_degree) * mask + (mask.int() - 1)
+            print_if_verbose(f"kv_to_q_rank_seq:\n", kv_to_q_rank_seq, "\n")
+            kv_to_q_rank_local.append(kv_to_q_rank_seq)
+            #### Compute kv context size (For this kv, how many tokens are in the context).
+            # TODO(GindaChen): `kv_context_size_seq` - Insert the proper kv_context_size_seq for the context parallel size
+            if num_cp <= 1:
+                kv_context_size_seq = torch.arange(num_cp) * seq_shard_len
+            else:
+                kv_context_size_seq = exclusive_cumsum(_seq_shard_len, dim=0)
+            print_if_verbose(f"kv_context_size_seq:\n", kv_context_size_seq, "\n")
+            kv_context_size_local.append(kv_context_size_seq)
+            #### Compute num_kv_to_q (For this kv, how many shards are in the context).
+            num_kv_to_q_seq = torch.arange(num_cp) + 1
+            print_if_verbose(f"num_kv_to_q_seq:\n", num_kv_to_q_seq, "\n")
+            num_kv_to_q_local.append(num_kv_to_q_seq)
+            
+            # breakpoint()
+
+        if len(cp_seq_lens_local) == 0:
+            continue
+    
+        cp_seq_lens_local = torch.cat(cp_seq_lens_local, dim=0)
+        cp_query_dst_local = torch.cat(cp_query_dst_local, dim=0)
+        kv_to_q_mapping_local = torch.cat(kv_to_q_mapping_local, dim=0)
+        kv_to_q_rank_local = torch.cat(kv_to_q_rank_local, dim=0)
+        kv_context_size_local = torch.cat(kv_context_size_local, dim=0)
+        num_kv_to_q_local = torch.cat(num_kv_to_q_local, dim=0)
+
+        seq_shards = cp_seq_lens_local.shape[0]
+        assert cp_seq_lens_local.shape == (seq_shards,)
+        assert cp_query_dst_local.shape == (seq_shards,)
+        assert kv_to_q_mapping_local.shape == (seq_shards, max_cp_degree, 2)
+        assert kv_to_q_rank_local.shape == (seq_shards, max_cp_degree)
+        assert kv_context_size_local.shape == (seq_shards,)
+        assert num_kv_to_q_local.shape == (seq_shards,)
+
+        cp_seq_lens[i, :seq_shards] = cp_seq_lens_local
+        cp_query_dst[i, :seq_shards] = cp_query_dst_local
+        kv_to_q_mapping[i, :seq_shards] = kv_to_q_mapping_local
+        kv_to_q_rank[i, :seq_shards] = kv_to_q_rank_local
+        kv_context_size[i, :seq_shards] = kv_context_size_local
+        num_kv_to_q[i, :seq_shards] = num_kv_to_q_local
+
+    print_if_verbose(f"cp_seq_lens: ", cp_seq_lens)
+    print_if_verbose(f"cp_query_dst: ", cp_query_dst)
+    print_if_verbose(f"kv_to_q_mapping: ", kv_to_q_mapping)
+    print_if_verbose(f"kv_to_q_rank: ", kv_to_q_rank)
+    print_if_verbose(f"kv_context_size: ", kv_context_size)
+    print_if_verbose(f"num_kv_to_q: ", num_kv_to_q)
+    print_if_verbose(f"num_cp_shards: ", num_cp_shards)
+
+    num_total_kv_to_q = kv_context_size + cp_seq_lens
+    print_if_verbose(f"num_total_kv_to_q: ", num_total_kv_to_q)
+
+    fwd_q_metadata, rev_q_metadata, intermediates = compute_metadata(
+        cp_seq_lens, cp_query_dst, return_intermediate=True
+    )
+    _, q_seq_to_dst, _ = intermediates
+    fwd_k_metadata, rev_k_metadata = compute_metadata_kv(
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size, num_kv_to_q,
+        num_total_kv_to_q, cp_seq_lens, num_cp_shards, cp_query_dst,
+        q_seq_to_dst.squeeze(2), pad_len
+    )
+    attention_metadata = compute_attn_layout_seqlens(
+        cp_seq_lens, num_total_kv_to_q, cp_query_dst
+    )
+
+    
+    breakpoint()
+    print_if_verbose(f"fwd_q_metadata: ", fwd_q_metadata)
+    print_if_verbose(f"rev_q_metadata: ", rev_q_metadata)
+    print_if_verbose(f"fwd_k_metadata: ", fwd_k_metadata)
+    print_if_verbose(f"rev_k_metadata: ", rev_k_metadata)
+    print_if_verbose(f"attention_metadata: ", attention_metadata)
+
+    breakpoint()
+    
+    return (
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
+    )
+
+
+
+if __name__ == "__main__":
+    # create_qkv_dispatch(world_size=4, total_seq_len=1024, num_seqs=2, max_cp_degree=8)
+    # create_qkv_dispatch_2cp(world_size=4, total_seq_len=1024, num_seqs=2, max_cp_degree=8)
+
+    # if False:
+    if True:
+        create_qkv_dispatch_2cp_with_explicit_sharding(
+            world_size=4,
+            # Define how many sequences are we going to dispatch
+            seq_lens=torch.tensor([
+                [1024, 2048], 
+                [0, 0],
+                [0, 0],
+                [0, 0],
+            ]), 
+            cp_dst=torch.tensor([
+                [[0, 1, 2, 3, 3, 2, 1, 0],         [0, 1, 2, 3, 3, 2, 1, 0],       ],
+                [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
+                [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
+                [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
+            ]),
+            # # cp_shards[rank, seq_id] = length of this shard to that rank
+            # cp_shards=torch.tensor([
+            #     [128, 128, 128, 128, 128, 128, 128, 128], # equal sharding
+            #     [256, 256, 256, 256, 256, 256, 256, 256], # equal sharding
+            # ]),
+            cp_shards=torch.tensor([
+                # unequal sharding, sum to 1024            # unequal sharding, sum to 2048
+                [[64, 128, 192, 128, 64, 128, 192, 128],   [128, 256, 384, 256, 128, 256, 384, 256], ],
+                [[-1, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
+                [[-1, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
+                [[-1, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
+            ]),
+        )
+
+    # if True:
+    if False:
+        (
+            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
+        ) = create_qkv_dispatch_2cp_with_explicit_sharding(
+            world_size=4,
+            # Define how many sequences are we going to dispatch
+            seq_lens=torch.tensor([
+                [1024, 2048], 
+                [128, 0],
+                [128, 0],
+                [128, 0],
+            ]), 
+            cp_dst=torch.tensor([
+                [[0, 1, 2, 3, 3, 2, 1, 0],         [0, 1, 2, 3, 3, 2, 1, 0],       ],
+                [[1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
+                [[2, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
+                [[3, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
+            ]),
+            # # cp_shards[rank, seq_id] = length of this shard to that rank
+            # cp_shards=torch.tensor([
+            #     [128, 128, 128, 128, 128, 128, 128, 128], # equal sharding
+            #     [256, 256, 256, 256, 256, 256, 256, 256], # equal sharding
+            # ]),
+            cp_shards=torch.tensor([
+                # unequal sharding, sum to 1024            # unequal sharding, sum to 2048
+                [[64, 128, 192, 128, 64, 128, 192, 128],   [128, 256, 384, 256, 128, 256, 384, 256], ],
+                [[128, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
+                [[128, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
+                [[128, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
+            ]),
+        )
+
+
+
+
+        

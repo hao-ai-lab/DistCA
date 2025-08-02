@@ -166,7 +166,6 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
     seq_len[:, -1] -= seq_len_total_error
     return seq_len
 
-
 def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int):
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
     # init sequence
@@ -212,6 +211,9 @@ def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_
         for j in range(num_seqs):
             num_cp = int((cp_num[i, j]).item())
             seq_len = seq_lens[i, j]
+            if seq_len <= 0:
+                continue
+            
             seq_shard_len = seq_len // num_cp
 
             cp_seq_lens_local.append(seq_shard_len.reshape(1,).repeat(num_cp))
@@ -329,6 +331,9 @@ def create_qkv_dispatch_2cp(world_size: int, total_seq_len: int, num_seqs: int, 
         for j in range(num_seqs):
             num_cp = int((cp_num[i, j]).item())
             seq_len = seq_lens[i, j]
+            if seq_len <= 0:
+                continue
+
             seq_shard_len = seq_len // num_cp
             print_if_verbose(f"Dispatch Rank {i}, SeqID {j}, cp_num {cp_num[i, j]}, seq_len {seq_len}, seq_shard_len {seq_shard_len}")
 
