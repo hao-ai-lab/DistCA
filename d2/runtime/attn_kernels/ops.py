@@ -56,6 +56,98 @@ def nvshmem_barrier_all() -> None:
 def nvshmem_barrier_all_on_current_stream() -> None:
     _ops.nvshmem_barrier_all_on_current_stream()
 
+def dispatch_core(
+    fptr: '_ops.DispatchHelper',
+    # Q
+    send_tensor: torch.Tensor,
+    recv_tensor: torch.Tensor,
+    dst_rank: torch.Tensor,
+    dst_offset: torch.Tensor,
+    num_recv_tokens: torch.Tensor,
+    seq_len: torch.Tensor,
+    # KV
+    kv_send_tensor: Optional[torch.Tensor],
+    kv_recv_tensor: Optional[torch.Tensor],
+    kv_dst_rank: Optional[torch.Tensor],
+    kv_dst_offset: Optional[torch.Tensor],
+    kv_num_recv_tokens: Optional[torch.Tensor],
+    # Backward
+    seq_recv_mask: Optional[torch.Tensor],
+    recv_seq_lens: Optional[torch.Tensor],
+):
+    """
+    Dispatch core. Call into `csrc/bindings/all_to_all.cpp` to dispatch the qkv tensors.
+        The function does not add any more checks or specific logic. 
+        It is mainly for documentation and type-annotation purpose.
+
+    ---
+    Arguments:
+        @param fptr: The dispatcher pointer.
+            type: _ops.DispatchHelper
+
+        @param send_tensor: The tensor to send Q. 
+            type: torch.Tensor
+            shape: (num_tokens, hidden_size)
+        
+        @param recv_tensor: The tensor to receive Q. 
+            type: torch.Tensor
+            shape: (num_tokens, hidden_size)
+        
+        @param dst_rank: The destination rank for Q. 
+            type: torch.Tensor
+            shape: (num_sequence,)
+        
+        @param dst_offset: The destination offset for Q. 
+            type: torch.Tensor
+            shape: (num_sequence,)
+        
+        @param num_recv_tokens: The number of received tokens for Q. 
+            type: torch.Tensor
+            shape: (world_size + 1,)
+        
+        @param seq_len: The sequence length for Q. 
+            type: torch.Tensor
+            shape: (num_sequence,)
+        
+        @param kv_send_tensor: The tensor to send KV. 
+            type: Optional[torch.Tensor]
+            shape: (num_tokens, hidden_size)
+        
+        @param kv_recv_tensor`: The tensor to receive KV. 
+            type: Optional[torch.Tensor]
+            shape: (num_tokens, hidden_size)
+        
+        @param kv_dst_rank: The destination rank for KV. 
+            type: Optional[torch.Tensor]
+            shape: (num_sequence, cp_degree)
+        
+        @param kv_dst_offset: The destination offset for KV. 
+            type: Optional[torch.Tensor]
+            shape: (num_sequence, cp_degree)
+        
+        @param kv_num_recv_tokens: The number of received tokens for KV. 
+            type: Optional[torch.Tensor]
+            shape: (world_size + 1,)
+        
+        @param seq_recv_mask: The sequence receive mask. 
+            type: Optional[torch.Tensor]
+            shape: (num_sequence,)
+        
+        @param recv_seq_lens: The sequence length for the received tokens. 
+            type: Optional[torch.Tensor]
+            shape: (num_sequence,)
+
+        @return: None
+    """
+
+    _ops.dispatch_core(
+        fptr,
+        send_tensor, recv_tensor, dst_rank, dst_offset, num_recv_tokens, seq_len,
+        kv_send_tensor, kv_recv_tensor, kv_dst_rank, kv_dst_offset, kv_num_recv_tokens,
+        seq_recv_mask, recv_seq_lens,
+    )
+    return 
+
 ###### MLP<->ATTN dispatch ######
 def create_dispatcher(
     q_stride: int,
@@ -163,6 +255,9 @@ def dispatch_qkv(
     kv_dst_tensor: torch.Tensor,
     kv_metadata: Metadata,
 ):
+    """
+    Dispatch qkv. Calling the `dispatch_core` CUDA function to dispatch the qkv tensors.
+    """
     assert metadata.dst_rank.dtype == torch.int32
     assert metadata.dst_offset.dtype == torch.uint32
     assert metadata.num_recv_tokens.dtype == torch.uint64
@@ -174,7 +269,7 @@ def dispatch_qkv(
     assert kv_metadata.num_recv_tokens.dtype == torch.uint64
     assert kv_metadata.seq_len.dtype == torch.uint32
     assert kv_tensor.dtype == kv_dst_tensor.dtype
-    return _ops.dispatch_core(
+    return dispatch_core(
         dispatcher.dispatcher,
         tensor, dst_tensor,
         metadata.dst_rank, metadata.dst_offset, metadata.num_recv_tokens, metadata.seq_len,
@@ -195,7 +290,7 @@ def dispatch_no_cp_tensor(
     assert metadata.num_recv_tokens.dtype == torch.uint64
     assert metadata.seq_len.dtype == torch.uint32
     assert tensor.dtype == dst_tensor.dtype
-    return _ops.dispatch_core(
+    return dispatch_core(
         dispatcher.dispatcher,
         tensor, dst_tensor,
         metadata.dst_rank, metadata.dst_offset, metadata.num_recv_tokens, metadata.seq_len,
@@ -215,7 +310,7 @@ def dispatch_kv_backward(
     assert metadata.seq_len.dtype == torch.uint32
     assert tensor.dtype == dst_tensor.dtype
     assert metadata.seq_recv_mask.dtype == torch.uint32
-    return _ops.dispatch_core(
+    return dispatch_core(
         dispatcher.dispatcher,
         tensor, dst_tensor,
         metadata.dst_rank, metadata.dst_offset, metadata.num_recv_tokens, metadata.seq_len,
