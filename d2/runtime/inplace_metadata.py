@@ -1,3 +1,8 @@
+"""
+Metadata about dispatching strategy.
+NOTE: with fast all2all display, this strategy is only logical.
+"""
+
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
@@ -45,6 +50,11 @@ def index_put_with_neg_padding_1d(
     tensor = torch.concat([tensor, torch.zeros([1], device=tensor.device, dtype=tensor.dtype)], dim=0)
     tensor.index_put_((index,), src, accumulate=False)
     return tensor[:-1].reshape(tensor_shape)  # remove the padding value at the end
+
+
+def prepend_zero_fn(tensor: torch.Tensor):
+    zero = torch.zeros_like(tensor[0:1])
+    return torch.cat([zero, tensor], dim=0)
 
 
 @dataclass
@@ -120,7 +130,7 @@ def compute_metadata(
     seq_len: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
     global_dispatch: torch.Tensor,  # shape of (world_size, max_num_local_seqs, max_cp_degree)
     return_intermediate: bool = False,
-) -> Tuple[Metadata, Metadata]:
+):
     """
     Given a dispatch plan, this function assigns the query tensor's attention layout.
     Args:
@@ -258,7 +268,7 @@ def compute_metadata(
 @torch.no_grad()
 def compute_attn_layout_seqlens(
     seq_shard_len: torch.Tensor, seq_shard_cumsum: torch.Tensor,
-    dispatch: torch.Tensor,
+    dispatch: torch.Tensor, prepend_zero: bool=True, shard_to_tuple: bool=False
 ):
     """
     Compute the cu_seqlens_q and cu_seqlens_kv for the attention layout.
@@ -270,6 +280,9 @@ def compute_attn_layout_seqlens(
           for the sequence shard's context. This is to compute the KV seqlens of the shard.
         dispatch: shape (world_size, max_num_local_seqs). The rank that each sequence
           shard is dispatched to. The value is -1 for padding.
+        prepend_zero: bool, whether to prepend a zero to the cu_seqlens.
+          flash attention requires tha prefix zero.
+        shard_to_tuple: bool, whether to return the output as a tuple of tensors, and apply the actual receive length.
     """
     world_size = dispatch.shape[0]
     max_num_local_seqs = dispatch.shape[1]
@@ -309,6 +322,20 @@ def compute_attn_layout_seqlens(
     cu_seqlens_kv = out_seqlens_kv.cumsum(dim=1)
     max_seqlen_q = out_seqlens_q.max(dim=1)[0]
     max_seqlen_kv = out_seqlens_kv.max(dim=1)[0]
+    if prepend_zero:
+        cu_seqlens_q = prepend_zero_fn(cu_seqlens_q)
+        cu_seqlens_kv = prepend_zero_fn(cu_seqlens_kv)
+    if shard_to_tuple:
+        cu_seqlens_q = tuple(
+            cu_seqlens_q[i][:num_local_seqs_recv[i]]
+            for i in range(world_size)
+        )
+        cu_seqlens_kv = tuple(
+            cu_seqlens_kv[i][:num_local_seqs_recv[i]]
+            for i in range(world_size)
+        )
+        # NOTE: max_seqlen does not need to shard to tuples because
+        # they are of the same length (1,) for each rank.
 
     return cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, num_local_seqs_recv
 
@@ -325,6 +352,7 @@ def compute_metadata_kv(
     q_dispatch: torch.Tensor,
     q_seq_to_dst: torch.Tensor,
     max_num_local_seqs: int,
+    return_intermediate: bool=False
 ):
     """
     Given the query's dispatch plan and a mapping from key-value to query,
@@ -376,6 +404,7 @@ def compute_metadata_kv(
     query_dst_kv_seq_id = exclusive_cumsum(num_kv_seq_to_dst, dim=0) * q_seq_to_dst.bool().reshape(-1, world_size)
     query_dst_kv_seq_id = query_dst_kv_seq_id.sum(dim=-1).reshape(world_size, max_num_local_seqs)
 
+    # shape (world_size, max_num_local_seqs, max_cp_degree): the dst rank's seq idx for this src kv replica
     kv_dst_seq_id = query_dst_kv_seq_id.flatten()[kv_to_q_mapping_flatten].reshape(kv_valid_mask.shape) * kv_valid_mask
     kv_dst_seq_id = kv_dst_seq_id + kv_to_q_rank
     # 3. compute the dst offset for each kv dispatch, on the attention layout.
@@ -447,6 +476,10 @@ def compute_metadata_kv(
     )
     # num_token_to_dst is the forward size tokens sent to the dst, which equals token received during backward.
     rev_kv_num_recv_tokens = num_send_tokens
+    rev_total_recv_tokens = rev_kv_num_recv_tokens.sum(dim=1, keepdim=True)
+    rev_kv_num_recv_tokens = torch.cat(
+        [rev_kv_num_recv_tokens, rev_total_recv_tokens], dim=1
+    )
 
     bwd_metadata = Metadata(
         rev_kv_dst_rank,
@@ -457,7 +490,12 @@ def compute_metadata_kv(
         recv_seq_lens=fwd_metadata.seq_len,
         num_seqs=num_seq_bwd,
         world_size=world_size,
+        num_total_recv_tokens=rev_total_recv_tokens.flatten().tolist()
     )
+    if return_intermediate:
+        return fwd_metadata, bwd_metadata, (
+            kv_dst_global_seq_id,
+        )
     return fwd_metadata, bwd_metadata
 
 
@@ -465,11 +503,9 @@ def mlp_layout_packed_params(seq_lens: torch.Tensor):
     """
     Compute the MLP layout packed_seq_params. MLP layout guarantees seqlens_q == seqlens_kv.
     This is mainly for RoPE.
+    NOTE: this is the seq lens on the local rank.
     """
-    cu_seqlens = torch.cat([
-        torch.zeros((1,), dtype=seq_lens.dtype, device=seq_lens.device),
-        seq_lens.cumsum(dim=0)
-    ])
+    cu_seqlens = prepend_zero_fn(seq_lens.cumsum(dim=0))
     max_seqlen = seq_lens.max()
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
@@ -479,3 +515,45 @@ def mlp_layout_packed_params(seq_lens: torch.Tensor):
         max_seqlen_kv=max_seqlen,
     )
     return packed_seq_params
+
+
+def compute_e2e_metadata(
+    mlp_seq_len: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    mlp_num_seqs: torch.Tensor,
+    mlp_q_dispatch: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    kv_to_q_mapping: torch.Tensor,
+    kv_to_q_rank: torch.Tensor,
+    kv_context_size: torch.Tensor,
+    q_to_num_kv_seq: torch.Tensor,
+    q_to_num_kv_token: torch.Tensor,
+    return_intermediate: bool = False
+):
+    """
+    High level functions to compute all required metadata.
+    """
+    fwd_metadata_q, rev_metadata_q, q_intermediates = compute_metadata(
+        mlp_seq_len, mlp_q_dispatch, return_intermediate=True
+    )
+
+    max_num_local_seqs = mlp_q_dispatch.shape[1]
+    _, q_seq_to_dst, num_received_seqs_q = q_intermediates
+    fwd_metadata_kv, rev_metadata_kv, kv_intermediates = compute_metadata_kv(
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+        q_to_num_kv_seq, q_to_num_kv_token, mlp_seq_len, mlp_num_seqs,
+        mlp_q_dispatch, q_seq_to_dst, max_num_local_seqs,
+        return_intermediate=True
+    )
+
+    (
+        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+        num_local_seqs_recv
+    ) = compute_attn_layout_seqlens(
+        mlp_seq_len, q_to_num_kv_token, mlp_q_dispatch, shard_to_tuple=True
+    )
+    fa_params = (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+
+    ret = fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params
+    if return_intermediate:
+        ret += (q_intermediates + kv_intermediates,)
+    return ret
+

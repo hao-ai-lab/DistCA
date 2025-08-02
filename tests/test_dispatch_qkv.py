@@ -1,3 +1,6 @@
+# NOTE: this file should be deprecated:
+# We have a new all2all implementation, and a new kv metadata generation.
+
 import math
 from typing import List, Tuple, Optional
 
@@ -13,6 +16,7 @@ from d2.runtime.inplace_metadata import compute_metadata, Metadata
 from test_util import gen_seq_lens
 from test_comm_metadata import orchestrate_simulate
 
+
 @ray.remote(num_gpus=1)
 class Worker:
     def __init__(self, rank: int, world_size: int):
@@ -22,6 +26,7 @@ class Worker:
 
     def init_comm(self,
         uid: torch.Tensor, stride_q: int, stride_kv: int, max_tokens_query: int, max_tokens_key_value: int,
+        use_fast: bool=False
     ):
         DispatcherWrapper.init(
             q_stride=stride_q,

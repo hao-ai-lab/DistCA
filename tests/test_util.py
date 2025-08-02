@@ -167,7 +167,10 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
     return seq_len
 
 
-def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int):
+def create_qkv_dispatch(
+    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
+    return_intermediate: bool=False
+):
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
     # init sequence
     assert total_seq_len % (max_cp_degree) == 0
@@ -196,7 +199,7 @@ def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_
     kv_to_q_mapping = torch.ones((world_size, pad_len, max_cp_degree, 2), dtype=torch.int64) * -1
     kv_to_q_rank = torch.ones((world_size, pad_len, max_cp_degree), dtype=torch.int64) * -1
     kv_context_size = torch.zeros((world_size, pad_len), dtype=torch.int64)
-    num_kv_to_q = torch.zeros((world_size, pad_len), dtype=torch.int64)
+    q_to_num_kv_seq = torch.zeros((world_size, pad_len), dtype=torch.int64)
 
     # cumulative number of cp shards before this one.
     num_cul_cp_shards = exclusive_cumsum(cp_num, dim=1)
@@ -207,7 +210,7 @@ def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_
         kv_to_q_mapping_local = []
         kv_to_q_rank_local = []
         kv_context_size_local = []
-        num_kv_to_q_local = []
+        q_to_num_kv_seq_local = []
 
         for j in range(num_seqs):
             num_cp = int((cp_num[i, j]).item())
@@ -232,16 +235,16 @@ def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_
             #### Compute kv context size (For this kv, how many tokens are in the context).
             kv_context_size_seq = torch.arange(num_cp) * seq_shard_len
             kv_context_size_local.append(kv_context_size_seq)
-            #### Compute num_kv_to_q (For this kv, how many shards are in the context).
-            num_kv_to_q_seq = torch.arange(num_cp) + 1
-            num_kv_to_q_local.append(num_kv_to_q_seq)
+            #### Compute q_to_num_kv_seq (For this kv, how many shards are in the context).
+            q_to_num_kv_seq_seq = torch.arange(num_cp) + 1
+            q_to_num_kv_seq_local.append(q_to_num_kv_seq_seq)
 
         cp_seq_lens_local = torch.cat(cp_seq_lens_local, dim=0)
         cp_query_dst_local = torch.cat(cp_query_dst_local, dim=0)
         kv_to_q_mapping_local = torch.cat(kv_to_q_mapping_local, dim=0)
         kv_to_q_rank_local = torch.cat(kv_to_q_rank_local, dim=0)
         kv_context_size_local = torch.cat(kv_context_size_local, dim=0)
-        num_kv_to_q_local = torch.cat(num_kv_to_q_local, dim=0)
+        q_to_num_kv_seq_local = torch.cat(q_to_num_kv_seq_local, dim=0)
         # shape check:
         seq_shards = cp_seq_lens_local.shape[0]
         assert cp_seq_lens_local.shape == (seq_shards,)
@@ -249,29 +252,36 @@ def create_qkv_dispatch(world_size: int, total_seq_len: int, num_seqs: int, max_
         assert kv_to_q_mapping_local.shape == (seq_shards, max_cp_degree, 2)
         assert kv_to_q_rank_local.shape == (seq_shards, max_cp_degree)
         assert kv_context_size_local.shape == (seq_shards,)
-        assert num_kv_to_q_local.shape == (seq_shards,)
+        assert q_to_num_kv_seq_local.shape == (seq_shards,)
 
         cp_seq_lens[i, :seq_shards] = cp_seq_lens_local
         cp_query_dst[i, :seq_shards] = cp_query_dst_local
         kv_to_q_mapping[i, :seq_shards] = kv_to_q_mapping_local
         kv_to_q_rank[i, :seq_shards] = kv_to_q_rank_local
         kv_context_size[i, :seq_shards] = kv_context_size_local
-        num_kv_to_q[i, :seq_shards] = num_kv_to_q_local
+        q_to_num_kv_seq[i, :seq_shards] = q_to_num_kv_seq_local
 
-    num_total_kv_to_q = kv_context_size + cp_seq_lens
+    q_to_num_kv_tokens = kv_context_size + cp_seq_lens
 
-    fwd_q_metadata, rev_q_metadata, intermediates = compute_metadata(
+    fwd_q_metadata, rev_q_metadata, q_intermediates = compute_metadata(
         cp_seq_lens, cp_query_dst, return_intermediate=True
     )
-    _, q_seq_to_dst, _ = intermediates
-    fwd_k_metadata, rev_k_metadata = compute_metadata_kv(
-        kv_to_q_mapping, kv_to_q_rank, kv_context_size, num_kv_to_q,
-        num_total_kv_to_q, cp_seq_lens, num_cp_shards, cp_query_dst,
-        q_seq_to_dst.squeeze(2), pad_len
+    _, q_seq_to_dst, _ = q_intermediates
+    fwd_k_metadata, rev_k_metadata, kv_intermediates = compute_metadata_kv(
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size, q_to_num_kv_seq,
+        q_to_num_kv_tokens, cp_seq_lens, num_cp_shards, cp_query_dst,
+        q_seq_to_dst.squeeze(2), pad_len,
+        return_intermediate=True
     )
     attention_metadata = compute_attn_layout_seqlens(
-        cp_seq_lens, num_total_kv_to_q, cp_query_dst
+        cp_seq_lens, q_to_num_kv_tokens, cp_query_dst
     )
+    if return_intermediate:
+        intermediates = q_intermediates + kv_intermediates
+        return (
+            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+            attention_metadata, intermediates
+        )
     return (
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
     )

@@ -13,11 +13,12 @@ import ray
 from ray.util.placement_group import placement_group
 import torch
 
-from d2.runtime.inplace_metadata import compute_attn_layout_seqlens, orchestrate_simulate, Metadata
+from d2.runtime.inplace_metadata import compute_attn_layout_seqlens, Metadata, prepend_zero_fn
 from d2.runtime.megatron_patch.model_patch import get_gpt_layer_with_transformer_engine_spec, get_gpt_config
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.transformer_layer import TransformerLayer as PingPangTransformerLayer
 
+from test_comm_metadata import orchestrate_simulate
 from test_dispatch_qkv import create_testcase_qkv
 from test_util import MegatronBaseWorker, ParallelConfig
 
@@ -112,7 +113,7 @@ class MegatronLayerWorker(MegatronBaseWorker):
 
 
 def get_seqlen_shard(cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor,
-                     max_seqlen_q: torch.Tensor, max_seqlen_kv: torch.Tensor, num_local_seqs_recv: torch.Tensor, rank: int):
+                     max_seqlen_q: torch.Tensor, max_seqlen_kv: torch.Tensor, num_local_seqs_recv: torch.Tensor, rank: int, prepend_zero: bool=False):
     """
     Get the seqlen related arguments for a specific rank.
     This removes padding at the num_sequence dimension.
@@ -120,8 +121,11 @@ def get_seqlen_shard(cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor,
     num_seq = num_local_seqs_recv[rank].item()
     max_seqlen_q = max_seqlen_q[rank]
     max_seqlen_kv = max_seqlen_kv[rank]
-    cu_seqlens_q = torch.cat([torch.zeros((1,), dtype=cu_seqlens_q.dtype), cu_seqlens_q[rank][:num_seq]])
-    cu_seqlens_kv = torch.cat([torch.zeros((1,), dtype=cu_seqlens_kv.dtype), cu_seqlens_kv[rank][:num_seq]])
+    cu_seqlens_q = cu_seqlens_q[rank][:num_seq]
+    cu_seqlens_kv = cu_seqlens_kv[rank][:num_seq]
+    if prepend_zero:
+        cu_seqlens_q = prepend_zero_fn(cu_seqlens_q)
+        cu_seqlens_kv = prepend_zero_fn(cu_seqlens_kv)
     return cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, num_seq
 
 
