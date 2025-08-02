@@ -3,7 +3,7 @@ from torch import Tensor
 
 from d2.runtime.attn_kernels.ops import (
     FastDispatcherWrapper, fast_a2a_memcpy_non_cp,
-    fast_a2a_memcpy_cp, fast_a2a
+    fast_a2a_memcpy_cp, fast_a2a,
 )
 
 def fast_a2a_qkv(

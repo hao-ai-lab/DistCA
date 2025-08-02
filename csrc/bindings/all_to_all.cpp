@@ -389,6 +389,54 @@ void fast_a2a(
   );
 }
 
+void _debug_nvshmem_buffer(
+  fptr_t fptr,
+  bool get_send,
+  bool get_recv,
+  bool get_signal,
+  at::Tensor &target
+) {
+  if (get_send) {
+    TORCH_CHECK(!get_recv, "can only probe one buffer");
+    TORCH_CHECK(!get_signal, "can only probe one buffer");
+  } else if (get_recv) {
+    TORCH_CHECK(!get_send, "can only probe one buffer");
+    TORCH_CHECK(!get_signal, "can only probe one buffer");
+  } else if (get_signal) {
+    TORCH_CHECK(!get_send, "can only probe one buffer");
+    TORCH_CHECK(!get_recv, "can only probe one buffer");
+  } else {
+    TORCH_CHECK(false, "must get at least one buffer");
+  }
+
+  auto *dispatch_helper = (FastA2aDispatchHelper*)fptr;
+  size_t size;
+
+  if (get_send || get_recv) {
+    size = dispatch_helper->_buffer_size;
+    uint8_t *dst_ptr = (uint8_t *)(
+      target.data_ptr()
+    );
+    uint8_t *src_ptr = get_send ?
+      dispatch_helper->buffer.send_buffer :
+      dispatch_helper->buffer.recv_buffer;
+    TORCH_CHECK(target.nbytes() >= size, "dst tensor size < buffer size");
+    cudaMemcpy(
+      dst_ptr, src_ptr, size, cudaMemcpyDeviceToDevice
+    );
+  } else {
+    size = dispatch_helper->_world_size;
+    TORCH_CHECK(target.scalar_type() == at::ScalarType::UInt64,
+                "dst tensor must be of dtype uint64");
+    TORCH_CHECK(target.numel() >= size, "dst tensor size < world_size");
+    uint64_t *dst_ptr = target.data_ptr<uint64_t>();
+    cudaMemcpy(
+      dst_ptr, dispatch_helper->buffer.sync_signal,
+      size * sizeof(uint64_t), cudaMemcpyDeviceToDevice
+    );
+  }
+}
+
 
 }; // namespace
 
@@ -407,5 +455,6 @@ void register_all_to_all_ops(torch::Library &m) {
   m.def("fast_a2a_memcpy_cp", &fast_a2a_memcpy_cp);
   m.def("fast_a2a_memcpy_cp_debug", &fast_a2a_memcpy_cp_debug);
   m.def("fast_a2a", &fast_a2a);
+  m.def("_debug_nvshmem_buffer", &_debug_nvshmem_buffer);
 }
 }; // namespace attn

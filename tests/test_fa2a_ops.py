@@ -1,20 +1,17 @@
 import torch
-from torch import Tensor
 
 from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.fast_alltoall_metadata import (
     compute_forward_qkv_a2a_layout_meatadata,
     compute_reverse_a2a_layout_metadata,
     SeqLens,
-    LogicalShape,
-    FastAlltoAllMetadata
+    LogicalShape
 )
 
 from d2.runtime.attn_kernels.ops import (
     fast_a2a_memcpy_non_cp, fast_a2a_memcpy_cp
 )
 
-from test_comm_metadata import orchestrate_simulate
 from test_util import create_qkv_dispatch
 from test_fa2a_metadata import (
     simulate_fa2a_send_copy_non_cp, simulate_fa2a_send_copy_cp,
@@ -44,9 +41,10 @@ def test(args):
         world_size, total_seq_len, num_seqs, max_cp_degree, return_intermediate=True
     )
 
-    tensor_q = torch.rand((world_size, total_seq_len, hidden_size_q), device=device) + 1    # + 1 to avoid zeros
-    tensor_k = torch.rand((world_size, total_seq_len, hidden_size_k), device=device) + 1
-    tensor_v = torch.rand((world_size, total_seq_len, hidden_size_k), device=device) + 1
+    dtype = torch.float16
+    tensor_q = torch.rand((world_size, total_seq_len, hidden_size_q), device=device, dtype=dtype) + 1    # + 1 to avoid zeros
+    tensor_k = torch.rand((world_size, total_seq_len, hidden_size_k), device=device, dtype=dtype) + 1
+    tensor_v = torch.rand((world_size, total_seq_len, hidden_size_k), device=device, dtype=dtype) + 1
 
     (q_tokens_to_dst_per_dispatch, q_seq_to_dst,
      _, kv_dst_global_seq_id) = intermediates
@@ -91,8 +89,6 @@ def test(args):
     tot_recv_bytes = qkv_fwd_fa2a_metadata.fa2a_metadata[3].sum(dim=1) // element_size
     max_recv_bytes = int(torch.max(tot_recv_bytes).item())
 
-    dtype = tensor_q.dtype
-    device = tensor_q.device
     src_buffer = torch.zeros(
         (world_size, max_send_bytes), dtype=dtype, device=device
     )
@@ -235,8 +231,9 @@ def test(args):
         grad_send_mask = get_send_mask_slice(fwd_k_metadata, rank)
         grad_do_shard = grad_send_mask.to(torch.int8).cuda()
 
+        grad_k_shard_cor = grad_k_shard.flatten(start_dim=1).clone()
         grad_k_shard_cor = simulate_fa2a_recv_copy_kv_grad(
-            grad_k_shard.flatten(start_dim=1), grad_shard,
+            grad_k_shard_cor, grad_shard,
             grad_k_recv_offsets, grad_seqlen_kv,
             hidden_size_k, element_size, max_cp_degree,
             grad_send_mask

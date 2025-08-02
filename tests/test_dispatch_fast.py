@@ -52,7 +52,7 @@ class Worker:
             self.rank, local_rank, self.world_size, buffer_size, uid
         )
 
-    def test_qkv(
+    def run_qkv(
         self, fa2a_metadata_fwd: FastAlltoAllMetadata,
         fa2a_metadata_rev: FastAlltoAllMetadata,
         tensor_q: torch.Tensor, tensor_kv: torch.Tensor,
@@ -258,7 +258,7 @@ def test_qkv(
     fa2a_metadata_rev_slice = fa2a_metadata_rev.get_slice(rank)
 
     # run this communication
-    out_dict = worker.test_qkv(
+    out_dict = worker.run_qkv(
         fa2a_metadata_fwd_slice, fa2a_metadata_rev_slice,
         q_slice, kv_slice, dispatch_mask
     )
@@ -316,8 +316,8 @@ if __name__ == "__main__":
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--max-cp-degree", type=int, default=2)
-    parser.add_argument("--hidden-size-query", type=int, default=256)
-    parser.add_argument("--hidden-size-kv", type=int, default=128)
+    parser.add_argument("--hidden-size-query", type=int, default=64)
+    parser.add_argument("--hidden-size-kv", type=int, default=16)
     parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()

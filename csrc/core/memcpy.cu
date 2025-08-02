@@ -117,8 +117,8 @@ __global__ void memcpy_nvshmem_cp(
     const size_t token_physical_offset_on_tensor = (
       TO_NVSHMEM ? (token_idx % total_num_tokens) : token_idx
     ) * token_bytes;
-    const int4 *send = (int4 *)(tensor + token_physical_offset_on_tensor);
-    uint8_t *recv =  (
+    uint8_t *tensor_token = tensor + token_physical_offset_on_tensor;
+    uint8_t *buffer_token =  (
       // sequence start (bytes)
       nvshmem_buffer + cur_seq_start_offset +
       // token offset (bytes)
@@ -128,7 +128,11 @@ __global__ void memcpy_nvshmem_cp(
     for (size_t i = threadIdx.x; i * sizeof(int4) < token_bytes;
          i += blockDim.x) {
       // i-th byte's offset in src
-      ((int4*)recv)[i] = send[i];
+      if constexpr (TO_NVSHMEM) {
+        ((int4*)buffer_token)[i] = ((int4*)tensor_token)[i];
+      } else {
+        ((int4*)tensor_token)[i] = ((int4*)buffer_token)[i];
+      }
     }
   }
 }

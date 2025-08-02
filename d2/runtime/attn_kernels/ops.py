@@ -306,3 +306,26 @@ def fast_a2a(
         sender_recv_disp, recver_transfer_sz,
         my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz
     )
+
+
+def _debug_dump_buffer(
+    dump_target: str,
+    buffer_dtype: torch.dtype,
+    device: torch.device,
+    instance: FastDispatcherWrapper=None,
+):
+    assert dump_target in ["send", "recv", "signal"]
+    get_send = dump_target == "send"
+    get_recv = dump_target == "recv"
+    get_signal = dump_target == "signal"
+    instance = instance or FastDispatcherWrapper.get_instance()
+    out_tensor = torch.zeros(
+        (instance.buffer_size // buffer_dtype.itemsize,),
+        dtype=buffer_dtype, device=device
+    )
+    _ops._debug_nvshmem_buffer(
+        instance.handle,
+        get_send, get_recv, get_signal, out_tensor
+    )
+    torch.cuda.synchronize()
+    return out_tensor
