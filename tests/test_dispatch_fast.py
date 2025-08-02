@@ -9,16 +9,14 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 2 test_dispatch_fast.py \
     --world-size 2
 """
-import math
 import os
-from typing import List, Tuple, Optional
 
 import torch
 
 from d2.runtime.attn_kernels.ops import (
-    nvshmem_barrier_all, nvshmem_get_unique_id,
-    nvshmem_alloc_empty_unique_id, FastDispatcherWrapper,
+    nvshmem_barrier_all
 )
+# TODO: test fast_a2a_attn_out and its metadata by sending q_attn_layout back to q_mlp_layout via attn_out metadata.
 from d2.runtime.attn_kernels.dispatch import (
     fast_a2a_qkv, fast_a2a_attn_out
 )
@@ -26,31 +24,10 @@ from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata, compute_fa2a_metadata_from_logical_metadata
 
 from test_comm_metadata import orchestrate_simulate
-from test_fa2a_metadata import create_qkv_dispatch
+from test_util import BaseWorker, create_qkv_dispatch
 
 
-class Worker:
-    def __init__(self, rank: int, world_size: int):
-        self.rank = rank
-        self.world_size = world_size
-
-    def init_comm(self, buffer_size: int, local_rank: int = None):
-        # Init megatron communication.
-        if local_rank is None:
-            local_rank = int(os.getenv("LOCAL_RANK"))
-
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size)
-
-        if self.rank == 0:
-            uid = nvshmem_get_unique_id()
-        else:
-            uid = nvshmem_alloc_empty_unique_id()
-        torch.distributed.broadcast(uid, src=0)
-
-        FastDispatcherWrapper.init(
-            self.rank, local_rank, self.world_size, buffer_size, uid
-        )
+class Worker(BaseWorker):
 
     def run_qkv(
         self, fa2a_metadata_fwd: FastAlltoAllMetadata,

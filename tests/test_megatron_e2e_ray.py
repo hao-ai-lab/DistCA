@@ -20,7 +20,7 @@ from d2.runtime.inplace_metadata import (
 
 from test_util import MegatronBaseWorker, ParallelConfig
 from deprecated.test_dispatch_qkv import create_testcase_qkv
-from test_megatron_layer import create_pg, get_seqlen_shard
+from deprecated.test_megatron_layer import create_pg, get_seqlen_shard
 from test_megatron_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,

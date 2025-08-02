@@ -23,7 +23,7 @@ from d2.runtime.megatron_patch.packed_seq_params import PackedSeqParams, PingPan
 
 from deprecated.test_dispatch_qkv import create_testcase_qkv
 from test_util import ParallelConfig
-from test_megatron_layer import MegatronLayerWorker, get_seqlen_shard
+from deprecated.test_megatron_layer import MegatronLayerWorker, get_seqlen_shard
 
 
 class PingPangLayerWorker(MegatronLayerWorker):

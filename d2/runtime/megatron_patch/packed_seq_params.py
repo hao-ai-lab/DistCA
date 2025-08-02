@@ -5,7 +5,7 @@ import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
 
-from d2.runtime.inplace_metadata import Metadata
+from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata
 
 
 def _to_cuda_int32(tensor: Optional[torch.Tensor]):
@@ -16,10 +16,10 @@ def _to_cuda_int32(tensor: Optional[torch.Tensor]):
 
 @dataclass
 class PingPangSingleStepPackedSeqParams(PackedSeqParams):
-    mlp_to_attn_metadata: Metadata = None
-    attn_to_mlp_metadata: Metadata = None
-    mlp_to_attn_kv_metadata: Metadata = None
-    mlp_to_attn_kv_grad_metadata: Metadata = None
+    qkv_fwd_metadata: FastAlltoAllMetadata = None
+    qkv_bwd_metadata: FastAlltoAllMetadata = None
+    attn_out_fwd_metadata: FastAlltoAllMetadata = None
+    attn_out_bwd_metadata: FastAlltoAllMetadata = None
     stream: torch.cuda.Stream = None
 
     def to_device(self):
@@ -31,10 +31,10 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
             cu_seqlens_kv_padded=_to_cuda_int32(self.cu_seqlens_kv_padded),
             max_seqlen_q=_to_cuda_int32(self.max_seqlen_q),
             max_seqlen_kv=_to_cuda_int32(self.max_seqlen_kv),
-            mlp_to_attn_metadata=self.mlp_to_attn_metadata.normalize_dtype().cuda(),
-            attn_to_mlp_metadata=self.attn_to_mlp_metadata.normalize_dtype().cuda(),
-            mlp_to_attn_kv_metadata=self.mlp_to_attn_kv_metadata.normalize_dtype().cuda(),
-            mlp_to_attn_kv_grad_metadata=self.mlp_to_attn_kv_grad_metadata.normalize_dtype().cuda(),
+            qkv_fwd_metadata=self.qkv_fwd_metadata.normalize(),
+            qkv_bwd_metadata=self.qkv_bwd_metadata.normalize(),
+            attn_out_fwd_metadata=self.attn_out_fwd_metadata.normalize(),
+            attn_out_bwd_metadata=self.attn_out_bwd_metadata.normalize(),
             stream=self.stream,
         )
 
