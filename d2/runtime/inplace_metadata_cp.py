@@ -1,49 +1,112 @@
-from dataclasses import dataclass
-import os
-import socket
-from typing import Optional
-import math
 
-
-from megatron.core import parallel_state as mpu
-import ray
 import torch
-
 from d2.runtime.attn_kernels.ops import nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper
+
 from d2.runtime.inplace_metadata import (
-    Metadata, compute_attn_layout_seqlens, compute_metadata, compute_metadata_kv,
-    exclusive_cumsum
+    Metadata, compute_metadata, compute_metadata_kv, compute_attn_layout_seqlens, exclusive_cumsum
 )
-from test_util import (ParallelConfig, MegatronBaseWorker, gen_seq_lens)
+
+
+def compute_e2e_metadata(
+    mlp_seq_len: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    mlp_num_seqs: torch.Tensor,
+    mlp_q_dispatch: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    kv_to_q_mapping: torch.Tensor,
+    kv_to_q_rank: torch.Tensor,
+    kv_context_size: torch.Tensor,
+    q_to_num_kv_seq: torch.Tensor,
+    q_to_num_kv_token: torch.Tensor,
+    return_intermediate: bool = False
+):
+    """
+    High level functions to compute all required metadata.
+    """
+    fwd_metadata_q, rev_metadata_q, q_intermediates = compute_metadata(
+        mlp_seq_len, mlp_q_dispatch, return_intermediate=True
+    )
+
+    max_num_local_seqs = mlp_q_dispatch.shape[1]
+    _, q_seq_to_dst, num_received_seqs_q = q_intermediates
+    fwd_metadata_kv, rev_metadata_kv, kv_intermediates = compute_metadata_kv(
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+        q_to_num_kv_seq, q_to_num_kv_token, mlp_seq_len, mlp_num_seqs,
+        mlp_q_dispatch, q_seq_to_dst, max_num_local_seqs,
+        return_intermediate=True
+    )
+
+    (
+        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+        num_local_seqs_recv
+    ) = compute_attn_layout_seqlens(
+        mlp_seq_len, q_to_num_kv_token, mlp_q_dispatch, shard_to_tuple=True
+    )
+    fa_params = (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+
+    ret = fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params
+    if return_intermediate:
+        ret += (q_intermediates + kv_intermediates,)
+    return ret
+
+
+
 
 import rich
 # VERBOSE = True
 VERBOSE = False
+DEBUG = False
+
 def print_if_verbose(*args, **kwargs):
     if VERBOSE:
         rich.print(*args, **kwargs)
 
+
 def create_qkv_dispatch_2cp_with_explicit_sharding(
     world_size: int,
-
-    # seq_lens[src_rank, seq_id] = sequence length
-    #      Make a sequence of (src_rank, seq_id) to (sequence length)
-    #      shape: (world_size, num_seqs)
     seq_lens: torch.Tensor,
-
-    # cp_dst[src_rank, seq_id, shard_id] = dst_rank
-    #      Make a sequence of (src_rank, seq_id)'s (shard_id) to (dst_rank)
-    #      dst_rank == -1 then it is a mask
-    #      shape: (world_size, num_seqs, max_cp_degree)
     cp_dst: torch.Tensor,
-
-    # cp_shards[src_rank, seq_id, shard_id] = length 
-    #      (length of the shard to send to `cp_dst[src_rank, seq_id, shard_id]`)
-    #      shape: (world_size, num_seqs, max_cp_degree)
-    #      value == -1 then it is a mask
     cp_shards: torch.Tensor,
 ):
-    """Create qkv with explicit sharding passing from the outside."""
+    """
+    Create qkv with explicit sequence sharding.
+
+    ----
+    Arguments
+
+    @param world_size: int
+        The number of ranks in the context-parallel world.
+
+    @param seq_lens: torch.Tensor
+        seq_lens[src_rank, seq_id] = The length of the sequence.
+        shape: (world_size, num_seqs)
+
+    @param cp_dst: torch.Tensor
+        cp_dst[src_rank, seq_id, shard_id] = dst_rank
+            The destination rank of this sequence shard from (src_rank, seq_id)'s shard_id.
+            The sequence shard's length is defined in `cp_shards`, a tensor of the same shape.
+            If dst_rank == -1, it is a mask.
+        shape: (world_size, num_seqs, max_cp_degree)
+
+    @param cp_shards: torch.Tensor
+        cp_shards[src_rank, seq_id, shard_id] = length
+            The length of the sequence shard to send to `cp_dst[src_rank, seq_id, shard_id]`.
+            If value == -1, it is a mask.
+        shape: (world_size, num_seqs, max_cp_degree)
+
+    ----
+    Return values
+    
+    @return fwd_q_metadata: Metadata
+    @return rev_q_metadata: Metadata
+    @return fwd_k_metadata: Metadata
+    @return rev_k_metadata: Metadata
+    @return attention_metadata: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    
+    ----
+    Usage
+
+    See test_util_cp_metadata.py for usage.
+
+    """
     # init sequence    
     num_seqs: torch.Tensor = (seq_lens > 0).sum(dim=1).max()
     # max_num_seqs = num_seqs.max()
@@ -198,90 +261,16 @@ def create_qkv_dispatch_2cp_with_explicit_sharding(
     )
 
     
-    breakpoint()
+    if DEBUG: breakpoint()
+
     print_if_verbose(f"fwd_q_metadata: ", fwd_q_metadata)
     print_if_verbose(f"rev_q_metadata: ", rev_q_metadata)
     print_if_verbose(f"fwd_k_metadata: ", fwd_k_metadata)
     print_if_verbose(f"rev_k_metadata: ", rev_k_metadata)
     print_if_verbose(f"attention_metadata: ", attention_metadata)
 
-    breakpoint()
+    if DEBUG: breakpoint()
     
     return (
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
     )
-
-
-
-if __name__ == "__main__":
-    # create_qkv_dispatch(world_size=4, total_seq_len=1024, num_seqs=2, max_cp_degree=8)
-    # create_qkv_dispatch_2cp(world_size=4, total_seq_len=1024, num_seqs=2, max_cp_degree=8)
-
-    # if False:
-    if True:
-        create_qkv_dispatch_2cp_with_explicit_sharding(
-            world_size=4,
-            # Define how many sequences are we going to dispatch
-            seq_lens=torch.tensor([
-                [1024, 2048], 
-                [0, 0],
-                [0, 0],
-                [0, 0],
-            ]), 
-            cp_dst=torch.tensor([
-                [[0, 1, 2, 3, 3, 2, 1, 0],         [0, 1, 2, 3, 3, 2, 1, 0],       ],
-                [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
-                [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
-                [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
-            ]),
-            # # cp_shards[rank, seq_id] = length of this shard to that rank
-            # cp_shards=torch.tensor([
-            #     [128, 128, 128, 128, 128, 128, 128, 128], # equal sharding
-            #     [256, 256, 256, 256, 256, 256, 256, 256], # equal sharding
-            # ]),
-            cp_shards=torch.tensor([
-                # unequal sharding, sum to 1024            # unequal sharding, sum to 2048
-                [[64, 128, 192, 128, 64, 128, 192, 128],   [128, 256, 384, 256, 128, 256, 384, 256], ],
-                [[-1, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
-                [[-1, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
-                [[-1, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
-            ]),
-        )
-
-    # if True:
-    if False:
-        (
-            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
-        ) = create_qkv_dispatch_2cp_with_explicit_sharding(
-            world_size=4,
-            # Define how many sequences are we going to dispatch
-            seq_lens=torch.tensor([
-                [1024, 2048], 
-                [128, 0],
-                [128, 0],
-                [128, 0],
-            ]), 
-            cp_dst=torch.tensor([
-                [[0, 1, 2, 3, 3, 2, 1, 0],         [0, 1, 2, 3, 3, 2, 1, 0],       ],
-                [[1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
-                [[2, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
-                [[3, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
-            ]),
-            # # cp_shards[rank, seq_id] = length of this shard to that rank
-            # cp_shards=torch.tensor([
-            #     [128, 128, 128, 128, 128, 128, 128, 128], # equal sharding
-            #     [256, 256, 256, 256, 256, 256, 256, 256], # equal sharding
-            # ]),
-            cp_shards=torch.tensor([
-                # unequal sharding, sum to 1024            # unequal sharding, sum to 2048
-                [[64, 128, 192, 128, 64, 128, 192, 128],   [128, 256, 384, 256, 128, 256, 384, 256], ],
-                [[128, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
-                [[128, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
-                [[128, -1, -1, -1, -1, -1, -1, -1],         [-1, -1, -1, -1, -1, -1, -1, -1]],
-            ]),
-        )
-
-
-
-
-        

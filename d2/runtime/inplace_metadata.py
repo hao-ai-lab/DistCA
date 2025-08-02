@@ -259,7 +259,7 @@ def compute_metadata(
 def compute_attn_layout_seqlens(
     seq_shard_len: torch.Tensor, seq_shard_cumsum: torch.Tensor,
     dispatch: torch.Tensor,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the cu_seqlens_q and cu_seqlens_kv for the attention layout.
     NOTE: both inputs and outputs are the global value, so it has `world_size` dimension.
