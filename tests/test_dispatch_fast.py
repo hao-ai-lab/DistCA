@@ -21,8 +21,7 @@ from d2.runtime.attn_kernels.dispatch import (
 from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata, compute_fa2a_metadata_from_logical_metadata
 
-from test_comm_metadata import orchestrate_simulate
-from test_util import BaseWorker, create_qkv_dispatch, init_worker_torch_distributed
+from test_util import BaseWorker, create_qkv_dispatch, init_worker_torch_distributed, orchestrate_simulate
 
 
 class Worker(BaseWorker):

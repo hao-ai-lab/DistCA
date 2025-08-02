@@ -8,9 +8,9 @@ from d2.runtime.fast_alltoall_metadata import (
     FastAlltoAllMetadata
 )
 
-from test_comm_metadata import orchestrate_simulate
 from test_util import (
-    create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch
+    create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch,
+    orchestrate_simulate
 )
 
 
@@ -152,6 +152,7 @@ def simulate_fa2a_recv_qkv_rev(
 
 def simulate_fa2a(send_buffer: Tensor, recv_buffer: Tensor,
                   fa2a_metadata: Sequence[Tensor], element_size: int):
+    """Simulate all2all from send buffer to recv buffer."""
     world_size = send_buffer.shape[0]
     assert recv_buffer.shape[0] == world_size
     (sender_send_disp, sender_transfer_sz, sender_recv_disp,
@@ -181,6 +182,10 @@ def simulate_qkv_a2a(
     max_cp: int, kv_comm_mask: Tensor,
     is_fwd: bool
 ):
+    """
+    Simulate the whole QKV A2A communication: copy to the send buffer,
+    simulate the all2all, and copy back from the recv buffer.
+    """
     world_size = q.shape[0]
     assert k.shape[0] == world_size
     assert v.shape[0] == world_size

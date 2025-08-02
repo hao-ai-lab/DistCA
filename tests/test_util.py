@@ -28,6 +28,8 @@ class ParallelConfig:
     expert_tensor_parallel_size: Optional[int] = None
 
 
+# NOTE: the Worker abstraction is to make it compatible with ray.
+# However, since ray has some issue with nsys, our default launch is torchrun.
 class BaseWorker:
     def __init__(self, rank: int, world_size: int):
         self.rank = rank
@@ -99,6 +101,8 @@ def init_worker_torch_distributed(world_size, buffer_size, worker_cls=BaseWorker
     )
     worker.init_comm(buffer_size, local_rank)
     return worker
+
+
 ######## Data construction
 def test_local_proj_metadata(world_size: int, seq_len: int, offset: int):
     """
@@ -310,3 +314,70 @@ def create_fast_a2a_metadata_from_qkv_dispatch(
         return (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
                 attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,)
     return (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata)
+
+
+@torch.no_grad()
+def orchestrate_simulate(
+    tensor: torch.Tensor, output_tensor: torch.Tensor, metadata: Metadata
+):
+    """Simulate a communication based on the metadata."""
+    assert tensor.dim() == 3    # (world_size, num_tokens, hidden_dim)
+    world_size = tensor.shape[0]
+    # handle sending rank-by-rank:
+    for src_rank in range(world_size):
+        dst_rank = metadata.dst_rank[src_rank]
+        dst_offset = metadata.dst_offset[src_rank]
+        seq_lens = metadata.seq_len[src_rank]
+        acu_tokens = 0
+        for j, rs in enumerate(dst_rank):
+            seq_len = seq_lens[j]
+            seq = tensor[src_rank][acu_tokens:acu_tokens + seq_len]
+            if dst_rank.dim() == 1:
+                rank = rs
+                if rank >= 0:
+                    try:
+                        output_tensor[rank][dst_offset[j]: dst_offset[j] + seq_len] = seq
+                    except RuntimeError as e:
+                        print(f"{src_rank=}, {rank=}, {dst_offset[j]=}, {dst_offset[j] + seq_len=}, {seq_len=}, {output_tensor.shape, seq.shape, acu_tokens, tensor.shape}")
+                        raise e
+            else:
+                for k, rank in enumerate(rs):
+                    if rank >= 0:
+                        output_tensor[rank][dst_offset[j][k]: dst_offset[j][k] + seq_len] = seq
+            acu_tokens += seq_len
+    return output_tensor
+
+
+def simulate_communication(tensors: list[torch.Tensor], metadata: Metadata):
+    """
+    Simulate a communication based on the metadata, but with all input paddings
+    already removed.
+    """
+    world_size = len(tensors)
+    assert world_size == metadata.world_size
+    output_seq_len = int(metadata.num_recv_tokens.max().item())
+    input_pad_len = max(tensor.shape[0] for tensor in tensors)
+    pad_tensors = [
+        torch.cat([
+            tensor,
+            torch.zeros(
+                (input_pad_len - tensor.shape[0], *tensor.shape[1:]),
+                dtype=tensor.dtype, device=tensor.device
+            )
+        ], dim=0).unsqueeze(0) for tensor in tensors
+    ]
+    input_tensor = torch.cat(pad_tensors, dim=0)
+    output_tensor = torch.zeros(
+        (world_size, output_seq_len, *input_tensor.shape[2:]),
+        dtype=input_tensor.dtype, device=input_tensor.device
+    )
+    output_tensor = orchestrate_simulate(
+        input_tensor.reshape(world_size, input_pad_len, -1),
+        output_tensor.reshape(world_size, output_seq_len, -1),
+        metadata
+    ).reshape(world_size, output_seq_len, *input_tensor.shape[2:])
+    output_tensors = torch.split(output_tensor, 1, dim=0)
+    output_tensors_split = [
+        t[0, :metadata.num_recv_tokens[rank].max()] for rank, t in enumerate(output_tensors)
+    ]
+    return output_tensors_split
