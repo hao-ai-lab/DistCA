@@ -388,3 +388,29 @@ items = plan_relocation(
     items, 
     # verbose=True
 )
+# %%
+items
+
+# %%
+# Unique sequences to move
+set([
+    # (src_gpuid, seqid)
+    (item["src_gpuid"], item["seqid"]) 
+    for item in items if not item["is_original"]
+])
+
+
+# %%
+[item for item in items if not item["is_original"]]
+
+# %%
+
+# %%
+def moving_plan(items):
+    # 1. Get all query that is no original
+    
+    pass
+
+
+moving_plan(items)
+# %%
