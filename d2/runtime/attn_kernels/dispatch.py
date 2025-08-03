@@ -17,7 +17,7 @@ def fast_a2a_qkv(
     sender_recv_disp: Tensor, recver_transfer_sz: Tensor,
     my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
     is_fwd: bool,
-    switch_buffer: bool = False,
+    switch_buffer: bool = True,
 ):
     # copy in advance
     to_nvshmem = True
@@ -75,7 +75,7 @@ def fast_a2a_attn_out(
     sender_send_disp: torch.Tensor, sender_transfer_sz: torch.Tensor,
     sender_recv_disp: torch.Tensor, recver_transfer_sz: torch.Tensor,
     my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
-    switch_buffer: bool = False,
+    switch_buffer: bool = True,
 ):
     # copy in advance
     to_nvshmem = True

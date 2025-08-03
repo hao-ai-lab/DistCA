@@ -9,48 +9,22 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 2 test_dispatch_fast.py \
     --world-size 2
 """
-import math
-import os
-from typing import List, Tuple, Optional
-
 import torch
 
 from d2.runtime.attn_kernels.ops import (
-    nvshmem_barrier_all, nvshmem_get_unique_id,
-    nvshmem_alloc_empty_unique_id, FastDispatcherWrapper,
+    nvshmem_barrier_all
 )
+# TODO: test fast_a2a_attn_out and its metadata by sending q_attn_layout back to q_mlp_layout via attn_out metadata.
 from d2.runtime.attn_kernels.dispatch import (
-    fast_a2a_qkv, fast_a2a_attn_out
+    fast_a2a_qkv
 )
 from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata, compute_fa2a_metadata_from_logical_metadata
 
-from test_comm_metadata import orchestrate_simulate
-from test_fa2a_metadata import create_qkv_dispatch
+from test_util import BaseWorker, create_qkv_dispatch, init_worker_torch_distributed, orchestrate_simulate
 
 
-class Worker:
-    def __init__(self, rank: int, world_size: int):
-        self.rank = rank
-        self.world_size = world_size
-
-    def init_comm(self, buffer_size: int, local_rank: int = None):
-        # Init megatron communication.
-        if local_rank is None:
-            local_rank = int(os.getenv("LOCAL_RANK"))
-
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size)
-
-        if self.rank == 0:
-            uid = nvshmem_get_unique_id()
-        else:
-            uid = nvshmem_alloc_empty_unique_id()
-        torch.distributed.broadcast(uid, src=0)
-
-        FastDispatcherWrapper.init(
-            self.rank, local_rank, self.world_size, buffer_size, uid
-        )
+class Worker(BaseWorker):
 
     def run_qkv(
         self, fa2a_metadata_fwd: FastAlltoAllMetadata,
@@ -81,7 +55,7 @@ class Worker:
         dst_tensor_v = dst_tensor_k.clone()
         fast_a2a_qkv(
             tensor_q, tensor_k, tensor_v,
-            dispatch_mask,
+            fa2a_metadata_fwd.kv_replica_mask,
             dst_tensor_q, dst_tensor_k, dst_tensor_v,
             fa2a_metadata_fwd.seq_lens[0].send_seqlens,
             fa2a_metadata_fwd.seq_lens[1].send_seqlens,
@@ -115,7 +89,7 @@ class Worker:
 
         fast_a2a_qkv(
             dst_tensor_q, dst_tensor_k, dst_tensor_v,
-            dispatch_mask,
+            fa2a_metadata_rev.kv_replica_mask,
             back_tensor_q, back_tensor_k, back_tensor_v,
             fa2a_metadata_rev.seq_lens[0].send_seqlens,
             fa2a_metadata_rev.seq_lens[1].send_seqlens,
@@ -230,11 +204,10 @@ def create_test_case(world_size: int, total_seq_len: int, num_seqs: int,
         hidden_size_q, hidden_size_k,
     )
     element_size = tensor_q.dtype.itemsize
-    mlp_seq_len = fwd_q_metadata.seq_len
 
     fa2a_metadata = compute_fa2a_metadata_from_logical_metadata(
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        intermediates, mlp_seq_len, hidden_size_q, hidden_size_k,
+        intermediates, total_seq_len, hidden_size_q, hidden_size_k,
         element_size
     )
     (fa2a_metadata_qkv_fwd, fa2a_metadata_qkv_rev,
@@ -299,17 +272,6 @@ def test_qkv(
     torch.testing.assert_close(rev_kv, rev_kv_shard.to(dst_q.device))
 
 
-def init_worker_torch_distributed(world_size, buffer_size):
-    assert world_size == int(os.environ.get("WORLD_SIZE"))
-    rank = int(os.environ.get("RANK"))
-    local_rank = int(os.environ.get("LOCAL_RANK"))
-    worker = Worker(
-        rank, world_size
-    )
-    worker.init_comm(buffer_size, local_rank)
-    return worker
-
-
 def test(args):
     stride_q = args.hidden_size_query * torch.float16.itemsize
     stride_kv = args.hidden_size_kv * torch.float16.itemsize
@@ -323,7 +285,7 @@ def test(args):
         stride_kv * max_tokens_key_value * max_cp_degree * 2
     )
     worker = init_worker_torch_distributed(
-        world_size, buffer_size
+        world_size, buffer_size, Worker
     )
     print("init done.")
     test_qkv(

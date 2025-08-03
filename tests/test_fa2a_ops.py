@@ -1,21 +1,15 @@
 import torch
 
 from d2.runtime.inplace_metadata import Metadata
-from d2.runtime.fast_alltoall_metadata import (
-    compute_forward_qkv_a2a_layout_meatadata,
-    compute_reverse_a2a_layout_metadata,
-    SeqLens,
-    LogicalShape
-)
 
 from d2.runtime.attn_kernels.ops import (
     fast_a2a_memcpy_non_cp, fast_a2a_memcpy_cp
 )
 
-from test_util import create_qkv_dispatch
+from test_util import (
+    create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch)
 from test_fa2a_metadata import (
-    simulate_fa2a_send_copy_non_cp, simulate_fa2a_send_copy_cp,
-    simulate_fa2a_recv_copy_non_cp, simulate_fa2a_recv_copy_kv_grad,
+    simulate_fa2a_copy_non_cp, simulate_fa2a_copy_cp,
     simulate_fa2a, 
 )
 
@@ -45,44 +39,14 @@ def test(args):
     tensor_q = torch.rand((world_size, total_seq_len, hidden_size_q), device=device, dtype=dtype) + 1    # + 1 to avoid zeros
     tensor_k = torch.rand((world_size, total_seq_len, hidden_size_k), device=device, dtype=dtype) + 1
     tensor_v = torch.rand((world_size, total_seq_len, hidden_size_k), device=device, dtype=dtype) + 1
-
-    (q_tokens_to_dst_per_dispatch, q_seq_to_dst,
-     _, kv_dst_global_seq_id) = intermediates
     element_size = tensor_q.element_size()
-    bytes_q = element_size * hidden_size_q
-    bytes_k = element_size * hidden_size_k
-    recver_transfer_sz_q = (
-        fwd_q_metadata.num_recv_tokens * bytes_q
-    )[..., :-1]
-    recver_transfer_sz_kv = (
-        fwd_k_metadata.num_recv_tokens * bytes_k
-    )[..., :-1]
-    num_recv_seqs_q = rev_q_metadata.num_seqs
-    num_recv_seqs_kv = rev_k_metadata.num_seqs
-    num_seqs_fwd = fwd_k_metadata.num_seqs
-    num_send_tokens_kv = rev_k_metadata.num_recv_tokens[..., :-1]
 
-    seq_lens = [
-        SeqLens.get_seqlens(fwd_q_metadata, rev_q_metadata),
-        SeqLens.get_seqlens(fwd_k_metadata, rev_k_metadata)
-    ]
-    tensor_shape = [
-        LogicalShape.get_shape(fwd_q_metadata, hidden_size_q, total_seq_len),
-        LogicalShape.get_shape(fwd_k_metadata, hidden_size_k, total_seq_len),
-    ]
-
-    qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
-        q_tokens_to_dst_per_dispatch.squeeze(2), q_seq_to_dst,
-        recver_transfer_sz_q, recver_transfer_sz_kv,
-        num_recv_seqs_q, num_recv_seqs_kv, num_seqs_fwd,
-        fwd_k_metadata.dst_rank, fwd_k_metadata.seq_len,
-        kv_dst_global_seq_id, num_send_tokens_kv,
-        bytes_q, bytes_k, seq_lens, tensor_shape
-    )
-
-    qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
-        qkv_fwd_fa2a_metadata,
-    )
+    qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata = \
+        create_fast_a2a_metadata_from_qkv_dispatch(
+            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+            intermediates, element_size, hidden_size_q, hidden_size_k,
+            total_seq_len,
+        )
 
     tot_send_bytes = qkv_fwd_fa2a_metadata.fa2a_metadata[1].sum(dim=1) // element_size
     max_send_bytes = int(torch.max(tot_send_bytes).item())
@@ -110,9 +74,9 @@ def test(args):
         src_shard_cor = src_shard.clone()
         send_mask = get_send_mask_slice(fwd_k_metadata, rank)
         # Q shard
-        src_shard_cor = simulate_fa2a_send_copy_non_cp(
+        src_shard_cor = simulate_fa2a_copy_non_cp(
             q_shard.flatten(), src_shard_cor, q_src_offsets, q_src_seqlen,
-            hidden_size_q, element_size
+            hidden_size_q, element_size, is_send=True
         )
         src_shard_out = src_shard.clone()
         fast_a2a_memcpy_non_cp(
@@ -123,10 +87,10 @@ def test(args):
         torch.testing.assert_close(src_shard_cor, src_shard_out)
         print(f"copying rank {rank} q shard to src buffer done.")
         # K shard
-        src_shard_cor = simulate_fa2a_send_copy_cp(
+        src_shard_cor = simulate_fa2a_copy_cp(
             k_shard.flatten(), src_shard_cor, k_src_offsets,
             kv_src_seqlen, hidden_size_k, element_size, max_cp_degree,
-            send_mask
+            send_mask, is_send=True,
         )
         do_shard = send_mask.to(torch.int8).cuda()
         fast_a2a_memcpy_cp(
@@ -137,10 +101,10 @@ def test(args):
         torch.cuda.synchronize()
         torch.testing.assert_close(src_shard_cor, src_shard_out)
         print(f"copying rank {rank} k shard to src buffer done.")
-        src_shard_cor = simulate_fa2a_send_copy_cp(
+        src_shard_cor = simulate_fa2a_copy_cp(
             v_shard.flatten(), src_shard_cor, v_src_offsets,
             kv_src_seqlen, hidden_size_k, element_size, max_cp_degree,
-            send_mask
+            send_mask, is_send=True,
         )
         src_buffer[rank] = src_shard_cor
         fast_a2a_memcpy_cp(
@@ -185,9 +149,9 @@ def test(args):
         dst_shard = dst_buffer[rank]
         # Q
         dst_q_shard_cor = dst_q_shard.clone().flatten()
-        dst_q_shard_cor = simulate_fa2a_recv_copy_non_cp(
+        dst_q_shard_cor = simulate_fa2a_copy_non_cp(
             dst_q_shard_cor, dst_shard, q_recv_offsets,
-            recv_seqlen_q, hidden_size_q, element_size
+            recv_seqlen_q, hidden_size_q, element_size, is_send=False,
         )
         dst_q_shard_out = dst_q_shard.clone()
         fast_a2a_memcpy_non_cp(
@@ -199,9 +163,9 @@ def test(args):
         print(f"copying rank {rank} q shard from dst buffer done.")
         # K
         dst_k_shard_cor = dst_k_shard.clone().flatten()
-        dst_k_shard_cor = simulate_fa2a_recv_copy_non_cp(
+        dst_k_shard_cor = simulate_fa2a_copy_non_cp(
             dst_k_shard_cor, dst_shard, k_recv_offsets,
-            recv_seqlen_kv, hidden_size_k, element_size
+            recv_seqlen_kv, hidden_size_k, element_size, is_send=False,
         )
         dst_k_shard_out = dst_k_shard.clone()
         fast_a2a_memcpy_non_cp(
@@ -232,11 +196,9 @@ def test(args):
         grad_do_shard = grad_send_mask.to(torch.int8).cuda()
 
         grad_k_shard_cor = grad_k_shard.flatten(start_dim=1).clone()
-        grad_k_shard_cor = simulate_fa2a_recv_copy_kv_grad(
-            grad_k_shard_cor, grad_shard,
-            grad_k_recv_offsets, grad_seqlen_kv,
-            hidden_size_k, element_size, max_cp_degree,
-            grad_send_mask
+        grad_k_shard_cor = simulate_fa2a_copy_cp(
+            grad_k_shard_cor, grad_shard, grad_k_recv_offsets, grad_seqlen_kv,
+            hidden_size_k, element_size, max_cp_degree, grad_send_mask, is_send=False,
         )
         grad_k_shard_cor = grad_k_shard_cor.reshape_as(grad_k_shard)
         torch.testing.assert_close(

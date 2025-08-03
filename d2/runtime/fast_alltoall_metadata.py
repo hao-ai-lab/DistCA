@@ -1,11 +1,10 @@
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 
 from d2.runtime.inplace_metadata import compute_e2e_metadata, exclusive_cumsum, index_put_with_neg_padding_1d, Metadata
-
 
 _Tensor_Or_Tensor_List = Union[torch.Tensor, Sequence[torch.Tensor]]
 
@@ -114,7 +113,9 @@ class FastAlltoAllMetadata:
     # This is to construct the recv buffer size.
     # NOTE: for Q/KV backward, this is just a placeholder and we don't use it.
     tensor_shape: Sequence[LogicalShape]
-    stream: torch.cuda.Stream = None
+    # List of kv replica mask for each rank. (or this rank)
+    # shape is (num_local_seqs, cp_degree).
+    kv_replica_mask: Optional[_Tensor_Or_Tensor_List] = None
     # Debug setting
     single_stream: bool = False
 
@@ -138,7 +139,9 @@ class FastAlltoAllMetadata:
             self.my_rank_send_sz[rank],
             seq_lens,
             tensor_shape,
-            stream=self.stream,
+            kv_replica_mask=(
+                self.kv_replica_mask[rank] if self.kv_replica_mask is not None else None
+            ),
             single_stream=self.single_stream,
         )
 
@@ -153,7 +156,10 @@ class FastAlltoAllMetadata:
             self.my_rank_send_sz,
             tuple(t.normalize() for t in self.seq_lens),
             self.tensor_shape,
-            stream=self.stream,
+            kv_replica_mask=(
+                self.kv_replica_mask.cuda().to(torch.int8).contiguous()
+                if self.kv_replica_mask is not None else None
+            ),
             single_stream=self.single_stream,
         )
 
@@ -199,8 +205,10 @@ def compute_forward_qkv_a2a_layout_meatadata(
     kv_dst_global_seq_id: torch.Tensor,  # shape (world_size, num_local_seqs, cp_degree)
     num_send_tokens_kv: torch.Tensor,
     bytes_q: int, bytes_kv: int,
+    # These values are passed only to be added to the FastAlltoAllMetadata at the end.
     seqlens: Sequence[SeqLens],
     tensor_shape: Sequence[LogicalShape],
+    kv_replica_mask: Sequence[torch.Tensor],
 ):
     """
     Returns:
@@ -355,7 +363,8 @@ def compute_forward_qkv_a2a_layout_meatadata(
 
     return FastAlltoAllMetadata(
         fwd_fa2a_metadata, fwd_send_memcpy_metadata, fwd_recv_memcpy_metadata,
-        **my_rank_vals, seq_lens=seqlens, tensor_shape=tensor_shape
+        **my_rank_vals, seq_lens=seqlens, tensor_shape=tensor_shape,
+        kv_replica_mask=kv_replica_mask,
     )
 
 
@@ -397,7 +406,8 @@ def compute_reverse_a2a_layout_metadata(
     my_rank_vals = _get_my_rank_from_metadata(bwd_fa2a_metadata)
     return FastAlltoAllMetadata(
         bwd_fa2a_metadata, send_memcpy_metadata, recv_memcpy_metadata,
-        **my_rank_vals, seq_lens=bwd_seqlens, tensor_shape=bwd_tensor_shape
+        **my_rank_vals, seq_lens=bwd_seqlens, tensor_shape=bwd_tensor_shape,
+        kv_replica_mask=fwd_metadata.kv_replica_mask,
     )
 
 
@@ -459,6 +469,7 @@ def compute_backward_attn_out_a2a_layout_metadata(
     return FastAlltoAllMetadata(
         bwd_fa2a_metadata, bwd_send_memcpy_metadata, bwd_recv_memcpy_metadata,
         **my_rank_vals, seq_lens=seq_lens, tensor_shape=tensor_shape,
+        kv_replica_mask=None,
     )
     
 
@@ -468,7 +479,7 @@ def compute_fa2a_metadata_from_logical_metadata(
     fwd_metadata_kv: Metadata,
     rev_metadata_kv: Metadata,
     intermediates,
-    mlp_seq_len: torch.Tensor,
+    mlp_num_tokens: int,
     hidden_size_q: int,
     hidden_size_k: int,
     element_size: int,  # dtype's size
@@ -487,8 +498,6 @@ def compute_fa2a_metadata_from_logical_metadata(
     recver_transfer_sz_kv = (
         fwd_metadata_kv.num_recv_tokens * bytes_k
     )[..., :-1]
-    # NOTE: this is a walk-around. Should directly give this input.
-    mlp_num_tokens = int(mlp_seq_len.sum(dim=1).max().item())
 
     num_recv_seqs_q = rev_metadata_q.num_seqs
     num_recv_seqs_kv = rev_metadata_kv.num_seqs
@@ -501,6 +510,11 @@ def compute_fa2a_metadata_from_logical_metadata(
         LogicalShape.get_shape(fwd_metadata_q, hidden_size_q, mlp_num_tokens),
         LogicalShape.get_shape(fwd_metadata_kv, hidden_size_k, mlp_num_tokens),
     ]
+    kv_replica_mask = fwd_metadata_kv.dst_rank >= 0
+    kv_replica_mask = tuple(
+        kv_replica_mask[i][:num_seq].to(torch.int8)
+        for i, num_seq in enumerate(num_seqs)
+    )
 
     qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
@@ -508,7 +522,8 @@ def compute_fa2a_metadata_from_logical_metadata(
         num_recv_seqs_q, num_recv_seqs_kv, num_seqs,
         fwd_metadata_kv.dst_rank, fwd_metadata_kv.seq_len,
         kv_dst_global_seq_id, num_send_tokens_kv,
-        bytes_q, bytes_k, seqlens, tensor_shape
+        bytes_q, bytes_k,
+        seqlens, tensor_shape, kv_replica_mask,
     )
     qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
         qkv_fwd_fa2a_metadata,
@@ -559,9 +574,10 @@ def compute_e2e_fa2a_metadata(
         q_to_num_kv_token,
         return_intermediate=True
     )
+    mlp_num_tokens = mlp_seq_len.sum(dim=1).max().item()
     fa2a_metadata = compute_fa2a_metadata_from_logical_metadata(
         fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv,
-        intermediates, mlp_seq_len, hidden_size_q, hidden_size_k,
+        intermediates, mlp_num_tokens, hidden_size_q, hidden_size_k,
         element_size
     )
     return (

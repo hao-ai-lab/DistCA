@@ -52,9 +52,9 @@ def index_put_with_neg_padding_1d(
     return tensor[:-1].reshape(tensor_shape)  # remove the padding value at the end
 
 
-def prepend_zero_fn(tensor: torch.Tensor):
-    zero = torch.zeros_like(tensor[0:1])
-    return torch.cat([zero, tensor], dim=0)
+def prepend_zero_fn(tensor: torch.Tensor, dim: int=0):
+    zero = torch.zeros_like(tensor.select(dim, 0)).unsqueeze(dim)
+    return torch.cat([zero, tensor], dim=dim)
 
 
 @dataclass
@@ -304,15 +304,22 @@ def compute_attn_layout_seqlens(
     # if dispatch[i, j] = k, then local_indices_flat[i, j, k] = l means sequence [i,j] is at out_sequence [k,l]
     # out_seqlens_q[k, l] = seq_shard_len[i, j]
     max_num_seq = int(local_indices_flat.max().item() + 1)
-    scatter_index = (flatten_dispatch * (flatten_dispatch >= 0)) * max_num_seq + local_indices_flat
+    scatter_index = flatten_dispatch * max_num_seq + local_indices_flat
+    scatter_index = mask_by_neg(scatter_index, flatten_dispatch >= 0)
 
     src_seqlens = seq_shard_len.flatten()
     src_seq_lens_kv = seq_shard_cumsum.flatten()
 
     out_seqlens_q = torch.zeros(world_size * max_num_seq, dtype=torch.int64, device=dispatch.device)
     out_seqlens_kv = torch.zeros(world_size * max_num_seq, dtype=torch.int64, device=dispatch.device)
-    out_seqlens_q.scatter_(0, scatter_index, src_seqlens)
-    out_seqlens_kv.scatter_(0, scatter_index, src_seq_lens_kv)
+
+    out_seqlens_q = index_put_with_neg_padding_1d(
+        out_seqlens_q, src_seqlens, scatter_index
+    )
+    out_seqlens_kv = index_put_with_neg_padding_1d(
+        out_seqlens_kv, src_seq_lens_kv, scatter_index
+    )
+
     out_seqlens_q = out_seqlens_q.reshape(world_size, max_num_seq)
     out_seqlens_kv = out_seqlens_kv.reshape(world_size, max_num_seq)
 
@@ -323,15 +330,16 @@ def compute_attn_layout_seqlens(
     max_seqlen_q = out_seqlens_q.max(dim=1)[0]
     max_seqlen_kv = out_seqlens_kv.max(dim=1)[0]
     if prepend_zero:
-        cu_seqlens_q = prepend_zero_fn(cu_seqlens_q)
-        cu_seqlens_kv = prepend_zero_fn(cu_seqlens_kv)
+        cu_seqlens_q = prepend_zero_fn(cu_seqlens_q, dim=1)
+        cu_seqlens_kv = prepend_zero_fn(cu_seqlens_kv, dim=1)
     if shard_to_tuple:
+        sq_len_extra = 1 if prepend_zero else 0
         cu_seqlens_q = tuple(
-            cu_seqlens_q[i][:num_local_seqs_recv[i]]
+            cu_seqlens_q[i][:num_local_seqs_recv[i] + sq_len_extra]
             for i in range(world_size)
         )
         cu_seqlens_kv = tuple(
-            cu_seqlens_kv[i][:num_local_seqs_recv[i]]
+            cu_seqlens_kv[i][:num_local_seqs_recv[i] + sq_len_extra]
             for i in range(world_size)
         )
         # NOTE: max_seqlen does not need to shard to tuples because

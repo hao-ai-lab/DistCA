@@ -5,20 +5,18 @@ from torch import Tensor
 
 from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.fast_alltoall_metadata import (
-    compute_forward_qkv_a2a_layout_meatadata,
-    compute_reverse_a2a_layout_metadata,
-    SeqLens,
-    LogicalShape,
     FastAlltoAllMetadata
 )
 
-from test_comm_metadata import orchestrate_simulate
-from test_util import create_qkv_dispatch
+from test_util import (
+    create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch,
+    orchestrate_simulate
+)
 
 
-def simulate_fa2a_send_copy_non_cp(
-    q: Tensor, dst_tensor: Tensor, q_offsets: Tensor, q_seqlen: Tensor,
-    hidden_size_q: int, element_size: int
+def simulate_fa2a_copy_non_cp(
+    q: Tensor, buffer: Tensor, q_offsets: Tensor, q_seqlen: Tensor,
+    hidden_size_q: int, element_size: int, is_send: bool=True
 ):
 
     q_seq_offset = 0
@@ -26,18 +24,23 @@ def simulate_fa2a_send_copy_non_cp(
         q_offset_bytes = q_offsets[seq_id]
         q_dst_offset = q_offset_bytes // element_size
         q_size = seq_len * hidden_size_q
-        dst_tensor[q_dst_offset:q_dst_offset + q_size] = (
-            q[q_seq_offset:q_seq_offset + q_size]
-        )
+        if is_send:
+            buffer[q_dst_offset:q_dst_offset + q_size] = (
+                q[q_seq_offset:q_seq_offset + q_size]
+            )
+        else:
+            q[q_seq_offset:q_seq_offset + q_size] = (
+                buffer[q_dst_offset:q_dst_offset + q_size]
+            )
         q_seq_offset += q_size
-    return dst_tensor
+    return buffer if is_send else q
 
 
-def simulate_fa2a_send_copy_cp(
-    k: Tensor, dst_tensor: Tensor,
+def simulate_fa2a_copy_cp(
+    k: Tensor, buffer: Tensor,
     k_offsets: Tensor, k_seqlen: Tensor,
     hidden_size_k: int, element_size: int, max_cp: int,
-    send_mask: Tensor
+    send_mask: Tensor, is_send: bool=True
 ):
     """
     Simulate the fa2a send: MLP layout (CP) -> a2a layout.
@@ -53,57 +56,19 @@ def simulate_fa2a_send_copy_cp(
                 continue
             k_offset_bytes = k_offsets[cp_id, seq_id]
             k_dst_offset = k_offset_bytes // element_size
-            dst_tensor[k_dst_offset:k_dst_offset + k_size] = (
-                k[k_seq_offset:k_seq_offset + k_size]
-            )
+            if is_send:
+                buffer[k_dst_offset:k_dst_offset + k_size] = (
+                    k[k_seq_offset:k_seq_offset + k_size]
+                )
+            else:
+                k[cp_id, k_seq_offset:k_seq_offset + k_size] = (
+                    buffer[k_dst_offset:k_dst_offset + k_size]
+                )
             k_seq_offset += k_size
-    return dst_tensor
+    return buffer if is_send else k
 
 
-def simulate_fa2a_recv_copy_non_cp(
-    q: Tensor, src_tensor: Tensor, q_offsets: Tensor, q_seqlen: Tensor,
-    hidden_size_q: int, element_size: int
-):
-    """Simulate the fa2a recv: a2a layout -> non-CP layout."""
-    q_seq_offset = 0
-    for seq_id, seq_len in enumerate(q_seqlen):
-        q_offset_bytes = q_offsets[seq_id]
-        q_dst_offset = q_offset_bytes // element_size
-        q_size = seq_len * hidden_size_q
-        q[q_seq_offset:q_seq_offset + q_size] = (
-            src_tensor[q_dst_offset:q_dst_offset + q_size]
-        )
-        q_seq_offset += q_size
-    return q
-
-
-def simulate_fa2a_recv_copy_kv_grad(
-    k: Tensor, src_tensor: Tensor,
-    k_offsets: Tensor, k_seqlen: Tensor,
-    hidden_size_k: int, element_size: int, max_cp: int,
-    send_mask: Tensor
-):
-    """
-    Simulate the fa2a recv: a2a layout -> MLP grad CP layout.
-    MLP grad CP layout is in form of: (max_cp, seq_len)
-    """
-    for cp_id in range(max_cp):
-        k_seq_offset = 0
-        for seq_id, seq_len in enumerate(k_seqlen):
-            k_size = seq_len * hidden_size_k
-            if not send_mask[seq_id, cp_id]:
-                k_seq_offset += k_size
-                continue
-            k_offset_bytes = k_offsets[cp_id, seq_id]
-            k_dst_offset = k_offset_bytes // element_size
-            k[cp_id, k_seq_offset:k_seq_offset + k_size] = (
-                src_tensor[k_dst_offset:k_dst_offset + k_size]
-            )
-            k_seq_offset += k_size
-    return k
-
-
-def simulate_fa2a_send_qkv_copy(
+def simulate_fa2a_send_qkv(
     q: Tensor, k: Tensor, v: Tensor,
     dst_tensor: Tensor, q_offset: Tensor, k_offset: Tensor, v_offset: Tensor,
     q_seqlen: Tensor, k_seqlen: Tensor,
@@ -111,59 +76,59 @@ def simulate_fa2a_send_qkv_copy(
     send_mask: Tensor,
 ):
     """QKV (MLP) -> a2a send layout"""
-    dst_tensor = simulate_fa2a_send_copy_non_cp(
-        q, dst_tensor, q_offset, q_seqlen, hidden_size_q, element_size
+    dst_tensor = simulate_fa2a_copy_non_cp(
+        q, dst_tensor, q_offset, q_seqlen, hidden_size_q, element_size, is_send=True
     )
-    dst_tensor = simulate_fa2a_send_copy_cp(
+    dst_tensor = simulate_fa2a_copy_cp(
         k, dst_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
-        max_cp, send_mask
+        max_cp, send_mask, is_send=True,
     )
-    dst_tensor = simulate_fa2a_send_copy_cp(
+    dst_tensor = simulate_fa2a_copy_cp(
         v, dst_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
-        max_cp, send_mask
+        max_cp, send_mask, is_send=True,
     )
     return dst_tensor
 
 
-def simulate_fa2a_send_qkv_copy_rev(
+def simulate_fa2a_send_qkv_rev(
     q: Tensor, k: Tensor, v: Tensor,
     dst_tensor: Tensor, q_offset: Tensor, k_offset: Tensor, v_offset: Tensor,
     q_seqlen: Tensor, k_seqlen: Tensor,
     hidden_size_q: int, hidden_size_k: int, element_size: int
 ):
     """QKV grad (ATTN) -> a2a send layout"""
-    dst_tensor = simulate_fa2a_send_copy_non_cp(
-        q, dst_tensor, q_offset, q_seqlen, hidden_size_q, element_size
+    dst_tensor = simulate_fa2a_copy_non_cp(
+        q, dst_tensor, q_offset, q_seqlen, hidden_size_q, element_size, is_send=True
     )
-    dst_tensor = simulate_fa2a_send_copy_non_cp(
-        k, dst_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
+    dst_tensor = simulate_fa2a_copy_non_cp(
+        k, dst_tensor, k_offset, k_seqlen, hidden_size_k, element_size, is_send=True
     )
-    dst_tensor = simulate_fa2a_send_copy_non_cp(
-        v, dst_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
+    dst_tensor = simulate_fa2a_copy_non_cp(
+        v, dst_tensor, v_offset, k_seqlen, hidden_size_k, element_size, is_send=True
     )
     return dst_tensor
 
 
-def simulate_fa2a_recv_copy_qkv(
+def simulate_fa2a_recv_qkv(
     q: Tensor, k: Tensor, v: Tensor,
     src_tensor: Tensor, q_offset: Tensor, k_offset: Tensor, v_offset: Tensor,
     q_seqlen: Tensor, k_seqlen: Tensor,
     hidden_size_q: int, hidden_size_k: int, element_size: int
 ):
     """a2a recv layout -> QKV (ATTN)"""
-    q = simulate_fa2a_recv_copy_non_cp(
-        q, src_tensor, q_offset, q_seqlen, hidden_size_q, element_size
+    q = simulate_fa2a_copy_non_cp(
+        q, src_tensor, q_offset, q_seqlen, hidden_size_q, element_size, is_send=False
     )
-    k = simulate_fa2a_recv_copy_non_cp(
-        k, src_tensor, k_offset, k_seqlen, hidden_size_k, element_size
+    k = simulate_fa2a_copy_non_cp(
+        k, src_tensor, k_offset, k_seqlen, hidden_size_k, element_size, is_send=False
     )
-    v = simulate_fa2a_recv_copy_non_cp(
-        v, src_tensor, v_offset, k_seqlen, hidden_size_k, element_size
+    v = simulate_fa2a_copy_non_cp(
+        v, src_tensor, v_offset, k_seqlen, hidden_size_k, element_size, is_send=False
     )
     return q, k, v
 
 
-def simulate_fa2a_recv_copy_qkv_rev(
+def simulate_fa2a_recv_qkv_rev(
     q: Tensor, k: Tensor, v: Tensor,
     src_tensor: Tensor, q_offset: Tensor, k_offset: Tensor, v_offset: Tensor,
     q_seqlen: Tensor, k_seqlen: Tensor,
@@ -171,22 +136,23 @@ def simulate_fa2a_recv_copy_qkv_rev(
     max_cp: int, send_mask: Tensor
 ):
     """a2a recv layout -> QKV grad (MLP)"""
-    q = simulate_fa2a_recv_copy_non_cp(
-        q, src_tensor, q_offset, q_seqlen, hidden_size_q, element_size
+    q = simulate_fa2a_copy_non_cp(
+        q, src_tensor, q_offset, q_seqlen, hidden_size_q, element_size, is_send=False
     )
-    k = simulate_fa2a_recv_copy_kv_grad(
+    k = simulate_fa2a_copy_cp(
         k, src_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
-        max_cp, send_mask,
+        max_cp, send_mask, is_send=False,
     )
-    v = simulate_fa2a_recv_copy_kv_grad(
+    v = simulate_fa2a_copy_cp(
         v, src_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
-        max_cp, send_mask
+        max_cp, send_mask, is_send=False,
     )
     return q, k, v
 
 
 def simulate_fa2a(send_buffer: Tensor, recv_buffer: Tensor,
                   fa2a_metadata: Sequence[Tensor], element_size: int):
+    """Simulate all2all from send buffer to recv buffer."""
     world_size = send_buffer.shape[0]
     assert recv_buffer.shape[0] == world_size
     (sender_send_disp, sender_transfer_sz, sender_recv_disp,
@@ -216,6 +182,10 @@ def simulate_qkv_a2a(
     max_cp: int, kv_comm_mask: Tensor,
     is_fwd: bool
 ):
+    """
+    Simulate the whole QKV A2A communication: copy to the send buffer,
+    simulate the all2all, and copy back from the recv buffer.
+    """
     world_size = q.shape[0]
     assert k.shape[0] == world_size
     assert v.shape[0] == world_size
@@ -241,6 +211,13 @@ def simulate_qkv_a2a(
         kv_src_seqlen = get_seq_len_slice(fwd_kv_metadata, rank)
         torch.testing.assert_close(q_src_seqlen, metadata_slice.seq_lens[0].send_seqlens)
         torch.testing.assert_close(kv_src_seqlen, metadata_slice.seq_lens[1].send_seqlens)
+        # NOTE: fwd and rev in the arg is not the actual fwd/rev, but instead
+        # relative to this communication.
+        num_seqs_send = fwd_kv_metadata.num_seqs[rank] if is_fwd else rev_kv_metadata.num_seqs[rank]
+        torch.testing.assert_close(metadata_slice.kv_replica_mask,
+                                   (kv_comm_mask[rank][:num_seqs_send]).to(
+                                        metadata_slice.kv_replica_mask.dtype
+                                    ))
 
         args = (
             q[rank], k[rank], v[rank], src_buffer[rank],
@@ -250,9 +227,9 @@ def simulate_qkv_a2a(
         )
         if is_fwd:
             args += (max_cp, kv_comm_mask[rank])
-            copy_fn = simulate_fa2a_send_qkv_copy
+            copy_fn = simulate_fa2a_send_qkv
         else:
-            copy_fn = simulate_fa2a_send_qkv_copy_rev
+            copy_fn = simulate_fa2a_send_qkv_rev
         src_buffer[rank] = copy_fn(*args)
 
     dst_buffer = simulate_fa2a(
@@ -295,6 +272,13 @@ def simulate_qkv_a2a(
         assert expected_shape_k == metadata_slice.tensor_shape[1].recv_shape, f"{rank} {expected_shape_k} != {metadata_slice.tensor_shape[1].recv_shape}"
         torch.testing.assert_close(rev_seqlen_q, metadata_slice.seq_lens[0].recv_seqlens)
         torch.testing.assert_close(rev_seqlen_kv, metadata_slice.seq_lens[1].recv_seqlens)
+        # NOTE: fwd and rev in the arg is not the actual fwd/rev, but instead
+        # relative to this communication.
+        num_seqs_send = fwd_kv_metadata.num_seqs[rank] if is_fwd else rev_kv_metadata.num_seqs[rank]
+        torch.testing.assert_close(metadata_slice.kv_replica_mask,
+                                   kv_comm_mask[rank][:num_seqs_send].to(
+                                       metadata_slice.kv_replica_mask.dtype
+                                   ))
 
         args = (
             dst_q[rank], dst_k[rank], dst_v[rank],
@@ -305,9 +289,9 @@ def simulate_qkv_a2a(
         )
         if not is_fwd:
             args += (max_cp, kv_comm_mask[rank])
-            copy_fn = simulate_fa2a_recv_copy_qkv_rev
+            copy_fn = simulate_fa2a_recv_qkv_rev
         else:
-            copy_fn = simulate_fa2a_recv_copy_qkv
+            copy_fn = simulate_fa2a_recv_qkv
 
         q_slice, k_slice, v_slice = copy_fn(*args)
         dst_q[rank] = q_slice
@@ -367,39 +351,12 @@ def test(args):
     (q_tokens_to_dst_per_dispatch, q_seq_to_dst,
      _, kv_dst_global_seq_id) = intermediates
     element_size = tensor_q.element_size()
-    bytes_q = element_size * hidden_size_q
-    bytes_k = element_size * hidden_size_k
-    recver_transfer_sz_q = (
-        fwd_q_metadata.num_recv_tokens * bytes_q
-    )[..., :-1]
-    recver_transfer_sz_kv = (
-        fwd_k_metadata.num_recv_tokens * bytes_k
-    )[..., :-1]
-    num_recv_seqs_q = rev_q_metadata.num_seqs
-    num_recv_seqs_kv = rev_k_metadata.num_seqs
-    num_seqs_fwd = fwd_k_metadata.num_seqs
-    num_send_tokens_kv = rev_k_metadata.num_recv_tokens[..., :-1]
-    seq_lens = [
-        SeqLens.get_seqlens(fwd_q_metadata, rev_q_metadata),
-        SeqLens.get_seqlens(fwd_k_metadata, rev_k_metadata)
-    ]
-    tensor_shape = [
-        LogicalShape.get_shape(fwd_q_metadata, hidden_size_q, total_seq_len),
-        LogicalShape.get_shape(fwd_k_metadata, hidden_size_k, total_seq_len),
-    ]
-
-    qkv_fwd_fa2a_metadata = compute_forward_qkv_a2a_layout_meatadata(
-        q_tokens_to_dst_per_dispatch.squeeze(2), q_seq_to_dst,
-        recver_transfer_sz_q, recver_transfer_sz_kv,
-        num_recv_seqs_q, num_recv_seqs_kv, num_seqs_fwd,
-        fwd_k_metadata.dst_rank, fwd_k_metadata.seq_len,
-        kv_dst_global_seq_id, num_send_tokens_kv,
-        bytes_q, bytes_k, seq_lens, tensor_shape
-    )
-
-    qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
-        qkv_fwd_fa2a_metadata,
-    )
+    qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata = \
+        create_fast_a2a_metadata_from_qkv_dispatch(
+            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+            intermediates, element_size, hidden_size_q, hidden_size_k,
+            total_seq_len,
+        )
 
     fa2a_q, fa2a_k, fa2a_v = simulate_qkv_a2a(
         tensor_q, tensor_k, tensor_v,

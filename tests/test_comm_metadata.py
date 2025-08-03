@@ -6,36 +6,7 @@ from d2.runtime.inplace_metadata import (
     Metadata, compute_metadata
 )
 
-from test_util import gen_seq_lens, create_qkv_dispatch
-
-
-@torch.no_grad()
-def orchestrate_simulate(tensor: torch.Tensor, output_tensor: torch.Tensor, metadata: Metadata):
-    assert tensor.dim() == 3    # (world_size, num_tokens, hidden_dim)
-    world_size = tensor.shape[0]
-    # handle sending rank-by-rank:
-    for src_rank in range(world_size):
-        dst_rank = metadata.dst_rank[src_rank]
-        dst_offset = metadata.dst_offset[src_rank]
-        seq_lens = metadata.seq_len[src_rank]
-        acu_tokens = 0
-        for j, rs in enumerate(dst_rank):
-            seq_len = seq_lens[j]
-            seq = tensor[src_rank][acu_tokens:acu_tokens + seq_len]
-            if dst_rank.dim() == 1:
-                rank = rs
-                if rank >= 0:
-                    try:
-                        output_tensor[rank][dst_offset[j]: dst_offset[j] + seq_len] = seq
-                    except RuntimeError as e:
-                        print(f"{src_rank=}, {rank=}, {dst_offset[j]=}, {dst_offset[j] + seq_len=}, {seq_len=}, {output_tensor.shape, seq.shape, acu_tokens, tensor.shape}")
-                        raise e
-            else:
-                for k, rank in enumerate(rs):
-                    if rank >= 0:
-                        output_tensor[rank][dst_offset[j][k]: dst_offset[j][k] + seq_len] = seq
-            acu_tokens += seq_len
-    return output_tensor
+from test_util import gen_seq_lens, create_qkv_dispatch, orchestrate_simulate
 
 
 def test_query_dispatch(args):

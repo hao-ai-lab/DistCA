@@ -24,7 +24,8 @@ from megatron.core.transformer.transformer_layer import (
 from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
-from d2.runtime.megatron_patch.dispatcher_wrapper import n_to_n_dispatch, TickSync
+from d2.runtime.megatron_patch.dispatcher_wrapper import TickSync
+from d2.runtime.megatron_patch.fast_dispatch_fn import qkv_dispatch, attn_out_dispatch
 
 
 #### Tool functions for splitting and gathering args ####
@@ -83,7 +84,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
     def _layout_attn_to_mlp(
         self, attn_out: torch.Tensor,
-        packed_seq_params: PingPangPackedSeqParams,
+        packed_seq_params: PingPangSingleStepPackedSeqParams,
     ):
         """
         Communication between attention layout and mlp layout.
@@ -101,13 +102,10 @@ class TransformerLayer(MegatronTransformerLayer):
             head_dim = attn_out.shape[-1]
             attn_out = attn_out.view(attn_out.shape[0], num_heads * head_dim)
             ####
-            attn_out_mlp_layout, _ = n_to_n_dispatch.apply(
-                attn_out, # query_in
-                packed_seq_params.attn_to_mlp_metadata, # query_metadata
-                packed_seq_params.mlp_to_attn_metadata, # rev_query_metadata
-                None, # key_value_in
-                None, # key_value_metadata
-                None, # rev_key_value_metadata
+            attn_out_mlp_layout = attn_out_dispatch.apply(
+                attn_out,
+                packed_seq_params.attn_out_fwd_metadata,
+                packed_seq_params.attn_out_bwd_metadata,
                 packed_seq_params.stream, # stream
             )
             #### switch layout back
@@ -118,12 +116,15 @@ class TransformerLayer(MegatronTransformerLayer):
 
     def _layout_mlp_to_attn(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-        packed_seq_params: PingPangPackedSeqParams,
+        packed_seq_params: PingPangSingleStepPackedSeqParams,
     ):
         """
         Communication between attention layout and mlp layout.
         This operation runs on the stream `packed_seq_params.stream`.
         """
+        # Although we set cuda stream in the dispatch function (qkv_dispatch)
+        # since in this function there are some implicit reshape, we add
+        # cuda stream context as well.
         if packed_seq_params.stream is not None:
             context = torch.cuda.stream(packed_seq_params.stream)
         else:
@@ -139,29 +140,23 @@ class TransformerLayer(MegatronTransformerLayer):
             num_kv_heads = key.shape[-2]
             q_head_dim = query.shape[-1]
             kv_head_dim = key.shape[-1]
-            # NOTE: qkv used to be concatenated, so here they are not contiguous, and
-            # the reshape is an extra copy.
+            # qkv used to be concatenated, so here they are not contiguous, the reshape is an extra copy.
+            # TODO: write memcpy to nvshmem buffer kernel with stride support.
             query = query.reshape(query.shape[0], num_q_heads * q_head_dim)
             key = key.reshape(key.shape[0], num_kv_heads * kv_head_dim)
             value = value.reshape(value.shape[0], num_kv_heads * kv_head_dim)
             ####
-
-            key_value = torch.cat([key, value], dim=-1).contiguous()
-            query_attn_layout, key_value_attn_layout = n_to_n_dispatch.apply(
-                query,  # query_in
-                packed_seq_params.mlp_to_attn_metadata, # query_metadata
-                packed_seq_params.attn_to_mlp_metadata, # rev_query_metadata
-                key_value, # key_value_in
-                packed_seq_params.mlp_to_attn_kv_metadata, # key_value_metadata
-                packed_seq_params.mlp_to_attn_kv_grad_metadata, # rev_key_value_metadata
+            query_attn_layout, key_attn_layout, value_attn_layout = qkv_dispatch.apply(
+                query, key, value,
+                packed_seq_params.qkv_fwd_metadata, # query_metadata
+                packed_seq_params.qkv_bwd_metadata, # rev_query_metadata
                 packed_seq_params.stream, # stream
             )
-            key_attn_layout, value_attn_layout = key_value_attn_layout.split(key_value_attn_layout.shape[1] // 2, dim=1)
 
             #### switch layout back
             query_attn_layout = query_attn_layout.view(-1, num_q_heads, q_head_dim).contiguous()
-            key_attn_layout = key_attn_layout.reshape(-1, num_kv_heads, kv_head_dim).contiguous()
-            value_attn_layout = value_attn_layout.reshape(-1, num_kv_heads, kv_head_dim).contiguous()
+            key_attn_layout = key_attn_layout.view(-1, num_kv_heads, kv_head_dim).contiguous()
+            value_attn_layout = value_attn_layout.view(-1, num_kv_heads, kv_head_dim).contiguous()
             torch.cuda.nvtx.range_pop()
 
         return query_attn_layout, key_attn_layout, value_attn_layout
@@ -335,7 +330,7 @@ class TransformerLayer(MegatronTransformerLayer):
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
-        packed_seq_params: Optional[PingPangPackedSeqParams] = None,
+        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
     ):
         """
@@ -422,7 +417,7 @@ class TransformerLayer(MegatronTransformerLayer):
         attention_mask: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         attn_mask_type: Optional[AttnMaskType] = None,
-        packed_seq_params: Optional[PingPangPackedSeqParams] = None,
+        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
     ):
         """
         Copied from megatron.core.transformer.attention.Attention.forward

@@ -9,11 +9,12 @@ from megatron.core import parallel_state as mpu
 import ray
 import torch
 
-from d2.runtime.attn_kernels.ops import nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper
+from d2.runtime.attn_kernels.ops import nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, FastDispatcherWrapper
 from d2.runtime.inplace_metadata import (
     Metadata, compute_attn_layout_seqlens, compute_metadata, compute_metadata_kv,
     exclusive_cumsum
 )
+from d2.runtime.fast_alltoall_metadata import  compute_fa2a_metadata_from_logical_metadata
 
 
 ######## Workers
@@ -27,15 +28,32 @@ class ParallelConfig:
     expert_tensor_parallel_size: Optional[int] = None
 
 
-class MegatronBaseWorker:
-    """Worker base class to init communication groups (megatron and nvshmem)."""
+# NOTE: the Worker abstraction is to make it compatible with ray.
+# However, since ray has some issue with nsys, our default launch is torchrun.
+class BaseWorker:
     def __init__(self, rank: int, world_size: int):
         self.rank = rank
         self.world_size = world_size
-        self.nvshmem_initialized = False
-        self.nvshmem_pe = None
 
-    #### General init functions
+    def init_comm(self, buffer_size: int, local_rank: int = None):
+        # Init megatron communication.
+        if local_rank is None:
+            local_rank = int(os.getenv("LOCAL_RANK"))
+
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size)
+
+        if self.rank == 0:
+            uid = nvshmem_get_unique_id()
+        else:
+            uid = nvshmem_alloc_empty_unique_id()
+        torch.distributed.broadcast(uid, src=0)
+
+        FastDispatcherWrapper.init(
+            self.rank, local_rank, self.world_size, buffer_size, uid
+        )
+
+    #### General init functions for ray.
     def get_node_ip_port(self):
         host_ipv4 = os.getenv("MY_HOST_IP", None)
         host_ipv6 = os.getenv("MY_HOST_IPV6", None)
@@ -53,14 +71,14 @@ class MegatronBaseWorker:
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = master_port
 
-    def init_comm(self, stride_q: int, stride_kv: int, max_tokens_query: int, max_tokens_key_value: int,
-                  parallel_config: ParallelConfig):
-        # Init megatron communication.
-        if not torch.distributed.is_initialized():
-            local_rank = int(os.environ["LOCAL_RANK"])
-            torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size)
-        # NOTE: do not set to local_rank here because the cuda visible device is set by ray.
 
+class MegatronBaseWorker(BaseWorker):
+    """Worker base class to init communication groups (megatron and nvshmem)."""
+
+    def init_comm(self, buffer_size: int, parallel_config: ParallelConfig, local_rank: Optional[int] = None):
+        # Init megatron communication.
+        super().init_comm(buffer_size, local_rank)
+        # NOTE: do not set to local_rank here because the cuda visible device is set by ray.
         mpu.initialize_model_parallel(
             tensor_model_parallel_size=parallel_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=parallel_config.pipeline_model_parallel_size,
@@ -72,22 +90,22 @@ class MegatronBaseWorker:
             expert_tensor_parallel_size=parallel_config.expert_tensor_parallel_size,
             nccl_communicator_config_path=None,
         )
-        # Init nvshmem.
-        if self.rank == 0:
-            uid = nvshmem_get_unique_id()
-        else:
-            uid = nvshmem_alloc_empty_unique_id()
-        torch.distributed.broadcast(uid, src=0)
 
-        DispatcherWrapper.init(
-            q_stride=stride_q,
-            kv_stride=stride_kv,
-            max_tokens_query=max_tokens_query,
-            max_tokens_key_value=max_tokens_key_value,
-            rank=self.rank,
-            world_size=self.world_size,
-            uid=uid,
-        )
+
+def init_worker_torch_distributed(
+    world_size, buffer_size, worker_cls=BaseWorker, parallel_config=None
+):
+    assert world_size == int(os.environ.get("WORLD_SIZE"))
+    rank = int(os.environ.get("RANK"))
+    local_rank = int(os.environ.get("LOCAL_RANK"))
+    worker = worker_cls(
+        rank, world_size
+    )
+    if parallel_config is not None:
+        worker.init_comm(buffer_size, parallel_config, local_rank)
+    else:
+        worker.init_comm(buffer_size, local_rank)
+    return worker
 
 
 ######## Data construction
@@ -169,7 +187,7 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
 
 def create_qkv_dispatch(
     world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
-    return_intermediate: bool=False
+    return_intermediate: bool=False, return_mlp_no_shard_seq_lens: bool=False
 ):
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
     # init sequence
@@ -274,14 +292,98 @@ def create_qkv_dispatch(
         return_intermediate=True
     )
     attention_metadata = compute_attn_layout_seqlens(
-        cp_seq_lens, q_to_num_kv_tokens, cp_query_dst
+        cp_seq_lens, q_to_num_kv_tokens, cp_query_dst, shard_to_tuple=True
+    )
+    ret = (
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
     )
     if return_intermediate:
         intermediates = q_intermediates + kv_intermediates
-        return (
-            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-            attention_metadata, intermediates
-        )
-    return (
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
+        ret += (intermediates,)
+    if return_mlp_no_shard_seq_lens:
+        ret += (seq_lens,)
+    return ret
+
+
+# FIXME: remove this function.
+def create_fast_a2a_metadata_from_qkv_dispatch(
+    fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, intermediates, element_size: int, hidden_size_q: int, hidden_size_k: int, mlp_total_token: int,
+    create_attn_outs: bool=False
+):
+    (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
+     attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
+    ) = compute_fa2a_metadata_from_logical_metadata(
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+        intermediates, mlp_total_token, hidden_size_q, hidden_size_k, element_size,
     )
+    if create_attn_outs:
+        return (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
+                attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,)
+    return (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata)
+
+
+@torch.no_grad()
+def orchestrate_simulate(
+    tensor: torch.Tensor, output_tensor: torch.Tensor, metadata: Metadata
+):
+    """Simulate a communication based on the metadata."""
+    assert tensor.dim() == 3    # (world_size, num_tokens, hidden_dim)
+    world_size = tensor.shape[0]
+    # handle sending rank-by-rank:
+    for src_rank in range(world_size):
+        dst_rank = metadata.dst_rank[src_rank]
+        dst_offset = metadata.dst_offset[src_rank]
+        seq_lens = metadata.seq_len[src_rank]
+        acu_tokens = 0
+        for j, rs in enumerate(dst_rank):
+            seq_len = seq_lens[j]
+            seq = tensor[src_rank][acu_tokens:acu_tokens + seq_len]
+            if dst_rank.dim() == 1:
+                rank = rs
+                if rank >= 0:
+                    try:
+                        output_tensor[rank][dst_offset[j]: dst_offset[j] + seq_len] = seq
+                    except RuntimeError as e:
+                        print(f"{src_rank=}, {rank=}, {dst_offset[j]=}, {dst_offset[j] + seq_len=}, {seq_len=}, {output_tensor.shape, seq.shape, acu_tokens, tensor.shape}")
+                        raise e
+            else:
+                for k, rank in enumerate(rs):
+                    if rank >= 0:
+                        output_tensor[rank][dst_offset[j][k]: dst_offset[j][k] + seq_len] = seq
+            acu_tokens += seq_len
+    return output_tensor
+
+
+def simulate_communication(tensors: list[torch.Tensor], metadata: Metadata):
+    """
+    Simulate a communication based on the metadata, but with all input paddings
+    already removed.
+    """
+    world_size = len(tensors)
+    assert world_size == metadata.world_size
+    output_seq_len = int(metadata.num_recv_tokens.max().item())
+    input_pad_len = max(tensor.shape[0] for tensor in tensors)
+    pad_tensors = [
+        torch.cat([
+            tensor,
+            torch.zeros(
+                (input_pad_len - tensor.shape[0], *tensor.shape[1:]),
+                dtype=tensor.dtype, device=tensor.device
+            )
+        ], dim=0).unsqueeze(0) for tensor in tensors
+    ]
+    input_tensor = torch.cat(pad_tensors, dim=0)
+    output_tensor = torch.zeros(
+        (world_size, output_seq_len, *input_tensor.shape[2:]),
+        dtype=input_tensor.dtype, device=input_tensor.device
+    )
+    output_tensor = orchestrate_simulate(
+        input_tensor.reshape(world_size, input_pad_len, -1),
+        output_tensor.reshape(world_size, output_seq_len, -1),
+        metadata
+    ).reshape(world_size, output_seq_len, *input_tensor.shape[2:])
+    output_tensors = torch.split(output_tensor, 1, dim=0)
+    output_tensors_split = [
+        t[0, :metadata.num_recv_tokens[rank].max()] for rank, t in enumerate(output_tensors)
+    ]
+    return output_tensors_split
