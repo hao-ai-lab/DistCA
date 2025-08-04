@@ -35,7 +35,7 @@ def set_random_seed(seed, set_megatron: bool=True):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    if get_torch_device().device_count() > 0:
+    if get_torch_device().device_count() > 0 and set_megatron:
         from megatron.core import tensor_parallel
 
         tensor_parallel.model_parallel_cuda_manual_seed(seed)

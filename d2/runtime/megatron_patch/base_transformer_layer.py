@@ -135,9 +135,6 @@ class TransformerLayer(MegatronTransformerLayer):
         # ==================================
         # core attention computation
         # ==================================
-
-        # TODO(yonghao): this core attention still has the CP communication.
-        # Need to remove it since we can merge it with our all2all
         if self.self_attention.checkpoint_core_attention and self.training:
             core_attn_out = self.self_attention._checkpointed_attention_forward(
                 query,
