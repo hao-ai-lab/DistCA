@@ -582,8 +582,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         if l_no > 0:
             _tick_sync(
                 compute_stream, self.comm_stream,
-                arg_group_0, "query",           # compute out
-                arg_group_1, "core_attn_out",   # prev layer's comm out,
+                arg_group_0, "signal",  # compute out
+                arg_group_1, "signal",  # prev layer's comm out,
             )
 
         # tick 1
@@ -595,8 +595,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
         _tick_sync(
             compute_stream, self.comm_stream,
-            arg_group_0, "query",   # comm out
-            arg_group_1, "query",   # compute out
+            arg_group_0, "signal",  # comm out
+            arg_group_1, "signal",  # compute out
         )
 
         # tick 2
@@ -606,8 +606,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
         _tick_sync(
             compute_stream, self.comm_stream,
-            arg_group_0, "core_attn_out",   # compute out
-            arg_group_1, "query",           # comm out.
+            arg_group_0, "signal",  # compute out
+            arg_group_1, "signal",  # comm out.
         )
 
         # tick 3
@@ -617,8 +617,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
         _tick_sync(
             compute_stream, self.comm_stream,
-            arg_group_0, "core_attn_out",   # comm out
-            arg_group_1, "core_attn_out",   # compute out
+            arg_group_0, "signal",  # comm out
+            arg_group_1, "signal",  # compute out
         )
 
         # tick 4, also the tick 0 of the next layer
@@ -634,18 +634,12 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             _tick_sync(
                 compute_stream, self.comm_stream,
                 arg_group_0, "hidden_states",   # place holder
-                arg_group_1, "core_attn_out",   # comm out
+                arg_group_1, "signal",          # comm out
             )
             arg_group_1 = _forward_post_core_attn(layer, arg_group_1)
             # gathering the result
-            hidden_states = _gather_tensor([
-                arg_group_0["hidden_states"],
-                arg_group_1["hidden_states"]
-            ], 2)
-            context = _gather_tensor([
-                arg_group_0["context"],
-                arg_group_1["context"]
-            ], 2)
+            hidden_states = _gather_tensor([arg_group_0["hidden_states"], arg_group_1["hidden_states"]], 2)
+            context = _gather_tensor([arg_group_0["context"],arg_group_1["context"]], 2)
         else:
             hidden_states = None
             context = None
@@ -661,53 +655,45 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             args["mlp_packed_seq_params"],
             args["sequence_len_offset"],
         )
+        signal = layer._pre_mlp_to_attn(query, key, value, args["packed_seq_params"])
         args["query"] = query
         args["key"] = key
         args["value"] = value
         args["residual"] = residual
         args["attn_mask_type"] = attn_mask_type
+        args["signal"] = signal
         return args
 
-    def _TODOUPDATETHIS(layer: TransformerLayer, args: Dict[str, Any]):
-        query = args.pop("query")
-        key = args.pop("key")
-        value = args.pop("value")
-        query, key, value = _layout_mlp_to_attn(
-            query, key, value,
-            args["packed_seq_params"],
-        )
-        args["query"] = query
-        args["key"] = key
-        args["value"] = value
+    def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
+        args.pop("query"), args.pop("key"), args.pop("value")
+        signal = args.pop("signal")
+        args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=True)
         return args
 
     def _forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         # pop out to make sure the tensor is freed
-        query = args.pop("query")
-        key = args.pop("key")
-        value = args.pop("value")
+        signal = args.pop("signal")
+        query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
         core_attn_out = layer._forward_core_attn(
-            query,
-            key,
-            value,
+            query, key, value,
             args["attention_mask"],
             args["attention_bias"],
             args["attn_mask_type"],
             args["packed_seq_params"],
         )
         args["core_attn_out"] = core_attn_out
+        args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
         return args
 
-    def _TODOUPDATE(layer: TransformerLayer, args: Dict[str, Any]):
-        core_attn_out = args.pop("core_attn_out")
-        core_attn_out = _layout_attn_to_mlp(
-            core_attn_out, args["packed_seq_params"]
-        )
-        args["core_attn_out"] = core_attn_out
+    def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
+        args.pop("core_attn_out")
+        signal = args.pop("signal")
+        args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=False)
         return args
 
     def _forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        core_attn_out = args.pop("core_attn_out")
+        signal = args.pop("signal")
+        core_attn_out = layer._post_attn_to_mlp(signal, args["packed_seq_params"])
         residual = args.pop("residual")
         mlp_output, context = layer._forward_post_core_attn(
             core_attn_out,
@@ -727,10 +713,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         tensors_0 = [arg_group_0[key] for key in keys_0]
         tensors_1 = [arg_group_1[key] for key in keys_1]
         tensors = tensors_0 + tensors_1
-        out_tensors = TickSync.apply(
-            compute_stream, comm_stream,
-            *tensors
-        )
+        out_tensors = TickSync.apply(compute_stream, comm_stream, *tensors)
         out_tensors_0 = out_tensors[:len(tensors_0)]
         out_tensors_1 = out_tensors[len(tensors_0):]
         for key, out_tensor in zip(keys_0, out_tensors_0):
