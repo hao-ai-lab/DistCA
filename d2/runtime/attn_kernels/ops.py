@@ -56,6 +56,7 @@ def nvshmem_barrier_all() -> None:
 def nvshmem_barrier_all_on_current_stream() -> None:
     _ops.nvshmem_barrier_all_on_current_stream()
 
+
 #### Fast dispatch
 class FastDispatcherWrapper:
     instance: Tuple[
