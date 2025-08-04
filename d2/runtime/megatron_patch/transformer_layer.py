@@ -25,7 +25,7 @@ from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
 from d2.runtime.megatron_patch.base_transformer_layer import TransformerLayer as BaseTransformerLayer
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
-from d2.runtime.megatron_patch.dispatcher_wrapper import TickSync
+from d2.runtime.megatron_patch.stream_sync_fn import TickSync
 from d2.runtime.megatron_patch.fast_dispatch_fn import (
     all_to_all, post_all2all_layout_transfer, pre_all2all_layout_transfer
 )
