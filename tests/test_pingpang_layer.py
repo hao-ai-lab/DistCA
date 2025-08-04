@@ -1,9 +1,18 @@
 """
+Profiling:
+
 NVSHMEM_IB_ENABLE_IBGDA=true NVSHMEM_DEBUG=DEBUG NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
     nsys profile -o pingpang_layer_%p.nsys-rep -t cuda,nvtx \
 torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer.py \
     --world-size 2 \
     --profile \
+    --num-query-heads 8 --num-heads 32 --hidden-size 4096 --num-tokens 8192
+
+Correctness:
+
+NVSHMEM_IB_ENABLE_IBGDA=true NVSHMEM_DEBUG=DEBUG NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer.py \
+    --world-size 2 \
     --num-query-heads 8 --num-heads 32 --hidden-size 4096 --num-tokens 8192
 """
 
