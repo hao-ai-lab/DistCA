@@ -26,7 +26,9 @@ from megatron.core.utils import WrappedTensor, make_viewless_tensor
 from d2.runtime.megatron_patch.base_transformer_layer import TransformerLayer as BaseTransformerLayer
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.dispatcher_wrapper import TickSync
-from d2.runtime.megatron_patch.fast_dispatch_fn import qkv_dispatch, attn_out_dispatch
+from d2.runtime.megatron_patch.fast_dispatch_fn import (
+    all_to_all, post_all2all_layout_transfer, pre_all2all_layout_transfer
+)
 
 
 #### Tool functions for splitting and gathering args ####
@@ -68,7 +70,7 @@ def _gather_tensor(tensors: List[torch.Tensor], num_splits: int):
 
 class TransformerLayer(BaseTransformerLayer):
     ########## Attention Layout <-> MLP Layout Transformation ##########
-    def _layout_attn_to_mlp(
+    def _pre_attn_to_mlp(
         self, attn_out: torch.Tensor,
         packed_seq_params: PingPangSingleStepPackedSeqParams,
     ):
@@ -76,31 +78,42 @@ class TransformerLayer(BaseTransformerLayer):
         Communication between attention layout and mlp layout.
         This operation runs on the stream `packed_seq_params.stream`.
         """
-        if packed_seq_params.stream is None:
-            context = nullcontext()
-        else:
-            context = torch.cuda.stream(packed_seq_params.stream)
+        torch.cuda.nvtx.range_push("pre_attn_to_mlp")
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        attn_out = attn_out.view(attn_out.shape[0], num_heads * head_dim)
+        ####
+        signal = pre_all2all_layout_transfer.apply(
+            attn_out, None, None,
+            packed_seq_params.attn_out_fwd_metadata,
+            packed_seq_params.attn_out_bwd_metadata,
+            packed_seq_params.dispatcher_id,
+            False,  # is_qkv
+        )
+        torch.cuda.nvtx.range_pop()
+        return signal
 
-        with context:
-            torch.cuda.nvtx.range_push("attn_to_mlp")
-            #### NOTE: this is a hack. We should fix this in the future.
-            num_heads = attn_out.shape[-2]
-            head_dim = attn_out.shape[-1]
-            attn_out = attn_out.view(attn_out.shape[0], num_heads * head_dim)
-            ####
-            attn_out_mlp_layout = attn_out_dispatch.apply(
-                attn_out,
-                packed_seq_params.attn_out_fwd_metadata,
-                packed_seq_params.attn_out_bwd_metadata,
-                packed_seq_params.stream, # stream
-            )
-            #### switch layout back
-            attn_out_mlp_layout = attn_out_mlp_layout.view(-1, num_heads, head_dim)
-            ####
-            torch.cuda.nvtx.range_pop()
-        return attn_out_mlp_layout
+    def _post_attn_to_mlp(
+        self, signal: torch.Tensor,
+        packed_seq_params: PingPangSingleStepPackedSeqParams,
+    ):
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        torch.cuda.nvtx.range_push("post_attn_to_mlp")
+        attn_out = post_all2all_layout_transfer.apply(
+            signal,
+            packed_seq_params.attn_out_fwd_metadata,
+            packed_seq_params.attn_out_bwd_metadata,
+            packed_seq_params.dispatcher_id,
+            False,  # is_qkv
+        )
+        attn_out = attn_out.reshape(
+            attn_out.shape[0], 1, num_heads * head_dim,
+        ).contiguous()
+        torch.cuda.nvtx.range_pop()
+        return attn_out
 
-    def _layout_mlp_to_attn(
+    def _pre_mlp_to_attn(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
         packed_seq_params: PingPangSingleStepPackedSeqParams,
     ):
@@ -108,45 +121,75 @@ class TransformerLayer(BaseTransformerLayer):
         Communication between attention layout and mlp layout.
         This operation runs on the stream `packed_seq_params.stream`.
         """
-        # Although we set cuda stream in the dispatch function (qkv_dispatch)
-        # since in this function there are some implicit reshape, we add
-        # cuda stream context as well.
-        if packed_seq_params.stream is not None:
-            context = torch.cuda.stream(packed_seq_params.stream)
+
+        torch.cuda.nvtx.range_push("mlp_to_attn")
+        # TODO(yonghao): current we do a walk around: merge head dimension
+        # into hidden dimension. In this way, we need the TP degree being
+        # kept for attention and other parts.
+        assert query.dim() in [3, 4], f"{query.shape=}, should be t1nh or tnh layout"
+        num_q_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_query_groups or self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_q_heads
+        # TODO: write memcpy to nvshmem buffer kernel with stride support.
+        query = query.reshape(query.shape[0], num_q_heads * head_dim)
+        key = key.reshape(key.shape[0], num_kv_heads * head_dim)
+        value = value.reshape(value.shape[0], num_kv_heads * head_dim)
+        ####
+        signal = pre_all2all_layout_transfer.apply(
+            query, key, value,
+            packed_seq_params.qkv_fwd_metadata, # query_metadata
+            packed_seq_params.qkv_bwd_metadata, # rev_query_metadata
+            packed_seq_params.dispatcher_id,
+            True,  # is_qkv
+        )
+        torch.cuda.nvtx.range_pop()
+
+        return signal
+
+    def _post_mlp_to_attn(
+        self, signal: torch.Tensor,
+        packed_seq_params: PingPangSingleStepPackedSeqParams,
+    ):
+        num_q_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_query_groups or self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_q_heads
+        torch.cuda.nvtx.range_push("post_mlp_to_attn")
+        query, key, value = post_all2all_layout_transfer.apply(
+            signal,
+            packed_seq_params.qkv_fwd_metadata,
+            packed_seq_params.qkv_bwd_metadata,
+            packed_seq_params.dispatcher_id,
+            True,  # is_qkv
+        )
+        query = query.view(query.shape[0], num_q_heads, head_dim).contiguous()
+        key = key.view(key.shape[0], num_kv_heads, head_dim).contiguous()
+        value = value.view(value.shape[0], num_kv_heads, head_dim).contiguous()
+        torch.cuda.nvtx.range_pop()
+        return query, key, value
+
+    def _all_to_all(self, signal: torch.Tensor,
+                    packed_seq_params: PingPangSingleStepPackedSeqParams,
+                    is_qkv: bool,):
+        metadatas = []
+        if is_qkv:
+            metadatas = [
+                packed_seq_params.qkv_fwd_metadata,
+                packed_seq_params.qkv_bwd_metadata,
+            ]
         else:
-            context = nullcontext()
+            metadatas = [
+                packed_seq_params.attn_out_fwd_metadata,
+                packed_seq_params.attn_out_bwd_metadata,
+            ]
+        signal = all_to_all.apply(
+            signal,
+            *metadatas,
+            packed_seq_params.dispatcher_id,
+            packed_seq_params.stream,
+        )
+        return signal
 
-        with context:
-            torch.cuda.nvtx.range_push("mlp_to_attn")
-            # TODO(yonghao): current we do a walk around: merge head dimension
-            # into hidden dimension. In this way, we need the TP degree being
-            # kept for attention and other parts.
-            assert query.dim() in [3, 4], f"{query.shape=}, should be t1nh or tnh layout"
-            num_q_heads = query.shape[-2]
-            num_kv_heads = key.shape[-2]
-            q_head_dim = query.shape[-1]
-            kv_head_dim = key.shape[-1]
-            # qkv used to be concatenated, so here they are not contiguous, the reshape is an extra copy.
-            # TODO: write memcpy to nvshmem buffer kernel with stride support.
-            query = query.reshape(query.shape[0], num_q_heads * q_head_dim)
-            key = key.reshape(key.shape[0], num_kv_heads * kv_head_dim)
-            value = value.reshape(value.shape[0], num_kv_heads * kv_head_dim)
-            ####
-            query_attn_layout, key_attn_layout, value_attn_layout = qkv_dispatch.apply(
-                query, key, value,
-                packed_seq_params.qkv_fwd_metadata, # query_metadata
-                packed_seq_params.qkv_bwd_metadata, # rev_query_metadata
-                packed_seq_params.stream, # stream
-            )
-
-            #### switch layout back
-            query_attn_layout = query_attn_layout.view(-1, num_q_heads, q_head_dim).contiguous()
-            key_attn_layout = key_attn_layout.view(-1, num_kv_heads, kv_head_dim).contiguous()
-            value_attn_layout = value_attn_layout.view(-1, num_kv_heads, kv_head_dim).contiguous()
-            torch.cuda.nvtx.range_pop()
-
-        return query_attn_layout, key_attn_layout, value_attn_layout
-
+    ########## Ping-Pong ##########
     def ping_pang_forward(
         self,
         hidden_states: Tensor,
@@ -226,7 +269,7 @@ class TransformerLayer(BaseTransformerLayer):
         # NOTE: do not remove this debug tensor. see above.
         debug_tensors = (query_0, key_0, value_0)
 
-        query_0, key_0, value_0 = self._layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
+        query_0, key_0, value_0 = _layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
         torch.cuda.nvtx.range_push("pre_core_attn.1")
         query_1, key_1, value_1, residual_1, attn_mask_type_1 = self._forward_pre_core_attn(
             hidden_states_1,
@@ -244,7 +287,7 @@ class TransformerLayer(BaseTransformerLayer):
         debug_tensors = (query_1, key_1, value_1)
 
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
-        query_1, key_1, value_1 = self._layout_mlp_to_attn(query_1, key_1, value_1, packed_seq_params_1)
+        query_1, key_1, value_1 = _layout_mlp_to_attn(query_1, key_1, value_1, packed_seq_params_1)
         torch.cuda.nvtx.range_push("core_attn.0")
         core_attn_out_0 = self._forward_core_attn(
             query_0,
@@ -263,7 +306,7 @@ class TransformerLayer(BaseTransformerLayer):
         debug_tensors = core_attn_out_0
 
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
-        core_attn_out_0 = self._layout_attn_to_mlp(core_attn_out_0, packed_seq_params_0)
+        core_attn_out_0 = _layout_attn_to_mlp(core_attn_out_0, packed_seq_params_0)
         torch.cuda.nvtx.range_push("core_attn.1")
         core_attn_out_1 = self._forward_core_attn(
             query_1,
@@ -280,7 +323,7 @@ class TransformerLayer(BaseTransformerLayer):
         debug_tensors = core_attn_out_1
 
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
-        core_attn_out_1 = self._layout_attn_to_mlp(core_attn_out_1, packed_seq_params_1)
+        core_attn_out_1 = _layout_attn_to_mlp(core_attn_out_1, packed_seq_params_1)
         torch.cuda.nvtx.range_push("post_core_attn.0")
         mlp_output_0, context_0 = self._forward_post_core_attn(
             core_attn_out_0,
@@ -347,7 +390,9 @@ class TransformerLayer(BaseTransformerLayer):
         )
         debug_tensors = [(query, key, value),]
 
-        query, key, value = self._layout_mlp_to_attn(query, key, value, packed_seq_params)
+        signal = self._pre_mlp_to_attn(query, key, value, packed_seq_params)
+        signal = self._all_to_all(signal, packed_seq_params, is_qkv=True)
+        query, key, value = self._post_mlp_to_attn(signal, packed_seq_params)
         debug_tensors.append((query, key, value))
 
         core_attn_out = self._forward_core_attn(
@@ -361,7 +406,11 @@ class TransformerLayer(BaseTransformerLayer):
         )
         debug_tensors.append(core_attn_out)
 
-        core_attn_out = self._layout_attn_to_mlp(core_attn_out, packed_seq_params)
+        signal = self._pre_attn_to_mlp(
+            core_attn_out, packed_seq_params
+        )
+        signal = self._all_to_all(signal, packed_seq_params, is_qkv=False)
+        core_attn_out = self._post_attn_to_mlp(signal, packed_seq_params)
         debug_tensors.append(core_attn_out)
 
         mlp_output, context = self._forward_post_core_attn(
@@ -583,11 +632,11 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         args["attn_mask_type"] = attn_mask_type
         return args
 
-    def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
+    def _TODOUPDATETHIS(layer: TransformerLayer, args: Dict[str, Any]):
         query = args.pop("query")
         key = args.pop("key")
         value = args.pop("value")
-        query, key, value = layer._layout_mlp_to_attn(
+        query, key, value = _layout_mlp_to_attn(
             query, key, value,
             args["packed_seq_params"],
         )
@@ -613,9 +662,9 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         args["core_attn_out"] = core_attn_out
         return args
 
-    def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
+    def _TODOUPDATE(layer: TransformerLayer, args: Dict[str, Any]):
         core_attn_out = args.pop("core_attn_out")
-        core_attn_out = layer._layout_attn_to_mlp(
+        core_attn_out = _layout_attn_to_mlp(
             core_attn_out, args["packed_seq_params"]
         )
         args["core_attn_out"] = core_attn_out
