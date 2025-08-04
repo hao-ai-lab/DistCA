@@ -93,11 +93,10 @@ class FastDispatcherWrapper:
         ) for _ in range(2)]
 
     @staticmethod
-    def get_instance():
+    def get_instance(instance_id: int=None) -> "FastDispatcherWrapper":
         assert FastDispatcherWrapper.instance is not None, "DispatcherWrapper not initialized"
-        return FastDispatcherWrapper.instance[
-            FastDispatcherWrapper.cur_instance
-        ]
+        instance_id = instance_id if instance_id is not None else FastDispatcherWrapper.cur_instance
+        return FastDispatcherWrapper.instance[instance_id]
 
     @staticmethod
     def switch_buffer():
@@ -112,7 +111,7 @@ class FastDispatcherWrapper:
 def fast_a2a_memcpy_non_cp(
     tensor: torch.Tensor, nvshmem_offset: torch.Tensor,
     seq_tokens: torch.Tensor, to_nvshmem: bool,
-    buffer: Optional[torch.Tensor]=None
+    buffer: Optional[torch.Tensor]=None, instance_id: int=None
 ):
     if buffer is not None:
         # Debug mode, explicitly pass the "nvshmem" buffer.
@@ -120,7 +119,7 @@ def fast_a2a_memcpy_non_cp(
             tensor, nvshmem_offset, seq_tokens, to_nvshmem, buffer
         )
     return _ops.fast_a2a_memcpy_non_cp(
-        FastDispatcherWrapper.get_instance().handle,
+        FastDispatcherWrapper.get_instance(instance_id).handle,
         tensor, nvshmem_offset, seq_tokens, to_nvshmem
     )
 
@@ -128,7 +127,8 @@ def fast_a2a_memcpy_non_cp(
 def fast_a2a_memcpy_cp(
     tensor: torch.Tensor, do_shard: torch.Tensor,
     nvshmem_offset: torch.Tensor, seq_tokens: torch.Tensor,
-    to_nvshmem: bool, buffer: Optional[torch.Tensor]=None
+    to_nvshmem: bool, buffer: Optional[torch.Tensor]=None,
+    instance_id: int=None,
 ):
     if buffer is not None:
         # Debug mode, explicitly pass the "nvshmem" buffer.
@@ -137,7 +137,7 @@ def fast_a2a_memcpy_cp(
         )
 
     return _ops.fast_a2a_memcpy_cp(
-        FastDispatcherWrapper.get_instance().handle,
+        FastDispatcherWrapper.get_instance(instance_id).handle,
         tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem
     )
 
@@ -145,10 +145,11 @@ def fast_a2a_memcpy_cp(
 def fast_a2a(
     sender_send_disp: torch.Tensor, sender_transfer_sz: torch.Tensor,
     sender_recv_disp: torch.Tensor, recver_transfer_sz: torch.Tensor,
-    my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int
+    my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
+    instance_id: int=None,
 ):
     return _ops.fast_a2a(
-        FastDispatcherWrapper.get_instance().handle,
+        FastDispatcherWrapper.get_instance(instance_id).handle,
         sender_send_disp, sender_transfer_sz,
         sender_recv_disp, recver_transfer_sz,
         my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz
@@ -159,13 +160,13 @@ def _debug_dump_buffer(
     dump_target: str,
     buffer_dtype: torch.dtype,
     device: torch.device,
-    instance: FastDispatcherWrapper=None,
+    instance_id: int=None,
 ):
     assert dump_target in ["send", "recv", "signal"]
     get_send = dump_target == "send"
     get_recv = dump_target == "recv"
     get_signal = dump_target == "signal"
-    instance = instance or FastDispatcherWrapper.get_instance()
+    instance = FastDispatcherWrapper.get_instance(instance_id)
     out_tensor = torch.zeros(
         (instance.buffer_size // buffer_dtype.itemsize,),
         dtype=buffer_dtype, device=device

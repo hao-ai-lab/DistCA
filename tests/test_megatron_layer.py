@@ -189,7 +189,7 @@ def test_forward(
 
 
 def init_megatron_test(
-    world_size, hidden_size, num_heads, dtype,
+    world_size, hidden_size, num_heads, num_query_heads, dtype,
     max_tokens_query, max_tokens_key_value, max_cp_degree, tp_size, seed,
     worker_cls=MegatronLayerWorker
 ):
@@ -212,6 +212,7 @@ def init_megatron_test(
         num_layers=1,
         hidden_size=hidden_size,
         num_attention_heads=num_heads,
+        num_query_groups=num_query_heads,
         ffn_hidden_size=hidden_size * 4,
         fp16=True,
         deterministic_mode=True,
@@ -232,15 +233,17 @@ def test(args):
     tp_size = args.tp_size
     num_heads = args.num_heads
     dtype = torch.float16
+    num_query_heads = num_heads
+    hidden_size_kv = (hidden_size * num_query_heads) // num_heads
 
     worker = init_megatron_test(
-        world_size, hidden_size, num_heads, dtype,
+        world_size, hidden_size, num_heads, num_query_heads, dtype,
         max_tokens_query, max_tokens_key_value, max_cp_degree, tp_size, seed,
     )
 
     test_forward(
         args.seed, world_size, args.num_tokens, args.num_seqs,
-        max_cp_degree, worker, args.hidden_size, args.hidden_size
+        max_cp_degree, worker, hidden_size, hidden_size_kv
     )
 
 

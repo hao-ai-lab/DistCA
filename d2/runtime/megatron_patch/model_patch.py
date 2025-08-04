@@ -253,6 +253,7 @@ def get_gpt_config(
     normalization: str = "RMSNorm",
     fp16: bool = False,
     bf16: bool = False,
+    num_query_groups: int=None,
     **kwargs,
 ):
     return TransformerConfig(
@@ -265,5 +266,6 @@ def get_gpt_config(
         normalization=normalization,
         fp16=fp16,
         bf16=bf16,
+        num_query_groups=num_query_groups,
         **kwargs,
     )

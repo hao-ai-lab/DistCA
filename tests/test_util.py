@@ -71,6 +71,9 @@ class BaseWorker:
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = master_port
 
+    def __del__(self):
+        torch.distributed.destroy_process_group()
+
 
 class MegatronBaseWorker(BaseWorker):
     """Worker base class to init communication groups (megatron and nvshmem)."""

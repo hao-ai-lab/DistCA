@@ -23,9 +23,12 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
+from d2.runtime.megatron_patch.base_transformer_layer import TransformerLayer as BaseTransformerLayer
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
-from d2.runtime.megatron_patch.dispatcher_wrapper import TickSync
-from d2.runtime.megatron_patch.fast_dispatch_fn import qkv_dispatch, attn_out_dispatch
+from d2.runtime.megatron_patch.stream_sync_fn import TickSync
+from d2.runtime.megatron_patch.fast_dispatch_fn import (
+    all_to_all, post_all2all_layout_transfer, pre_all2all_layout_transfer
+)
 
 
 #### Tool functions for splitting and gathering args ####
@@ -65,24 +68,9 @@ def _gather_tensor(tensors: List[torch.Tensor], num_splits: int):
 ####
 
 
-class TransformerLayer(MegatronTransformerLayer):
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-        submodules: TransformerLayerSubmodules,
-        layer_number: int = 1,
-        hidden_dropout: Optional[float] = None,
-    ):
-        super().__init__(config, submodules, layer_number, hidden_dropout)
-
-        # TODO(yonghao): this is a dev annotation for type hinting. remove it later.
-        from megatron.core.transformer.attention import SelfAttention
-        from megatron.core.extensions.transformer_engine import TEDotProductAttention
-        self.self_attention: SelfAttention
-        assert isinstance(self.self_attention.core_attention, TEDotProductAttention)
-
-    def _layout_attn_to_mlp(
+class TransformerLayer(BaseTransformerLayer):
+    ########## Attention Layout <-> MLP Layout Transformation ##########
+    def _pre_attn_to_mlp(
         self, attn_out: torch.Tensor,
         packed_seq_params: PingPangSingleStepPackedSeqParams,
     ):
@@ -90,31 +78,42 @@ class TransformerLayer(MegatronTransformerLayer):
         Communication between attention layout and mlp layout.
         This operation runs on the stream `packed_seq_params.stream`.
         """
-        if packed_seq_params.stream is None:
-            context = nullcontext()
-        else:
-            context = torch.cuda.stream(packed_seq_params.stream)
+        torch.cuda.nvtx.range_push("pre_attn_to_mlp")
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        attn_out = attn_out.view(attn_out.shape[0], num_heads * head_dim)
+        ####
+        signal = pre_all2all_layout_transfer.apply(
+            attn_out, None, None,
+            packed_seq_params.attn_out_fwd_metadata,
+            packed_seq_params.attn_out_bwd_metadata,
+            packed_seq_params.dispatcher_id,
+            False,  # is_qkv
+        )
+        torch.cuda.nvtx.range_pop()
+        return signal
 
-        with context:
-            torch.cuda.nvtx.range_push("attn_to_mlp")
-            #### NOTE: this is a hack. We should fix this in the future.
-            num_heads = attn_out.shape[-2]
-            head_dim = attn_out.shape[-1]
-            attn_out = attn_out.view(attn_out.shape[0], num_heads * head_dim)
-            ####
-            attn_out_mlp_layout = attn_out_dispatch.apply(
-                attn_out,
-                packed_seq_params.attn_out_fwd_metadata,
-                packed_seq_params.attn_out_bwd_metadata,
-                packed_seq_params.stream, # stream
-            )
-            #### switch layout back
-            attn_out_mlp_layout = attn_out_mlp_layout.view(-1, num_heads, head_dim)
-            ####
-            torch.cuda.nvtx.range_pop()
-        return attn_out_mlp_layout
+    def _post_attn_to_mlp(
+        self, signal: torch.Tensor,
+        packed_seq_params: PingPangSingleStepPackedSeqParams,
+    ):
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        torch.cuda.nvtx.range_push("post_attn_to_mlp")
+        attn_out = post_all2all_layout_transfer.apply(
+            signal,
+            packed_seq_params.attn_out_fwd_metadata,
+            packed_seq_params.attn_out_bwd_metadata,
+            packed_seq_params.dispatcher_id,
+            False,  # is_qkv
+        )
+        attn_out = attn_out.reshape(
+            attn_out.shape[0], 1, num_heads * head_dim,
+        ).contiguous()
+        torch.cuda.nvtx.range_pop()
+        return attn_out
 
-    def _layout_mlp_to_attn(
+    def _pre_mlp_to_attn(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
         packed_seq_params: PingPangSingleStepPackedSeqParams,
     ):
@@ -122,45 +121,75 @@ class TransformerLayer(MegatronTransformerLayer):
         Communication between attention layout and mlp layout.
         This operation runs on the stream `packed_seq_params.stream`.
         """
-        # Although we set cuda stream in the dispatch function (qkv_dispatch)
-        # since in this function there are some implicit reshape, we add
-        # cuda stream context as well.
-        if packed_seq_params.stream is not None:
-            context = torch.cuda.stream(packed_seq_params.stream)
+
+        torch.cuda.nvtx.range_push("mlp_to_attn")
+        # TODO(yonghao): current we do a walk around: merge head dimension
+        # into hidden dimension. In this way, we need the TP degree being
+        # kept for attention and other parts.
+        assert query.dim() in [3, 4], f"{query.shape=}, should be t1nh or tnh layout"
+        num_q_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_query_groups or self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_q_heads
+        # TODO: write memcpy to nvshmem buffer kernel with stride support.
+        query = query.reshape(query.shape[0], num_q_heads * head_dim)
+        key = key.reshape(key.shape[0], num_kv_heads * head_dim)
+        value = value.reshape(value.shape[0], num_kv_heads * head_dim)
+        ####
+        signal = pre_all2all_layout_transfer.apply(
+            query, key, value,
+            packed_seq_params.qkv_fwd_metadata, # query_metadata
+            packed_seq_params.qkv_bwd_metadata, # rev_query_metadata
+            packed_seq_params.dispatcher_id,
+            True,  # is_qkv
+        )
+        torch.cuda.nvtx.range_pop()
+
+        return signal
+
+    def _post_mlp_to_attn(
+        self, signal: torch.Tensor,
+        packed_seq_params: PingPangSingleStepPackedSeqParams,
+    ):
+        num_q_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_query_groups or self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_q_heads
+        torch.cuda.nvtx.range_push("post_mlp_to_attn")
+        query, key, value = post_all2all_layout_transfer.apply(
+            signal,
+            packed_seq_params.qkv_fwd_metadata,
+            packed_seq_params.qkv_bwd_metadata,
+            packed_seq_params.dispatcher_id,
+            True,  # is_qkv
+        )
+        query = query.view(query.shape[0], num_q_heads, head_dim).contiguous()
+        key = key.view(key.shape[0], num_kv_heads, head_dim).contiguous()
+        value = value.view(value.shape[0], num_kv_heads, head_dim).contiguous()
+        torch.cuda.nvtx.range_pop()
+        return query, key, value
+
+    def _all_to_all(self, signal: torch.Tensor,
+                    packed_seq_params: PingPangSingleStepPackedSeqParams,
+                    is_qkv: bool,):
+        metadatas = []
+        if is_qkv:
+            metadatas = [
+                packed_seq_params.qkv_fwd_metadata,
+                packed_seq_params.qkv_bwd_metadata,
+            ]
         else:
-            context = nullcontext()
+            metadatas = [
+                packed_seq_params.attn_out_fwd_metadata,
+                packed_seq_params.attn_out_bwd_metadata,
+            ]
+        signal = all_to_all.apply(
+            signal,
+            *metadatas,
+            packed_seq_params.dispatcher_id,
+            packed_seq_params.stream,
+        )
+        return signal
 
-        with context:
-            torch.cuda.nvtx.range_push("mlp_to_attn")
-            # TODO(yonghao): current we do a walk around: merge head dimension
-            # into hidden dimension. In this way, we need the TP degree being
-            # kept for attention and other parts.
-            assert query.dim() in [3, 4], f"{query.shape=}, should be t1nh or tnh layout"
-            num_q_heads = query.shape[-2]
-            num_kv_heads = key.shape[-2]
-            q_head_dim = query.shape[-1]
-            kv_head_dim = key.shape[-1]
-            # qkv used to be concatenated, so here they are not contiguous, the reshape is an extra copy.
-            # TODO: write memcpy to nvshmem buffer kernel with stride support.
-            query = query.reshape(query.shape[0], num_q_heads * q_head_dim)
-            key = key.reshape(key.shape[0], num_kv_heads * kv_head_dim)
-            value = value.reshape(value.shape[0], num_kv_heads * kv_head_dim)
-            ####
-            query_attn_layout, key_attn_layout, value_attn_layout = qkv_dispatch.apply(
-                query, key, value,
-                packed_seq_params.qkv_fwd_metadata, # query_metadata
-                packed_seq_params.qkv_bwd_metadata, # rev_query_metadata
-                packed_seq_params.stream, # stream
-            )
-
-            #### switch layout back
-            query_attn_layout = query_attn_layout.view(-1, num_q_heads, q_head_dim).contiguous()
-            key_attn_layout = key_attn_layout.view(-1, num_kv_heads, kv_head_dim).contiguous()
-            value_attn_layout = value_attn_layout.view(-1, num_kv_heads, kv_head_dim).contiguous()
-            torch.cuda.nvtx.range_pop()
-
-        return query_attn_layout, key_attn_layout, value_attn_layout
-
+    ########## Ping-Pong ##########
     def ping_pang_forward(
         self,
         hidden_states: Tensor,
@@ -198,6 +227,9 @@ class TransformerLayer(MegatronTransformerLayer):
         if debug:
             setattr(packed_seq_params_0, "stream", compute_stream)
             setattr(packed_seq_params_1, "stream", compute_stream)
+        else:
+            setattr(packed_seq_params_0, "dispatcher_id", 0)
+            setattr(packed_seq_params_1, "dispatcher_id", 1)
 
 
         # NOTE: DO NOT REMOVE THIS DEBUG TENSOR! Torch seems to have some
@@ -220,8 +252,7 @@ class TransformerLayer(MegatronTransformerLayer):
         comm_stream = packed_seq_params_0.stream
 
         # 2. pre-self-attention forward microbatch 0.
-        # Ideally, this part should merge to the previous layer's post-self-attention to maximize
-        # the communication-computation overlap.
+        ## compute,0
         torch.cuda.nvtx.range_push("pre_core_attn.0")
         query_0, key_0, value_0, residual_0, attn_mask_type_0 = self._forward_pre_core_attn(
             hidden_states_0,
@@ -232,15 +263,22 @@ class TransformerLayer(MegatronTransformerLayer):
             sequence_len_offset_0,
         )
         torch.cuda.nvtx.range_pop()
-        query_0, key_0, value_0, hidden_states_1 = TickSync.apply(
-            compute_stream, comm_stream, query_0, key_0, value_0, hidden_states_1
+        # pre-communicate,0
+        signal_0 = self._pre_mlp_to_attn(
+            query_0, key_0, value_0, packed_seq_params_0
+        )
+        signal_0, hidden_states_1 = TickSync.apply(
+            compute_stream, comm_stream, signal_0, hidden_states_1
         )
 
         # 3. pre-attention forward of microbatch 1, mlp2attn all2all of microbatch 0
         # NOTE: do not remove this debug tensor. see above.
         debug_tensors = (query_0, key_0, value_0)
-
-        query_0, key_0, value_0 = self._layout_mlp_to_attn(query_0, key_0, value_0, packed_seq_params_0)
+        ## communicate,0
+        signal_0 = self._all_to_all(
+            signal_0, packed_seq_params_0, is_qkv=True,
+        )
+        ## compute,1
         torch.cuda.nvtx.range_push("pre_core_attn.1")
         query_1, key_1, value_1, residual_1, attn_mask_type_1 = self._forward_pre_core_attn(
             hidden_states_1,
@@ -251,14 +289,26 @@ class TransformerLayer(MegatronTransformerLayer):
             sequence_len_offset_1,
         )
         torch.cuda.nvtx.range_pop()
-        query_0, key_0, value_0, query_1, key_1, value_1 = TickSync.apply(
-            compute_stream, comm_stream, query_0, key_0, value_0, query_1, key_1, value_1
+        # pre-communicate,1
+        signal_1 = self._pre_mlp_to_attn(
+            query_1, key_1, value_1, packed_seq_params_1
+        )
+        signal_0, signal_1 = TickSync.apply(
+            compute_stream, comm_stream, signal_0, signal_1
         )
         # NOTE: do not remove this debug tensor. see above.
         debug_tensors = (query_1, key_1, value_1)
 
         # 4. self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
-        query_1, key_1, value_1 = self._layout_mlp_to_attn(query_1, key_1, value_1, packed_seq_params_1)
+        ## communicate,1
+        signal_1 = self._all_to_all(
+            signal_1, packed_seq_params_1, is_qkv=True,
+        )
+        ## compute
+        # post-communicate,0
+        query_0, key_0, value_0 = self._post_mlp_to_attn(
+            signal_0, packed_seq_params_0
+        )
         torch.cuda.nvtx.range_push("core_attn.0")
         core_attn_out_0 = self._forward_core_attn(
             query_0,
@@ -270,14 +320,22 @@ class TransformerLayer(MegatronTransformerLayer):
             packed_seq_params_0,
         )
         torch.cuda.nvtx.range_pop()
-        query_1, key_1, value_1, core_attn_out_0 = TickSync.apply(
-            compute_stream, comm_stream, query_1, key_1, value_1, core_attn_out_0
+        # pre-communicate,0
+        signal_0 = self._pre_attn_to_mlp(core_attn_out_0, packed_seq_params_0)
+        signal_1, signal_0 = TickSync.apply(
+            compute_stream, comm_stream, signal_1, signal_0
         )
         # NOTE: do not remove this debug tensor. see above.
         debug_tensors = core_attn_out_0
 
         # 5. post-self-attention forward of microbatch 0, mlp2attn all2all of microbatch 1
-        core_attn_out_0 = self._layout_attn_to_mlp(core_attn_out_0, packed_seq_params_0)
+        ## communicate,0
+        signal_0 = self._all_to_all(
+            signal_0, packed_seq_params_0, is_qkv=False,
+        )
+        ## compute,1
+        # post-communicate,1
+        query_1, key_1, value_1 = self._post_mlp_to_attn(signal_1, packed_seq_params_1)
         torch.cuda.nvtx.range_push("core_attn.1")
         core_attn_out_1 = self._forward_core_attn(
             query_1,
@@ -289,12 +347,18 @@ class TransformerLayer(MegatronTransformerLayer):
             packed_seq_params_1,
         )
         torch.cuda.nvtx.range_pop()
-        core_attn_out_0, core_attn_out_1 = TickSync.apply(compute_stream, comm_stream, core_attn_out_0, core_attn_out_1)
+        # pre-communicate,1
+        signal_1 = self._pre_attn_to_mlp(core_attn_out_1, packed_seq_params_1)
+        signal_0, signal_1 = TickSync.apply(compute_stream, comm_stream, signal_0, signal_1)
         # NOTE: do not remove this debug tensor. see above.
         debug_tensors = core_attn_out_1
 
         # 6. mlp forward of microbatch 0, mlp2attn all2all of microbatch 1
-        core_attn_out_1 = self._layout_attn_to_mlp(core_attn_out_1, packed_seq_params_1)
+        # communicate,1
+        signal_1 = self._all_to_all(signal_1, packed_seq_params_1, is_qkv=False,)
+        ## compute,0
+        # post-communicate,0
+        core_attn_out_0 = self._post_attn_to_mlp(signal_0, packed_seq_params_0)
         torch.cuda.nvtx.range_push("post_core_attn.0")
         mlp_output_0, context_0 = self._forward_post_core_attn(
             core_attn_out_0,
@@ -303,11 +367,14 @@ class TransformerLayer(MegatronTransformerLayer):
             context_mask_0,
         )
         torch.cuda.nvtx.range_pop()
-        core_attn_out_1, mlp_output_0 = TickSync.apply(compute_stream, comm_stream, core_attn_out_1, mlp_output_0)
+        # no pre-communicate for 0 now.
+        signal_1, mlp_output_0 = TickSync.apply(compute_stream, comm_stream, signal_1, mlp_output_0)
         # NOTE: do not remove this debug tensor. see above.
         debug_tensors = None
 
         torch.cuda.nvtx.range_push("post_core_attn.1")
+        # post-communicate,1
+        core_attn_out_1 = self._post_attn_to_mlp(signal_1, packed_seq_params_1)
         mlp_output_1, context_1 = self._forward_post_core_attn(
             core_attn_out_1,
             residual_1,
@@ -324,261 +391,7 @@ class TransformerLayer(MegatronTransformerLayer):
             context = [context_0, context_1]
         return output, context
 
-    def _forward_pre_core_attn(
-        self,
-        hidden_states: Tensor,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-    ):
-        """
-        Perform a forward pass through the attention layer and the layernorms before and after
-        the attention operations.
-        """
-        residual = hidden_states
-        # Optional Input Layer norm
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                self.input_layernorm, hidden_states
-            )
-        else:
-            input_layernorm_output = self.input_layernorm(hidden_states)
-        # Below code copied from megatron.core.transformer.attention.Attention.forward
-        # rotary pos emb
-        assert rotary_pos_cos is None and rotary_pos_sin is None
-
-        # For self attention we just duplicate the rotary_pos_emb if it isn't already
-        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
-            rotary_pos_emb = (rotary_pos_emb,) * 2
-        # q, k, v
-        query, key, value = self.self_attention.get_query_key_value_tensors(input_layernorm_output, None)
-
-        #### Some code in core_attention. This is because we don't want the pos embedding
-        # being handled in the attention layout (the pos id will be hard to handle)
-        inference_context = None
-
-        query, key, value, rotary_pos_emb, attn_mask_type = self.self_attention._adjust_key_value_for_inference(
-            inference_context,
-            query,
-            key,
-            value,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-        )
-        if packed_seq_params is not None:
-            query = query.squeeze(1)
-            key = key.squeeze(1)
-            value = value.squeeze(1)
-
-        # ================================================
-        # relative positional embedding (rotary embedding)
-        # ================================================
-        if rotary_pos_emb is not None and not self.config.flash_decode:
-            q_pos_emb, k_pos_emb = rotary_pos_emb
-
-            if packed_seq_params is not None:
-                if packed_seq_params.cu_seqlens_q_padded is not None:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
-                else:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
-                if packed_seq_params.cu_seqlens_kv_padded is not None:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
-                else:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
-            else:
-                cu_seqlens_q = cu_seqlens_kv = None
-
-            if q_pos_emb is not None:
-                # TODO VIJAY: simplify
-                query = apply_rotary_pos_emb(
-                    query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
-                )
-            if k_pos_emb is not None:
-                key = apply_rotary_pos_emb(
-                    key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
-                )
-
-            # TODO, can apply positional embedding to value_layer so it has
-            # absolute positional embedding.
-            # otherwise, only relative positional embedding takes effect
-            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-        return query, key, value, residual, attn_mask_type
-
-    def _forward_core_attn(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        attn_mask_type: Optional[AttnMaskType] = None,
-        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
-    ):
-        """
-        Copied from megatron.core.transformer.attention.Attention.forward
-        """
-
-        # ==================================
-        # core attention computation
-        # ==================================
-
-        # TODO(yonghao): this core attention still has the CP communication.
-        # Need to remove it since we can merge it with our all2all
-        if self.self_attention.checkpoint_core_attention and self.training:
-            core_attn_out = self.self_attention._checkpointed_attention_forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
-        else:
-            # Static batching attention kernel.
-            # NOTE(yonghao): megatron.core.extensions.transformer_engine.TEDotProductAttention
-            # core impl in te.pytorch.DotProductAttention
-            # use `set_context_parallel_group` to disable context parallel
-            #   cp_size = get_distributed_world_size(self.cp_group)
-            core_attn_out = self.self_attention.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
-
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            # reshape to same output shape as unpacked case
-            # (t, np, hn) -> (t, b=1, h=np*hn)
-            # t is the pack size = sum (sq_i)
-            # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
-        return core_attn_out
-
-    def _forward_post_core_attn(
-        self,
-        core_attn_out: Tensor,
-        residual: Tensor,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-    ):
-        inference_context = None
-        attention_output_with_bias = self.self_attention.linear_proj(core_attn_out)
-        if self.recompute_input_layernorm:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
-
-        # Residual connection.
-        residual = hidden_states
-
-        # Optional Layer norm after self-attention
-        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
-
-        # Cross attention.
-        attention_output_with_bias = self.cross_attention(
-            pre_cross_attn_layernorm_output,
-            attention_mask=context_mask,
-            key_value_states=context,
-            inference_context=inference_context,
-        )
-
-        if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
-            context = attention_output_with_bias["context"]
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
-
-        # Residual connection.
-        residual = hidden_states
-
-        # Optional Layer norm post the cross-attention.
-        if self.recompute_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                self.pre_mlp_layernorm, hidden_states
-            )
-        else:
-            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
-
-        mlp_output = self._forward_mlp(pre_mlp_layernorm_output, residual)
-        return mlp_output, context
-
     #### Debug use.
-    def forward_no_switch(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_context: Optional[Any] = None,
-        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-        *,
-        inference_params: Optional[Any] = None,
-    ):
-        """Debug use. normal forward with output hooked."""
-        assert inference_params is None, "inference not supported yet"
-        assert inference_context is None, "inference not supported yet"
-        assert context is None, "cross-attention not supported yet"
-        assert context_mask is None, "cross-attention not supported yet"
-
-        setattr(packed_seq_params, "stream", torch.cuda.current_stream())
-
-        query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
-            hidden_states,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            packed_seq_params,
-            sequence_len_offset,
-        )
-        debug_tensors = [(query, key, value),]
-
-        core_attn_out = self._forward_core_attn(
-            query,
-            key,
-            value,
-            attention_mask,
-            attention_bias,
-            attn_mask_type,
-            packed_seq_params,
-        )
-        debug_tensors.append(core_attn_out)
-        mlp_output, context = self._forward_post_core_attn(
-            core_attn_out,
-            residual,
-            context,
-            context_mask,
-        )
-
-        return mlp_output, context, debug_tensors
-
     def forward_one_stage(
         self,
         hidden_states: Tensor,
@@ -615,7 +428,9 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         debug_tensors = [(query, key, value),]
 
-        query, key, value = self._layout_mlp_to_attn(query, key, value, packed_seq_params)
+        signal = self._pre_mlp_to_attn(query, key, value, packed_seq_params)
+        signal = self._all_to_all(signal, packed_seq_params, is_qkv=True)
+        query, key, value = self._post_mlp_to_attn(signal, packed_seq_params)
         debug_tensors.append((query, key, value))
 
         core_attn_out = self._forward_core_attn(
@@ -629,7 +444,9 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         debug_tensors.append(core_attn_out)
 
-        core_attn_out = self._layout_attn_to_mlp(core_attn_out, packed_seq_params)
+        signal = self._pre_attn_to_mlp(core_attn_out, packed_seq_params)
+        signal = self._all_to_all(signal, packed_seq_params, is_qkv=False)
+        core_attn_out = self._post_attn_to_mlp(signal, packed_seq_params)
         debug_tensors.append(core_attn_out)
 
         mlp_output, context = self._forward_post_core_attn(
@@ -765,8 +582,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         if l_no > 0:
             _tick_sync(
                 compute_stream, self.comm_stream,
-                arg_group_0, "query",           # compute out
-                arg_group_1, "core_attn_out",   # prev layer's comm out,
+                arg_group_0, "signal",  # compute out
+                arg_group_1, "signal",  # prev layer's comm out,
             )
 
         # tick 1
@@ -778,8 +595,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
         _tick_sync(
             compute_stream, self.comm_stream,
-            arg_group_0, "query",   # comm out
-            arg_group_1, "query",   # compute out
+            arg_group_0, "signal",  # comm out
+            arg_group_1, "signal",  # compute out
         )
 
         # tick 2
@@ -789,8 +606,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
         _tick_sync(
             compute_stream, self.comm_stream,
-            arg_group_0, "core_attn_out",   # compute out
-            arg_group_1, "query",           # comm out.
+            arg_group_0, "signal",  # compute out
+            arg_group_1, "signal",  # comm out.
         )
 
         # tick 3
@@ -800,8 +617,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
         _tick_sync(
             compute_stream, self.comm_stream,
-            arg_group_0, "core_attn_out",   # comm out
-            arg_group_1, "core_attn_out",   # compute out
+            arg_group_0, "signal",  # comm out
+            arg_group_1, "signal",  # compute out
         )
 
         # tick 4, also the tick 0 of the next layer
@@ -817,18 +634,12 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             _tick_sync(
                 compute_stream, self.comm_stream,
                 arg_group_0, "hidden_states",   # place holder
-                arg_group_1, "core_attn_out",   # comm out
+                arg_group_1, "signal",          # comm out
             )
             arg_group_1 = _forward_post_core_attn(layer, arg_group_1)
             # gathering the result
-            hidden_states = _gather_tensor([
-                arg_group_0["hidden_states"],
-                arg_group_1["hidden_states"]
-            ], 2)
-            context = _gather_tensor([
-                arg_group_0["context"],
-                arg_group_1["context"]
-            ], 2)
+            hidden_states = _gather_tensor([arg_group_0["hidden_states"], arg_group_1["hidden_states"]], 2)
+            context = _gather_tensor([arg_group_0["context"],arg_group_1["context"]], 2)
         else:
             hidden_states = None
             context = None
@@ -844,53 +655,45 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             args["mlp_packed_seq_params"],
             args["sequence_len_offset"],
         )
+        signal = layer._pre_mlp_to_attn(query, key, value, args["packed_seq_params"])
         args["query"] = query
         args["key"] = key
         args["value"] = value
         args["residual"] = residual
         args["attn_mask_type"] = attn_mask_type
+        args["signal"] = signal
         return args
 
     def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        query = args.pop("query")
-        key = args.pop("key")
-        value = args.pop("value")
-        query, key, value = layer._layout_mlp_to_attn(
-            query, key, value,
-            args["packed_seq_params"],
-        )
-        args["query"] = query
-        args["key"] = key
-        args["value"] = value
+        args.pop("query"), args.pop("key"), args.pop("value")
+        signal = args.pop("signal")
+        args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=True)
         return args
 
     def _forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         # pop out to make sure the tensor is freed
-        query = args.pop("query")
-        key = args.pop("key")
-        value = args.pop("value")
+        signal = args.pop("signal")
+        query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
         core_attn_out = layer._forward_core_attn(
-            query,
-            key,
-            value,
+            query, key, value,
             args["attention_mask"],
             args["attention_bias"],
             args["attn_mask_type"],
             args["packed_seq_params"],
         )
         args["core_attn_out"] = core_attn_out
+        args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
         return args
 
     def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
-        core_attn_out = args.pop("core_attn_out")
-        core_attn_out = layer._layout_attn_to_mlp(
-            core_attn_out, args["packed_seq_params"]
-        )
-        args["core_attn_out"] = core_attn_out
+        args.pop("core_attn_out")
+        signal = args.pop("signal")
+        args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=False)
         return args
 
     def _forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        core_attn_out = args.pop("core_attn_out")
+        signal = args.pop("signal")
+        core_attn_out = layer._post_attn_to_mlp(signal, args["packed_seq_params"])
         residual = args.pop("residual")
         mlp_output, context = layer._forward_post_core_attn(
             core_attn_out,
@@ -910,10 +713,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         tensors_0 = [arg_group_0[key] for key in keys_0]
         tensors_1 = [arg_group_1[key] for key in keys_1]
         tensors = tensors_0 + tensors_1
-        out_tensors = TickSync.apply(
-            compute_stream, comm_stream,
-            *tensors
-        )
+        out_tensors = TickSync.apply(compute_stream, comm_stream, *tensors)
         out_tensors_0 = out_tensors[:len(tensors_0)]
         out_tensors_1 = out_tensors[len(tensors_0):]
         for key, out_tensor in zip(keys_0, out_tensors_0):

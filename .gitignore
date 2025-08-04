@@ -175,3 +175,6 @@ cython_debug/
 .pypirc
 .DS_Store
 wandb/
+
+# nsys profile
+.nsys-rep

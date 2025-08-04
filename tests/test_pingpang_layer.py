@@ -1,7 +1,19 @@
 """
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+Profiling:
+
+NVSHMEM_IB_ENABLE_IBGDA=true NVSHMEM_DEBUG=DEBUG NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+    nsys profile -o pingpang_layer_%p.nsys-rep -t cuda,nvtx \
 torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer.py \
-    --world-size 2
+    --world-size 2 \
+    --profile \
+    --num-query-heads 8 --num-heads 32 --hidden-size 4096 --num-tokens 8192
+
+Correctness:
+
+NVSHMEM_IB_ENABLE_IBGDA=true NVSHMEM_DEBUG=DEBUG NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer.py \
+    --world-size 2 \
+    --num-query-heads 8 --num-heads 32 --hidden-size 4096 --num-tokens 8192
 """
 
 import argparse
@@ -29,6 +41,8 @@ class PingPangLayerWorker(MegatronLayerWorker):
         if not packed_seq_params.debug:
             for params in packed_seq_params.seq_params:
                 setattr(params, "stream", self.stream)
+            setattr(packed_seq_params.seq_params[0], "dispatcher_id", 0)
+            setattr(packed_seq_params.seq_params[0], "dispatcher_id", 1)
         else:
             for params in packed_seq_params.seq_params:
                 setattr(params, "stream", torch.cuda.current_stream())
@@ -99,7 +113,7 @@ def get_single_step_packed_seq_params(
 def test_forward(
     seed, world_size, total_seq_len, num_seqs, max_cp_degree,
     worker: PingPangLayerWorker, hidden_size_q: int, hidden_size_k: int,
-    debug=False,
+    debug=False, profile=False,
 ):
     torch.manual_seed(seed)
     dtype = torch.float16
@@ -135,6 +149,7 @@ def test_forward(
     ping_pang_params_1 = get_single_step_packed_seq_params(
         fa2a_metadata_1, attn_metadata_1, rank
     )
+    print(f"{rank=}, pingpong 0 send bytes:{ping_pang_params_0.qkv_fwd_metadata.fa2a_metadata[1]}, pingpong 1 send bytes:{ping_pang_params_1.qkv_fwd_metadata.fa2a_metadata[1]}")
     mlp_layout_seq_params = tuple(
         mlp_layout_packed_params(seq_lens) for seq_lens in
         (raw_seq_lens_0[rank][:num_seqs], raw_seq_lens_1[rank][:num_seqs])
@@ -153,6 +168,21 @@ def test_forward(
     )
     torch.testing.assert_close(ans, normal_forward_out)
     print(f"Rank {rank} forward ping-pang passed.")
+    if profile:
+        for _ in range(3):
+            worker.forward_ping_pang(
+                tensor_shard, ping_pang_params
+            )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        print("warmup done")
+        for _ in range(20):
+            worker.forward_ping_pang(
+                tensor_shard, ping_pang_params
+            )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        print("ping-pang forward done")
 
 
 def test(args):
@@ -166,15 +196,18 @@ def test(args):
     tp_size = args.tp_size
     num_heads = args.num_heads
     dtype = torch.float16
+    num_query_heads = args.num_query_heads
+    hidden_size_kv = (hidden_size * num_query_heads) // num_heads
 
     worker = init_megatron_test(
-        world_size, hidden_size, num_heads, dtype,
+        world_size, hidden_size, num_heads, num_query_heads, dtype,
         max_tokens_query, max_tokens_key_value, max_cp_degree, tp_size, seed,
         PingPangLayerWorker
     )
     test_forward(
         args.seed, world_size, args.num_tokens, args.num_seqs,
-        max_cp_degree, worker, args.hidden_size, args.hidden_size
+        max_cp_degree, worker, hidden_size, hidden_size_kv,
+        profile=args.profile
     )
 
 
@@ -190,5 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=2)
+    parser.add_argument("--num-query-heads", type=int, default=2)
+    parser.add_argument("--profile", action="store_true", default=False,)
     args = parser.parse_args()
     test(args)

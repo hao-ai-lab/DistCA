@@ -21,6 +21,7 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
     attn_out_fwd_metadata: FastAlltoAllMetadata = None
     attn_out_bwd_metadata: FastAlltoAllMetadata = None
     stream: torch.cuda.Stream = None
+    dispatcher_id: int = None
 
     def to_device(self):
         return PingPangSingleStepPackedSeqParams(
@@ -36,6 +37,7 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
             attn_out_fwd_metadata=self.attn_out_fwd_metadata.normalize(),
             attn_out_bwd_metadata=self.attn_out_bwd_metadata.normalize(),
             stream=self.stream,
+            dispatcher_id=self.dispatcher_id,
         )
 
 
