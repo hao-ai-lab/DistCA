@@ -3,11 +3,11 @@ Launch command:
 
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 2 test_dispatch_fast_balanced_flops.py \
-    --world-size 2
+    --world-size 2 --num-seqs 2 --max-cp-degree 4
 
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_dispatch_fast_balanced_flops.py \
-    --world-size 4
+    --world-size 4 --num-seqs 8 --max-cp-degree 6
 """
 import torch
 import rich
@@ -218,6 +218,7 @@ def create_qkv_dispatch_balanced_flops(
     ]
 
     batches = batches[:world_size_]
+    rich.print(f"batches =", batches)
 
     items = batch_to_items(batches)
     items = plan_relocation(items, verbose=False, plot=False)
@@ -377,6 +378,9 @@ def test(args):
         args.seed, world_size, args.num_tokens, args.num_seqs, max_cp_degree,
         worker, args.hidden_size_query, args.hidden_size_kv
     )
+
+    if rank == 0:
+        rich.print(f"🟢 Test {__file__} passed")
 
 
 if __name__ == "__main__":
