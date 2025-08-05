@@ -40,15 +40,15 @@ class SeqLens:
 
     @staticmethod
     def get_seqlens(
-        fwd_metadata: Metadata, rev_metadata: Metadata
+        fwd_metadata: Metadata, bwd_metadata: Metadata
     ):
         fwd_seq_lens = _get_ragged_seqlen(
             fwd_metadata.seq_len, fwd_metadata.num_seqs
         )
-        rev_seq_lens = _get_ragged_seqlen(
-            rev_metadata.seq_len, rev_metadata.num_seqs
+        bwd_seq_lens = _get_ragged_seqlen(
+            bwd_metadata.seq_len, bwd_metadata.num_seqs
         )
-        return SeqLens(fwd_seq_lens, rev_seq_lens)
+        return SeqLens(fwd_seq_lens, bwd_seq_lens)
 
 
 @dataclass
@@ -476,9 +476,9 @@ def compute_backward_attn_out_a2a_layout_metadata(
 
 def compute_fa2a_metadata_from_logical_metadata(
     fwd_metadata_q: Metadata,
-    rev_metadata_q: Metadata,
+    bwd_metadata_q: Metadata,
     fwd_metadata_kv: Metadata,
-    rev_metadata_kv: Metadata,
+    bwd_metadata_kv: Metadata,
     intermediates,
     mlp_num_tokens: int,
     hidden_size_q: int,
@@ -500,13 +500,13 @@ def compute_fa2a_metadata_from_logical_metadata(
         fwd_metadata_kv.num_recv_tokens * bytes_k
     )[..., :-1]
 
-    num_recv_seqs_q = rev_metadata_q.num_seqs
-    num_recv_seqs_kv = rev_metadata_kv.num_seqs
+    num_recv_seqs_q = bwd_metadata_q.num_seqs
+    num_recv_seqs_kv = bwd_metadata_kv.num_seqs
     num_seqs = fwd_metadata_q.num_seqs
 
-    num_send_tokens_kv = rev_metadata_kv.num_recv_tokens[..., :-1]
-    seqlens = [SeqLens.get_seqlens(fwd_metadata_q, rev_metadata_q),
-               SeqLens.get_seqlens(fwd_metadata_kv, rev_metadata_kv)]
+    num_send_tokens_kv = bwd_metadata_kv.num_recv_tokens[..., :-1]
+    seqlens = [SeqLens.get_seqlens(fwd_metadata_q, bwd_metadata_q),
+               SeqLens.get_seqlens(fwd_metadata_kv, bwd_metadata_kv)]
     tensor_shape = [
         LogicalShape.get_shape(fwd_metadata_q, hidden_size_q, mlp_num_tokens),
         LogicalShape.get_shape(fwd_metadata_kv, hidden_size_k, mlp_num_tokens),
@@ -526,26 +526,26 @@ def compute_fa2a_metadata_from_logical_metadata(
         bytes_q, bytes_k,
         seqlens, tensor_shape, kv_replica_mask,
     )
-    qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
+    qkv_bwd_fa2a_metadata = compute_reverse_a2a_layout_metadata(
         qkv_fwd_fa2a_metadata,
     )
 
     # the backward seqlens of attn out equals that of forward q.
     seqlens = [seqlens[0]]
     tensor_shape = [tensor_shape[0]]
-    attn_out_rev_fa2a_metadata = compute_backward_attn_out_a2a_layout_metadata(
+    attn_out_bwd_fa2a_metadata = compute_backward_attn_out_a2a_layout_metadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
         recver_transfer_sz_q, num_recv_seqs_q, bytes_q,
         seq_lens=seqlens, tensor_shape=tensor_shape,
     )
     attn_out_fwd_fa2a_metadata = compute_reverse_a2a_layout_metadata(
-        attn_out_rev_fa2a_metadata,
+        attn_out_bwd_fa2a_metadata,
     )
     fa2a_metadata = (
         qkv_fwd_fa2a_metadata,
-        qkv_rev_fa2a_metadata,
+        qkv_bwd_fa2a_metadata,
         attn_out_fwd_fa2a_metadata,
-        attn_out_rev_fa2a_metadata,
+        attn_out_bwd_fa2a_metadata,
     )
     return fa2a_metadata
 
@@ -564,7 +564,7 @@ def compute_e2e_fa2a_metadata(
     element_size: int,  # dtype's size
 ):
     (
-        fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params, intermediates
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv, fa_params, intermediates
     ) = compute_e2e_metadata(
         mlp_seq_len, mlp_num_seqs,
         mlp_q_dispatch,
@@ -577,10 +577,10 @@ def compute_e2e_fa2a_metadata(
     )
     mlp_num_tokens = mlp_seq_len.sum(dim=1).max().item()
     fa2a_metadata = compute_fa2a_metadata_from_logical_metadata(
-        fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv,
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
         intermediates, mlp_num_tokens, hidden_size_q, hidden_size_k,
         element_size
     )
     return (
-        fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params, fa2a_metadata
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv, fa_params, fa2a_metadata
     )
