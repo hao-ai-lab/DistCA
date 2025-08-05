@@ -468,55 +468,97 @@ def create_qkv_dispatch_2cp(
 
 def create_qkv_dispatch_balanced_flops(
     world_size: int, 
-    
-    total_seq_len: int, num_seqs: int, max_cp_degree: int,
+    seq_lens: 'torch.Tensor[world_size, max_num_seqs]',
+    # cp_num[src_rank, seq_id] = num_cp_shards
+    cp_num: 'torch.Tensor[world_size, max_num_seqs]',
+    # cp_dst[src_rank, seq_id, shard_id] = dst_rank (or -1 as null)
+    cp_dst: 'torch.Tensor[world_size, max_num_seqs, max_cp_degree]',
+    # seq_shard_lens[src_rank, seq_id, shard_id] = shard_len (or 0 as null)
+    seq_shard_lens: 'torch.Tensor[world_size, max_num_seqs, max_cp_degree]',
     return_intermediate: bool=False, return_mlp_no_shard_seq_lens: bool=False,
     verbose: bool=False,
 ):
     """
     Test a case where we deliberately construct a flops-balanced 2CP case..
-    
-    TODO:
-    - delete `total_seq_len`
-    - let user pass in `seq_lens`, `num_seqs`, `cp_dst`, 
     """
     VERBOSE = verbose
     def print_if_verbose(*args, **kwargs):
         if VERBOSE:
             rich.print(*args, **kwargs)
 
+    num_seqs = seq_lens.shape[1]
+    max_cp_degree = cp_dst.shape[2]
+    
     assert max_cp_degree == world_size * 2, "2CP is only supported for max_cp_degree = world_size * 2"
 
-    # init sequence
-    assert total_seq_len % (max_cp_degree) == 0
-    _num_tokens_shard = total_seq_len // (max_cp_degree)
-    seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
-    # make sure each sequence is divisible by max_cp_degree.
-    seq_lens *= max_cp_degree
-    print_if_verbose("seq_lens =", seq_lens)
+    assert seq_lens.shape == (world_size, num_seqs)
+    assert seq_lens.min() >= 0
+    assert cp_num.shape == (world_size, num_seqs)
+    assert cp_num.min() >= 0
+    assert cp_dst.shape == (world_size, num_seqs, max_cp_degree)
 
-    # init cp degree for each sequence
-    log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
-    cp_num = torch.pow(2, log_cp_num)
+    
+    print_if_verbose("seq_lens =", seq_lens)
     print_if_verbose("cp_num =", cp_num)
 
-    # init cp send dstination.
-    cp_dst_helper = torch.rand((world_size, num_seqs, max_cp_degree)).argsort(dim=2)
-    cp_dst_helper = cp_dst_helper % world_size # ensure everything is in the range of world_size
-    cp_dst = cp_dst_helper[:, :, :max_cp_degree]
-    mask = torch.arange(max_cp_degree).expand(world_size, num_seqs, max_cp_degree)
-    cp_num_expanded = cp_num.unsqueeze(-1)
-    mask = mask >= cp_num_expanded
-    cp_dst[mask] = -1
+    def check_seq_lens():
+        for i in range(world_size):
+            for j in range(num_seqs):
+                if seq_lens[i, j] == 0:
+                    # Then everything k > j should also be 0
+                    for k in range(j + 1, num_seqs):
+                        assert seq_lens[i, k] == 0, f"seq_lens[{i}, {k}] = {seq_lens[i, k]} is not 0"
+        return
+
+    check_seq_lens()
+    print_if_verbose("seq_lens =", seq_lens)
+
+    # # init cp send dstination.
+    # cp_dst_helper = torch.rand((world_size, num_seqs, max_cp_degree)).argsort(dim=2)
+    # cp_dst_helper = cp_dst_helper % world_size # ensure everything is in the range of world_size
+    # cp_dst = cp_dst_helper[:, :, :max_cp_degree]
+    # mask = torch.arange(max_cp_degree).expand(world_size, num_seqs, max_cp_degree)
+    # cp_num_expanded = cp_num.unsqueeze(-1)
+    # mask = mask >= cp_num_expanded
+    # cp_dst[mask] = -1
+
+    # check: cp_dst[src_rank, seq_id, shard_id] >= 0 if shard_id < cp_num[src_rank, seq_id]
+    def check_cp_dst():
+        for i in range(world_size):
+            for j in range(num_seqs):
+                num_cp = int((cp_num[i, j]).item())
+                for k in range(max_cp_degree):
+                    if k < num_cp:
+                        assert cp_dst[i, j, k] >= 0, f"cp_dst[{i}, {j}, {k}] = {cp_dst[i, j, k]} is not >= 0"
+                    else:
+                        assert cp_dst[i, j, k] == -1, f"cp_dst[{i}, {j}, {k}] = {cp_dst[i, j, k]} is not -1"
+        return
+    
+    check_cp_dst()
     print_if_verbose("cp_dst =", cp_dst)
 
     # Prepare the sequence length for each shard
-    seq_shard_lens = torch.zeros((world_size, num_seqs, max_cp_degree), dtype=torch.int64)
-    for i in range(world_size):
-        for j in range(num_seqs):
-            num_cp = int((cp_num[i, j]).item())
-            seq_len = seq_lens[i, j]
-            seq_shard_lens[i, j, :num_cp] = seq_len // num_cp
+    # seq_shard_lens = torch.zeros((world_size, num_seqs, max_cp_degree), dtype=torch.int64)
+    # for i in range(world_size):
+    #     for j in range(num_seqs):
+    #         num_cp = int((cp_num[i, j]).item())
+    #         seq_len = seq_lens[i, j]
+    #         seq_shard_lens[i, j, :num_cp] = seq_len // num_cp
+    def check_seq_shard_lens():
+        for i in range(world_size):
+            for j in range(num_seqs):
+                # Check if the shard length is valid.
+                num_cp = int((cp_num[i, j]).item())
+                for k in range(max_cp_degree):
+                    if k < num_cp:
+                        assert seq_shard_lens[i, j, k] > 0, f"seq_shard_lens[{i}, {j}, {k}] = {seq_shard_lens[i, j, k]} is not >= 0"
+                    else:
+                        assert seq_shard_lens[i, j, k] == 0, f"seq_shard_lens[{i}, {j}, {k}] = {seq_shard_lens[i, j, k]} is not 0"
+                # Check the sum of this sequence matches seq_len[i, j]
+                assert seq_shard_lens[i, j, :num_cp].sum() == seq_lens[i, j], f"seq_shard_lens[{i}, {j}, :{num_cp}].sum() = {seq_shard_lens[i, j, :num_cp].sum()} is not equal to seq_lens[{i}, {j}] = {seq_lens[i, j]}"
+        return
+    
+    check_seq_shard_lens()
     print_if_verbose("seq_shard_lens =", seq_shard_lens)
 
     # q_global_dispatch tensor:
@@ -536,6 +578,8 @@ def create_qkv_dispatch_balanced_flops(
     num_cul_cp_shards = exclusive_cumsum(cp_num, dim=1)
     print_if_verbose("num_cul_cp_shards =", num_cul_cp_shards)
 
+    # breakpoint()
+
     for i in range(world_size):
         cp_seq_lens_local = []
         cp_query_dst_local = []
@@ -547,9 +591,14 @@ def create_qkv_dispatch_balanced_flops(
         for j in range(num_seqs):
             num_cp = int((cp_num[i, j]).item())
             seq_len = seq_lens[i, j]
+            if seq_len == 0:
+                break
             # seq_shard_len = seq_len // num_cp
             _seq_shard_len = seq_shard_lens[i, j, :num_cp]
-            _kv_context_size_seq = exclusive_cumsum(_seq_shard_len, dim=0)
+            try:
+                _kv_context_size_seq = exclusive_cumsum(_seq_shard_len, dim=0)
+            except Exception as e:
+                breakpoint()
 
             cp_seq_lens_local.append(_seq_shard_len)
             cp_query_dst_local.append(cp_dst[i, j, :num_cp].flatten())
