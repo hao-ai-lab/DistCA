@@ -1,8 +1,13 @@
 """
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes 1 --nproc_per_node 4 test_megatron_layer_2cp.py \
+torchrun --nnodes 1 --nproc_per_node 2 test_megatron_layer_2cp.py \
     --world-size 2 \
     --max-cp-degree 4
+
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 4 test_megatron_layer_2cp.py \
+    --world-size 4 \
+    --max-cp-degree 8
 """
 
 from typing import Optional
