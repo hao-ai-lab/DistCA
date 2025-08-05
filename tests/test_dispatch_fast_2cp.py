@@ -5,9 +5,17 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node $NUM_WORKER test_dispatch_fast.py \
     --world-size $NUM_WORKER
 
+
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 2 test_dispatch_fast_2cp.py \
-    --world-size 2
+    --world-size 2 --max-cp-degree 4
+
+# FIXME: Encounter Deadlock
+NVSHMEM_DEBUG=TRACE \
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 4 test_dispatch_fast_2cp.py \
+    --world-size 4 --max-cp-degree 8
+
 """
 import torch
 import rich
@@ -33,11 +41,14 @@ class Worker(BaseWorker):
         tensor_q: torch.Tensor, tensor_kv: torch.Tensor,
         dispatch_mask: torch.Tensor,
     ):
+        print(f"[Rank {self.rank}] run_qkv")
+        
         tensor_q = tensor_q.cuda()
         tensor_kv = tensor_kv.cuda()
         dispatch_mask = dispatch_mask.cuda().to(torch.int8)
         tensor_k = tensor_kv[:, :tensor_kv.shape[-1] // 2]
         tensor_v = tensor_kv[:, tensor_kv.shape[-1] // 2:]
+
 
         fa2a_metadata_fwd = fa2a_metadata_fwd.normalize()
         fa2a_metadata_rev = fa2a_metadata_rev.normalize()
@@ -54,6 +65,33 @@ class Worker(BaseWorker):
             dtype=dtype, device=device
         )
         dst_tensor_v = dst_tensor_k.clone()
+        
+        
+        for i in range(self.world_size):
+            if i == self.rank:
+                rich.print(f"[Rank {self.rank}] tensor_q.shape =", tensor_q.shape)
+                rich.print(f"[Rank {self.rank}] tensor_kv.shape =", tensor_kv.shape)
+                rich.print(f"[Rank {self.rank}] tensor_k.shape =", tensor_k.shape)
+                rich.print(f"[Rank {self.rank}] tensor_v.shape =", tensor_v.shape)
+                rich.print(f"[Rank {self.rank}] fast_a2a_qkv args:")
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.kv_replica_mask =", fa2a_metadata_fwd.kv_replica_mask)
+                rich.print(f"[Rank {self.rank}] dst_tensor_q.shape =", dst_tensor_q.shape)
+                rich.print(f"[Rank {self.rank}] dst_tensor_k.shape =", dst_tensor_k.shape)
+                rich.print(f"[Rank {self.rank}] dst_tensor_v.shape =", dst_tensor_v.shape)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.seq_lens[0].send_seqlens =", fa2a_metadata_fwd.seq_lens[0].send_seqlens)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.seq_lens[1].send_seqlens =", fa2a_metadata_fwd.seq_lens[1].send_seqlens)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.seq_lens[0].recv_seqlens =", fa2a_metadata_fwd.seq_lens[0].recv_seqlens)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.seq_lens[1].recv_seqlens =", fa2a_metadata_fwd.seq_lens[1].recv_seqlens)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.send_memcpy_metadata =", fa2a_metadata_fwd.send_memcpy_metadata)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.recv_memcpy_metadata =", fa2a_metadata_fwd.recv_memcpy_metadata)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.fa2a_metadata =", fa2a_metadata_fwd.fa2a_metadata)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.my_rank_send_offset =", fa2a_metadata_fwd.my_rank_send_offset)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.my_rank_recv_offset =", fa2a_metadata_fwd.my_rank_recv_offset)
+                rich.print(f"[Rank {self.rank}] fa2a_metadata_fwd.my_rank_send_sz =", fa2a_metadata_fwd.my_rank_send_sz)
+            nvshmem_barrier_all()
+
+        rich.print(f"[Rank {self.rank}] Entering fast_a2a_qkv...")
+
         fast_a2a_qkv(
             tensor_q, tensor_k, tensor_v,
             fa2a_metadata_fwd.kv_replica_mask,

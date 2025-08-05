@@ -2,8 +2,12 @@
 Launch command:
 
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 2 test_dispatch_fast_balanced_flops.py \
+    --world-size 2 --num-seqs 2 --max-cp-degree 4
+
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_dispatch_fast_balanced_flops.py \
-    --world-size 4
+    --world-size 4 --num-seqs 8 --max-cp-degree 6
 """
 import torch
 import rich
@@ -190,26 +194,33 @@ def create_qkv_dispatch_balanced_flops(
 
     K = 1024
     
-    world_size = 4
-    assert world_size == world_size_, f"This test forces world_size = 4"
-
     total_seq_len = 16 * K
     assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = 16K"
     
     
-
     from d2.planner.equal_flops import (
         batch_to_items, 
         plan_relocation,
         item_to_intermediate_tensors,
     )
 
-    items = batch_to_items([
+    batches = [
         [16 * K] * 1,
         [8 * K] * 2,
         [4 * K] * 4,
-        [2 * K] * 8, 
-    ])
+        [2 * K] * 8,
+
+        [8 * K] * 2,
+        [4 * K] * 4,
+        [2 * K] * 8,
+        [2 * K] * 8,
+
+    ]
+
+    batches = batches[:world_size_]
+    rich.print(f"batches =", batches)
+
+    items = batch_to_items(batches)
     items = plan_relocation(items, verbose=False, plot=False)
 
     world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens) = item_to_intermediate_tensors(items)    
@@ -221,8 +232,6 @@ def create_qkv_dispatch_balanced_flops(
     
     assert num_seqs == num_seqs_, f"This test forces num_seqs = {num_seqs}"
     assert max_cp_degree == max_cp_degree_, f"This test forces max_cp_degree = {max_cp_degree}"
-    
-
     
     ret = create_qkv_dispatch_with_custom_mapping(
         world_size, 
@@ -296,6 +305,7 @@ def test_qkv(
         hidden_size_q, hidden_size_k,
         verbose=True if rank == 0 else False
     )
+    print("create_test_case done.")
 
     q_slice = tensor_q[rank]
     kv_slice = tensor_kv[rank]
@@ -309,7 +319,26 @@ def test_qkv(
     fa2a_metadata_fwd_slice = fa2a_metadata_qkv_fwd.get_slice(rank)
     fa2a_metadata_rev_slice = fa2a_metadata_qkv_rev.get_slice(rank)
 
+    for _rank in range(world_size):
+        if rank == _rank:
+            rich.print(f"[Rank {rank}] num_tokens_q_dst =", num_tokens_q_dst)
+            rich.print(f"[Rank {rank}] num_tokens_kv_dst =", num_tokens_kv_dst)
+            rich.print(f"[Rank {rank}] dispatch_mask =", dispatch_mask)
+            rich.print(f"[Rank {rank}] fa2a_metadata_fwd_slice =", fa2a_metadata_fwd_slice)
+            rich.print(f"[Rank {rank}] fa2a_metadata_rev_slice =", fa2a_metadata_rev_slice)
+            # send_side_offset[i][j], send_size[i][j], recv_side_offset[j][i], recv_size[i][j]
+            fa2a_metadata = fa2a_metadata_fwd_slice.fa2a_metadata
+            send_side_offset, send_size, recv_side_offset, recv_size = fa2a_metadata
+            rich.print(f"[Rank {rank}] send_side_offset =", send_side_offset)
+            rich.print(f"[Rank {rank}] send_size =", send_size)
+            rich.print(f"[Rank {rank}] recv_side_offset =", recv_side_offset)
+            rich.print(f"[Rank {rank}] recv_size =", recv_size)
+
+        # barrier
+        nvshmem_barrier_all()
+
     # run this communication
+    print("Running qkv...")
     out_dict = worker.run_qkv(
         fa2a_metadata_fwd_slice, fa2a_metadata_rev_slice,
         q_slice, kv_slice, dispatch_mask
@@ -350,6 +379,9 @@ def test(args):
         worker, args.hidden_size_query, args.hidden_size_kv
     )
 
+    if rank == 0:
+        rich.print(f"🟢 Test {__file__} passed")
+
 
 if __name__ == "__main__":
     import argparse
@@ -358,13 +390,12 @@ if __name__ == "__main__":
     parser.add_argument("--num-tokens", type=int, default=16 * 1024)
     parser.add_argument("--max-cp-degree", type=int, default=6)
     parser.add_argument("--hidden-size-query", type=int, default=64)
-    parser.add_argument("--hidden-size-kv", type=int, default=16)
+    parser.add_argument("--hidden-size-kv", type=int, default=64)
     parser.add_argument("--num-seqs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     rich.print(f"Testing {__file__} with args =", args)
     rich.print(f"[red]This test currently deadlocked...[/red]")
-
 
     test(args)
