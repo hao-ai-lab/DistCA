@@ -170,6 +170,9 @@ def fast_a2a_attn_out(
     return recv_q
 
 
+#### Functions for PP and grad ckpt:
+#### during forward, attention out will be sent with softmax_lse.
+#### during backward, attn_out_grad, attn_out, softmax_lse, and qkv are all sent.
 _CUDA_INT4_BYTES = 16
 
 
@@ -190,7 +193,7 @@ def size_pad_by_int4(hidden_size: int, itemsize: int):
     return hidden_size_pad, pad_size
 
 
-def pre_fast_a2a_attn_out_resend_qkv(
+def pre_fast_a2a_attn_out_grad_resend_qkv(
     attn_out_grad: Tensor, attn_out: Tensor, lse_norm: Tensor,
     q: Tensor, k: Tensor, v: Tensor, kv_dispatch_mask: Tensor,
     q_seq_tokens: Tensor, k_seq_tokens: Tensor,
@@ -217,7 +220,7 @@ def pre_fast_a2a_attn_out_resend_qkv(
                             is_fwd=is_fwd, instance_id=instance_id)
 
 
-def post_fast_a2a_attn_out_resend_qkv(
+def post_fast_a2a_attn_out_grad_resend_qkv(
     recv_attn_out: Tensor, recv_lse: Tensor, recv_q: Tensor, recv_k: Tensor, recv_v: Tensor,
     kv_dispatch_mask: Tensor, q_recv_seq_tokens: Tensor, k_recv_seq_tokens: Tensor,
     q_recv_buffer_offset: Tensor, k_recv_buffer_offset: Tensor, v_recv_buffer_offset: Tensor,
@@ -253,4 +256,17 @@ def post_fast_a2a_attn_out_resend_qkv(
     return (
         recv_attn_out_grad, recv_attn_out, recv_lse,
         recv_q, recv_k, recv_v
+    )
+
+
+def pre_fast_a2a_attn_out_with_lse(
+    attn_out: Tensor, softmax_lse: Tensor,
+    send_seqlens: Tensor, send_memcpy_metadata: Tensor, dispatcher_id: int
+):
+    assert softmax_lse.shape[0] == attn_out.shape[0]
+    merged_attn_out = torch.concat([attn_out, softmax_lse], dim=1)
+    # TODO: maybe apply a padding here?
+    return pre_fast_a2a_attn_out(
+        merged_attn_out, send_seqlens, send_memcpy_metadata[0],
+        instance_id=dispatcher_id,
     )
