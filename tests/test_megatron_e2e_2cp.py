@@ -17,7 +17,7 @@ torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_2cp.py \
 
 
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_2cp.py \
+torchrun --nnodes 1 --nproc_per_node 8 test_megatron_e2e_2cp.py \
     --num-nodes=1 --num-gpus-per-node=8 --cp-degree=16
 """
 import argparse
