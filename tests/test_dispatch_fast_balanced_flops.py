@@ -2,6 +2,10 @@
 Launch command:
 
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 2 test_dispatch_fast_balanced_flops.py \
+    --world-size 2
+
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_dispatch_fast_balanced_flops.py \
     --world-size 4
 """
@@ -190,8 +194,12 @@ def create_qkv_dispatch_balanced_flops(
 
     K = 1024
     
-    world_size = 4
-    assert world_size == world_size_, f"This test forces world_size = 4"
+    # world_size = 4
+    # assert world_size == world_size_, f"This test forces world_size = 4"
+
+    world_size = 2
+    assert world_size == world_size_, f"This test forces world_size = {world_size}"
+
 
     total_seq_len = 16 * K
     assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = 16K"
@@ -207,8 +215,8 @@ def create_qkv_dispatch_balanced_flops(
     items = batch_to_items([
         [16 * K] * 1,
         [8 * K] * 2,
-        [4 * K] * 4,
-        [2 * K] * 8, 
+        # [4 * K] * 4,
+        # [2 * K] * 8, 
     ])
     items = plan_relocation(items, verbose=False, plot=False)
 
@@ -296,6 +304,7 @@ def test_qkv(
         hidden_size_q, hidden_size_k,
         verbose=True if rank == 0 else False
     )
+    print("create_test_case done.")
 
     q_slice = tensor_q[rank]
     kv_slice = tensor_kv[rank]
@@ -309,7 +318,18 @@ def test_qkv(
     fa2a_metadata_fwd_slice = fa2a_metadata_qkv_fwd.get_slice(rank)
     fa2a_metadata_rev_slice = fa2a_metadata_qkv_rev.get_slice(rank)
 
+    for _rank in range(world_size):
+        if rank == _rank:
+            rich.print(f"[Rank {rank}] num_tokens_q_dst =", num_tokens_q_dst)
+            rich.print(f"[Rank {rank}] num_tokens_kv_dst =", num_tokens_kv_dst)
+            rich.print(f"[Rank {rank}] dispatch_mask =", dispatch_mask)
+            rich.print(f"[Rank {rank}] fa2a_metadata_fwd_slice =", fa2a_metadata_fwd_slice)
+            rich.print(f"[Rank {rank}] fa2a_metadata_rev_slice =", fa2a_metadata_rev_slice)
+        # barrier
+        nvshmem_barrier_all()
+
     # run this communication
+    print("Running qkv...")
     out_dict = worker.run_qkv(
         fa2a_metadata_fwd_slice, fa2a_metadata_rev_slice,
         q_slice, kv_slice, dispatch_mask
@@ -358,7 +378,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-tokens", type=int, default=16 * 1024)
     parser.add_argument("--max-cp-degree", type=int, default=6)
     parser.add_argument("--hidden-size-query", type=int, default=64)
-    parser.add_argument("--hidden-size-kv", type=int, default=16)
+    parser.add_argument("--hidden-size-kv", type=int, default=64)
     parser.add_argument("--num-seqs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
