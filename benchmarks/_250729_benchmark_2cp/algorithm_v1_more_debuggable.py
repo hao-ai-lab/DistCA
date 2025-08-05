@@ -396,7 +396,138 @@ items = plan_relocation(
 # %%
 rich.print(items)
 
+# %%
+from collections import defaultdict
+info_mapping = defaultdict(list)
+for item in items:
+    sid = (item["src_gpuid"], item["seqid"])
+    info_mapping[sid].append(item)
 
+info_list = list(info_mapping.items())
+info_list.sort(
+    key=lambda x: x[0]
+)
+for key, values in info_list:
+    values.sort(key=lambda x: x["kv"])
+    pass
+rich.print(info_list)
+
+# %%
+world_size = max(item["src_gpuid"] for item in items) + 1
+num_seqs = max(item["seqid"] for item in items) + 1
+max_cp_degree = max(
+    len(value)
+    for value in info_mapping.values()
+)
+rich.print(dict(world_size=world_size, num_seqs=num_seqs, max_cp_degree=max_cp_degree))
+
+# %%
+import torch
+seq_lens = torch.zeros((world_size, num_seqs), dtype=torch.int64)
+for i in range(world_size):
+    for j in range(num_seqs):
+        seq_lens[i, j] = sum(item["q"] for item in info_mapping[(i, j)])
+rich.print(seq_lens)
+# %%
+cp_num = torch.zeros((world_size, num_seqs), dtype=torch.int64)
+for i in range(world_size):
+    for j in range(num_seqs):
+        cp_num[i, j] = len(info_mapping[(i, j)])
+rich.print(cp_num)
+# %%
+cp_dst = torch.ones((world_size, num_seqs, max_cp_degree), dtype=torch.int64) * -1
+for i in range(world_size):
+    for j in range(num_seqs):
+        cp_num_ = cp_num[i, j]
+        for k in range(max_cp_degree):
+            if k < cp_num_:
+                cp_dst[i, j, k] = info_mapping[(i, j)][k]["gpuid"]
+            else:
+                cp_dst[i, j, k] = -1
+rich.print(cp_dst)
+# %%
+seq_shard_lens = torch.zeros((world_size, num_seqs, max_cp_degree), dtype=torch.int64)
+for i in range(world_size):
+    for j in range(num_seqs):
+        cp_num_ = cp_num[i, j]
+        for k in range(max_cp_degree):
+            if k < cp_num_:
+                seq_shard_lens[i, j, k] = info_mapping[(i, j)][k]["q"]
+            else:
+                seq_shard_lens[i, j, k] = 0
+rich.print(seq_shard_lens)
+
+
+
+def item_to_intermediate_tensors(items, verbose=False):
+    def print_if_verbose(message):
+        if verbose:
+            rich.print(message)
+
+    from collections import defaultdict
+    from copy import deepcopy
+    
+    # Prepare the info_mapping[(src_gpuid, seqid)] -> [items]
+    items = deepcopy(items)
+    info_mapping = defaultdict(list)
+    for item in items:
+        sid = (item["src_gpuid"], item["seqid"])
+        info_mapping[sid].append(item)
+
+    info_list = list(info_mapping.items())
+    info_list.sort(
+        key=lambda x: x[0]
+    )
+    for key, values in info_list:
+        values.sort(key=lambda x: x["kv"])
+        pass
+
+    print_if_verbose(info_list)
+
+    world_size = max(item["src_gpuid"] for item in items) + 1
+    num_seqs = max(item["seqid"] for item in items) + 1
+    max_cp_degree = max(
+        len(value)
+        for value in info_mapping.values()
+    )
+    world_info = dict(world_size=world_size, num_seqs=num_seqs, max_cp_degree=max_cp_degree)
+    print_if_verbose(world_info)
+
+    seq_lens = torch.zeros((world_size, num_seqs), dtype=torch.int64)
+    for i in range(world_size):
+        for j in range(num_seqs):
+            seq_lens[i, j] = sum(item["q"] for item in info_mapping[(i, j)])
+    print_if_verbose(seq_lens)
+
+    cp_num = torch.zeros((world_size, num_seqs), dtype=torch.int64)
+    for i in range(world_size):
+        for j in range(num_seqs):
+            cp_num[i, j] = len(info_mapping[(i, j)])
+    print_if_verbose(cp_num)
+
+    cp_dst = torch.ones((world_size, num_seqs, max_cp_degree), dtype=torch.int64) * -1
+    for i in range(world_size):
+        for j in range(num_seqs):
+            cp_num_ = cp_num[i, j]
+            for k in range(max_cp_degree):
+                if k < cp_num_:
+                    cp_dst[i, j, k] = info_mapping[(i, j)][k]["gpuid"]
+                else:
+                    cp_dst[i, j, k] = -1
+    print_if_verbose(cp_dst)
+
+    seq_shard_lens = torch.zeros((world_size, num_seqs, max_cp_degree), dtype=torch.int64)
+    for i in range(world_size):
+        for j in range(num_seqs):
+            cp_num_ = cp_num[i, j]
+            for k in range(max_cp_degree):
+                if k < cp_num_:
+                    seq_shard_lens[i, j, k] = info_mapping[(i, j)][k]["q"]
+                else:
+                    seq_shard_lens[i, j, k] = 0
+    print_if_verbose(seq_shard_lens)
+
+    return world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens)
 
 # %%
 items = [

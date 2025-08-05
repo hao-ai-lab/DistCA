@@ -23,7 +23,7 @@ def test_create_qkv_dispatch_balanced_flops_1(
 ):
 
     K = 1024
-    
+
     world_size = 4
     assert world_size == world_size_, f"This test forces world_size = 4"
     
@@ -113,6 +113,59 @@ def test_create_qkv_dispatch_balanced_flops_1(
 
 
 
+def test_create_qkv_dispatch_balanced_flops_2(
+    world_size_, total_seq_len_, num_seqs_, max_cp_degree_, 
+    verbose=False,
+):
+
+    K = 1024
+    
+    world_size = 4
+    assert world_size == world_size_, f"This test forces world_size = 4"
+    
+    total_seq_len = 16 * K
+    assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = 16K"
+
+    num_seqs = 8
+    assert num_seqs == num_seqs_, f"This test forces num_seqs = 8"
+
+    max_cp_degree = 8
+    assert max_cp_degree == max_cp_degree_, f"This test forces max_cp_degree = 8"
+    
+
+    from d2.planner.equal_flops import (
+        batch_to_items, 
+        plan_relocation,
+        item_to_intermediate_tensors,
+    )
+
+    items = batch_to_items([
+        [16 * K] * 1,
+        [8 * K] * 2,
+        [4 * K] * 4,
+        [2 * K] * 8, 
+    ])
+    items = plan_relocation(items, verbose=False, plot=False)
+
+    world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens) = item_to_intermediate_tensors(items)    
+
+    world_size = world_info["world_size"]
+    num_seqs = world_info["num_seqs"]
+    max_cp_degree = world_info["max_cp_degree"]
+
+    
+    ret = create_qkv_dispatch_balanced_flops(
+        world_size, 
+        seq_lens,
+        cp_num,
+        cp_dst,
+        seq_shard_lens,
+        verbose=verbose,
+    )
+    return ret
+
+
+
 def test_query_dispatch(args):
     rich.print("⚪ Testing query dispatch")
 
@@ -146,8 +199,14 @@ def test_query_dispatch(args):
     rich.print("🟢 Test query dispatch passed")
 
 
+from typing import Union
 
-def test_qkv_dispatch(args):
+test_fn_list = [
+    test_create_qkv_dispatch_balanced_flops_1,
+    test_create_qkv_dispatch_balanced_flops_2,
+]
+
+def test_qkv_dispatch(args, test_fn):
     world_size = args.world_size
     num_seqs = args.num_seqs
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -159,7 +218,7 @@ def test_qkv_dispatch(args):
     rich.print("⚪ Testing qkv dispatch")
 
     # TODO: Make sure the metadata is correctly defined via the interface.
-    (fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, _) = test_create_qkv_dispatch_balanced_flops_1(
+    (fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, _) = test_fn(
         world_size_=world_size,
         total_seq_len_=total_seq_len,
         num_seqs_=num_seqs,
@@ -213,13 +272,16 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=0, help='Random seed for reproducibility')
     args = parser.parse_args()
     rich.print(f"Testing {__file__} with args =", args)
-    
-    test_create_qkv_dispatch_balanced_flops_1(
-        world_size_=args.world_size,
-        total_seq_len_=args.num_tokens,
-        num_seqs_=args.num_seqs,
-        max_cp_degree_=args.max_seq_shard,
-        verbose=True,
-    )
+
     test_query_dispatch(args)
-    test_qkv_dispatch(args)
+
+    for test_fn in test_fn_list:
+        test_fn(
+            world_size_=args.world_size,
+            total_seq_len_=args.num_tokens,
+            num_seqs_=args.num_seqs,
+            max_cp_degree_=args.max_seq_shard,
+            verbose=True,
+        )
+    
+        test_qkv_dispatch(args, test_fn=test_fn)
