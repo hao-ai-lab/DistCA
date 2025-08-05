@@ -254,6 +254,7 @@ def get_gpt_config(
     fp16: bool = False,
     bf16: bool = False,
     num_query_groups: int=None,
+    tensor_model_parallel_size: int = 1,
     **kwargs,
 ):
     return TransformerConfig(
@@ -267,5 +268,6 @@ def get_gpt_config(
         fp16=fp16,
         bf16=bf16,
         num_query_groups=num_query_groups,
+        tensor_model_parallel_size=tensor_model_parallel_size,
         **kwargs,
     )

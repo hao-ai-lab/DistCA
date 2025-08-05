@@ -12,6 +12,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 import torch
 
 from d2.runtime.inplace_metadata import mlp_layout_packed_params
+from d2.runtime.megatron_patch.create_group import get_attn_server_group
 from d2.runtime.megatron_patch.model_patch import get_gpt_layer_with_transformer_engine_spec, get_gpt_config
 from d2.runtime.megatron_patch.packed_seq_params import PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.transformer_layer import TransformerLayer as PingPangTransformerLayer
@@ -62,40 +63,46 @@ class MegatronLayerWorker(MegatronBaseWorker):
 
 
 def test_forward(
-    seed, world_size, total_seq_len, num_seqs, max_cp_degree,
-    worker: MegatronLayerWorker, hidden_size_q: int, hidden_size_k: int
+    seed, total_seq_len, num_seqs, max_cp_degree,
+    worker: MegatronLayerWorker, hidden_size_q: int, hidden_size_k: int,
+    tp_size: int = 1,
 ):
     torch.manual_seed(seed)
     dtype = torch.float16
     element_size = dtype.itemsize
+    as_world_size = worker.as_world_size
+    as_rank = worker.as_rank
+
     (
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
         attention_metadata_attn_layout, intermediates, seq_lens
     ) = create_qkv_dispatch(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
+        as_world_size, total_seq_len, num_seqs, max_cp_degree,
         return_intermediate=True, return_mlp_no_shard_seq_lens=True
     )
     # NOTE: this already adds prepended zeros and is sharded to tuples (remove padding seqs)
     (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
      num_local_seqs_recv) = attention_metadata_attn_layout
 
+    hidden_size_q_tp = hidden_size_q // tp_size
+    hidden_size_k_tp = hidden_size_k // tp_size
+
     (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
      attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
     ) = compute_fa2a_metadata_from_logical_metadata(
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        intermediates, total_seq_len, hidden_size_q, hidden_size_k,
+        intermediates, total_seq_len, hidden_size_q_tp, hidden_size_k_tp,
         element_size,
     )
 
     # thd layout's hidden size input is "t,1,h"
     torch.manual_seed(seed)
     tensors = torch.randn(
-        (world_size, total_seq_len, 1, hidden_size_q), dtype=dtype
+        (as_world_size, total_seq_len, 1, hidden_size_q), dtype=dtype
     )
-    rank = worker.rank
-    tensor_shard = tensors[rank]
+    tensor_shard = tensors[as_rank]
     # 1. normal forward. Need to provide the PackedSeqParams
-    seq_lens_local = seq_lens[rank][:num_seqs]
+    seq_lens_local = seq_lens[as_rank][:num_seqs]
     packed_seq_params = mlp_layout_packed_params(seq_lens_local)
     normal_forward_out, debug_ref = worker.forward_normal(
         tensor_shard, packed_seq_params
@@ -103,27 +110,28 @@ def test_forward(
 
     ping_pang_params = PingPangSingleStepPackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_q[rank],
-        cu_seqlens_kv=cu_seqlens_kv[rank],
-        max_seqlen_q=max_seqlen_q[rank],
-        max_seqlen_kv=max_seqlen_kv[rank],
-        qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(rank),
-        qkv_bwd_metadata=qkv_rev_fa2a_metadata.get_slice(rank),
-        attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
-        attn_out_bwd_metadata=attn_out_rev_fa2a_metadata.get_slice(rank),
+        cu_seqlens_q=cu_seqlens_q[as_rank],
+        cu_seqlens_kv=cu_seqlens_kv[as_rank],
+        max_seqlen_q=max_seqlen_q[as_rank],
+        max_seqlen_kv=max_seqlen_kv[as_rank],
+        qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(as_rank),
+        qkv_bwd_metadata=qkv_rev_fa2a_metadata.get_slice(as_rank),
+        attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(as_rank),
+        attn_out_bwd_metadata=attn_out_rev_fa2a_metadata.get_slice(as_rank),
     )
     ping_pang_out, debug_out = worker.forward_ping_pang_one_stage(
         tensor_shard, ping_pang_params
     )
 
-    ref_debug = [None] * world_size
-    ans_debug = [None] * world_size
-    pingpong_seq_params = [None] * world_size
-    torch.distributed.all_gather_object(ref_debug, debug_ref)
-    torch.distributed.all_gather_object(ans_debug, debug_out)
+    ref_debug = [None] * as_world_size
+    ans_debug = [None] * as_world_size
+    pingpong_seq_params = [None] * as_world_size
+    as_group = get_attn_server_group()
+    torch.distributed.all_gather_object(ref_debug, debug_ref, group=as_group)
+    torch.distributed.all_gather_object(ans_debug, debug_out, group=as_group)
     torch.distributed.all_gather_object(pingpong_seq_params, ping_pang_params)
     print("debug tensors gathered.")
-    if rank == 0:
+    if as_rank == 0:
         device = torch.device("cuda", rank)
         def to_device(o):
             if isinstance(o, torch.Tensor):
@@ -152,7 +160,7 @@ def test_forward(
         ref_ks_post_comm = simulate_communication(ref_ks, fwd_k_metadata)
         ref_vs_post_comm = simulate_communication(ref_vs, fwd_k_metadata)
         ref_qkvs_post_comm = [
-            (ref_qs_post_comm[rank], ref_ks_post_comm[rank], ref_vs_post_comm[rank]) for rank in range(world_size)
+            (ref_qs_post_comm[rank], ref_ks_post_comm[rank], ref_vs_post_comm[rank]) for rank in range(as_world_size)
         ]
         torch.testing.assert_close(
             ans_debug_qkvs_post_transfer, ref_qkvs_post_comm
@@ -161,7 +169,7 @@ def test_forward(
 
         from flash_attn import flash_attn_varlen_func
         ref_attn_outs_a_layout = []
-        for rank in range(world_size):
+        for rank in range(as_world_size):
             metadata = pingpong_seq_params[rank].to_device()
             ref_attn_out = flash_attn_varlen_func(
                 ref_qs_post_comm[rank], ref_ks_post_comm[rank], ref_vs_post_comm[rank],
@@ -217,6 +225,7 @@ def init_megatron_test(
         fp16=True,
         deterministic_mode=True,
         params_dtype=dtype,
+        tensor_model_parallel_size=tp_size,
     )
     worker.init_layer(config, spec, seed=seed)
     return worker
@@ -242,8 +251,9 @@ def test(args):
     )
 
     test_forward(
-        args.seed, world_size, args.num_tokens, args.num_seqs,
-        max_cp_degree, worker, hidden_size, hidden_size_kv
+        args.seed, args.num_tokens, args.num_seqs,
+        max_cp_degree, worker, hidden_size, hidden_size_kv,
+        tp_size,
     )
 
 

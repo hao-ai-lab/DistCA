@@ -6,6 +6,7 @@ from typing import Callable, List, Optional, Tuple
 from megatron.core import parallel_state as mpu
 import torch
 
+_ATTN_SERVER_GROUP = None
 _ATTN_SERVER_GROUP_GLOO = None
 _ATTN_SERVER_GLOBAL_RANKS = None
 
@@ -14,6 +15,7 @@ def initialize_attention_server_comm(
     distributed_timeout_minutes: int = 10,
 ):
     rank = torch.distributed.get_rank()
+    global _ATTN_SERVER_GROUP
     global _ATTN_SERVER_GROUP_GLOO
     global _ATTN_SERVER_GLOBAL_RANKS
     # Create Gloo group only to send the uid in order to create the NVSHMEM group.
@@ -52,12 +54,34 @@ def initialize_attention_server_comm(
             ranks, timeout=timeout, backend="gloo",
             group_desc="ATTN_SERVER_GROUP_GLOO"
         )
+        group = mpu.create_group(
+            ranks, timeout=timeout, backend="nccl",
+            group_desc="ATTN_SERVER_GROUP"
+        )
         if rank in ranks:
             _ATTN_SERVER_GROUP_GLOO = group_gloo
             _ATTN_SERVER_GLOBAL_RANKS = ranks
+            _ATTN_SERVER_GROUP = group
+
+
+def destroy_attention_server_comm():
+    """Destroy the attention server communication group."""
+    global _ATTN_SERVER_GROUP
+    global _ATTN_SERVER_GROUP_GLOO
+    global _ATTN_SERVER_GLOBAL_RANKS
+
+    _ATTN_SERVER_GROUP = None
+    _ATTN_SERVER_GROUP_GLOO = None
+    _ATTN_SERVER_GLOBAL_RANKS = None
 
 
 ######## Tool functions ########
+def get_attn_server_group(check_initialized: bool = True):
+    if check_initialized:
+        assert _ATTN_SERVER_GROUP is not None, "attention server communication group is not initialized."
+    return _ATTN_SERVER_GROUP
+
+
 def get_attn_server_group_gloo(check_initialized: bool = True):
     if check_initialized:
         assert _ATTN_SERVER_GROUP_GLOO is not None, "attention server communication group is not initialized."
@@ -75,3 +99,8 @@ def get_attn_server_rank():
     return torch.distributed.get_rank(
         group=get_attn_server_group_gloo(check_initialized=True)
     )
+
+
+def get_attn_server_group_src_rank():
+    """Get the source rank of the attention server group."""
+    return get_attn_server_global_ranks(check_initialized=True)[0]

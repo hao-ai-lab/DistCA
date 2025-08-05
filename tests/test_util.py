@@ -17,7 +17,10 @@ from d2.runtime.inplace_metadata import (
     Metadata, compute_attn_layout_seqlens, compute_metadata,
     compute_metadata_kv, exclusive_cumsum
 )
-from d2.runtime.megatron_patch.create_group import initialize_attention_server_comm, get_attn_server_group_gloo, get_attn_server_rank
+from d2.runtime.megatron_patch.create_group import (
+    initialize_attention_server_comm, get_attn_server_group_gloo,
+    get_attn_server_rank, get_attn_server_group_src_rank
+)
 
 
 ######## Workers
@@ -54,6 +57,9 @@ class BaseWorker:
         )
 
     def init_comm(self, buffer_size: int, local_rank: int = None):
+        if local_rank is None:
+            local_rank = int(os.getenv("LOCAL_RANK"))
+
         self.init_torch_distributed()
         self.init_nvshmem(buffer_size, local_rank)
 
@@ -75,11 +81,11 @@ class BaseWorker:
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = master_port
 
-    def shutdown(self):
-        torch.distributed.destroy_process_group()
+    # def shutdown(self):
+    #     torch.distributed.destroy_process_group()
 
-    def __del__(self):
-        self.shutdown()
+    # def __del__(self):
+    #     self.shutdown()
 
 
 class MegatronBaseWorker(BaseWorker):
@@ -90,6 +96,9 @@ class MegatronBaseWorker(BaseWorker):
         self.as_rank = None
 
     def init_nvshmem(self, buffer_size: int, parallel_config: ParallelConfig, local_rank: int=None):
+        if local_rank is None:
+            local_rank = int(os.getenv("LOCAL_RANK"))
+
         tp_size = parallel_config.tensor_model_parallel_size
         if tp_size == 1:
             super().init_nvshmem(buffer_size, local_rank)
@@ -100,6 +109,7 @@ class MegatronBaseWorker(BaseWorker):
         group = get_attn_server_group_gloo()
         as_world_size = torch.distributed.get_world_size(group=group)
         as_rank = get_attn_server_rank()
+        as_src_rank = get_attn_server_group_src_rank()
 
         self.as_world_size = as_world_size
         self.as_rank = as_rank
@@ -107,7 +117,7 @@ class MegatronBaseWorker(BaseWorker):
             uid = nvshmem_get_unique_id()
         else:
             uid = nvshmem_alloc_empty_unique_id()
-        torch.distributed.broadcast(uid, src=0, group=group)
+        torch.distributed.broadcast(uid, src=as_src_rank, group=group)
         FastDispatcherWrapper.init(
             as_rank, local_rank, as_world_size, buffer_size, uid
         )
