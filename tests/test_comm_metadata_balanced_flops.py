@@ -11,7 +11,7 @@ from test_util import (
     gen_seq_lens, 
     create_qkv_dispatch, 
     orchestrate_simulate, 
-    create_qkv_dispatch_balanced_flops,
+    create_qkv_dispatch_with_custom_mapping,
 )
 
 
@@ -100,7 +100,7 @@ def test_create_qkv_dispatch_balanced_flops_1(
     
     # breakpoint()
     
-    ret = create_qkv_dispatch_balanced_flops(
+    ret = create_qkv_dispatch_with_custom_mapping(
         world_size, 
         seq_lens,
         cp_num,
@@ -259,7 +259,7 @@ def test_create_qkv_dispatch_balanced_flops_2(
     ])
 
     
-    ret = create_qkv_dispatch_balanced_flops(
+    ret = create_qkv_dispatch_with_custom_mapping(
         world_size, 
         seq_lens,
         cp_num,
@@ -311,7 +311,7 @@ def test_create_qkv_dispatch_balanced_flops_3(
     max_cp_degree = world_info["max_cp_degree"]
 
     
-    ret = create_qkv_dispatch_balanced_flops(
+    ret = create_qkv_dispatch_with_custom_mapping(
         world_size, 
         seq_lens,
         cp_num,

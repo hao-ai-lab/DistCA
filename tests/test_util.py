@@ -466,7 +466,7 @@ def create_qkv_dispatch_2cp(
 
 
 
-def create_qkv_dispatch_balanced_flops(
+def create_qkv_dispatch_with_custom_mapping(
     world_size: int, 
     seq_lens: 'torch.Tensor[world_size, max_num_seqs]',
     # cp_num[src_rank, seq_id] = num_cp_shards
