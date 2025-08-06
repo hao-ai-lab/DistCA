@@ -221,26 +221,27 @@ def pre_fast_a2a_attn_out_grad_resend_qkv(
 
 
 def post_fast_a2a_attn_out_grad_resend_qkv(
-    recv_attn_out: Tensor, recv_lse: Tensor, recv_q: Tensor, recv_k: Tensor, recv_v: Tensor,
+    recv_attn_out_shape: list[int], recv_lse_shape: list[int], recv_q_shape: list[int],
+    recv_k: Tensor, recv_v: Tensor,
     kv_dispatch_mask: Tensor, q_recv_seq_tokens: Tensor, k_recv_seq_tokens: Tensor,
     q_recv_buffer_offset: Tensor, k_recv_buffer_offset: Tensor, v_recv_buffer_offset: Tensor,
     is_fwd: bool, switch_buffer: bool = True, instance_id: int=None
 ):
     is_fwd = True
-    assert recv_attn_out.ndim == 2
-    assert recv_lse.ndim == 2 and recv_lse.shape[0] == recv_attn_out.shape[0]
-    assert recv_q.ndim == 2 and recv_q.shape[0] == recv_attn_out.shape[0]
+    assert len(recv_attn_out_shape) == 2
+    assert len(recv_lse_shape) == 2 and recv_lse_shape[0] == recv_attn_out_shape[0]
+    assert len(recv_q_shape) == 2 and recv_q_shape[0] == recv_attn_out_shape[0]
 
     # layout: attn_out_grad, attn_out, softmax_lse, q
     recv_q_splits = (
-        recv_attn_out.shape[1], recv_attn_out.shape[1], recv_lse.shape[1],
-        recv_q.shape[1]
+        recv_attn_out_shape[1], recv_attn_out_shape[1], recv_lse_shape[1],
+        recv_q_shape[1]
     )
     recv_merged_q_hidden = sum(recv_q_splits)
-    recv_merged_q_hidden, padding = size_pad_by_int4(recv_merged_q_hidden, recv_q.itemsize)
+    recv_merged_q_hidden, padding = size_pad_by_int4(recv_merged_q_hidden, recv_k.itemsize)
 
     recv_merged_q = torch.empty(
-        (recv_attn_out.shape[0], recv_merged_q_hidden), dtype=recv_q.dtype,
+        (recv_attn_out_shape[0], recv_merged_q_hidden), dtype=recv_q.dtype,
         device=recv_q.device
     )
 

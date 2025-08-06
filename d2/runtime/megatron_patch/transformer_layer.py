@@ -23,7 +23,7 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
-from d2.runtime.megatron_patch.fused_comm_attn import FlashAttnArgs, FusedCommAttn
+from d2.runtime.megatron_patch.fused_comm_attn import FlashAttnArgs, FusedCommAttn, post_a2a_attn_out_with_lse
 from d2.runtime.megatron_patch.base_transformer_layer import TransformerLayer as BaseTransformerLayer
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.stream_sync_fn import TickSync
@@ -451,7 +451,12 @@ class TransformerLayer(BaseTransformerLayer):
         )
 
         signal = self._all_to_all(signal, packed_seq_params, is_qkv=False)
-        core_attn_out = self._post_attn_to_mlp(signal, packed_seq_params)
+        core_attn_out = post_a2a_attn_out_with_lse.apply(
+            signal, query, key, value,
+            packed_seq_params.attn_out_fwd_metadata,
+            packed_seq_params.attn_out_bwd_metadata,
+            packed_seq_params.dispatcher_id,
+        )
         debug_tensors.append(core_attn_out)
 
         mlp_output, context = self._forward_post_core_attn(
