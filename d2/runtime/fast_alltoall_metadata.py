@@ -549,7 +549,9 @@ def compute_fa2a_metadata_from_logical_metadata(
         return (qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata)
     # the backward seqlens of attn out equals that of forward q.
     seqlens = [seqlens[0]]
-    tensor_shape = [tensor_shape[0]]
+    tensor_shape = [
+        LogicalShape.get_shape(fwd_metadata_q, hidden_size_attn_out, mlp_num_tokens),
+    ]
     attn_out_bwd_fa2a_metadata = compute_backward_attn_out_a2a_layout_metadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
         recver_transfer_sz_attn_out, num_recv_seqs_q, bytes_attn_out,

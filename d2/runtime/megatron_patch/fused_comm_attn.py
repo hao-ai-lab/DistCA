@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from typing import Tuple
 
 from flash_attn.flash_attn_interface import (
@@ -277,9 +278,10 @@ class post_a2a_attn_out_with_lse(torch.autograd.Function):
             switch_buffer=switch_buffer,
             instance_id=dispatcher_id,
         )
+        hidden_size = math.prod(q.shape[1:])
         lse_size = torch.float32.itemsize // signal.itemsize
-        attn_out = recv_attn_out[:, :-lse_size]
-        softmax_lse = recv_attn_out[:, -lse_size:]
+        attn_out = recv_attn_out[:, :hidden_size].unsqueeze(1)
+        softmax_lse = recv_attn_out[:, hidden_size:hidden_size + lse_size]
         ctx.save_for_backward(
             q, k, v, attn_out, softmax_lse,
             # q_grad, k_grad send shape
