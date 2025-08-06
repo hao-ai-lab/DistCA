@@ -1,4 +1,6 @@
 """
+# DP + TP Testing
+# 🟢 Passed
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
     --num-nodes=1 --num-gpus-per-node=4 --tp-size=2
@@ -363,6 +365,11 @@ def test(args):
     torch.cuda.synchronize()
     torch.distributed.barrier()
     print("=" * 20 + "forward_backward_batch attention server, done")
+    
+    rank = worker.rank
+    if rank == 0:
+        import rich
+        rich.print(f"🟢 Test {__file__} passed")
 
 
 if __name__ == "__main__":

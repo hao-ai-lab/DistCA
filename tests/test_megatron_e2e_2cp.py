@@ -11,7 +11,7 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_2cp.py \
     --num-nodes=1 --num-gpus-per-node=4 --cp-degree=8
 
-# ⚠️ Stuck
+# 🟢 Passed
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_2cp.py \
     --num-nodes=1 --num-gpus-per-node=4 --cp-degree=8
@@ -22,7 +22,7 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 8 test_megatron_e2e_2cp.py \
     --num-nodes=1 --num-gpus-per-node=8 --cp-degree=16
 
-# ⚠️ Stuck
+# 🟢 Passed
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 8 test_megatron_e2e_2cp.py \
     --num-nodes=1 --num-gpus-per-node=8 --cp-degree=16
@@ -43,7 +43,7 @@ from d2.runtime.inplace_metadata import mlp_layout_packed_params
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed
 from test_pingpang_layer import create_one_batch, get_single_step_packed_seq_params
-from test_megatron_utils import (
+from megatron_test_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
@@ -365,32 +365,37 @@ def test(args):
     set_random_seed(seed, set_megatron=False)
 
     rank = worker.rank
+    as_rank = worker.as_rank
+    as_world_size = worker.as_world_size
+
+    hidden_size_q_tp = hidden_size_q // tp_size
+    hidden_size_k_tp = hidden_size_kv // tp_size
 
     _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_one_batch_2cp(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
-        hidden_size_q, hidden_size_kv, element_size
+        as_world_size, total_seq_len, num_seqs, max_cp_degree,
+        hidden_size_q_tp, hidden_size_k_tp, element_size
     )
     _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_one_batch_2cp(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
-        hidden_size_q, hidden_size_kv, element_size
+        as_world_size, total_seq_len, num_seqs, max_cp_degree,
+        hidden_size_q_tp, hidden_size_k_tp, element_size
     )
 
     set_random_seed(seed, set_megatron=False)
-    input_ids = torch.randint(0, 100, (world_size, total_seq_len * 2))
-    position_ids = torch.arange(total_seq_len).repeat(world_size, 2)
-    input_ids_local = input_ids[rank]
-    position_ids_local = position_ids[rank]
+    input_ids = torch.randint(0, 100, (as_world_size, total_seq_len * 2))
+    position_ids = torch.arange(total_seq_len).repeat(as_world_size, 2)
+    input_ids_local = input_ids[as_rank]
+    position_ids_local = position_ids[as_rank]
     ping_pang_params_0 = get_single_step_packed_seq_params(
-        fa2a_metadata_0, attn_metadata_0, rank
+        fa2a_metadata_0, attn_metadata_0, as_rank
     )
     ping_pang_params_1 = get_single_step_packed_seq_params(
-        fa2a_metadata_1, attn_metadata_1, rank
+        fa2a_metadata_1, attn_metadata_1, as_rank
     )
 
     # NOTE: we don't consider that seq_lens var has padding because our data generation
     # guarantees so. However, in practice, this is not true.
-    mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[rank])
-    mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[rank])
+    mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
+    mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
     ping_pang_params = PingPangPackedSeqParams(
         seq_params=[ping_pang_params_0, ping_pang_params_1],
         mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
