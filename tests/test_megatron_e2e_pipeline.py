@@ -20,7 +20,7 @@ from d2.runtime.inplace_metadata import (
 )
 from d2.runtime.megatron_patch.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
 
-from test_util import MegatronBaseWorker, ParallelConfig, create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch
+from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch
 from test_megatron_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
@@ -277,23 +277,24 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self.optim_config = optim_config
 
 
-def init_test(args, hidden_size_q, hidden_size_kv, worker_cls=MegatronE2eWorker):
-    world_size = int(os.getenv("WORLD_SIZE"))
-    rank = int(os.getenv("RANK"))
-    worker = worker_cls(rank, world_size)
-    print("Workers created")
-    stride_q = hidden_size_q * torch.float16.itemsize // args.tp_size
-    stride_kv = hidden_size_kv * torch.float16.itemsize * 2 // args.tp_size
-    # NOTE: a reason very likely causing the hanging is that
-    # max_tokens_query and max_tokens_key_value are not large enough (nvshmem buffer not enough)
-    max_tokens_query = args.num_tokens * world_size
-    max_tokens_key_value = args.num_tokens * world_size
-    parallel_config = ParallelConfig(
-        tensor_model_parallel_size=args.tp_size,
-        pipeline_model_parallel_size=args.pp_size,
+def init_megatron_e2e_test(
+    hidden_size_q: int, hidden_size_kv: int, num_tokens: int,
+    world_size: int, max_cp_degree: int, tp_size: int,
+    dtype, worker_cls=MegatronE2eWorker
+):
+    token_bytes_q = hidden_size_q * dtype.itemsize
+    token_bytes_kv = hidden_size_kv * dtype.itemsize
+    max_tokens_query = num_tokens * world_size
+    max_tokens_key_value = num_tokens * world_size
+    buffer_size = (
+        token_bytes_q * max_tokens_query +
+        token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     )
-    worker.init_comm(
-        stride_q, stride_kv, max_tokens_query, max_tokens_key_value, parallel_config
+    parallel_config = ParallelConfig(
+        tensor_model_parallel_size=tp_size
+    )
+    worker = init_worker_torch_distributed(
+        world_size, buffer_size, worker_cls, parallel_config
     )
     print("Communication groups initialized")
     return worker
@@ -304,17 +305,29 @@ def test(args):
     num_tokens = args.num_tokens
     max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
+    tp_size = args.tp_size
+    world_size = args.num_nodes * args.num_gpus_per_node
+    total_seq_len = args.num_tokens
+
+    dtype = torch.bfloat16
+    element_size = dtype.itemsize
 
     model_path = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
     hf_config = AutoConfig.from_pretrained(model_path)
     hidden_size_q = hf_config.hidden_size
-    hidden_size_kv = hidden_size_q * 2
+
+    hidden_size_kv = hidden_size_q
     if hasattr(hf_config, "num_key_value_heads"):
         hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
                           hf_config.num_attention_heads)
 
-    worker = init_test(args, hidden_size_q, hidden_size_kv, worker_cls=MegatronE2eWorker)
-    world_size = worker.world_size
+    worker: MegatronE2eWorker = init_megatron_e2e_test(
+        hidden_size_q, hidden_size_kv, num_tokens,
+        world_size, max_cp_degree, tp_size,
+        dtype, MegatronE2eWorker
+    )
+    worker.set_config(dtype=dtype)
+    worker.init(model_path, seed=seed)
     rank = worker.rank
     worker.set_config()
     worker.init(model_path)
@@ -428,7 +441,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-nodes", type=int, default=1)
-    parser.add_argument("--num-gpus-per-node", type=int, default=2)
+    parser.add_argument("--num-gpus-per-node", type=int, default=4)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--pp-size", type=int, default=4)
     args = parser.parse_args()
