@@ -56,6 +56,7 @@ class MegatronLayerWorker(MegatronBaseWorker):
         tensor_input = tensor_input.cuda()
         self.layer.train()
         mlp_output, context, debug_tensors = self.layer.forward_one_stage(tensor_input, packed_seq_params=packed_seq_params)
+        mlp_output.mean().backward()
         torch.cuda.synchronize()
         print(self.rank, "ping-pong one stage forward done")
         return (mlp_output, context), debug_tensors
@@ -198,7 +199,8 @@ def init_megatron_test(
     token_bytes_q = hidden_size * dtype.itemsize
     token_bytes_kv = hidden_size * dtype.itemsize
     buffer_size = (
-        token_bytes_q * max_tokens_query +
+        token_bytes_q * max_tokens_query * 3 +
+        num_heads * torch.float32.itemsize * 2 * max_tokens_query +
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     )
     parallel_config = ParallelConfig(

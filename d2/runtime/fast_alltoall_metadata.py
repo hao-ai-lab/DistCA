@@ -619,7 +619,7 @@ def compute_backward_resend_qkv_from_logical_metadata(
     hidden_size_lse: int,   # The size of the softmax_lse tensor. Should be num_heads.
 ):
     # merged_q has: q, attn_out, attn_out_grad, softmax_lse
-    hidden_size_merged_q = hidden_size_q + hidden_size_q + hidden_size_lse
+    hidden_size_merged_q = hidden_size_q * 3 + hidden_size_lse
     padded_hidden_size_q, _ = size_pad_by_int4(hidden_size_merged_q, element_size)
     # NOTE: we cannot use the bwd metadata generated here, because it's hidden size is wrong.
     grad_fwd_fa2a_metadata_qkv, _ = compute_fa2a_metadata_from_logical_metadata(

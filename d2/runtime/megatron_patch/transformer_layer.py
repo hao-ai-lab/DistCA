@@ -453,6 +453,7 @@ class TransformerLayer(BaseTransformerLayer):
         signal = self._all_to_all(signal, packed_seq_params, is_qkv=False)
         core_attn_out = post_a2a_attn_out_with_lse.apply(
             signal, query, key, value,
+            self.config.num_attention_heads // self.config.tensor_model_parallel_size,
             packed_seq_params.attn_out_fwd_metadata,
             packed_seq_params.attn_out_bwd_metadata,
             packed_seq_params.dispatcher_id,

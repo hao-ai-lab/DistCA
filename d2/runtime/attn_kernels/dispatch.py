@@ -214,7 +214,7 @@ def pre_fast_a2a_attn_out_grad_resend_qkv(
     # Padding for int4. TODO(yonghao): 
     _, pad_len = size_pad_by_int4(merged_q.shape[1], q.itemsize)
     if pad_len > 0:
-        merged_q = F.pad(merged_q, (0, _CUDA_INT4_BYTES - pad_len), mode='constant', value=0)
+        merged_q = F.pad(merged_q, (0, pad_len), mode='constant', value=0)
     return pre_fast_a2a_qkv(merged_q, k, v, kv_dispatch_mask, q_seq_tokens, k_seq_tokens,
                             q_send_buffer_offset, k_send_buffer_offset, v_send_buffer_offset,
                             is_fwd=is_fwd, instance_id=instance_id)
@@ -240,10 +240,7 @@ def post_fast_a2a_attn_out_grad_resend_qkv(
     recv_merged_q_hidden = sum(recv_q_splits)
     recv_merged_q_hidden, padding = size_pad_by_int4(recv_merged_q_hidden, recv_k.itemsize)
 
-    recv_merged_q = torch.empty(
-        (recv_attn_out_shape[0], recv_merged_q_hidden), dtype=recv_q.dtype,
-        device=recv_q.device
-    )
+    recv_merged_q = recv_k.new_empty((recv_attn_out_shape[0], recv_merged_q_hidden))
 
     recv_merged_q, recv_k, recv_v = post_fast_a2a_qkv(
         recv_merged_q, recv_k, recv_v, kv_dispatch_mask,
@@ -251,7 +248,7 @@ def post_fast_a2a_attn_out_grad_resend_qkv(
         q_recv_buffer_offset, k_recv_buffer_offset, v_recv_buffer_offset,
         is_fwd, switch_buffer=switch_buffer, instance_id=instance_id
     )
-    recv_attn_out_grad, recv_attn_out, recv_lse, recv_q = torch.split(
+    recv_attn_out_grad, recv_attn_out, recv_lse, recv_q, _ = torch.split(
         recv_merged_q, [*recv_q_splits, padding], dim=1
     )
     return (
@@ -268,7 +265,7 @@ def pre_fast_a2a_attn_out_with_lse(
     merged_attn_out = torch.concat([attn_out, softmax_lse], dim=1)
     _, pad_len = size_pad_by_int4(merged_attn_out.shape[1], attn_out.itemsize)
     if pad_len > 0:
-        merged_attn_out = F.pad(merged_attn_out, (0, _CUDA_INT4_BYTES - pad_len), mode='constant', value=0)
+        merged_attn_out = F.pad(merged_attn_out, (0, pad_len), mode='constant', value=0)
     return pre_fast_a2a_attn_out(
         merged_attn_out, send_seqlens, send_memcpy_metadata[0],
         instance_id=dispatcher_id,
