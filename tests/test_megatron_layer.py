@@ -39,7 +39,8 @@ class MegatronLayerWorker(MegatronBaseWorker):
         torch.manual_seed(seed + mpu.get_tensor_model_parallel_rank())
         self.layer = build_module(spec, config)
 
-    def forward_normal(self, tensor_input: torch.Tensor, packed_seq_params: PackedSeqParams):
+    def forward_normal(self, tensor_input: torch.Tensor, packed_seq_params: PackedSeqParams,
+                       return_grad: bool = False):
         packed_seq_params = PackedSeqParams(
             qkv_format=packed_seq_params.qkv_format,
             cu_seqlens_q=packed_seq_params.cu_seqlens_q.cuda().to(torch.int32),
@@ -47,24 +48,37 @@ class MegatronLayerWorker(MegatronBaseWorker):
             max_seqlen_q=packed_seq_params.max_seqlen_q.cuda().to(torch.int32),
             max_seqlen_kv=packed_seq_params.max_seqlen_kv.cuda().to(torch.int32),
         )
-        tensor_input = tensor_input.cuda()
+        tensor_input = tensor_input.cuda().detach()
+        tensor_input.requires_grad = True
         self.layer.train()
-        mlp_output, context, debug = self.layer.forward_no_switch(tensor_input, packed_seq_params=packed_seq_params)
+        mlp_output, context, debug = self.layer.forward_no_switch(
+            tensor_input, packed_seq_params=packed_seq_params
+        )
+        mlp_output.mean().backward()
         torch.cuda.synchronize()
         print(self.rank, "normal forward done")
-        return (mlp_output, context), debug
+        return (mlp_output, context, *((tensor_input.grad,) if return_grad else ())), debug
 
     def forward_ping_pang_one_stage(
         self, tensor_input: torch.Tensor,
         packed_seq_params: PingPangSingleStepPackedSeqParams,
+        return_grad: bool = False,
     ):
         packed_seq_params = packed_seq_params.to_device()
-        tensor_input = tensor_input.cuda()
+        tensor_input = tensor_input.cuda().detach()
+        tensor_input.requires_grad = True
+
+        backward_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
+
         self.layer.train()
-        mlp_output, context, debug_tensors = self.layer.forward_one_stage(tensor_input, packed_seq_params=packed_seq_params)
+        mlp_output, context, debug_tensors = self.layer.forward_one_stage(
+            tensor_input, packed_seq_params=packed_seq_params,
+            backward_resend_qkv=backward_resend_qkv
+        )
+        mlp_output.mean().backward()
         torch.cuda.synchronize()
         print(self.rank, "ping-pong one stage forward done")
-        return (mlp_output, context), debug_tensors
+        return (mlp_output, context, *((tensor_input.grad,) if return_grad else ())), debug_tensors
 
 
 def test_forward(
@@ -211,7 +225,8 @@ def init_megatron_test(
     token_bytes_q = hidden_size * dtype.itemsize
     token_bytes_kv = hidden_size * dtype.itemsize
     buffer_size = (
-        token_bytes_q * max_tokens_query +
+        token_bytes_q * max_tokens_query * 3 +
+        num_heads * torch.float32.itemsize * 2 * max_tokens_query +
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     )
     parallel_config = ParallelConfig(

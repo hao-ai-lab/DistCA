@@ -46,7 +46,8 @@ class PingPangLayerWorker(MegatronLayerWorker):
         super().init_torch_distributed()
         self.stream = torch.cuda.Stream(device=self.device, priority=-1)
 
-    def forward_ping_pang(self, tensor_input: torch.Tensor, packed_seq_params: PingPangPackedSeqParams):
+    def forward_ping_pang(self, tensor_input: torch.Tensor, packed_seq_params: PingPangPackedSeqParams,
+                          run_backward: bool = False):
         packed_seq_params = packed_seq_params.to_device()
         tensor_input = tensor_input.cuda()
         self.layer.train()
@@ -59,7 +60,21 @@ class PingPangLayerWorker(MegatronLayerWorker):
         else:
             for params in packed_seq_params.seq_params:
                 setattr(params, "stream", torch.cuda.current_stream())
-        return self.layer.ping_pang_forward(tensor_input, packed_seq_params=packed_seq_params)
+        torch.distributed.barrier()
+
+        if run_backward:
+            tensor_input.requires_grad = True
+            ctx = torch.enable_grad()
+        else:
+            ctx = torch.no_grad()
+        with ctx:
+            ret = self.layer.ping_pang_forward(tensor_input, packed_seq_params=packed_seq_params)
+            if not run_backward:
+                return ret
+            output, context = ret
+            loss = (output**2).mean()
+            loss.backward()
+            self.layer.zero_grad()
 
 
 def create_one_batch(
@@ -191,14 +206,16 @@ def test_forward(
     if profile:
         for _ in range(3):
             worker.forward_ping_pang(
-                tensor_shard, ping_pang_params
+                tensor_shard, ping_pang_params,
+                run_backward=True
             )
         torch.cuda.synchronize()
         torch.distributed.barrier()
         print("warmup done")
         for _ in range(20):
             worker.forward_ping_pang(
-                tensor_shard, ping_pang_params
+                tensor_shard, ping_pang_params,
+                run_backward=True
             )
         torch.cuda.synchronize()
         torch.distributed.barrier()

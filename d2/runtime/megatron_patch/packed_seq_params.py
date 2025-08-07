@@ -20,6 +20,7 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
     qkv_bwd_metadata: FastAlltoAllMetadata = None
     attn_out_fwd_metadata: FastAlltoAllMetadata = None
     attn_out_bwd_metadata: FastAlltoAllMetadata = None
+    bwd_packed_seq_params: PackedSeqParams = None
     stream: torch.cuda.Stream = None
     dispatcher_id: int = None
 
@@ -36,6 +37,7 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
             qkv_bwd_metadata=self.qkv_bwd_metadata.normalize(),
             attn_out_fwd_metadata=self.attn_out_fwd_metadata.normalize(),
             attn_out_bwd_metadata=self.attn_out_bwd_metadata.normalize(),
+            bwd_packed_seq_params=arg_to_cuda(self.bwd_packed_seq_params),
             stream=self.stream,
             dispatcher_id=self.dispatcher_id,
         )
@@ -77,6 +79,8 @@ class PingPangPackedSeqParams:
 
 
 def arg_to_cuda(v):
+    if v is None:
+        return None
     if isinstance(v, torch.Tensor):
         return v.cuda()
     elif isinstance(v, PingPangPackedSeqParams):
