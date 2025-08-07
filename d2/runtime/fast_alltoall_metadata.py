@@ -581,7 +581,7 @@ def compute_e2e_fa2a_metadata(
     hidden_size_q: int,
     hidden_size_k: int,
     element_size: int,  # dtype's size
-    softmax_lse_size: int,
+    softmax_lse_size: int = 0,
 ):
     (
         fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv, fa_params, intermediates

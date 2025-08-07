@@ -479,13 +479,7 @@ class TransformerLayer(BaseTransformerLayer):
                 packed_seq_params.dispatcher_id,
             )
         else:
-            core_attn_out = post_a2a_attn_out_with_lse.apply(
-                signal, query, key, value,
-                self.config.num_attention_heads // self.config.tensor_model_parallel_size,
-                packed_seq_params.attn_out_fwd_metadata,
-                packed_seq_params.attn_out_bwd_metadata,
-                packed_seq_params.dispatcher_id,
-            )
+            core_attn_out = self._post_attn_to_mlp(signal, packed_seq_params)
         debug_tensors.append(core_attn_out)
 
         mlp_output, context = self._forward_post_core_attn(
