@@ -79,6 +79,8 @@ class PingPangPackedSeqParams:
 
 
 def arg_to_cuda(v):
+    if v is None:
+        return None
     if isinstance(v, torch.Tensor):
         return v.cuda()
     elif isinstance(v, PingPangPackedSeqParams):

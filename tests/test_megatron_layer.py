@@ -57,8 +57,14 @@ class MegatronLayerWorker(MegatronBaseWorker):
         packed_seq_params = packed_seq_params.to_device()
         tensor_input = tensor_input.cuda().detach()
         tensor_input.requires_grad = True
+
+        backward_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
+
         self.layer.train()
-        mlp_output, context, debug_tensors = self.layer.forward_one_stage(tensor_input, packed_seq_params=packed_seq_params)
+        mlp_output, context, debug_tensors = self.layer.forward_one_stage(
+            tensor_input, packed_seq_params=packed_seq_params,
+            backward_resend_qkv=backward_resend_qkv
+        )
         mlp_output.mean().backward()
         torch.cuda.synchronize()
         print(self.rank, "ping-pong one stage forward done")

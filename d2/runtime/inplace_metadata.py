@@ -391,7 +391,7 @@ def compute_metadata_kv(
     assert kv_context_size.shape == (world_size, max_num_local_seqs)
     assert q_to_num_kv_seq.shape == (world_size, max_num_local_seqs)
     assert q_dispatch.shape == (world_size, max_num_local_seqs)
-    assert q_seq_to_dst.shape == (world_size, max_num_local_seqs, world_size), f"{q_seq_to_dst.shape=} {world_size=}, {max_num_local_seqs=}"
+    assert q_seq_to_dst.shape == (world_size, max_num_local_seqs, world_size)
     assert seq_len.shape == (world_size, max_num_local_seqs)
     assert num_seqs.shape == (world_size,)
     ######## Forward
