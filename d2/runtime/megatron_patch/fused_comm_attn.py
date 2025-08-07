@@ -153,7 +153,6 @@ class FusedCommAttn(torch.autograd.Function):
         recv_q = torch.empty(recv_q_shape, dtype=signal.dtype, device=signal.device)
         recv_k = torch.empty(recv_k_shape, dtype=signal.dtype, device=signal.device)
         recv_v = torch.empty_like(recv_k)
-        print(123, flush=True)
         post_fast_a2a_qkv(
             recv_q, recv_k, recv_v, None,
             fwd_qkv_metadata.seq_lens[0].recv_seqlens, fwd_qkv_metadata.seq_lens[1].recv_seqlens,
@@ -187,13 +186,11 @@ class FusedCommAttn(torch.autograd.Function):
         assert attn_out.shape == recv_q.shape
         softmax_lse_dtype = softmax_lse.dtype
         softmax_lse = softmax_lse.T.contiguous().view(attn_out.dtype)
-        print(456, flush=True)
         attn_out = pre_fast_a2a_attn_out_with_lse(
             attn_out, softmax_lse, fwd_attn_out_metadata.seq_lens[0].send_seqlens,
             fwd_attn_out_metadata.send_memcpy_metadata[0],
             dispatcher_id,
         )
-        print(789, flush=True)
         signal = torch.empty((1,), device=attn_out.device, dtype=attn_out.dtype)
 
         saved_tensors.extend([
