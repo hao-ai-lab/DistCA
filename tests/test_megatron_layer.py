@@ -84,7 +84,7 @@ class MegatronLayerWorker(MegatronBaseWorker):
 def test_forward(
     seed, total_seq_len, num_seqs, max_cp_degree,
     worker: MegatronLayerWorker, hidden_size_q: int, hidden_size_k: int,
-    tp_size: int = 1,
+    tp_size: int = 1, profile: bool = False,
 ):
     torch.manual_seed(seed)
     dtype = torch.float16
@@ -214,6 +214,34 @@ def test_forward(
         torch.testing.assert_close(normal_forward_out, ping_pang_out)
         print("pass final result")
 
+    if profile:
+        for _ in range(3):
+            normal_forward_out, debug_ref = worker.forward_normal(
+                tensor_shard, packed_seq_params, return_grad=True
+            )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        for _ in range(15):
+            normal_forward_out, debug_ref = worker.forward_normal(
+                tensor_shard, packed_seq_params, return_grad=True
+            )
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+        print("normal forward profiling done")
+        for _ in range(3):
+            ping_pang_out, debug_out = worker.forward_ping_pang_one_stage(
+                tensor_shard, ping_pang_params, return_grad=True
+            )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        for _ in range(20):
+            ping_pang_out, debug_out = worker.forward_ping_pang_one_stage(
+                tensor_shard, ping_pang_params, return_grad=True
+            )
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+        print("ping-pong one stage forward profiling done")
+
 
 def init_megatron_test(
     world_size, hidden_size, num_heads, num_query_heads, dtype,
@@ -262,7 +290,7 @@ def test(args):
     tp_size = args.tp_size
     num_heads = args.num_heads
     dtype = torch.float16
-    num_query_heads = num_heads
+    num_query_heads = args.num_query_heads
     hidden_size_kv = (hidden_size * num_query_heads) // num_heads
 
     worker: MegatronLayerWorker = init_megatron_test(
@@ -273,7 +301,7 @@ def test(args):
     test_forward(
         args.seed, args.num_tokens, args.num_seqs,
         max_cp_degree, worker, hidden_size, hidden_size_kv,
-        tp_size,
+        tp_size, profile=args.profile,
     )
 
 
@@ -290,5 +318,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=2)
+    parser.add_argument("--num-query-heads", type=int, default=2)
+    parser.add_argument("--profile", action="store_true", default=False,)
     args = parser.parse_args()
     test(args)

@@ -491,9 +491,11 @@ class TransformerLayer(BaseTransformerLayer):
 
 
 def add_ping_pang_forward(block: MegatronTransformerBlock):
-    def init_ping_pang_communication_ctx(self):
-        self.comm_stream = torch.cuda.Stream(priority=-1)
+    def init_ping_pang_communication_ctx(self, device: torch.device):
+        assert not self.ping_pong_comm_initialized
+        self.comm_stream = torch.cuda.Stream(device=device, priority=-1)
         self._ping_pang_debug = True
+        self.ping_pong_comm_initialized = True
 
     def ping_pang_forward(
         self: MegatronTransformerBlock,
@@ -536,19 +538,17 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
 
         compute_stream = torch.cuda.current_stream()
 
+        packed_seq_params_0 = packed_seq_params.seq_params[0]
+        packed_seq_params_1 = packed_seq_params.seq_params[1]
+        setattr(packed_seq_params_0, "stream", self.comm_stream)
+        setattr(packed_seq_params_1, "stream", self.comm_stream)
+        setattr(packed_seq_params_0, "dispatcher_id", 0)
+        setattr(packed_seq_params_1, "dispatcher_id", 1)
+
         with rng_context, outer_fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
-                raise NotImplementedError("Full recompute not supported yet")
-                hidden_states = self._checkpointed_forward(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    context=context,
-                    context_mask=context_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                )
+                raise NotImplementedError("Full recompute full layer not supported in ping-pong forward yet.")
             else:
                 arg_group = {
                     "hidden_states": hidden_states,
@@ -564,10 +564,6 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                 arg_group_0, arg_group_1 = _split_all_dict(arg_group, 2)
                 del arg_group
 
-                packed_seq_params_0 = packed_seq_params.seq_params[0]
-                packed_seq_params_1 = packed_seq_params.seq_params[1]
-                setattr(packed_seq_params_0, "stream", self.comm_stream)
-                setattr(packed_seq_params_1, "stream", self.comm_stream)
                 arg_group_0["packed_seq_params"] = packed_seq_params_0
                 arg_group_1["packed_seq_params"] = packed_seq_params_1
                 arg_group_0["mlp_packed_seq_params"] = packed_seq_params.mlp_layout_seq_params[0]
@@ -618,12 +614,12 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             )
 
         # tick 1
+        # communication
+        arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
         # compute
         if l_no > 0:
             arg_group_1 = _forward_post_core_attn(prev_layer, arg_group_1)
         arg_group_1 = _forward_pre_core_attn(layer, arg_group_1)
-        # communication
-        arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
         _tick_sync(
             compute_stream, self.comm_stream,
             arg_group_0, "signal",  # comm out
@@ -631,10 +627,10 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         )
 
         # tick 2
-        # compute
-        arg_group_0 = _forward_core_attn(layer, arg_group_0)
         # communication
         arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
+        # compute
+        arg_group_0 = _forward_core_attn(layer, arg_group_0)
         _tick_sync(
             compute_stream, self.comm_stream,
             arg_group_0, "signal",  # compute out
@@ -642,10 +638,10 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         )
 
         # tick 3
-        # compute
-        arg_group_1 = _forward_core_attn(layer, arg_group_1)
         # communication
         arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
+        # compute
+        arg_group_1 = _forward_core_attn(layer, arg_group_1)
         _tick_sync(
             compute_stream, self.comm_stream,
             arg_group_0, "signal",  # comm out
@@ -653,10 +649,10 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         )
 
         # tick 4, also the tick 0 of the next layer
-        # compute
-        arg_group_0 = _forward_post_core_attn(layer, arg_group_0)
         # communication
         arg_group_1 = _layout_attn_to_mlp(layer, arg_group_1)
+        # compute
+        arg_group_0 = _forward_post_core_attn(layer, arg_group_0)
         # NOTE: communication of this tick is at the next layer.
 
         # if the last layer, do the other half of tick 4 and tick 5
@@ -755,6 +751,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
     def forward(self, *args, **kwargs):
         if self._ping_pang_debug:
             return self._normal_forward(*args, **kwargs)
+        assert self.ping_pong_comm_initialized
         return self.ping_pang_forward(*args, **kwargs)
 
     block.forward_layers = types.MethodType(forward_layers, block)
@@ -762,7 +759,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
     block.ping_pang_forward = types.MethodType(ping_pang_forward, block)
     block._normal_forward = block.forward
     block.forward = types.MethodType(forward, block)
-    block.init_ping_pang_communication_ctx()
+    block.ping_pong_comm_initialized = False
 
 
 class PingPangGPTModel(GPTModel):
@@ -773,3 +770,6 @@ class PingPangGPTModel(GPTModel):
 
     def set_debug(self, debug: bool):
         self.decoder._ping_pang_debug = debug
+
+    def init_ping_pong_communication_ctx(self, device: torch.device):
+        self.decoder.init_ping_pang_communication_ctx(device)
