@@ -4,8 +4,38 @@
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
     --num-nodes=1 --num-gpus-per-node=4 --tp-size=2
+
+
+# DP + TP CrossNode Testing
+
+# 🟢 Passed: TP = 2, DP = 4
+NGPU=4
+TP_SIZE=2
+
+# 🟢 Passed: TP = 4, DP = 4
+NGPU=8
+TP_SIZE=4
+
+# 🟢 Passed: TP = 2, DP = 8
+NGPU=8
+TP_SIZE=2
+
+MASTER_ADDR=<master_addr>
+# if hostname is fs-mbz-gpu-717, then node_rank=0 else node_rank=1
+if [[ $(hostname) == fs-mbz-gpu-717 ]]; then
+    NODE_RANK=0
+else
+    NODE_RANK=1
+fi
+set -x
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes=2 --nproc_per_node=$NGPU --node_rank=$NODE_RANK \
+    --master_addr=$MASTER_ADDR --master_port=29600 test_megatron_e2e.py \
+    --num-nodes=2 --num-gpus-per-node=$NGPU --tp-size=$TP_SIZE
+set +x
 """
 import argparse
+import rich
 
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
@@ -302,6 +332,7 @@ def test(args):
 
     as_rank = worker.as_rank
     as_world_size = worker.as_world_size
+    rich.print(f"[Rank {worker.rank}] as_rank: {as_rank}, as_world_size: {as_world_size}")
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
@@ -368,7 +399,6 @@ def test(args):
     
     rank = worker.rank
     if rank == 0:
-        import rich
         rich.print(f"🟢 Test {__file__} passed")
 
 

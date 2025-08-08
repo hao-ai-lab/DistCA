@@ -301,7 +301,7 @@ from d2.runtime.fast_alltoall_metadata import compute_fa2a_metadata_from_logical
 
 
 from typing import Iterable, List
-from d2.planner.samples import sample_wlbllm_docs_upsample, batch_documents
+from d2.simulator.optimizers.samples import sample_wlbllm_docs_upsample, batch_documents
 
 ITERATION_ID = 0
 GLOBAL_BATCH: Iterable[List[int]] = None

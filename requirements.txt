@@ -4,3 +4,7 @@ pandas
 matplotlib
 streamlit
 streamlit-cookies-manager
+
+omegaconf
+transformers
+ray

@@ -6,6 +6,9 @@ from collections import deque
 from pathlib import Path
 
 
+data_folder = Path(__file__).parent.parent / "data"
+
+
 def sample_random_docs(
     *,
     max_ctx_length: int,
@@ -104,8 +107,7 @@ def sample_wlbllm_docs(
     list[int]
         A list of document lengths.
     """
-    thisdir = Path(os.path.dirname(__file__))
-    docpath = thisdir.parent / "data" / "dist_wlbllm.json"
+    docpath = data_folder / "dist_wlbllm.json"
     with open(docpath, "r") as f:
         docs = json.load(f)
     rng = np.random.default_rng(seed)
@@ -135,8 +137,7 @@ def sample_wlbllm_docs_altered(
     list[int]
         A list of document lengths.
     """
-    thisdir = Path(os.path.dirname(__file__))
-    docpath = thisdir.parent / "data" / "dist_wlbllm.json"
+    docpath = data_folder / "dist_wlbllm.json"
     with open(docpath, "r") as f:
         docs = json.load(f)
     shorter_docs = [doc for doc in docs if doc < filter_threshold]
@@ -147,6 +148,57 @@ def sample_wlbllm_docs_altered(
     rng = np.random.default_rng(seed)
     docs = rng.choice(docs, size=size, replace=False)
     return docs.tolist()
+
+
+def sample_wlbllm_docs_upsample(
+    *,
+    size: int,
+    seed: int = 42,
+    filter_threshold: int = 10000,
+    filter_ratio: float = 1.0,
+    upsample_long_factor: int = 2,
+) -> list[int]:
+    """
+    Sample `size` documents from the WLB-LLM distribution, upsampling long docs.
+
+    Parameters
+    ----------
+    size : int
+        Number of documents to sample.
+    seed : int
+        RNG seed.
+    filter_threshold : int
+        Token count threshold separating short and long docs.
+    filter_ratio : float
+        Fraction of short docs to keep (for downsampling).
+    upsample_long_factor : float
+        Multiplicative upsampling factor for long docs (≥ threshold).
+
+    Returns
+    -------
+    list[int]
+        A list of sampled document lengths.
+    """
+    docpath = data_folder / "dist_wlbllm.json"
+    with open(docpath, "r") as f:
+        docs = json.load(f)
+
+    shorter_docs = [doc for doc in docs if doc < filter_threshold]
+    longer_docs = [doc for doc in docs if doc >= filter_threshold]
+
+    # Downsample short docs
+    if 0 < filter_ratio < 1.0:
+        shorter_docs = shorter_docs[:int(len(shorter_docs) * filter_ratio)]
+
+    # Upsample long docs
+    # if upsample_long_factor > 1.0:
+    longer_docs = longer_docs * int(upsample_long_factor)
+
+    combined_docs = shorter_docs + longer_docs
+
+    rng = np.random.default_rng(seed)
+    sampled_docs = rng.choice(combined_docs, size=size, replace=False)
+    return sampled_docs.tolist()
 
 
 def batch_documents(
