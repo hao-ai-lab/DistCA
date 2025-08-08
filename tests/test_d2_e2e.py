@@ -2,13 +2,13 @@
 
 # 🟢 Passed: TP = 4, DP = 4
 # - Node 0
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
     --master_addr=<master_ip> --master_port=29500 test_d2_e2e.py \
     --num-nodes=2 --num-gpus-per-node=8 --tp-size=4  --total-seq-len 16384
 
 # - Node 1
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
     --master_addr=<master_ip> --master_port=29500 test_d2_e2e.py \
     --num-nodes=2 --num-gpus-per-node=8 --tp-size=4  --total-seq-len 16384
@@ -16,13 +16,13 @@ torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
 
 # 🟢 Passed: TP = 8, DP = 2
 # - Node 0
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
     --master_addr=<master_ip> --master_port=29500 test_d2_e2e.py \
     --num-nodes=2 --num-gpus-per-node=8 --tp-size=8  --num-tokens 16384
 
 # - Node 1
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
     --master_addr=<master_ip> --master_port=29500 test_d2_e2e.py \
     --num-nodes=2 --num-gpus-per-node=8 --tp-size=8  --num-tokens 16384
@@ -75,9 +75,11 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self.dtype = torch.bfloat16
         self.enable_gradient_checkpointing = False
         self.gradient_checkpointing_kwargs = {}
+        self.stream = None
 
     def init_comm(self, *args, **kwargs):
         super().init_comm(*args, **kwargs)
+        self.stream = torch.cuda.Stream(device=self.device, priority=-1)
 
     def set_config(self, dtype=torch.bfloat16, enable_gradient_checkpointing=False, gradient_checkpointing_kwargs={}):
         self.dtype = dtype
@@ -184,7 +186,20 @@ class MegatronE2eWorker(MegatronBaseWorker):
             input_ids = batch['input_ids']
             position_ids = batch['position_ids']
             attention_mask = None
+
+            # Stream for ping-pong
             packed_seq_params = batch['packed_seq_params']
+            if not packed_seq_params.debug:
+                stream = self.stream
+                assert stream is not None, f"[Rank {self.rank}] stream should be initialized for ping-pong."
+                for params in packed_seq_params.seq_params:
+                    setattr(params, "stream", stream)
+                setattr(packed_seq_params.seq_params[0], "dispatcher_id", 0)
+                setattr(packed_seq_params.seq_params[0], "dispatcher_id", 1)
+            else:
+                stream = torch.cuda.current_stream()
+                for params in packed_seq_params.seq_params:
+                    setattr(params, "stream", stream)
             # returns "hidden_states" if not model.post_process (not the last layer)
             # returns "logits" when label is None.
             output = gptmodel_forward(
@@ -300,11 +315,11 @@ from test_util import create_qkv_dispatch_with_custom_mapping
 from d2.runtime.fast_alltoall_metadata import compute_fa2a_metadata_from_logical_metadata
 
 
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 from d2.simulator.optimizers.samples import sample_wlbllm_docs_upsample, batch_documents
 
 ITERATION_ID = 0
-GLOBAL_BATCH: Iterable[List[int]] = None
+GLOBAL_BATCH: Optional[Iterable[List[int]]] = None
 
 K = 1024
 
@@ -502,8 +517,6 @@ def test(args):
         # print(rank, microbatch["packed_seq_params"])
         microbatches = [microbatch]
 
-        
-
         if sample_id == 0:
             # Warmup
             for _ in range(5):
@@ -545,16 +558,30 @@ def test(args):
         avg_duration_ms = duration_ms / N
         sample_times.append(avg_duration_ms)
         if rank == 0:
-            print(f"[Sample ID={sample_id}] forward_backward_batch: avg_time_per_iteration = {avg_duration_ms} ms")
+            rich.print(f"[Sample ID={sample_id}] forward_backward_batch: avg_time_per_iteration = {avg_duration_ms} ms")
 
     torch.cuda.synchronize()
     torch.distributed.barrier()
     print("=" * 20 + "forward_backward_batch attention server, done")
 
     if rank == 0:
+        from datetime import datetime
+        import pytz
+        pst = pytz.timezone('US/Pacific')
+        timestamp = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S PST")
         rich.print(f"🟢 Test {__file__} passed")
-        for idx, (sample, duration) in enumerate(zip(iterated_samples, sample_times)):
-            rich.print(f"🟢 Sample {idx}: {sample}, duration: {duration} ms")
+        dp_size = world_size // tp_size
+        config = dict(tp_size=tp_size, dp_size=dp_size, num_tokens=num_tokens)
+        rich.print(f"🟢 HF Config: ", hf_config)
+        rich.print(f"🟢 Test Config: ", config)
+        rich.print(f"🟢 Test DateTime: ", timestamp)
+        for idx in range(len(sample_times)):
+            samples = iterated_samples[2*idx: 2*idx+2]
+            duration = sample_times[idx]
+            rich.print(f"🟢 Sample {idx}: {samples}, duration: {duration} ms")
+
+        # for idx, (sample, duration) in enumerate(zip(iterated_samples, sample_times)):
+        #     rich.print(f"🟢 Sample {idx}: {sample}, duration: {duration} ms")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
