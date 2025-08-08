@@ -33,7 +33,7 @@ __global__ void spreadout_alltoallv_internode_kernel(
   const uint32_t server_n = rank_n / local_rank_n;
   const uint32_t inter_node_rank_n = rank_n - local_rank_n;
 
-  if (warp_id == 0){
+  if (warp_id == 0) {
     //use warp 0 in block 0 to do inter-node transfer
     for (uint step = 1; step < server_n; step ++){
       const uint32_t dst_server_id = (server_id + step) % server_n;
@@ -64,14 +64,12 @@ __global__ void spreadout_alltoallv_internode_kernel(
       // This is to guarantee that two ranks are running the
       // communication at all times, or at most with 1 communication
       // different (so that we can use dual buffers).
-      if (threadIdx.x == 0) {
-        nvshmemx_signal_op(&sync_signal[this_rank], 1, NVSHMEM_SIGNAL_ADD, send_rank_id);
-      }
+      nvshmemx_signal_op(&sync_signal[this_rank], 1, NVSHMEM_SIGNAL_ADD, send_rank_id);
     }
     nvshmem_quiet();
   } else if (warp_id == 1) {
     for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP){
-      const uint32_t src_rank = ((server_id + 1)* local_rank_n + i) % rank_n;
+      const uint32_t src_rank = ((server_id + 1) * local_rank_n + i) % rank_n;
       // + 1 is because we've added a signal to all ranks to avoid no
       // communication.
       const int64_t recv_sz = __ldg(&inter_recver_transfer_sz[src_rank]) + 1;
@@ -114,14 +112,6 @@ int launch_alltoallv(
     &inter_params->recver_transfer_sz,
   };
   dim3 inter_grid(1, 1, 1), inter_block(THREAD_N_PER_2WARP, 1, 1);
-  // The local communication
-  CUDACHECK(cudaMemcpyAsync(
-    buf->recv_buffer + my_rank_recv_offset,
-    buf->send_buffer + my_rank_send_offset,
-    my_rank_send_sz,
-    cudaMemcpyDeviceToDevice,
-    stream
-  ));
   CUDACHECK(cudaLaunchKernel(
     (void *)&spreadout_alltoallv_internode_kernel,
       inter_grid,
@@ -130,6 +120,14 @@ int launch_alltoallv(
       0,
       stream
     ));
+  // The local communication
+  CUDACHECK(cudaMemcpyAsync(
+    buf->recv_buffer + my_rank_recv_offset,
+    buf->send_buffer + my_rank_send_offset,
+    my_rank_send_sz,
+    cudaMemcpyDeviceToDevice,
+    stream
+  ));
   // CUDACHECK(cudaStreamSynchronize(stream1));
   return NVSHMEMX_SUCCESS;
 }

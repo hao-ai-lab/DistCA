@@ -16,14 +16,30 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
-set(CMAKE_PREFIX_PATH /mnt/weka/home/yonghao.zhuang/miniconda3/envs/attn/lib/python3.12/site-packages/torch/share/cmake)
+
+
+execute_process(
+    COMMAND python -c "import torch; print(torch.utils.cmake_prefix_path)"
+    OUTPUT_VARIABLE TORCH_CMAKE_PREFIX_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if(EXISTS "${TORCH_CMAKE_PREFIX_PATH}")
+    set(CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX_PATH}")
+else()
+    set(CMAKE_PREFIX_PATH "/mnt/weka/home/yonghao.zhuang/miniconda3/envs/attn/lib/python3.12/site-packages/torch/share/cmake")
+endif()
 
 # Dependencies
 include(FetchContent)
 find_package(CUDAToolkit REQUIRED)
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(Torch REQUIRED)
-find_package(NVSHMEM REQUIRED HINTS /mnt/sharefs/software/DeepEP/nvshmem/lib)
+if(DEFINED ENV{NVSHMEM_PREFIX} AND EXISTS "$ENV{NVSHMEM_PREFIX}/lib")
+    find_package(NVSHMEM REQUIRED HINTS $ENV{NVSHMEM_PREFIX}/lib)
+else()
+    find_package(NVSHMEM REQUIRED HINTS /mnt/sharefs/software/DeepEP/nvshmem/lib)
+endif()
 
 # Created imported target for PyTorch
 add_library(torch_imported INTERFACE)
@@ -44,17 +60,6 @@ function(set_cuda_compile_options target)
 endfunction()
 
 # Add CUDA kernel library
-add_library(dispatch_kernels STATIC
-    core/in_place_attn_switch.cu
-)
-target_link_libraries(dispatch_kernels PUBLIC
-    CUDA::cudart
-)
-target_link_libraries(dispatch_kernels PUBLIC
-    nvshmem::nvshmem_device
-    nvshmem::nvshmem_host
-)
-set_cuda_compile_options(dispatch_kernels)
 
 add_library(fast_a2a_kernels STATIC
     core/fastalltoall.cu
@@ -75,7 +80,6 @@ add_library(as_comm SHARED
     bindings/all_to_all.cpp
 )
 target_link_libraries(as_comm PUBLIC
-    dispatch_kernels
     fast_a2a_kernels
     torch::py_limited
     Python::Module

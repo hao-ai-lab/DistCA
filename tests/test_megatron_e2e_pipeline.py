@@ -20,15 +20,15 @@ from d2.runtime.inplace_metadata import (
 )
 from d2.runtime.megatron_patch.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
 
-from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch
-from test_megatron_utils import (
+from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch, create_qkv_dispath_with_backward
+from megatron_test_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
 )
 
 
-def set_random_seed(seed):
+def set_random_seed(seed, set_megatron: bool=True):
     """Set worker side random seed."""
     import random
 
@@ -38,7 +38,7 @@ def set_random_seed(seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    if get_torch_device().device_count() > 0:
+    if get_torch_device().device_count() > 0 and set_megatron:
         from megatron.core import tensor_parallel
 
         tensor_parallel.model_parallel_cuda_manual_seed(seed)
@@ -63,14 +63,14 @@ class MegatronE2eWorker(MegatronBaseWorker):
 
     def init_comm(self, *args, **kwargs):
         super().init_comm(*args, **kwargs)
-        set_random_seed(42)
 
     def set_config(self, dtype=torch.bfloat16, enable_gradient_checkpointing=False, gradient_checkpointing_kwargs={}):
         self.dtype = dtype
         self.enable_gradient_checkpointing = enable_gradient_checkpointing
         self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
 
-    def init(self, model_path):
+    def init(self, model_path, seed=42):
+        set_random_seed(seed)
         self.model_path = model_path
         override_model_config = OmegaConf.create()
         override_transformer_config = OmegaConf.create()
@@ -279,7 +279,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
 
 def init_megatron_e2e_test(
     hidden_size_q: int, hidden_size_kv: int, num_tokens: int,
-    world_size: int, max_cp_degree: int, tp_size: int,
+    world_size: int, max_cp_degree: int, tp_size: int, pp_size: int,
     dtype, worker_cls=MegatronE2eWorker
 ):
     token_bytes_q = hidden_size_q * dtype.itemsize
@@ -291,7 +291,8 @@ def init_megatron_e2e_test(
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     )
     parallel_config = ParallelConfig(
-        tensor_model_parallel_size=tp_size
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
     )
     worker = init_worker_torch_distributed(
         world_size, buffer_size, worker_cls, parallel_config
@@ -306,6 +307,7 @@ def test(args):
     max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
     tp_size = args.tp_size
+    pp_size = args.pp_size
     world_size = args.num_nodes * args.num_gpus_per_node
     total_seq_len = args.num_tokens
 
@@ -323,100 +325,82 @@ def test(args):
 
     worker: MegatronE2eWorker = init_megatron_e2e_test(
         hidden_size_q, hidden_size_kv, num_tokens,
-        world_size, max_cp_degree, tp_size,
+        world_size, max_cp_degree, tp_size, pp_size,
         dtype, MegatronE2eWorker
     )
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
-    rank = worker.rank
-    worker.set_config()
-    worker.init(model_path)
-    print("=" * 20 + "model init done")
+    # set again to potentially adapt to the ray launch case.
+    set_random_seed(seed, set_megatron=False)
 
-    seq_len = args.num_tokens
-    refs = []
-    # easiest case: all sequences run attention locally.
+    rank = as_rank = worker.as_rank
+    as_world_size = worker.as_world_size
+
+    hidden_size_q_tp = hidden_size_q // tp_size
+    hidden_size_k_tp = hidden_size_kv // tp_size
+
     (
-        fwd_q_metadata_0, rev_q_metadata_0,
-        fwd_kv_metadata_0, rev_kv_metadata_0,
-    ) = inplace_metadata.test_local_proj_metadata(world_size, seq_len, 0)
-    # (
-    #     fwd_q_metadata_0, rev_q_metadata_0,
-    #     fwd_kv_metadata_0, rev_kv_metadata_0,
-    #     sp_kv_dst_0, sp_seq_lens_0, sp_query_dst_0, cp_dst_kv_len_0, seq_lens_0,
-    # ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
-    # (
-    #     fwd_q_metadata_1, rev_q_metadata_1,
-    #     fwd_kv_metadata_1, rev_kv_metadata_1,
-    #     sp_kv_dst_1, sp_seq_lens_1, sp_query_dst_1, cp_dst_kv_len_1, seq_lens_1,
-    # ) = create_testcase_qkv(seed, world_size, num_tokens, max_cp_degree, num_seqs)
-    # (cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0) = compute_attn_layout_seqlens(
-    #     sp_seq_lens_0, cp_dst_kv_len_0, sp_query_dst_0
-    # )
-    # (cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1) = compute_attn_layout_seqlens(
-    #     sp_seq_lens_1, cp_dst_kv_len_1, sp_query_dst_1
-    # )
-    input_ids = torch.randint(0, 1024, (world_size, seq_len * 1))
-    position_ids = torch.arange(seq_len).repeat(world_size, 2)
-    input_ids_local = input_ids[rank]
-    position_ids_local = position_ids[rank]
-    fwd_q_metadata_0_local = fwd_q_metadata_0.get_slice(rank)
-    rev_q_metadata_0_local = rev_q_metadata_0.get_slice(rank)
-    fwd_kv_metadata_0_local = fwd_kv_metadata_0.get_slice(rank)
-    rev_kv_metadata_0_local = rev_kv_metadata_0.get_slice(rank)
-    # fwd_q_metadata_1_local = fwd_q_metadata_1.get_slice(rank)
-    # rev_q_metadata_1_local = rev_q_metadata_1.get_slice(rank)
-    # fwd_kv_metadata_1_local = fwd_kv_metadata_1.get_slice(rank)
-    # rev_kv_metadata_1_local = rev_kv_metadata_1.get_slice(rank)
-    # (cu_seqlens_q_0, cu_seqlens_kv_0, max_seqlen_q_0, max_seqlen_kv_0, num_seq_0) = get_seqlen_shard(
-    #     cu_seqlens_q_pp_0, cu_seqlens_kv_pp_0, max_seqlen_q_pp_0, max_seqlen_kv_pp_0, num_local_seqs_recv_pp_0, rank
-    # )
-    # print(cu_seqlens_q_0.shape, cu_seqlens_kv_0.shape, max_seqlen_q_0.shape, max_seqlen_kv_0.shape)
-    cu_seqlens_q_0 = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
-    cu_seqlens_kv_0 = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
-    max_seqlen_q_0 = torch.tensor(seq_len, dtype=torch.int32)
-    max_seqlen_kv_0 = torch.tensor(seq_len, dtype=torch.int32)
-    # (cu_seqlens_q_1, cu_seqlens_kv_1, max_seqlen_q_1, max_seqlen_kv_1, num_seq_1) = get_seqlen_shard(
-    #     cu_seqlens_q_pp_1, cu_seqlens_kv_pp_1, max_seqlen_q_pp_1, max_seqlen_kv_pp_1, num_local_seqs_recv_pp_1, rank
-    # )
-    packed_seq_params_stage_0 = PingPangSingleStepPackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_q_0,
-        cu_seqlens_kv=cu_seqlens_kv_0,
-        max_seqlen_q=max_seqlen_q_0,
-        max_seqlen_kv=max_seqlen_kv_0,
-        mlp_to_attn_metadata=fwd_q_metadata_0_local,
-        attn_to_mlp_metadata=rev_q_metadata_0_local,
-        mlp_to_attn_kv_metadata=fwd_kv_metadata_0_local,
-        mlp_to_attn_kv_grad_metadata=rev_kv_metadata_0_local,
+        # fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+        # attention_metadata_attn_layout, intermediates, seq_lens
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
+        fa_fwd_params, fa_bwd_params,
+        qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
+        attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
+        seq_lens,
+    ) = create_qkv_dispath_with_backward(
+        world_size, total_seq_len, num_seqs, max_cp_degree,
+        hidden_size_q_tp, hidden_size_k_tp, element_size, hf_config.num_attention_heads * torch.float32.itemsize // element_size,
+        return_mlp_no_shard_seq_lens=True
     )
-    # packed_seq_params_stage_1 = PingPangSingleStepPackedSeqParams(
-    #     qkv_format="thd",
-    #     cu_seqlens_q=cu_seqlens_q_1,
-    #     cu_seqlens_kv=cu_seqlens_kv_1,
-    #     max_seqlen_q=max_seqlen_q_1,
-    #     max_seqlen_kv=max_seqlen_kv_1,
-    #     mlp_to_attn_metadata=fwd_q_metadata_1_local,
-    #     attn_to_mlp_metadata=rev_q_metadata_1_local,
-    #     mlp_to_attn_kv_metadata=fwd_kv_metadata_1_local,
-    #     mlp_to_attn_kv_grad_metadata=rev_kv_metadata_1_local,
+
+    set_random_seed(seed, set_megatron=False)
+    input_ids = torch.randint(0, 100, (as_world_size, total_seq_len))
+    position_ids = torch.arange(total_seq_len).repeat(as_world_size, 1)
+    input_ids_local = input_ids[as_rank]
+    position_ids_local = position_ids[as_rank]
+    (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_bwd_params
+    bwd_packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_q[rank],
+        cu_seqlens_kv=cu_seqlens_kv[rank],
+        max_seqlen_q=max_seqlen_q[rank],
+        max_seqlen_kv=max_seqlen_kv[rank],
+    )
+    (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_fwd_params
+
+    ping_pang_params = PingPangSingleStepPackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_q[rank],
+        cu_seqlens_kv=cu_seqlens_kv[rank],
+        max_seqlen_q=max_seqlen_q[rank],
+        max_seqlen_kv=max_seqlen_kv[rank],
+        qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(rank),
+        qkv_bwd_metadata=qkv_bwd_fa2a_metadata.get_slice(rank),
+        attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
+        attn_out_bwd_metadata=attn_out_qkv_bwd_fa2a_metadata.get_slice(rank),
+        bwd_packed_seq_params=bwd_packed_seq_params,
+    )
+    # ping_pang_params_0 = get_single_step_packed_seq_params(
+    #     fa2a_metadata_0, attn_metadata_0, as_rank
     # )
+    # ping_pang_params_1 = get_single_step_packed_seq_params(
+    #     fa2a_metadata_1, attn_metadata_1, as_rank
+    # )
+
     # NOTE: we don't consider that seq_lens var has padding because our data generation
     # guarantees so. However, in practice, this is not true.
-    mlp_seq_params_0 = mlp_layout_packed_params(torch.tensor([seq_len], dtype=torch.int32))
-    # mlp_seq_params_0 = mlp_layout_packed_params(seq_lens_0[rank])
-    # mlp_seq_params_1 = mlp_layout_packed_params(seq_lens_1[rank])
-    # packed_seq_params = PingPangPackedSeqParams(
-    #     seq_params=[packed_seq_params_stage_0, packed_seq_params_stage_1],
+    # mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
+    # mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
+    # ping_pang_params = PingPangPackedSeqParams(
+    #     seq_params=[ping_pang_params_0, ping_pang_params_1],
     #     mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
-    #     debug=False, do_gather=False,
-    #     max_seqlen_q=torch.tensor([seq_len * 2], dtype=torch.int32)[0],
-    #     max_seqlen_kv=torch.tensor([seq_len * 2], dtype=torch.int32)[0],
+    #     max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+    #     max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+    #     qkv_format="thd",
     # )
     microbatch = {
         "input_ids": input_ids_local,
         "position_ids": position_ids_local,
-        "packed_seq_params": packed_seq_params_stage_0,
+        "packed_seq_params": ping_pang_params,
     }
     # print(rank, microbatch["packed_seq_params"])
     microbatches = [microbatch, microbatch, microbatch, microbatch]
@@ -425,12 +409,12 @@ def test(args):
         normal_forward_fn=False,
         forward_only=False,
     )
-    microbatches = [microbatch, microbatch, microbatch, microbatch, microbatch, microbatch, microbatch, microbatch]
-    worker.forward_backward_batch(
-        microbatches=microbatches,
-        normal_forward_fn=False,
-        forward_only=False,
-    )
+    # microbatches = [microbatch, microbatch, microbatch, microbatch, microbatch, microbatch, microbatch, microbatch]
+    # worker.forward_backward_batch(
+    #     microbatches=microbatches,
+    #     normal_forward_fn=False,
+    #     forward_only=False,
+    # )
     print("=" * 20 + "forward_backward_batch attention server, done")
 
 
@@ -441,8 +425,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-nodes", type=int, default=1)
-    parser.add_argument("--num-gpus-per-node", type=int, default=4)
+    parser.add_argument("--num-gpus-per-node", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--pp-size", type=int, default=4)
+    parser.add_argument("--pp-size", type=int, default=2)
     args = parser.parse_args()
     test(args)

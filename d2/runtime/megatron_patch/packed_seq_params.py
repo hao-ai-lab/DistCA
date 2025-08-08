@@ -20,6 +20,7 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
     qkv_bwd_metadata: FastAlltoAllMetadata = None
     attn_out_fwd_metadata: FastAlltoAllMetadata = None
     attn_out_bwd_metadata: FastAlltoAllMetadata = None
+    bwd_packed_seq_params: PackedSeqParams = None
     stream: torch.cuda.Stream = None
     dispatcher_id: int = None
 
@@ -36,6 +37,7 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
             qkv_bwd_metadata=self.qkv_bwd_metadata.normalize(),
             attn_out_fwd_metadata=self.attn_out_fwd_metadata.normalize(),
             attn_out_bwd_metadata=self.attn_out_bwd_metadata.normalize(),
+            bwd_packed_seq_params=arg_to_cuda(self.bwd_packed_seq_params),
             stream=self.stream,
             dispatcher_id=self.dispatcher_id,
         )
@@ -57,15 +59,13 @@ class PingPangPackedSeqParams:
     qkv_format: str = "thd"
 
     def to_device(self):
-        # FIXME: this uses the local attention layout value, while it should
-        # be the MLP layout's value. Since Attention layout may have fewer
-        # tokens, this can be wrong.
+
         max_seqlen_q = self.max_seqlen_q
         if max_seqlen_q is None:
-            max_seqlen_q = max([p.max_seqlen_q for p in self.seq_params])
+            max_seqlen_q = max([p.max_seqlen_q for p in self.mlp_layout_seq_params])
         max_seqlen_kv = self.max_seqlen_kv
         if max_seqlen_kv is None:
-            max_seqlen_kv = max([p.max_seqlen_kv for p in self.seq_params])
+            max_seqlen_kv = max([p.max_seqlen_kv for p in self.mlp_layout_seq_params])
         return PingPangPackedSeqParams(
             seq_params=[seq_param.to_device() for seq_param in self.seq_params],
             mlp_layout_seq_params=[
@@ -79,6 +79,8 @@ class PingPangPackedSeqParams:
 
 
 def arg_to_cuda(v):
+    if v is None:
+        return None
     if isinstance(v, torch.Tensor):
         return v.cuda()
     elif isinstance(v, PingPangPackedSeqParams):

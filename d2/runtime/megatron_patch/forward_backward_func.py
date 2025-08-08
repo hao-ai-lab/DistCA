@@ -218,9 +218,9 @@ def forward_backward_pipelining_without_interleaving(
     for i in range(num_warmup_microbatches_including_dummy):
         if i < rank:
             print(f"forward dummy {rank=}, {i=}, {num_warmup_microbatches=}")  
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             print("=====", flush=True)
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             _ = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -251,9 +251,9 @@ def forward_backward_pipelining_without_interleaving(
 
             # print(f'recv forward {recv_tensor_shapes=}, {rank=}, {i=}')
             print(f'forward {rank=}, {i=}, {num_warmup_microbatches=}, {num_microbatches=}')
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             print("=====", flush=True)
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -307,9 +307,9 @@ def forward_backward_pipelining_without_interleaving(
 
         if forward_dummy:
             print(f'forward dummy {rank=}, {i=}, {num_warmup_microbatches=}')
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             print("=====", flush=True)
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             _ = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -326,9 +326,9 @@ def forward_backward_pipelining_without_interleaving(
             )
         else:
             print(f'forward {rank=}, {i=}, {num_warmup_microbatches=}')
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             print("=====", flush=True)
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             last_iteration = i == (num_microbatches_remaining - 1)
 
             # Decide to checkpoint all layers' activations of the current micro-batch
@@ -381,9 +381,9 @@ def forward_backward_pipelining_without_interleaving(
             if backward_dummy:
                 # dummy_backward
                 print(f'backward dummy, {rank=}, {i=}, {num_microbatches_remaining=}')
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
                 print("=====", flush=True)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
                 # get some dummy tensors for now
                 # FIXME: implement a truly dummy backward
                 input_tensor = input_tensors[0]
@@ -396,9 +396,9 @@ def forward_backward_pipelining_without_interleaving(
             else:
                 print(f'backward {send_tensor_shapes=}, {rank=}, {i=}, {num_microbatches_remaining=}')
                 # output_tensor_grad = recv_backward(send_tensor_shapes, config)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
                 print("=====", flush=True)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
 
                 # Pop input_tensor and output_tensor from the start of the list for
                 # the backward pass.
@@ -432,12 +432,14 @@ def forward_backward_pipelining_without_interleaving(
             if parallel_state.is_pipeline_last_stage() or forward_dummy:
                 output_tensor = [None]
             # print(f'send forward backward {rank=}, {i=}, {output_tensor[0] is not None}, {input_tensor_grad[0] is not None}, {rank > 0 and not next_forward_dummy}, {rank < last_rank and not next_backward_dummy}')
+            torch.cuda.nvtx.range_push(f'send forward backward {rank=}, {i=}')
             input_tensor, output_tensor_grad = send_forward_backward_recv_forward_backward(
                 output_tensor, input_tensor_grad,
                 not parallel_state.is_pipeline_first_stage() and not next_forward_dummy,
                 not parallel_state.is_pipeline_last_stage() and not next_backward_dummy,
                 send_tensor_shapes, config
             )
+            torch.cuda.nvtx.range_pop()
         # print(f'finish send forward backward {rank=}, {i=}')
 
 
@@ -449,15 +451,15 @@ def forward_backward_pipelining_without_interleaving(
             if dummy:
                 # dummy_backward
                 print(f'backward dummy, {rank=}, {i=}, {num_microbatches_remaining=}')
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
                 print("=====", flush=True)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
             else:
                 print(f'backward {send_tensor_shapes=}, {rank=}, {i=}, {num_microbatches_remaining=}')
                 # output_tensor_grad = recv_backward(send_tensor_shapes, config)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
                 print("=====", flush=True)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
 
                 # Enable async grad reduction in the last backward pass
                 # Note: If grad sync function is provided, only enable

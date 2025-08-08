@@ -2,32 +2,24 @@ from contextlib import nullcontext
 import functools
 from typing import Any, Dict, List, Optional, Union
 import types
+import warnings
 
 import torch
-import torch.distributed
 from torch import Tensor
 
 from megatron.core import tensor_parallel, parallel_state
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.common.embeddings.rope_utils import (
-    apply_rotary_pos_emb,
-)
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_block import (
     TransformerBlock as MegatronTransformerBlock
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import (
-    TransformerLayer as MegatronTransformerLayer,
-    TransformerLayerSubmodules,
-)
 from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
+from d2.runtime.megatron_patch.fused_comm_attn import FlashAttnArgs, FusedCommAttn, post_a2a_attn_out_with_lse
 from d2.runtime.megatron_patch.base_transformer_layer import TransformerLayer as BaseTransformerLayer
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.stream_sync_fn import TickSync
-from d2.runtime.megatron_patch.fast_dispatch_fn import (
+from d2.runtime.fast_dispatch_fn import (
     all_to_all, post_all2all_layout_transfer, pre_all2all_layout_transfer
 )
 
@@ -82,7 +74,8 @@ class TransformerLayer(BaseTransformerLayer):
         torch.cuda.nvtx.range_push("pre_attn_to_mlp")
         num_heads = self.config.num_attention_heads
         head_dim = self.config.hidden_size // self.config.num_attention_heads
-        attn_out = attn_out.view(attn_out.shape[0], num_heads * head_dim)
+        num_heads_local = num_heads // self.config.tensor_model_parallel_size
+        attn_out = attn_out.view(attn_out.shape[0], num_heads_local * head_dim)
         ####
         signal = pre_all2all_layout_transfer.apply(
             attn_out, None, None,
@@ -100,6 +93,8 @@ class TransformerLayer(BaseTransformerLayer):
     ):
         num_heads = self.config.num_attention_heads
         head_dim = self.config.hidden_size // num_heads
+        tp_size = self.config.tensor_model_parallel_size
+        num_heads_local = num_heads // tp_size
         torch.cuda.nvtx.range_push("post_attn_to_mlp")
         attn_out = post_all2all_layout_transfer.apply(
             signal,
@@ -109,7 +104,7 @@ class TransformerLayer(BaseTransformerLayer):
             False,  # is_qkv
         )
         attn_out = attn_out.reshape(
-            attn_out.shape[0], 1, num_heads * head_dim,
+            attn_out.shape[0], 1, num_heads_local * head_dim,
         ).contiguous()
         torch.cuda.nvtx.range_pop()
         return attn_out
@@ -131,10 +126,11 @@ class TransformerLayer(BaseTransformerLayer):
         num_q_heads = self.config.num_attention_heads
         num_kv_heads = self.config.num_query_groups or self.config.num_attention_heads
         head_dim = self.config.hidden_size // num_q_heads
+        tp_size = self.config.tensor_model_parallel_size
         # TODO: write memcpy to nvshmem buffer kernel with stride support.
-        query = query.reshape(query.shape[0], num_q_heads * head_dim)
-        key = key.reshape(key.shape[0], num_kv_heads * head_dim)
-        value = value.reshape(value.shape[0], num_kv_heads * head_dim)
+        query = query.reshape(query.shape[0], num_q_heads * head_dim // tp_size)
+        key = key.reshape(key.shape[0], num_kv_heads * head_dim // tp_size)
+        value = value.reshape(value.shape[0], num_kv_heads * head_dim // tp_size)
         ####
         signal = pre_all2all_layout_transfer.apply(
             query, key, value,
@@ -154,6 +150,10 @@ class TransformerLayer(BaseTransformerLayer):
         num_q_heads = self.config.num_attention_heads
         num_kv_heads = self.config.num_query_groups or self.config.num_attention_heads
         head_dim = self.config.hidden_size // num_q_heads
+
+        tp_size = self.config.tensor_model_parallel_size
+        num_q_heads_local = num_q_heads // tp_size
+        num_kv_heads_local = num_kv_heads // tp_size
         torch.cuda.nvtx.range_push("post_mlp_to_attn")
         query, key, value = post_all2all_layout_transfer.apply(
             signal,
@@ -162,9 +162,9 @@ class TransformerLayer(BaseTransformerLayer):
             packed_seq_params.dispatcher_id,
             True,  # is_qkv
         )
-        query = query.view(query.shape[0], num_q_heads, head_dim).contiguous()
-        key = key.view(key.shape[0], num_kv_heads, head_dim).contiguous()
-        value = value.view(value.shape[0], num_kv_heads, head_dim).contiguous()
+        query = query.view(query.shape[0], num_q_heads_local, head_dim).contiguous()
+        key = key.view(key.shape[0], num_kv_heads_local, head_dim).contiguous()
+        value = value.view(value.shape[0], num_kv_heads_local, head_dim).contiguous()
         torch.cuda.nvtx.range_pop()
         return query, key, value
 
@@ -249,8 +249,9 @@ class TransformerLayer(BaseTransformerLayer):
             rotary_pos_cos_0, rotary_pos_sin_0, attention_bias_0, sequence_len_offset_0) = args_0
         (hidden_states_1, attention_mask_1, context_1, context_mask_1, rotary_pos_emb_1,
             rotary_pos_cos_1, rotary_pos_sin_1, attention_bias_1, sequence_len_offset_1) = args_1
-        # TODO: confirm this is equal to the stream of packed_seq_params_1
+
         comm_stream = packed_seq_params_0.stream
+        assert comm_stream.stream_id == packed_seq_params_1.stream.stream_id
 
         # 2. pre-self-attention forward microbatch 0.
         ## compute,0
@@ -417,11 +418,12 @@ class TransformerLayer(BaseTransformerLayer):
         assert context_mask is None, "cross-attention not supported yet"
 
         setattr(packed_seq_params, "stream", torch.cuda.current_stream())
+        backward_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
 
-        # FIXME: support RoPE
-        # TODO: double check: this seems supported unless inference_context is not None.
-        # assert rotary_pos_emb is None, "RoPE needs the MLP layout packed seq params."
-        rotary_pos_emb = None
+        # FIXME: support RoPE in this test.
+        if rotary_pos_emb is not None:
+            rotary_pos_emb = None
+            warnings.warn("ZYHowell says I just put a warning here. You need to calculate rotary_pos_emb somewhere else.")
         query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
             hidden_states,
             rotary_pos_emb,
@@ -430,28 +432,58 @@ class TransformerLayer(BaseTransformerLayer):
             packed_seq_params,
             sequence_len_offset,
         )
-        # debug_tensors = [(query, key, value),]
+        debug_tensors = [(query, key, value),]
 
         signal = self._pre_mlp_to_attn(query, key, value, packed_seq_params)
         signal = self._all_to_all(signal, packed_seq_params, is_qkv=True)
-        query, key, value = self._post_mlp_to_attn(signal, packed_seq_params)
-        # debug_tensors.append((query, key, value))
 
-        core_attn_out = self._forward_core_attn(
-            query,
-            key,
-            value,
-            attention_mask,
-            attention_bias,
-            attn_mask_type,
-            packed_seq_params,
-        )
-        # debug_tensors.append(core_attn_out)
+        if backward_resend_qkv:
+            signal = FusedCommAttn.apply(
+                signal,
+                packed_seq_params.qkv_fwd_metadata,
+                packed_seq_params.qkv_bwd_metadata,
+                packed_seq_params.attn_out_fwd_metadata,
+                packed_seq_params.attn_out_bwd_metadata,
+                packed_seq_params,
+                packed_seq_params.bwd_packed_seq_params,
+                packed_seq_params.dispatcher_id,
+                FlashAttnArgs(
+                    num_heads_q=self.config.num_attention_heads // self.config.tensor_model_parallel_size,
+                    num_heads_kv=self.config.num_query_groups // self.config.tensor_model_parallel_size,
+                    head_dim=self.config.hidden_size // self.config.num_attention_heads,
+                    return_attn_probs=True,
+                ),
+            )
+        else:
+            query, key, value = self._post_mlp_to_attn(signal, packed_seq_params)
+            debug_tensors.append((query, key, value))
 
-        signal = self._pre_attn_to_mlp(core_attn_out, packed_seq_params)
+            core_attn_out = self._forward_core_attn(
+                query,
+                key,
+                value,
+                attention_mask,
+                attention_bias,
+                attn_mask_type,
+                packed_seq_params,
+            )
+            debug_tensors.append(core_attn_out)
+
+            signal = self._pre_attn_to_mlp(core_attn_out, packed_seq_params)
+
         signal = self._all_to_all(signal, packed_seq_params, is_qkv=False)
-        core_attn_out = self._post_attn_to_mlp(signal, packed_seq_params)
-        # debug_tensors.append(core_attn_out)
+
+        if backward_resend_qkv:
+            core_attn_out = post_a2a_attn_out_with_lse.apply(
+                signal, query, key, value,
+                self.config.num_attention_heads // self.config.tensor_model_parallel_size,
+                packed_seq_params.attn_out_fwd_metadata,
+                packed_seq_params.attn_out_bwd_metadata,
+                packed_seq_params.dispatcher_id,
+            )
+        else:
+            core_attn_out = self._post_attn_to_mlp(signal, packed_seq_params)
+        debug_tensors.append(core_attn_out)
 
         mlp_output, context = self._forward_post_core_attn(
             core_attn_out,
@@ -468,7 +500,7 @@ class TransformerLayer(BaseTransformerLayer):
 
 def add_ping_pang_forward(block: MegatronTransformerBlock):
     def init_ping_pang_communication_ctx(self):
-        self.comm_stream = torch.cuda.Stream()
+        self.comm_stream = torch.cuda.Stream(priority=-1)
         self._ping_pang_debug = True
 
     def ping_pang_forward(

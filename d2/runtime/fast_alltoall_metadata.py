@@ -4,7 +4,10 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from d2.runtime.inplace_metadata import compute_e2e_metadata, exclusive_cumsum, index_put_with_neg_padding_1d, Metadata
+from d2.runtime.attn_kernels.dispatch import size_pad_by_int4
+from d2.runtime.inplace_metadata import (
+    compute_e2e_metadata, exclusive_cumsum, index_put_with_neg_padding_1d, Metadata
+)
 
 _Tensor_Or_Tensor_List = Union[torch.Tensor, Sequence[torch.Tensor]]
 
@@ -40,15 +43,15 @@ class SeqLens:
 
     @staticmethod
     def get_seqlens(
-        fwd_metadata: Metadata, rev_metadata: Metadata
+        fwd_metadata: Metadata, bwd_metadata: Metadata
     ):
         fwd_seq_lens = _get_ragged_seqlen(
             fwd_metadata.seq_len, fwd_metadata.num_seqs
         )
-        rev_seq_lens = _get_ragged_seqlen(
-            rev_metadata.seq_len, rev_metadata.num_seqs
+        bwd_seq_lens = _get_ragged_seqlen(
+            bwd_metadata.seq_len, bwd_metadata.num_seqs
         )
-        return SeqLens(fwd_seq_lens, rev_seq_lens)
+        return SeqLens(fwd_seq_lens, bwd_seq_lens)
 
 
 @dataclass
@@ -476,22 +479,31 @@ def compute_backward_attn_out_a2a_layout_metadata(
 
 def compute_fa2a_metadata_from_logical_metadata(
     fwd_metadata_q: Metadata,
-    rev_metadata_q: Metadata,
+    bwd_metadata_q: Metadata,
     fwd_metadata_kv: Metadata,
-    rev_metadata_kv: Metadata,
+    bwd_metadata_kv: Metadata,
     intermediates,
     mlp_num_tokens: int,
     hidden_size_q: int,
     hidden_size_k: int,
     element_size: int,  # dtype's size
+    qkv_only: bool = False,
+    softmax_lse_size: int = 0,
 ):
     (
         tokens_to_dst_per_dispatch_q, q_seq_to_dst,
         num_received_seqs_q, kv_dst_global_seq_id
     ) = intermediates
 
+    # TODO: we believe there's no padding for qk
+    # which can be wrong in some extreme cases.
     bytes_q = element_size * hidden_size_q
     bytes_k = element_size * hidden_size_k
+    hidden_size_attn_out, _ = size_pad_by_int4(
+        hidden_size_q + softmax_lse_size,
+        element_size,
+    )
+    bytes_attn_out = element_size * hidden_size_attn_out
 
     recver_transfer_sz_q = (
         fwd_metadata_q.num_recv_tokens * bytes_q
@@ -499,14 +511,17 @@ def compute_fa2a_metadata_from_logical_metadata(
     recver_transfer_sz_kv = (
         fwd_metadata_kv.num_recv_tokens * bytes_k
     )[..., :-1]
+    recver_transfer_sz_attn_out = (
+        fwd_metadata_q.num_recv_tokens * bytes_attn_out
+    )[..., :-1]
 
-    num_recv_seqs_q = rev_metadata_q.num_seqs
-    num_recv_seqs_kv = rev_metadata_kv.num_seqs
+    num_recv_seqs_q = bwd_metadata_q.num_seqs
+    num_recv_seqs_kv = bwd_metadata_kv.num_seqs
     num_seqs = fwd_metadata_q.num_seqs
 
-    num_send_tokens_kv = rev_metadata_kv.num_recv_tokens[..., :-1]
-    seqlens = [SeqLens.get_seqlens(fwd_metadata_q, rev_metadata_q),
-               SeqLens.get_seqlens(fwd_metadata_kv, rev_metadata_kv)]
+    num_send_tokens_kv = bwd_metadata_kv.num_recv_tokens[..., :-1]
+    seqlens = [SeqLens.get_seqlens(fwd_metadata_q, bwd_metadata_q),
+               SeqLens.get_seqlens(fwd_metadata_kv, bwd_metadata_kv)]
     tensor_shape = [
         LogicalShape.get_shape(fwd_metadata_q, hidden_size_q, mlp_num_tokens),
         LogicalShape.get_shape(fwd_metadata_kv, hidden_size_k, mlp_num_tokens),
@@ -526,26 +541,30 @@ def compute_fa2a_metadata_from_logical_metadata(
         bytes_q, bytes_k,
         seqlens, tensor_shape, kv_replica_mask,
     )
-    qkv_rev_fa2a_metadata = compute_reverse_a2a_layout_metadata(
+    qkv_bwd_fa2a_metadata = compute_reverse_a2a_layout_metadata(
         qkv_fwd_fa2a_metadata,
     )
 
+    if qkv_only:
+        return (qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata)
     # the backward seqlens of attn out equals that of forward q.
     seqlens = [seqlens[0]]
-    tensor_shape = [tensor_shape[0]]
-    attn_out_rev_fa2a_metadata = compute_backward_attn_out_a2a_layout_metadata(
+    tensor_shape = [
+        LogicalShape.get_shape(fwd_metadata_q, hidden_size_attn_out, mlp_num_tokens),
+    ]
+    attn_out_bwd_fa2a_metadata = compute_backward_attn_out_a2a_layout_metadata(
         tokens_to_dst_per_dispatch_q.squeeze(2), q_seq_to_dst,
-        recver_transfer_sz_q, num_recv_seqs_q, bytes_q,
+        recver_transfer_sz_attn_out, num_recv_seqs_q, bytes_attn_out,
         seq_lens=seqlens, tensor_shape=tensor_shape,
     )
     attn_out_fwd_fa2a_metadata = compute_reverse_a2a_layout_metadata(
-        attn_out_rev_fa2a_metadata,
+        attn_out_bwd_fa2a_metadata,
     )
     fa2a_metadata = (
         qkv_fwd_fa2a_metadata,
-        qkv_rev_fa2a_metadata,
+        qkv_bwd_fa2a_metadata,
         attn_out_fwd_fa2a_metadata,
-        attn_out_rev_fa2a_metadata,
+        attn_out_bwd_fa2a_metadata,
     )
     return fa2a_metadata
 
@@ -562,9 +581,10 @@ def compute_e2e_fa2a_metadata(
     hidden_size_q: int,
     hidden_size_k: int,
     element_size: int,  # dtype's size
+    softmax_lse_size: int = 0,
 ):
     (
-        fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params, intermediates
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv, fa_params, intermediates
     ) = compute_e2e_metadata(
         mlp_seq_len, mlp_num_seqs,
         mlp_q_dispatch,
@@ -577,10 +597,97 @@ def compute_e2e_fa2a_metadata(
     )
     mlp_num_tokens = mlp_seq_len.sum(dim=1).max().item()
     fa2a_metadata = compute_fa2a_metadata_from_logical_metadata(
-        fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv,
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
         intermediates, mlp_num_tokens, hidden_size_q, hidden_size_k,
-        element_size
+        element_size, softmax_lse_size=softmax_lse_size, qkv_only=False,
     )
     return (
-        fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params, fa2a_metadata
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv, fa_params, fa2a_metadata
+    )
+
+
+def compute_backward_resend_qkv_from_logical_metadata(
+    fwd_metadata_q: Metadata,
+    bwd_metadata_q: Metadata,
+    fwd_metadata_kv: Metadata,
+    bwd_metadata_kv: Metadata,
+    intermediates,
+    mlp_num_tokens: int,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    element_size: int,  # dtype's size
+    hidden_size_lse: int,   # The size of the softmax_lse tensor. Should be num_heads.
+):
+    # merged_q has: q, attn_out, attn_out_grad, softmax_lse
+    hidden_size_merged_q = hidden_size_q * 3 + hidden_size_lse
+    padded_hidden_size_q, _ = size_pad_by_int4(hidden_size_merged_q, element_size)
+    # NOTE: we cannot use the bwd metadata generated here, because it's hidden size is wrong.
+    grad_fwd_fa2a_metadata_qkv, _ = compute_fa2a_metadata_from_logical_metadata(
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
+        intermediates, mlp_num_tokens, padded_hidden_size_q, hidden_size_k,
+        element_size, qkv_only=True
+    )
+    _, grad_bwd_fa2a_metadata_qkv = compute_fa2a_metadata_from_logical_metadata(
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
+        intermediates, mlp_num_tokens, hidden_size_q, hidden_size_k,
+        element_size, qkv_only=True
+    )
+    return grad_fwd_fa2a_metadata_qkv, grad_bwd_fa2a_metadata_qkv
+
+
+def forward_backward_with_resend_e2e_metadata(
+    mlp_seq_len: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    mlp_num_seqs: torch.Tensor,
+    # Forward side dispatching order from MLP to ATTN
+    mlp_q_dispatch_fwd: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    mlp_q_dispatch_bwd: torch.Tensor,  # shape of (world_size, max_num_local_seqs)
+    kv_to_q_mapping: torch.Tensor,
+    kv_to_q_rank: torch.Tensor,
+    kv_context_size: torch.Tensor,
+    q_to_num_kv_seq: torch.Tensor,
+    q_to_num_kv_token: torch.Tensor,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    element_size: int,  # dtype's size
+    softmax_lse_size: int,  # size of the softmax_lse tensor, should be num_heads
+):
+    # Step 1: compute forward communication
+    # NOTE: the two bwd_metadata here are actually not in use!
+    (fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
+     fa_fwd_params, fa2a_fwd_metadata) = compute_e2e_fa2a_metadata(
+        mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
+        kv_to_q_mapping, kv_to_q_rank,
+        kv_context_size, q_to_num_kv_seq, q_to_num_kv_token,
+        hidden_size_q, hidden_size_k,
+        element_size, softmax_lse_size
+    )
+    (qkv_fwd_fa2a_metadata, _, attn_out_fwd_fa2a_metadata, _,
+    ) = fa2a_fwd_metadata
+    # Step 2: compute backward communication
+    (attn_out_grad_fwd_metadata_q, attn_out_grad_bwd_metadata_q,
+     attn_out_grad_fwd_metadata_kv, attn_out_grad_bwd_metadata_kv,
+     fa_bwd_params, attn_out_grad_intermediates
+     ) = compute_e2e_metadata(
+        mlp_seq_len, mlp_num_seqs,
+        mlp_q_dispatch_bwd,
+        kv_to_q_mapping,
+        kv_to_q_rank,
+        kv_context_size,
+        q_to_num_kv_seq,
+        q_to_num_kv_token,
+        return_intermediate=True,
+    )
+    mlp_num_tokens=mlp_seq_len.sum(dim=1).max().item()
+    (attn_out_qkv_bwd_fa2a_metadata, qkv_bwd_fa2a_metadata
+     ) = compute_backward_resend_qkv_from_logical_metadata(
+        attn_out_grad_fwd_metadata_q, attn_out_grad_bwd_metadata_q,
+        attn_out_grad_fwd_metadata_kv, attn_out_grad_bwd_metadata_kv,
+        attn_out_grad_intermediates, mlp_num_tokens,
+        hidden_size_q, hidden_size_k, element_size, softmax_lse_size,
+    )
+    return (
+        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
+        fa_fwd_params, fa_bwd_params,
+        qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
+        attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
     )
