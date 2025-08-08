@@ -545,6 +545,8 @@ def compute_e2e_metadata(
 
     max_num_local_seqs = mlp_q_dispatch.shape[1]
     _, q_seq_to_dst, num_received_seqs_q = q_intermediates
+    if q_seq_to_dst.dim() == 4:
+        q_seq_to_dst = q_seq_to_dst.squeeze(2)
     fwd_metadata_kv, rev_metadata_kv, kv_intermediates = compute_metadata_kv(
         kv_to_q_mapping, kv_to_q_rank, kv_context_size,
         q_to_num_kv_seq, q_to_num_kv_token, mlp_seq_len, mlp_num_seqs,

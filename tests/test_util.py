@@ -12,7 +12,10 @@ import torch
 from d2.runtime.attn_kernels.ops import (
     nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, FastDispatcherWrapper
 )
-from d2.runtime.fast_alltoall_metadata import  compute_fa2a_metadata_from_logical_metadata
+from d2.runtime.fast_alltoall_metadata import (
+    compute_fa2a_metadata_from_logical_metadata,
+    forward_backward_with_resend_e2e_metadata,
+)
 from d2.runtime.inplace_metadata import (
     Metadata, compute_attn_layout_seqlens, compute_metadata,
     compute_metadata_kv, exclusive_cumsum
@@ -237,9 +240,9 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
     return seq_len
 
 
-def create_qkv_dispatch(
+def create_raw_qkv_dispatch(
     world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
-    return_intermediate: bool=False, return_mlp_no_shard_seq_lens: bool=False
+    return_mlp_no_shard_seq_lens: bool=False,
 ):
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
     # init sequence
@@ -332,11 +335,57 @@ def create_qkv_dispatch(
         q_to_num_kv_seq[i, :seq_shards] = q_to_num_kv_seq_local
 
     q_to_num_kv_tokens = kv_context_size + cp_seq_lens
+    return (
+        cp_seq_lens, num_cp_shards, cp_query_dst,
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+        q_to_num_kv_seq, q_to_num_kv_tokens,
+        (seq_lens, ) if return_mlp_no_shard_seq_lens else (),
+    )
 
+def create_qkv_dispath_with_backward(
+    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
+    hidden_size_q: int, hidden_size_k: int,
+    element_size: int, # dtype's size
+    softmax_lse_size: int, # size of the softmax_lse tensor, should be num_heads
+    return_mlp_no_shard_seq_lens: bool=False
+):
+    (mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
+     kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+     q_to_num_kv_seq, q_to_num_kv_tokens,
+     seq_lens) = create_raw_qkv_dispatch(
+        world_size, total_seq_len, num_seqs, max_cp_degree,
+        return_mlp_no_shard_seq_lens
+    )
+    mlp_q_dispatch_bwd = torch.randint_like(mlp_q_dispatch_fwd, low=0, high=world_size)
+    mask = torch.arange(mlp_q_dispatch_fwd.shape[1])[None].repeat_interleave(world_size, dim=0) >= mlp_num_seqs.reshape(world_size, 1)
+    mlp_q_dispatch_bwd[mask] = -1
+
+    ret = forward_backward_with_resend_e2e_metadata(
+        mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd, mlp_q_dispatch_bwd,
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+        q_to_num_kv_seq, q_to_num_kv_tokens,
+        hidden_size_q, hidden_size_k, element_size, softmax_lse_size,
+    )
+    ret += seq_lens
+    return ret
+
+
+def create_qkv_dispatch(
+    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
+    return_intermediate: bool=False, return_mlp_no_shard_seq_lens: bool=False
+):
+    (cp_seq_lens, num_cp_shards, cp_query_dst,
+     kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+     q_to_num_kv_seq, q_to_num_kv_tokens,
+     seq_lens) = create_raw_qkv_dispatch(
+        world_size, total_seq_len, num_seqs, max_cp_degree,
+        return_mlp_no_shard_seq_lens
+    )
     fwd_q_metadata, rev_q_metadata, q_intermediates = compute_metadata(
         cp_seq_lens, cp_query_dst, return_intermediate=True
     )
     _, q_seq_to_dst, _ = q_intermediates
+    pad_len = torch.max(num_cp_shards)
     fwd_k_metadata, rev_k_metadata, kv_intermediates = compute_metadata_kv(
         kv_to_q_mapping, kv_to_q_rank, kv_context_size, q_to_num_kv_seq,
         q_to_num_kv_tokens, cp_seq_lens, num_cp_shards, cp_query_dst,
@@ -352,8 +401,7 @@ def create_qkv_dispatch(
     if return_intermediate:
         intermediates = q_intermediates + kv_intermediates
         ret += (intermediates,)
-    if return_mlp_no_shard_seq_lens:
-        ret += (seq_lens,)
+    ret += seq_lens
     return ret
 
 

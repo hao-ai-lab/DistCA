@@ -113,6 +113,10 @@ class MegatronE2eWorker(MegatronBaseWorker):
         })
         self._build_model_optimizer(model_path, optim_config, override_model_config, override_transformer_config)
 
+        assert self.device is not None
+        for module in self.train_module:
+            unwrap_model(module).init_ping_pong_communication_ctx(self.device)
+
     def _init_hf_config_and_tf_config(
         self,
         model_path,
@@ -216,7 +220,9 @@ class MegatronE2eWorker(MegatronBaseWorker):
                 micro_batch_size=1,  # in use for pp = 1
                 forward_only=forward_only,
             )
-        return losses_reduced
+
+        update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        return losses_reduced, grad_norm
 
     def _build_model_optimizer(self,
         model_path, optim_config, override_model_config, override_transformer_config
