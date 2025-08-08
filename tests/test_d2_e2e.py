@@ -5,13 +5,13 @@
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
     --master_addr=fs-mbz-gpu-717 --master_port=29500 test_d2_e2e.py \
-    --num-nodes=2 --num-gpus-per-node=8 --tp-size=4 --num-seq 8 --cp-degree 6
+    --num-nodes=2 --num-gpus-per-node=8 --tp-size=4 --num-seq 8 --cp-degree 6 --total-seq-len 16384
 
 # - Node 1
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
     --master_addr=fs-mbz-gpu-717 --master_port=29500 test_d2_e2e.py \
-    --num-nodes=2 --num-gpus-per-node=8 --tp-size=4 --num-seq 8 --cp-degree 6
+    --num-nodes=2 --num-gpus-per-node=8 --tp-size=4 --num-seq 8 --cp-degree 6 --total-seq-len 16384
 
 """
 import argparse
@@ -285,10 +285,45 @@ from test_util import create_qkv_dispatch_with_custom_mapping
 from d2.runtime.fast_alltoall_metadata import compute_fa2a_metadata_from_logical_metadata
 
 
+from typing import Iterable, List
+from d2.planner.samples import sample_wlbllm_docs_upsample, batch_documents
+
+
+ITERATION_ID = 0
+GLOBAL_BATCH: Iterable[List[int]] = None
+
+K = 1024
+
+def setup_global_batch():
+    global GLOBAL_BATCH
+    if GLOBAL_BATCH is not None:
+        return
+    
+    GLOBAL_BATCH = batch_documents(
+        sample_wlbllm_docs_upsample(
+            size=10000,
+            upsample_long_factor=2,
+            filter_threshold=10000,
+            filter_ratio=0.09,
+        ), max_ctx_length=16 * K
+    )
+    pass
+
+def get_next_batch(dp_size):
+    global GLOBAL_BATCH
+    global ITERATION_ID
+    # get dp_size number of batches 
+    batches = []
+    for _ in range(dp_size):    
+        batches.append(next(GLOBAL_BATCH))
+    ITERATION_ID += 1
+    return batches
+
 def test_create_qkv_dispatch_balanced_flops(
     world_size_, total_seq_len_, num_seqs_, max_cp_degree_, 
     verbose=False, return_intermediate=False, return_mlp_no_shard_seq_lens=False,
 ):
+    setup_global_batch()
     K = 1024
 
     from d2.planner.equal_flops import (
@@ -297,21 +332,34 @@ def test_create_qkv_dispatch_balanced_flops(
         item_to_intermediate_tensors,
     )
 
-    items_list = [
-        [4 * K] * 1,
-        [2 * K] * 2,
-        [1 * K] * 4,
-        [512] * 8,
+    # items_list = [
+    #     [4 * K] * 1,
+    #     [2 * K] * 2,
+    #     [1 * K] * 4,
+    #     [512] * 8,
 
-        [2 * K] * 2,
-        [1 * K] * 4,
-        [512] * 8,
-        [512] * 8,
+    #     [2 * K] * 2,
+    #     [1 * K] * 4,
+    #     [512] * 8,
+    #     [512] * 8,
+    # ]
+    """
+
+    Generate Sample ID=1: [[12786, 3598], [16384], [8866, 785, 2622, 3023, 313, 775], [3782, 344, 4034, 1305, 496, 2001, 4422]]
+    Generate Sample ID=2: [[11855, 4529], [7779, 3201, 3622, 1782], [10681, 5703], [138, 10797, 1055, 4394]]
+
+    """
+
+    items_list = [
+        [16 * K] * 1,
+        [4 * K] * 4,
     ]
     items_list = items_list[:world_size_]
-    
+    # items_list = get_next_batch(world_size_)
+    rich.print(f"Generate Sample ID={ITERATION_ID}: {items_list}")
+
     total_seq_len = max(sum(batch) for batch in items_list)
-    assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = 16K, got {total_seq_len_=}"
+    assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = {total_seq_len_}, got {total_seq_len=}"
 
     items = batch_to_items(items_list)
     items = plan_relocation(items, verbose=False, plot=False)
@@ -319,11 +367,12 @@ def test_create_qkv_dispatch_balanced_flops(
     world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens) = item_to_intermediate_tensors(items)    
 
     world_size = world_info["world_size"]
-    num_seqs = world_info["num_seqs"]
-    max_cp_degree = world_info["max_cp_degree"]
+    # num_seqs = world_info["num_seqs"]
+    # max_cp_degree = world_info["max_cp_degree"]
 
-    assert world_size == world_size_ and num_seqs == num_seqs_ and max_cp_degree == max_cp_degree_, \
-        f"This test forces world_size = {world_size}, num_seqs = {num_seqs}, max_cp_degree = {max_cp_degree}, got {world_size_=}, {num_seqs_=}, {max_cp_degree_=}"
+    assert world_size == world_size_
+    # assert world_size == world_size_ and num_seqs == num_seqs_ and max_cp_degree == max_cp_degree_, \
+    #     f"This test forces world_size = {world_size}, num_seqs = {num_seqs}, max_cp_degree = {max_cp_degree}, got {world_size_=}, {num_seqs_=}, {max_cp_degree_=}"
 
     ret = create_qkv_dispatch_with_custom_mapping(
         world_size, 
@@ -471,7 +520,10 @@ def test(args):
     torch.distributed.barrier()
     if rank == 0:
         print("=" * 20 + "warmup done")
-    for _ in range(1):
+    
+    N = 3
+    start_time = time.time()
+    for _ in range(N):
         print(f"Rank {rank} forward_backward_batch[{_}]: starting")
         ref = worker.forward_backward_batch(
             microbatches=microbatches,
@@ -484,6 +536,11 @@ def test(args):
             print(f"Rank {rank} forward_backward_batch[{_}]: synchronize done")
             torch.distributed.barrier()
             print(f"Rank {rank} forward_backward_batch[{_}]: barrier done")
+    end_time = time.time()
+    duration = end_time - start_time
+    duration_ms = duration * 1000
+    avg_duration_ms = duration_ms / N
+    print(f"Rank {rank} forward_backward_batch: time per iteration = {avg_duration_ms} ms")
 
     torch.cuda.synchronize()
     torch.distributed.barrier()
@@ -494,7 +551,7 @@ def test(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-tokens", type=int, default=4 * 1024)
+    parser.add_argument("--num-tokens", "--total-seq-len", type=int, default=4 * 1024)
     parser.add_argument("--num-seqs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-nodes", type=int, default=1)
