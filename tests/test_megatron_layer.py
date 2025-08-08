@@ -6,6 +6,15 @@ torchrun --nnodes 1 --nproc_per_node 2 test_megatron_layer.py \
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_layer.py \
     --world-size 4 --tp-size 2
+
+# Profile: Node = 2, TP = 8, SeqLen = 16k 
+# (testing 8k does not make comp/comm overlap)
+
+mkdir -p nsys-profile
+
+NVSHMEM_DEBUG=DEBUG NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 nsys profile --force-overwrite=true -o nsys-profile/test_megatron_e2e.n0.t16k.nsys-rep -t cuda,nvtx torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 test_megatron_e2e.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
+
+NVSHMEM_DEBUG=DEBUG NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 nsys profile --force-overwrite=true -o nsys-profile/test_megatron_e2e.n1.t16k.nsys-rep -t cuda,nvtx torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 test_megatron_e2e.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
 """
 
 from typing import Optional
