@@ -9,7 +9,7 @@ instead of 1 batch at a time for this one.
 
 ```bash
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
+torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=<master_addr> \
     --master_port=29500 test_e2e_base.py --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096
 ```
 
@@ -459,8 +459,6 @@ def test(args):
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
-    setup_global_batch(total_seq_len)
-
     model_path = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
     hf_config = AutoConfig.from_pretrained(model_path)
     hidden_size_q = hf_config.hidden_size
@@ -491,13 +489,13 @@ def test(args):
     max_sample_id = 10
     sample_times = []
     for sample_id in range(max_sample_id):
-        
-        _seq_lens = get_next_batch(as_world_size * 2)
-        seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
-
-        total_seq_len_x2 = total_seq_len * 2
-
-        # rich.print(f"[Rank {as_rank}] Sample {sample_id}: seq_lens = {seq_lens}")
+        (
+            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+            attention_metadata_attn_layout, intermediates, seq_lens
+        ) = create_qkv_dispatch(
+            as_world_size, total_seq_len, num_seqs, max_cp_degree,
+            return_intermediate=True, return_mlp_no_shard_seq_lens=True
+        )
 
         # TODO(Refactor): Remove the `as_` part of the dependency.
         # thd layout's hidden size input is "t,1,h"
@@ -505,10 +503,10 @@ def test(args):
         #     (as_world_size, total_seq_len, 1, hidden_size_q), dtype=dtype
         # )
         # tensor_shard = tensors[as_rank]
-        input_ids = torch.randint(100, 10000, (as_world_size, total_seq_len_x2))
+        input_ids = torch.randint(100, 10000, (as_world_size, total_seq_len))
         input_ids_local = input_ids[as_rank]
         # 1. normal forward. Need to provide the PackedSeqParams
-        seq_lens_local = torch.tensor(seq_lens, dtype=torch.int32)
+        seq_lens_local = seq_lens[as_rank][:num_seqs]
         packed_seq_params = mlp_layout_packed_params(seq_lens_local)
         
         position_ids = torch.arange(total_seq_len, dtype=torch.int64).repeat(as_world_size, 2)
@@ -580,7 +578,7 @@ def test(args):
         rich.print(f"🟢 Test Config: ", config)
         rich.print(f"🟢 Test DateTime: ", timestamp)
         for idx in range(len(sample_times)):
-            samples = iterated_samples[idx]
+            samples = iterated_samples[2*idx: 2*idx+2]
             duration = sample_times[idx]
             # total_flops_factor = 
             rich.print(f"🟢 Sample {idx}: {samples}, duration: {duration} ms")
