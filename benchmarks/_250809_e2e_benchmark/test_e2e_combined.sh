@@ -1,6 +1,9 @@
 
 #!/bin/bash
 
+NUM_TOKENS=65536
+NUM_LAYERS=4
+
 # Read hostfile and get current hostname
 HOSTFILE="hostfile"
 CURRENT_HOSTNAME=$(hostname)
@@ -49,17 +52,36 @@ if [ ! -f $FILE_PATH ]; then
     exit 1
 fi
 
+
+TORCHRUN_DISTCONFIG=(
+    --nnodes=$WORLD_SIZE
+    --nproc_per_node=8 
+    --node_rank=$NODE_RANK 
+    --master_addr=$MASTER_ADDR 
+    --master_port=29500
+)
+
+EXEC_CONFIG=(
+    --num-nodes $WORLD_SIZE 
+    --num-gpus-per-node 8 
+    --tp-size 8 
+    --num-tokens $NUM_TOKENS 
+    --num-layers $NUM_LAYERS
+    --max-sample-id 32
+)
+
+
 echo "Running d2 mode"
 
 set -x
-torchrun --nnodes=$WORLD_SIZE --nproc_per_node=8 --node_rank=$NODE_RANK --master_addr=$MASTER_ADDR \
-    --master_port=29500 $FILE_PATH --mode d2 --num-nodes $WORLD_SIZE --num-gpus-per-node 8 --tp-size 8 --num-tokens 16384 --num-layers 4
+# nsys profile -o $this_dir/data/profile.d2.%p.nsys-rep -t cuda,nvtx \
+torchrun ${TORCHRUN_DISTCONFIG[@]} $FILE_PATH ${EXEC_CONFIG[@]} --mode d2 
 set +x
 sleep 5
 
 echo "Running baseline mode"
 
 set -x
-torchrun --nnodes=$WORLD_SIZE --nproc_per_node=8 --node_rank=$NODE_RANK --master_addr=$MASTER_ADDR \
-    --master_port=29500 $FILE_PATH --mode baseline --num-nodes $WORLD_SIZE --num-gpus-per-node 8 --tp-size 8 --num-tokens 16384 --num-layers 4
+# nsys profile -o $this_dir/data/profile.baseline.%p.nsys-rep -t cuda,nvtx \
+torchrun ${TORCHRUN_DISTCONFIG[@]} $FILE_PATH ${EXEC_CONFIG[@]} --mode baseline
 set +x

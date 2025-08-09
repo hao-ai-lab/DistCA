@@ -681,7 +681,7 @@ def test(args):
         now_ts = datetime.now(pst).strftime("%Y%m%d_%H%M%S")
         
         rich.print(f"🟢 Test {__file__} passed")
-        dp_size = world_size // tp_size
+        dp_size = as_world_size
         config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers)
         rich.print(f"🟢 Test Config: ", config)
         rich.print(f"🟢 Test DateTime: ", timestamp)
