@@ -1,5 +1,5 @@
 """
-Megatron E2E Base Test. 
+Megatron E2E Test. 
 
 Note: You should use `test_e2e_baseline.py` for testing. 
 For testing, we want to forward x2 batches at a time, 
@@ -10,7 +10,7 @@ instead of 1 batch at a time for this one.
 ```bash
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
-    --master_port=29500 test_e2e_base.py --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096
+    --master_port=29500 test_e2e_baseline.py --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096
 ```
 
 # Benchmark
@@ -20,11 +20,11 @@ torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
 
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
+    test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
 
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
+    test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
 
 ```
 
@@ -33,12 +33,12 @@ torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr>
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
     torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-        test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 65536
+        test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 65536
 
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
     torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-        test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 65536
+        test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 65536
 ```
 
 # ⚪ Not Tested: Node = 2, TP = 8, CPDP = 2, SeqLen = 96k, num_layers = 4
@@ -46,12 +46,12 @@ NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
     torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-        test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 98304
+        test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 98304
 
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
     torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-        test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 98304
+        test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 98304
 ```
 
 
@@ -60,12 +60,12 @@ NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
     torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=fs-mbz-gpu-463 --master_port=29500 \
-        test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 131072
+        test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 131072
 
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
     torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=fs-mbz-gpu-463 --master_port=29500 \
-        test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 131072
+        test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 131072
 ```
 
 # Profile: 
@@ -79,12 +79,12 @@ mkdir -p nsys-profile
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 nsys profile --force-overwrite=true -o nsys-profile/test_d2_e2e.n0.t16k.nsys-rep -t cuda,nvtx \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
+    test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
 
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 nsys profile --force-overwrite=true -o nsys-profile/test_d2_e2e.n1.t16k.nsys-rep -t cuda,nvtx \
 torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_base.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
+    test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
 ```
 """
 
