@@ -357,9 +357,37 @@ def _get_base_transformer_config(
     return base_config
 
 
+def _override_hf_config_num_layers_with_env_var(hf_config: PretrainedConfig):
+    # TODO:(Refactor) Override the number of layers in the HuggingFace config based on environment variable.
+    # This is a temporary workaround to modify the number of layers for testing purposes.
+    # Note: There appears to be an issue with the override config mechanism not properly
+    # updating the HF config in some cases.
+    
+    import rich
+    import os
+    num_layers = os.environ.get("NUM_LAYERS", None)
+    
+    if num_layers is not None:
+        num_layers = int(num_layers)
+        if hasattr(hf_config, 'num_hidden_layers'):
+            hf_config.num_hidden_layers = num_layers
+        elif hasattr(hf_config, 'num_layers'):
+            hf_config.num_layers = num_layers
+        elif hasattr(hf_config, 'n_layer'):
+            hf_config.n_layer = num_layers
+        else:
+            # Fallback - try to set the most common attribute name
+            hf_config.num_hidden_layers = num_layers
+        rich.print(f"Override HF Config: Set number of layers: {num_layers}. Now HF Config: ", str(hf_config))
+    return hf_config
+    
+
 def hf_to_mcore_config_dense(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
+    
+    hf_config = _override_hf_config_num_layers_with_env_var(hf_config)
+
     # for LlamaForCausalLM or Qwen2ForCausalLM
     qkv_bias = True if "Qwen2ForCausalLM" in hf_config.architectures else getattr(hf_config, "attention_bias", False)
     qk_layernorm = True if "Qwen3ForCausalLM" in hf_config.architectures else False
@@ -374,7 +402,6 @@ def hf_to_mcore_config_dense(
     )
     # override_transformer_config_kwargs as kwargs shall never be none
     args.update(override_transformer_config_kwargs)
-    print(f"Overridden TF init config: {args}")
     return TransformerConfig(**args)
 
 
