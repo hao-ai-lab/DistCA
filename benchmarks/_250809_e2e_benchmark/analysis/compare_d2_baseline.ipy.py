@@ -53,9 +53,16 @@ speedup_perc = [100 * (baseline_duration_ms[i] - d2_duration_ms[i]) / baseline_d
 # %%
 import matplotlib.pyplot as plt
 
-sorted_speedup = sorted(speedup)
-plt.plot(sorted_speedup, label="Speedup")
-plt.legend()
+plt.rcParams.update({'font.size': 14})
+
+sorted_speedup_perc = sorted(speedup_perc)
+plt.plot(sorted_speedup_perc, label="Speedup")
+plt.title("Llama 8B (nlayer=4) Seq 64K DP2TP8 - speedup", fontsize=16)
+plt.ylabel("Speedup % = (baseline - d2) / baseline", fontsize=14)
+plt.xlabel("sample (sorted by speedup_perc)", fontsize=14)
+
+
+plt.legend(fontsize=12)
 plt.show()
 
 # %%

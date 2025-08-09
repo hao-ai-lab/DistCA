@@ -333,7 +333,10 @@ K = 1024
 # TODO(Refactor): Remove this global variable.
 iterated_samples = []
 
-def setup_global_batch(total_seq_len):
+def setup_global_batch(
+    total_seq_len, 
+    up_sample_factor=2,
+):
     global GLOBAL_BATCH
     if GLOBAL_BATCH is not None:
         return
@@ -341,7 +344,7 @@ def setup_global_batch(total_seq_len):
     GLOBAL_BATCH = batch_documents(
         sample_wlbllm_docs_upsample(
             size=10000,
-            upsample_long_factor=2,
+            upsample_long_factor=up_sample_factor,
             filter_threshold=10000,
             filter_ratio=0.09,
         ), max_ctx_length=total_seq_len
@@ -418,7 +421,6 @@ def test_create_qkv_dispatch_balanced_flops(
     world_size_, total_seq_len_, seq_lens, max_cp_degree_, 
     verbose=False, return_intermediate=False, return_mlp_no_shard_seq_lens=False,
 ):
-    setup_global_batch(total_seq_len_)
     K = 1024
 
     from d2.planner.equal_flops import (
@@ -506,6 +508,7 @@ def test(args):
     num_layers = args.num_layers
     model_path = args.model_path
     max_sample_id = args.max_sample_id
+    up_sample_factor = args.up_sample_factor
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
@@ -517,7 +520,7 @@ def test(args):
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
-    setup_global_batch(total_seq_len)
+    setup_global_batch(total_seq_len, up_sample_factor)
 
     hf_config = AutoConfig.from_pretrained(model_path)
     hidden_size_q = hf_config.hidden_size
@@ -682,7 +685,7 @@ def test(args):
         
         rich.print(f"🟢 Test {__file__} passed")
         dp_size = as_world_size
-        config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers)
+        config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, max_sample_id=max_sample_id, up_sample_factor=up_sample_factor)
         rich.print(f"🟢 Test Config: ", config)
         rich.print(f"🟢 Test DateTime: ", timestamp)
         
@@ -769,5 +772,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-layers", type=int, default=None)
     parser.add_argument("--model-path", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
     parser.add_argument("--max-sample-id", type=int, default=10)
+    parser.add_argument("--up-sample-factor", type=int, default=2)
     args = parser.parse_args()
     test(args)
