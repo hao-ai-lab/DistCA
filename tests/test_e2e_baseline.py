@@ -1,7 +1,15 @@
 """
+# Debug
+
+```bash
+NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=<master_addr> \
+    --master_port=29500 test_e2e_baseline.py --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096
+```
+
 # Benchmark
 
-# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 16k 
+# ⚪ Not Tested: Node = 2, TP = 8, CPDP = 2, SeqLen = 16k 
 ```bash
 
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
@@ -14,7 +22,7 @@ torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr>
 
 ```
 
-# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 64k, num_layers = 4
+# ⚪ Not Tested: Node = 2, TP = 8, CPDP = 2, SeqLen = 64k, num_layers = 4
 ```bash
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
@@ -27,7 +35,7 @@ NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
         test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 65536
 ```
 
-# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 96k, num_layers = 4
+# ⚪ Not Tested: Node = 2, TP = 8, CPDP = 2, SeqLen = 96k, num_layers = 4
 ```bash
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
@@ -41,7 +49,7 @@ NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 ```
 
 
-# 🔴 Failed: Node = 2, TP = 8, CPDP = 2, SeqLen = 128k, num_layers = 4
+# ⚪ Not Tested: Node = 2, TP = 8, CPDP = 2, SeqLen = 128k, num_layers = 4
 ```bash
 NUM_LAYERS=4 \
 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
@@ -87,7 +95,7 @@ NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 
 # Profile: 
 
-# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 16k 
+# ⚪ Not Tested: Node = 2, TP = 8, CPDP = 2, SeqLen = 16k 
 #   (testing 8k does not make comp/comm overlap)
 ```bash
 mkdir -p nsys-profile
@@ -104,6 +112,7 @@ torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr>
     test_e2e_baseline.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384
 ```
 """
+
 import time
 import rich
 import argparse
@@ -376,13 +385,8 @@ def init_megatron_e2e_test(
     return worker
 
 
-from test_util import create_qkv_dispatch_with_custom_mapping
-from d2.runtime.fast_alltoall_metadata import compute_fa2a_metadata_from_logical_metadata
-
-
 from typing import Iterable, List, Optional
 from d2.simulator.optimizers.samples import sample_wlbllm_docs_upsample, batch_documents
-
 
 ITERATION_ID = 0
 GLOBAL_BATCH: Optional[Iterable[List[int]]] = None
@@ -406,6 +410,7 @@ def setup_global_batch(total_seq_len):
     )
     return
 
+
 def get_next_batch(dp_size):
     global GLOBAL_BATCH
     global ITERATION_ID
@@ -419,84 +424,51 @@ def get_next_batch(dp_size):
     return batches
 
 
-def test_create_qkv_dispatch_balanced_flops(
-    world_size_, total_seq_len_, num_seqs_, max_cp_degree_, 
-    verbose=False, return_intermediate=False, return_mlp_no_shard_seq_lens=False,
+from test_util import (
+    create_raw_qkv_dispatch,
+)
+
+from d2.runtime.inplace_metadata import (
+    compute_metadata,
+    compute_metadata_kv,
+    compute_attn_layout_seqlens,
+)
+
+
+def create_qkv_dispatch(
+    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
+    return_intermediate: bool=False, return_mlp_no_shard_seq_lens: bool=False
 ):
-    setup_global_batch(total_seq_len_)
-    K = 1024
-
-    from d2.planner.equal_flops import (
-        batch_to_items, 
-        plan_relocation,
-        item_to_intermediate_tensors,
+    (cp_seq_lens, num_cp_shards, cp_query_dst,
+     kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+     q_to_num_kv_seq, q_to_num_kv_tokens,
+     seq_lens) = create_raw_qkv_dispatch(
+        world_size, total_seq_len, num_seqs, max_cp_degree,
+        return_mlp_no_shard_seq_lens
     )
-
-    items_list = get_next_batch(world_size_)
-    
-    rank = torch.distributed.get_rank()
-    if rank == 0:
-        rich.print(f"Generate Sample ID={ITERATION_ID}: {items_list}")
-
-    total_seq_len = max(sum(batch) for batch in items_list)
-    assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = {total_seq_len_}, got {total_seq_len=}"
-
-    items = batch_to_items(items_list)
-    items = plan_relocation(items, verbose=False, plot=False)
-
-    world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens) = item_to_intermediate_tensors(items)    
-
-    world_size = world_info["world_size"]
-
-    assert world_size == world_size_
-
-    ret = create_qkv_dispatch_with_custom_mapping(
-        world_size, 
-        seq_lens,
-        cp_num,
-        cp_dst,
-        seq_shard_lens,
-        verbose=verbose, return_intermediate=return_intermediate,
+    fwd_q_metadata, rev_q_metadata, q_intermediates = compute_metadata(
+        cp_seq_lens, cp_query_dst, return_intermediate=True
     )
-    if return_mlp_no_shard_seq_lens:
-        ret += (seq_lens,)
+    _, q_seq_to_dst, _ = q_intermediates
+    pad_len = torch.max(num_cp_shards)
+    fwd_k_metadata, rev_k_metadata, kv_intermediates = compute_metadata_kv(
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size, q_to_num_kv_seq,
+        q_to_num_kv_tokens, cp_seq_lens, num_cp_shards, cp_query_dst,
+        q_seq_to_dst.squeeze(2), pad_len,
+        return_intermediate=True
+    )
+    attention_metadata = compute_attn_layout_seqlens(
+        cp_seq_lens, q_to_num_kv_tokens, cp_query_dst, shard_to_tuple=True
+    )
+    ret = (
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
+    )
+    if return_intermediate:
+        intermediates = q_intermediates + kv_intermediates
+        ret += (intermediates,)
+    ret += seq_lens
     return ret
 
-
-def create_one_batch_balanced_flops(
-    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
-    hidden_size_q: int, hidden_size_k: int, element_size: int
-):
-    (
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        attention_metadata_attn_layout, intermediates, seq_lens
-    ) = test_create_qkv_dispatch_balanced_flops(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
-        return_intermediate=True, return_mlp_no_shard_seq_lens=True
-    )
-    # NOTE: this already adds prepended zeros and is sharded to tuples (remove padding seqs)
-    (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-     num_local_seqs_recv) = attention_metadata_attn_layout
-
-    (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
-     attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
-    ) = compute_fa2a_metadata_from_logical_metadata(
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        intermediates, total_seq_len, hidden_size_q, hidden_size_k,
-        element_size,
-    )
-    logical_metadata = (
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-    )
-    fa2a_metadata = (
-        qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
-        attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
-    )
-    attn_metadata = (
-        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-    )
-    raw_seq_lens = seq_lens
-    return logical_metadata, fa2a_metadata, attn_metadata, raw_seq_lens
 
 def test(args):
     seed = args.seed
@@ -506,6 +478,8 @@ def test(args):
     tp_size = args.tp_size
     world_size = args.num_nodes * args.num_gpus_per_node
     total_seq_len = args.num_tokens
+
+    normal_forward_fn = True
 
     dtype = torch.bfloat16
     element_size = dtype.itemsize
@@ -540,44 +514,35 @@ def test(args):
     max_sample_id = 10
     sample_times = []
     for sample_id in range(max_sample_id):
-        _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_one_batch_balanced_flops(
+        (
+            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+            attention_metadata_attn_layout, intermediates, seq_lens
+        ) = create_qkv_dispatch(
             as_world_size, total_seq_len, num_seqs, max_cp_degree,
-            hidden_size_q_tp, hidden_size_k_tp, element_size
-        )
-        _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_one_batch_balanced_flops(
-            as_world_size, total_seq_len, num_seqs, max_cp_degree,
-            hidden_size_q_tp, hidden_size_k_tp, element_size
+            return_intermediate=True, return_mlp_no_shard_seq_lens=True
         )
 
-        set_random_seed(seed, set_megatron=False)
-        input_ids = torch.randint(0, 100, (as_world_size, total_seq_len * 2))
-        position_ids = torch.arange(total_seq_len).repeat(as_world_size, 2)
+        # TODO(Refactor): Remove the `as_` part of the dependency.
+        # thd layout's hidden size input is "t,1,h"
+        # tensors = torch.randn(
+        #     (as_world_size, total_seq_len, 1, hidden_size_q), dtype=dtype
+        # )
+        # tensor_shard = tensors[as_rank]
+        input_ids = torch.randint(100, 10000, (as_world_size, total_seq_len))
         input_ids_local = input_ids[as_rank]
+        # 1. normal forward. Need to provide the PackedSeqParams
+        seq_lens_local = seq_lens[as_rank][:num_seqs]
+        packed_seq_params = mlp_layout_packed_params(seq_lens_local)
+        
+        position_ids = torch.arange(total_seq_len, dtype=torch.int64).repeat(as_world_size, 2)
         position_ids_local = position_ids[as_rank]
-        ping_pang_params_0 = get_single_step_packed_seq_params(
-            fa2a_metadata_0, attn_metadata_0, as_rank
-        )
-        ping_pang_params_1 = get_single_step_packed_seq_params(
-            fa2a_metadata_1, attn_metadata_1, as_rank
-        )
 
-        # NOTE: we don't consider that seq_lens var has padding because our data generation
-        # guarantees so. However, in practice, this is not true.
-        mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
-        mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
-        ping_pang_params = PingPangPackedSeqParams(
-            seq_params=[ping_pang_params_0, ping_pang_params_1],
-            mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
-            max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-            max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-            qkv_format="thd",
-        )
         microbatch = {
+            # "input_ids": tensor_shard,
             "input_ids": input_ids_local,
             "position_ids": position_ids_local,
-            "packed_seq_params": ping_pang_params,
+            "packed_seq_params": packed_seq_params,
         }
-        # print(rank, microbatch["packed_seq_params"])
         microbatches = [microbatch]
 
         if sample_id == 0:
@@ -585,7 +550,7 @@ def test(args):
             for _ in range(5):
                 ref = worker.forward_backward_batch(
                     microbatches=microbatches,
-                    normal_forward_fn=False,
+                    normal_forward_fn=normal_forward_fn,
                     forward_only=False,
                 )
             time.sleep(1)
@@ -603,7 +568,7 @@ def test(args):
         for _ in range(N):
             ref = worker.forward_backward_batch(
                 microbatches=microbatches,
-                normal_forward_fn=False,
+                normal_forward_fn=normal_forward_fn,
                 forward_only=False,
             )
         torch.cuda.nvtx.range_pop()
