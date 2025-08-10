@@ -1,0 +1,242 @@
+{
+  "test_file": "/mnt/weka/home/hao.zhang/jd/d2/tests/test_e2e_anchor.py",
+  "timestamp": "2025-08-09 18:56:07 PST",
+  "config": {
+    "mode": "d2",
+    "tp_size": 8,
+    "dp_size": 2,
+    "num_tokens": 65536,
+    "model_path": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "num_layers": 4,
+    "max_sample_id": 4,
+    "up_sample_factor": 2,
+    "replan_iter": 0
+  },
+  "samples": [
+    {
+      "sample_id": 0,
+      "samples": [
+        [
+          65536
+        ],
+        [
+          65536
+        ],
+        [
+          65536
+        ],
+        [
+          65536
+        ]
+      ],
+      "duration_ms": 797.4367618560791,
+      "plans": [
+        [
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 0,
+            "seqid": 0,
+            "src_gpuid": 0,
+            "is_original": true
+          },
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 1,
+            "seqid": 0,
+            "src_gpuid": 1,
+            "is_original": true
+          }
+        ],
+        [
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 0,
+            "seqid": 0,
+            "src_gpuid": 0,
+            "is_original": true
+          },
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 1,
+            "seqid": 0,
+            "src_gpuid": 1,
+            "is_original": true
+          }
+        ]
+      ]
+    },
+    {
+      "sample_id": 1,
+      "samples": [
+        [
+          65536
+        ],
+        [
+          65536
+        ],
+        [
+          65536
+        ],
+        [
+          65536
+        ]
+      ],
+      "duration_ms": 795.8129405975342,
+      "plans": [
+        [
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 0,
+            "seqid": 0,
+            "src_gpuid": 0,
+            "is_original": true
+          },
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 1,
+            "seqid": 0,
+            "src_gpuid": 1,
+            "is_original": true
+          }
+        ],
+        [
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 0,
+            "seqid": 0,
+            "src_gpuid": 0,
+            "is_original": true
+          },
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 1,
+            "seqid": 0,
+            "src_gpuid": 1,
+            "is_original": true
+          }
+        ]
+      ]
+    },
+    {
+      "sample_id": 2,
+      "samples": [
+        [
+          65536
+        ],
+        [
+          65536
+        ],
+        [
+          65536
+        ],
+        [
+          65536
+        ]
+      ],
+      "duration_ms": 793.9713716506958,
+      "plans": [
+        [
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 0,
+            "seqid": 0,
+            "src_gpuid": 0,
+            "is_original": true
+          },
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 1,
+            "seqid": 0,
+            "src_gpuid": 1,
+            "is_original": true
+          }
+        ],
+        [
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 0,
+            "seqid": 0,
+            "src_gpuid": 0,
+            "is_original": true
+          },
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 1,
+            "seqid": 0,
+            "src_gpuid": 1,
+            "is_original": true
+          }
+        ]
+      ]
+    },
+    {
+      "sample_id": 3,
+      "samples": [
+        [
+          65536
+        ],
+        [
+          65536
+        ],
+        [
+          65536
+        ],
+        [
+          65536
+        ]
+      ],
+      "duration_ms": 791.874361038208,
+      "plans": [
+        [
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 0,
+            "seqid": 0,
+            "src_gpuid": 0,
+            "is_original": true
+          },
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 1,
+            "seqid": 0,
+            "src_gpuid": 1,
+            "is_original": true
+          }
+        ],
+        [
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 0,
+            "seqid": 0,
+            "src_gpuid": 0,
+            "is_original": true
+          },
+          {
+            "q": 65536,
+            "kv": 65536,
+            "gpuid": 1,
+            "seqid": 0,
+            "src_gpuid": 1,
+            "is_original": true
+          }
+        ]
+      ]
+    }
+  ],
+  "plans": []
+}

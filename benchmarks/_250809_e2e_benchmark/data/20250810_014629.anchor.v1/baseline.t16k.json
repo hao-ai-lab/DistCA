@@ -1,0 +1,94 @@
+{
+  "test_file": "/mnt/weka/home/hao.zhang/jd/d2/tests/test_e2e_anchor.py",
+  "timestamp": "2025-08-09 18:51:33 PST",
+  "config": {
+    "mode": "baseline",
+    "tp_size": 8,
+    "dp_size": 2,
+    "num_tokens": 16384,
+    "model_path": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "num_layers": 4,
+    "max_sample_id": 4,
+    "up_sample_factor": 2,
+    "replan_iter": 0
+  },
+  "samples": [
+    {
+      "sample_id": 0,
+      "samples": [
+        [
+          16384
+        ],
+        [
+          16384
+        ],
+        [
+          16384
+        ],
+        [
+          16384
+        ]
+      ],
+      "duration_ms": 141.68641567230225,
+      "plans": []
+    },
+    {
+      "sample_id": 1,
+      "samples": [
+        [
+          16384
+        ],
+        [
+          16384
+        ],
+        [
+          16384
+        ],
+        [
+          16384
+        ]
+      ],
+      "duration_ms": 141.84412956237793,
+      "plans": []
+    },
+    {
+      "sample_id": 2,
+      "samples": [
+        [
+          16384
+        ],
+        [
+          16384
+        ],
+        [
+          16384
+        ],
+        [
+          16384
+        ]
+      ],
+      "duration_ms": 141.4158821105957,
+      "plans": []
+    },
+    {
+      "sample_id": 3,
+      "samples": [
+        [
+          16384
+        ],
+        [
+          16384
+        ],
+        [
+          16384
+        ],
+        [
+          16384
+        ]
+      ],
+      "duration_ms": 141.41037464141846,
+      "plans": []
+    }
+  ],
+  "plans": []
+}

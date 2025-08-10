@@ -1,49 +1,7 @@
 """
-Combined Megatron E2E Test (D2 + Baseline)
+Anchor the 
 
-This script combines both D2 and baseline approaches for testing:
-- Baseline mode: Uses simple batch generation and normal forward function
-- D2 mode: Uses balanced flops planning and ping-pang parameters
 
-# Debug - Baseline Mode
-
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
-    --master_port=29500 test_e2e_combined.py --mode=baseline --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096 --num-layers 4
-```
-
-# Debug - D2 Mode
-
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
-    --master_port=29500 test_e2e_combined.py --mode=d2 --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096 --num-layers 4
-```
-
-# Benchmark
-
-# 🟢 Passed: Node = 2, TP = 8, DP = 2, SeqLen = 16k (Baseline)
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=baseline --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=baseline --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-```
-
-# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 16k (D2)
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=d2 --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=d2 --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-```
 """
 import os
 import gc
@@ -341,15 +299,11 @@ def setup_global_batch(
     global GLOBAL_BATCH
     if GLOBAL_BATCH is not None:
         return
-    
-    GLOBAL_BATCH = batch_documents(
-        sample_wlbllm_docs_upsample(
-            size=10000,
-            upsample_long_factor=up_sample_factor,
-            filter_threshold=10000,
-            filter_ratio=0.09,
-        ), max_ctx_length=total_seq_len
-    )
+
+    batches = []
+    for i in range(1000):
+        batches.append([total_seq_len])
+    GLOBAL_BATCH = iter(batches)
     return
 
 

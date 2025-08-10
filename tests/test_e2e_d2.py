@@ -54,37 +54,6 @@ NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
         test_e2e_d2.py --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 131072
 ```
 
-```log
-[rank7]: Traceback (most recent call last):
-[rank7]:   File "/mnt/weka/home/hao.zhang/jd/d2/tests/test_e2e_d2.py", line 603, in <module>
-[rank7]:     test(args)
-[rank7]:   File "/mnt/weka/home/hao.zhang/jd/d2/tests/test_e2e_d2.py", line 471, in test
-[rank7]:     worker.init(model_path, seed=seed)
-[rank7]:   File "/mnt/weka/home/hao.zhang/jd/d2/tests/test_e2e_d2.py", line 128, in init
-[rank7]:     self._build_model_optimizer(model_path, optim_config, override_model_config, override_transformer_config)
-[rank7]:   File "/mnt/weka/home/hao.zhang/jd/d2/tests/test_e2e_d2.py", line 278, in _build_model_optimizer
-[rank7]:     train_module = make_model(wrap_with_ddp=True)
-[rank7]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank7]:   File "/mnt/weka/home/hao.zhang/jd/d2/tests/test_e2e_d2.py", line 271, in make_model
-[rank7]:     return get_model(
-[rank7]:            ^^^^^^^^^^
-[rank7]:   File "/mnt/weka/home/hao.zhang/jd/d2/tests/megatron_test_utils.py", line 269, in get_model
-[rank7]:     model_module.broadcast_params()
-[rank7]:   File "/mnt/weka/home/hao.zhang/jd/d2-megatron/Megatron-LM/megatron/core/distributed/distributed_data_parallel.py", line 516, in broadcast_params
-[rank7]:     torch.distributed.broadcast(
-[rank7]:   File "/mnt/weka/home/hao.zhang/conda/miniconda/envs/jd-d2-megatron/lib/python3.12/site-packages/torch/distributed/c10d_logger.py", line 81, in wrapper
-[rank7]:     return func(*args, **kwargs)
-[rank7]:            ^^^^^^^^^^^^^^^^^^^^^
-[rank7]:   File "/mnt/weka/home/hao.zhang/conda/miniconda/envs/jd-d2-megatron/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 2714, in broadcast
-[rank7]:     work = group.broadcast([tensor], opts)
-[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank7]: torch.distributed.DistBackendError: NCCL error in: /pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:77, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.26.2
-[rank7]: ncclUnhandledCudaError: Call to CUDA function failed.
-[rank7]: Last error:
-[rank7]: Cuda failure 'invalid argument'
-```
-
-
 # Profile: 
 
 # 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 16k 
