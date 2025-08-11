@@ -297,10 +297,9 @@ def compute_attn_layout_seqlens(
 
     flatten_dispatch_one_hot = F.one_hot(flatten_dispatch + 1, num_classes=world_size + 1)[:, 1:]
     # shape: (world_size, seq_len, world_size)
-    local_indices_flat = (
-        # cumsum: the id of this sequence at the dst rank.
-        (flatten_dispatch_one_hot.cumsum(dim=0) - 1) * flatten_dispatch_one_hot
-    ).sum(dim=1).reshape(-1)
+    local_indices_flat_one_hot = (flatten_dispatch_one_hot.cumsum(dim=0) - 1) * flatten_dispatch_one_hot
+    # local_indices_flat_one_hot[shard_i, rank_j] = if shard_id is sent to rank j, then it is the index in that rank j, otherwise 0. 
+    local_indices_flat = local_indices_flat_one_hot.sum(dim=1).reshape(-1)
     # if dispatch[i, j] = k, then local_indices_flat[i, j, k] = l means sequence [i,j] is at out_sequence [k,l]
     # out_seqlens_q[k, l] = seq_shard_len[i, j]
     max_num_seq = int(local_indices_flat.max().item() + 1)
@@ -323,7 +322,8 @@ def compute_attn_layout_seqlens(
     out_seqlens_q = out_seqlens_q.reshape(world_size, max_num_seq)
     out_seqlens_kv = out_seqlens_kv.reshape(world_size, max_num_seq)
 
-    num_local_seqs_recv = local_indices_flat.reshape(-1, world_size).max(dim=1)[0] + 1
+    # TODO: Maybe we just take flatten_dispatch_one_hot and take a sum -> to get the max sequence length.
+    num_local_seqs_recv = local_indices_flat_one_hot.max(dim=0)[0] + 1
 
     cu_seqlens_q = out_seqlens_q.cumsum(dim=1)
     cu_seqlens_kv = out_seqlens_kv.cumsum(dim=1)
