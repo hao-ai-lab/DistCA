@@ -323,7 +323,7 @@ def compute_attn_layout_seqlens(
     out_seqlens_q = out_seqlens_q.reshape(world_size, max_num_seq)
     out_seqlens_kv = out_seqlens_kv.reshape(world_size, max_num_seq)
 
-    num_local_seqs_recv = local_indices_flat.reshape(-1, world_size).max(dim=0)[0] + 1
+    num_local_seqs_recv = local_indices_flat.reshape(-1, world_size).max(dim=1)[0] + 1
 
     cu_seqlens_q = out_seqlens_q.cumsum(dim=1)
     cu_seqlens_kv = out_seqlens_kv.cumsum(dim=1)
