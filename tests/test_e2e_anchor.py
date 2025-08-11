@@ -32,7 +32,13 @@ from megatron_test_utils import (
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
 )
+from contextlib import contextmanager
 
+@contextmanager
+def nvtx_range(name):
+    torch.cuda.nvtx.range_push(name)
+    yield
+    torch.cuda.nvtx.range_pop()
 
 def set_random_seed(seed, set_megatron: bool=True):
     """Set worker side random seed."""
@@ -465,10 +471,207 @@ def create_one_batch_balanced_flops(
         qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
         attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
     )
+    
     attn_metadata = (
         cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
     )
     raw_seq_lens = seq_lens
+
+    """
+    Override the metadata
+
+        🟢 [Rank 0] qkv_fwd_fa2a_metadata:
+        FastAlltoAllMetadata(
+            fa2a_metadata=(
+                tensor([[       0, 0],
+                [       0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]]),
+                tensor([[       0,        0],
+                [0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]])
+            ),
+            send_memcpy_metadata=(
+                (tensor([       0, 16777216]), tensor([0])),
+                (tensor([[33554432, 37748736],
+                [41943040,        0]]), tensor([[33554432],
+                [       0]])),
+                (tensor([[46137344, 50331648],
+                [54525952,        0]]), tensor([[41943040],
+                [       0]]))
+            ),
+            recv_memcpy_metadata=(
+                (tensor([       0, 16777216]), tensor([0])),
+                (tensor([33554432, 41943040, 37748736]), tensor([33554432])),
+                (tensor([46137344, 54525952, 50331648]), tensor([41943040]))
+            ),
+            my_rank_send_offset=[0, 0],
+            my_rank_recv_offset=[0, 0],
+            my_rank_send_sz=[58720256, 50331648],
+            seq_lens=[
+                SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768]))),
+                SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384, 16384]), tensor([32768])))
+            ],
+            tensor_shape=[
+                LogicalShape(send_shape=((32768, 512), (32768, 512)), recv_shape=((32768, 512), (32768, 512))),
+                LogicalShape(send_shape=((2, 32768, 128), (2, 32768, 128)), recv_shape=((49152, 128), (32768, 128)))
+            ],
+            kv_replica_mask=(tensor([[1, 1],
+                [1, 0]], dtype=torch.int8), tensor([[1, 0]], dtype=torch.int8)),
+            single_stream=False
+        )
+        🟢 [Rank 0] qkv_rev_fa2a_metadata:
+        FastAlltoAllMetadata(
+            fa2a_metadata=(
+                tensor([[       0, 0],
+                [       0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]]),
+                tensor([[       0,        0],
+                [0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]])
+            ),
+            send_memcpy_metadata=(
+                (tensor([       0, 16777216]), tensor([0])),
+                (tensor([33554432, 41943040, 37748736]), tensor([33554432])),
+                (tensor([46137344, 54525952, 50331648]), tensor([41943040]))
+            ),
+            recv_memcpy_metadata=(
+                (tensor([       0, 16777216]), tensor([0])),
+                (tensor([[33554432, 37748736],
+                [41943040,        0]]), tensor([[33554432],
+                [       0]])),
+                (tensor([[46137344, 50331648],
+                [54525952,        0]]), tensor([[41943040],
+                [       0]]))
+            ),
+            my_rank_send_offset=[0, 0],
+            my_rank_recv_offset=[0, 0],
+            my_rank_send_sz=[58720256, 50331648],
+            seq_lens=(
+                SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768]))),
+                SeqLens(send_seqlens=(tensor([16384, 16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768])))
+            ),
+            tensor_shape=(
+                LogicalShape(send_shape=((32768, 512), (32768, 512)), recv_shape=((32768, 512), (32768, 512))),
+                LogicalShape(send_shape=((49152, 128), (32768, 128)), recv_shape=((2, 32768, 128), (2, 32768, 128)))
+            ),
+            kv_replica_mask=(tensor([[1, 1],
+                [1, 0]], dtype=torch.int8), tensor([[1, 0]], dtype=torch.int8)),
+            single_stream=False
+        )
+        🟢 [Rank 0] attn_out_fwd_fa2a_metadata:
+        FastAlltoAllMetadata(
+            fa2a_metadata=(
+                tensor([[       0, 0],
+                [       0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]]),
+                tensor([[       0,        0],
+                [0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]])
+            ),
+            send_memcpy_metadata=((tensor([       0, 16777216]), tensor([0])),),
+            recv_memcpy_metadata=((tensor([       0, 16777216]), tensor([0, 0])),),
+            my_rank_send_offset=[0, 0],
+            my_rank_recv_offset=[0, 0],
+            my_rank_send_sz=[33554432, 33554432],
+            seq_lens=(SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768]))),),
+            tensor_shape=(LogicalShape(send_shape=((32768, 512), (32768, 512)), recv_shape=((32768, 512), (32768, 512))),),
+            kv_replica_mask=None,
+            single_stream=False
+        )
+        🟢 [Rank 0] attn_out_rev_fa2a_metadata:
+        FastAlltoAllMetadata(
+            fa2a_metadata=(
+                tensor([[       0, 0],
+                [       0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]]),
+                tensor([[       0,        0],
+                [0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]])
+            ),
+            send_memcpy_metadata=((tensor([       0, 16777216]), tensor([0, 0])),),
+            recv_memcpy_metadata=((tensor([       0, 16777216]), tensor([0])),),
+            my_rank_send_offset=[0, 0],
+            my_rank_recv_offset=[0, 0],
+            my_rank_send_sz=[33554432, 33554432],
+            seq_lens=[SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768])))],
+            tensor_shape=[LogicalShape(send_shape=((32768, 512), (32768, 512)), recv_shape=((32768, 512), (32768, 512)))],
+            kv_replica_mask=None,
+            single_stream=False
+        )
+    """
+
+    # # Rewrite the metadata
+    # from torch import tensor
+    # qkv_fwd_fa2a_metadata.fa2a_metadata = (
+    #     tensor([[       0, 0],
+    #     [       0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]]),
+    #     tensor([[       0,        0],
+    #     [0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]])
+    # )
+
+    # qkv_rev_fa2a_metadata.fa2a_metadata = (
+    #     tensor([[       0, 0],
+    #     [       0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]]),
+    #     tensor([[       0,        0],
+    #     [0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]])
+    # )
+
+    # attn_out_fwd_fa2a_metadata.fa2a_metadata = (
+    #     tensor([[       0, 0],
+    #     [       0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]]),
+    #     tensor([[       0,        0],
+    #     [0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]])
+    # )
+
+    # attn_out_rev_fa2a_metadata.fa2a_metadata = (
+    #     tensor([[       0, 0],
+    #     [       0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]]),
+    #     tensor([[       0,        0],
+    #     [0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]])
+    # )
+
+
+    
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        rich.print(f"🟢 [Rank {rank}] items:", items)
+        rich.print(f"🟢 [Rank {rank}] cu_seqlens_q: {cu_seqlens_q}")
+        rich.print(f"🟢 [Rank {rank}] cu_seqlens_kv: {cu_seqlens_kv}")
+        rich.print(f"🟢 [Rank {rank}] max_seqlen_q: {max_seqlen_q}")
+        rich.print(f"🟢 [Rank {rank}] max_seqlen_kv: {max_seqlen_kv}")
+        rich.print(f"🟢 [Rank {rank}] seq_lens: {seq_lens}")
+
+        rich.print(f"🟢 [Rank {rank}] qkv_fwd_fa2a_metadata:", qkv_fwd_fa2a_metadata)
+        rich.print(f"🟢 [Rank {rank}] qkv_rev_fa2a_metadata:", qkv_rev_fa2a_metadata)
+        rich.print(f"🟢 [Rank {rank}] attn_out_fwd_fa2a_metadata:", attn_out_fwd_fa2a_metadata)
+        rich.print(f"🟢 [Rank {rank}] attn_out_rev_fa2a_metadata:", attn_out_rev_fa2a_metadata)
+
+    
+    # exit(0)
 
     ret_vals = (logical_metadata, fa2a_metadata, attn_metadata, raw_seq_lens)
     if return_items:
@@ -585,6 +788,16 @@ def test(args):
             )
             iterated_plans.append([plan_items_0, plan_items_1])
 
+            # if rank == 0:
+            #     rich.print(f"🟢 [Rank {rank}] fa2a_metadata_0: {fa2a_metadata_0}")
+            #     rich.print(f"🟢 [Rank {rank}] fa2a_metadata_1: {fa2a_metadata_1}")
+            #     rich.print(f"🟢 [Rank {rank}] attn_metadata_0: {attn_metadata_0}")
+            #     rich.print(f"🟢 [Rank {rank}] attn_metadata_1: {attn_metadata_1}")
+            #     rich.print(f"🟢 [Rank {rank}] raw_seq_lens_0: {raw_seq_lens_0}")
+            #     rich.print(f"🟢 [Rank {rank}] raw_seq_lens_1: {raw_seq_lens_1}")
+            #     rich.print(f"🟢 [Rank {rank}] plan_items_0: {plan_items_0}")
+            #     rich.print(f"🟢 [Rank {rank}] plan_items_1: {plan_items_1}")
+
             set_random_seed(seed, set_megatron=False)
             input_ids = torch.randint(0, 100, (as_world_size, total_seq_len * 2))
             position_ids = torch.arange(total_seq_len).repeat(as_world_size, 2)
@@ -620,6 +833,12 @@ def test(args):
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
+        # Move all to cuda
+        with nvtx_range("microbatch_to_cuda"):
+            microbatch = {
+                k: arg_to_cuda(v) for k, v in microbatch.items()
+            }
+
         microbatches = [microbatch]
 
         if sample_id == 0:
@@ -630,7 +849,7 @@ def test(args):
                     normal_forward_fn=normal_forward_fn,
                     forward_only=False,
                 )
-            time.sleep(1)
+            time.sleep(3)
             torch.cuda.synchronize()
             torch.distributed.barrier()
             if rank == 0:
@@ -644,13 +863,12 @@ def test(args):
         start_time = time.time()
         torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
         for _ in range(N):
-            torch.cuda.nvtx.range_push(f"forward_backward_batch(iter={_})")
-            ref = worker.forward_backward_batch(
-                microbatches=microbatches,
-                normal_forward_fn=normal_forward_fn,
-                forward_only=False,
-            )
-            torch.cuda.nvtx.range_pop()
+            with nvtx_range(f"forward_backward_batch(iter={_})"):
+                ref = worker.forward_backward_batch(
+                    microbatches=microbatches,
+                    normal_forward_fn=normal_forward_fn,
+                    forward_only=False,
+                )
         torch.cuda.nvtx.range_pop()
         
         torch.cuda.synchronize()
@@ -709,7 +927,7 @@ def test(args):
             if mode == "d2":
                 plans = iterated_plans[idx]
             # total_flops_factor = 
-            rich.print(f"🟢 Sample {idx}: {samples}, duration: {duration} ms")
+            rich.print(f"🟢 Sample {idx}: {samples}, duration: {duration:.2f} ms")
             benchmark_data["samples"].append({
                 "sample_id": idx,
                 "samples": samples,
@@ -727,39 +945,54 @@ def test(args):
         #     rich.print(f"🟢 Sample {idx}: {sample}, duration: {duration} ms")
     
     # Cleanup and exit
-    rich.print(f"❄️ [Rank {rank}] Finished test and exit.")
     
-    print(f"[Rank {rank}] Starting aggressive cleanup process...")
     
     # NO BARRIER - this is what was causing the hang!
     # Instead, each process cleans up independently and exits
-    
-    # Prevent nsys to exit...
-    # # Clear CUDA cache first
-    # try:
-    #     if torch.cuda.is_available():
-    #         print(f"[Rank {rank}] Clearing CUDA cache...")
-    #         torch.cuda.empty_cache()
-    #         torch.cuda.synchronize()
-    #         torch.cuda.ipc_collect()
-    #         print(f"[Rank {rank}] CUDA cleanup completed")
-    # except Exception as e:
-    #     print(f"[Rank {rank}] Error in CUDA cleanup: {e}")
-    
-    # # Force garbage collection
-    # try:
+    rich.print(f"🟢 [Rank {rank}] Finished test and prepare to exit.")
+
+    del worker
+    torch.distributed.barrier()
+    rich.print(f"🟢 [Rank {rank}] Barrier passed.")
+    torch.distributed.destroy_process_group()
+    rich.print(f"🟢 [Rank {rank}] Process group destroyed.")
+
+
+
+    def exit_program():
+        print(f"[Rank {rank}] Starting aggressive cleanup process...")
+        # Prevent nsys to exit...
+        # Clear CUDA cache first
+        try:
+            if torch.cuda.is_available():
+                print(f"[Rank {rank}] Clearing CUDA cache...")
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                torch.cuda.ipc_collect()
+                print(f"[Rank {rank}] CUDA cleanup completed")
+        except Exception as e:
+            print(f"[Rank {rank}] Error in CUDA cleanup: {e}")
         
-    #     gc.collect()
-    #     print(f"[Rank {rank}] Garbage collection completed")
-    # except Exception as e:
-    #     print(f"[Rank {rank}] Error in garbage collection: {e}")
-    
-    # # Just force exit immediately - don't try to clean up distributed stuff
-    # # as it often hangs in complex setups like Megatron + NVSHMEM
-    # print(f"[Rank {rank}] Force exiting now...")
-    
-    # # Immediate force exit with os._exit (bypasses Python cleanup)
-    # os._exit(0)
+        # Force garbage collection
+        try:
+            
+            gc.collect()
+            print(f"[Rank {rank}] Garbage collection completed")
+        except Exception as e:
+            print(f"[Rank {rank}] Error in garbage collection: {e}")
+        
+        # Just force exit immediately - don't try to clean up distributed stuff
+        # as it often hangs in complex setups like Megatron + NVSHMEM
+        print(f"[Rank {rank}] Force exiting now...")
+        
+        # Immediate force exit with os._exit (bypasses Python cleanup)
+        os._exit(0)
+
+    if args.force_exit:
+        exit_program()
+
+    rich.print(f"❄️ [Rank {rank}] Right before exit.")
+    return
 
 
 if __name__ == "__main__":
@@ -779,5 +1012,6 @@ if __name__ == "__main__":
     parser.add_argument("--up-sample-factor", type=int, default=2)
     parser.add_argument("--output-file", type=str, default=None)
     parser.add_argument("--replan-iter", type=int, default=1, help="(d2 only) Number of replan iterations for planner")
+    parser.add_argument("--force-exit", action="store_true", default=False, help="Force exit the program")
     args = parser.parse_args()
     test(args)

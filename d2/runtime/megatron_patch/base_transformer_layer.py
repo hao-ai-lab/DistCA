@@ -16,6 +16,14 @@ from megatron.core.transformer.transformer_layer import (
 
 from d2.runtime.megatron_patch.packed_seq_params import PingPangSingleStepPackedSeqParams
 
+from contextlib import contextmanager
+@contextmanager
+def nvtx_range(name: str):
+    torch.cuda.nvtx.range_push(name)
+    yield
+    torch.cuda.nvtx.range_pop()
+
+
 class TransformerLayer(MegatronTransformerLayer):
     """Base transformer layer that splits the forward 3 steps: core attention, pre- and post- core attention."""
     def __init__(
@@ -46,76 +54,85 @@ class TransformerLayer(MegatronTransformerLayer):
         Perform a forward pass through the attention layer and the layernorms before and after
         the attention operations.
         """
-        residual = hidden_states
-        # Optional Input Layer norm
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                self.input_layernorm, hidden_states
-            )
-        else:
-            input_layernorm_output = self.input_layernorm(hidden_states)
-        # Below code copied from megatron.core.transformer.attention.Attention.forward
-        # rotary pos emb
-        assert rotary_pos_cos is None and rotary_pos_sin is None
+        with nvtx_range("TransformerLayer._forward_pre_core_attn"):
+            residual = hidden_states
 
-        # For self attention we just duplicate the rotary_pos_emb if it isn't already
-        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
-            rotary_pos_emb = (rotary_pos_emb,) * 2
-        # q, k, v
-        query, key, value = self.self_attention.get_query_key_value_tensors(input_layernorm_output, None)
-
-        #### Some code in core_attention. This is because we don't want the pos embedding
-        # being handled in the attention layout (the pos id will be hard to handle)
-        inference_context = None
-
-        query, key, value, rotary_pos_emb, attn_mask_type = self.self_attention._adjust_key_value_for_inference(
-            inference_context,
-            query,
-            key,
-            value,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-        )
-        if packed_seq_params is not None:
-            query = query.squeeze(1)
-            key = key.squeeze(1)
-            value = value.squeeze(1)
-
-        # ================================================
-        # relative positional embedding (rotary embedding)
-        # ================================================
-        if rotary_pos_emb is not None and not self.config.flash_decode:
-            q_pos_emb, k_pos_emb = rotary_pos_emb
-
-            if packed_seq_params is not None:
-                if packed_seq_params.cu_seqlens_q_padded is not None:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+            with nvtx_range("TransformerLayer._forward_pre_core_attn.input_layernorm"):
+                # Optional Input Layer norm
+                if self.recompute_input_layernorm:
+                    self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                    input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                        self.input_layernorm, hidden_states
+                    )
                 else:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
-                if packed_seq_params.cu_seqlens_kv_padded is not None:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
-                else:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
-            else:
-                cu_seqlens_q = cu_seqlens_kv = None
+                    input_layernorm_output = self.input_layernorm(hidden_states)
 
-            if q_pos_emb is not None:
-                # TODO VIJAY: simplify
-                query = apply_rotary_pos_emb(
-                    query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
-                )
-            if k_pos_emb is not None:
-                key = apply_rotary_pos_emb(
-                    key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
-                )
 
-            # TODO, can apply positional embedding to value_layer so it has
-            # absolute positional embedding.
-            # otherwise, only relative positional embedding takes effect
-            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+            # Below code copied from megatron.core.transformer.attention.Attention.forward
+            # rotary pos emb
+            assert rotary_pos_cos is None and rotary_pos_sin is None
+
+            # For self attention we just duplicate the rotary_pos_emb if it isn't already
+            if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+                rotary_pos_emb = (rotary_pos_emb,) * 2
+            # q, k, v
+            with nvtx_range("TransformerLayer._forward_pre_core_attn.get_query_key_value_tensors"):
+                query, key, value = self.self_attention.get_query_key_value_tensors(input_layernorm_output, None)
+            #### Some code in core_attention. This is because we don't want the pos embedding
+            # being handled in the attention layout (the pos id will be hard to handle)
+            inference_context = None
+            with nvtx_range("TransformerLayer._forward_pre_core_attn.adjust_key_value_for_inference"):
+                query, key, value, rotary_pos_emb, attn_mask_type = self.self_attention._adjust_key_value_for_inference(
+                    inference_context,
+                    query,
+                    key,
+                    value,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    sequence_len_offset,
+                )
+                if packed_seq_params is not None:
+                    query = query.squeeze(1)
+                    key = key.squeeze(1)
+                    value = value.squeeze(1)
+
+
+            # ================================================
+            # relative positional embedding (rotary embedding)
+            # ================================================
+            with nvtx_range("TransformerLayer._forward_pre_core_attn.apply_rotary_pos_emb"):
+                if rotary_pos_emb is not None and not self.config.flash_decode:
+                    q_pos_emb, k_pos_emb = rotary_pos_emb
+
+                    if packed_seq_params is not None:
+                        if packed_seq_params.cu_seqlens_q_padded is not None:
+                            cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+                        else:
+                            cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                        if packed_seq_params.cu_seqlens_kv_padded is not None:
+                            cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+                        else:
+                            cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                    else:
+                        cu_seqlens_q = cu_seqlens_kv = None
+
+                    if q_pos_emb is not None:
+                        # TODO VIJAY: simplify
+                        query = apply_rotary_pos_emb(
+                            query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
+                        )
+                    if k_pos_emb is not None:
+                        key = apply_rotary_pos_emb(
+                            key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
+                        )
+
+                    # TODO, can apply positional embedding to value_layer so it has
+                    # absolute positional embedding.
+                    # otherwise, only relative positional embedding takes effect
+                    # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+
+
         return query, key, value, residual, attn_mask_type
 
     def _forward_core_attn(
@@ -131,42 +148,42 @@ class TransformerLayer(MegatronTransformerLayer):
         """
         Copied from megatron.core.transformer.attention.Attention.forward
         """
+        with nvtx_range("TransformerLayer._forward_core_attn"):
+            # ==================================
+            # core attention computation
+            # ==================================
+            if self.self_attention.checkpoint_core_attention and self.training:
+                core_attn_out = self.self_attention._checkpointed_attention_forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                )
+            else:
+                # Static batching attention kernel.
+                # NOTE(yonghao): megatron.core.extensions.transformer_engine.TEDotProductAttention
+                # core impl in te.pytorch.DotProductAttention
+                # use `set_context_parallel_group` to disable context parallel
+                #   cp_size = get_distributed_world_size(self.cp_group)
+                core_attn_out = self.self_attention.core_attention(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                )
 
-        # ==================================
-        # core attention computation
-        # ==================================
-        if self.self_attention.checkpoint_core_attention and self.training:
-            core_attn_out = self.self_attention._checkpointed_attention_forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
-        else:
-            # Static batching attention kernel.
-            # NOTE(yonghao): megatron.core.extensions.transformer_engine.TEDotProductAttention
-            # core impl in te.pytorch.DotProductAttention
-            # use `set_context_parallel_group` to disable context parallel
-            #   cp_size = get_distributed_world_size(self.cp_group)
-            core_attn_out = self.self_attention.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
-
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            # reshape to same output shape as unpacked case
-            # (t, np, hn) -> (t, b=1, h=np*hn)
-            # t is the pack size = sum (sq_i)
-            # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                # reshape to same output shape as unpacked case
+                # (t, np, hn) -> (t, b=1, h=np*hn)
+                # t is the pack size = sum (sq_i)
+                # note that batch is a dummy dimension in the packed case
+                core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         return core_attn_out
 
     def _forward_post_core_attn(
@@ -176,59 +193,71 @@ class TransformerLayer(MegatronTransformerLayer):
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
     ):
-        inference_context = None
-        attention_output_with_bias = self.self_attention.linear_proj(core_attn_out)
-        if self.recompute_input_layernorm:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
+        with nvtx_range("TransformerLayer._forward_post_core_attn"):
+            inference_context = None
+            with nvtx_range("TransformerLayer._forward_post_core_attn.linear_proj"):
+                attention_output_with_bias = self.self_attention.linear_proj(core_attn_out)
 
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
+            with nvtx_range("TransformerLayer._forward_post_core_attn.recompute_input_layernorm"):
+                if self.recompute_input_layernorm:
+                    # discard the output of the input layernorm and register the recompute
+                    # as a gradient hook of attention_output_with_bias[0]
+                    self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                        attention_output_with_bias[0]
+                    )
 
-        # Residual connection.
-        residual = hidden_states
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            with nvtx_range("TransformerLayer._forward_post_core_attn.self_attn_bda"):
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                        attention_output_with_bias, residual, self.hidden_dropout
+                )
 
-        # Optional Layer norm after self-attention
-        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
-        # Cross attention.
-        attention_output_with_bias = self.cross_attention(
-            pre_cross_attn_layernorm_output,
-            attention_mask=context_mask,
-            key_value_states=context,
-            inference_context=inference_context,
-        )
+            # Residual connection.
+            residual = hidden_states
 
-        if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
-            context = attention_output_with_bias["context"]
+            # Optional Layer norm after self-attention
+            with nvtx_range("TransformerLayer._forward_post_core_attn.pre_cross_attn_layernorm"):
+                pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
+            with nvtx_range("TransformerLayer._forward_post_core_attn.cross_attention"):
+                # Cross attention.
+                attention_output_with_bias = self.cross_attention(
+                    pre_cross_attn_layernorm_output,
+                    attention_mask=context_mask,
+                    key_value_states=context,
+                    inference_context=inference_context,
+                )
 
-        # Residual connection.
-        residual = hidden_states
+            if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
+                context = attention_output_with_bias["context"]
 
-        # Optional Layer norm post the cross-attention.
-        if self.recompute_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                self.pre_mlp_layernorm, hidden_states
-            )
-        else:
-            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            with nvtx_range("TransformerLayer._forward_post_core_attn.cross_attn_bda"):
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                        attention_output_with_bias, residual, self.hidden_dropout
+                    )
 
-        mlp_output = self._forward_mlp(pre_mlp_layernorm_output, residual)
+            # Residual connection.
+            residual = hidden_states
+
+            # Optional Layer norm post the cross-attention.
+            with nvtx_range("TransformerLayer._forward_post_core_attn.pre_mlp_layernorm"):
+                if self.recompute_pre_mlp_layernorm:
+                    self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                    pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                        self.pre_mlp_layernorm, hidden_states
+                    )
+                else:
+                    pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+
+
+            with nvtx_range("TransformerLayer._forward_post_core_attn.mlp"):
+                mlp_output = self._forward_mlp(pre_mlp_layernorm_output, residual)
         return mlp_output, context
 
     ######## Debug ########
@@ -253,35 +282,59 @@ class TransformerLayer(MegatronTransformerLayer):
         assert inference_context is None, "inference not supported yet"
         assert context is None, "cross-attention not supported yet"
         assert context_mask is None, "cross-attention not supported yet"
-
         setattr(packed_seq_params, "stream", torch.cuda.current_stream())
+        
+        with nvtx_range("TransformerLayer.forward_no_switch"):
 
-        query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
-            hidden_states,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            packed_seq_params,
-            sequence_len_offset,
-        )
-        debug_tensors = [(query, key, value),]
+            with nvtx_range("TransformerLayer.forward_no_switch.pre_core_attn"):
+                query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
+                    hidden_states,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    packed_seq_params,
+                    sequence_len_offset,
+                )
+                debug_tensors = [(query, key, value),]
 
-        core_attn_out = self._forward_core_attn(
-            query,
-            key,
-            value,
-            attention_mask,
-            attention_bias,
-            attn_mask_type,
-            packed_seq_params,
-        )
-        debug_tensors.append(core_attn_out)
-        mlp_output, context = self._forward_post_core_attn(
-            core_attn_out,
-            residual,
-            context,
-            context_mask,
-        )
+
+            with nvtx_range("TransformerLayer.forward_no_switch.core_attn"):
+                core_attn_out = self._forward_core_attn(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attention_bias,
+                    attn_mask_type,
+                    packed_seq_params,
+                )
+                debug_tensors.append(core_attn_out)
+
+
+            with nvtx_range("TransformerLayer.forward_no_switch.post_core_attn"):
+                mlp_output, context = self._forward_post_core_attn(
+                    core_attn_out,
+                    residual,
+                    context,
+                    context_mask,
+                )
+
 
         return mlp_output, context, debug_tensors
 
+
+    ######## Adding NVTX to core functions just in case ########
+    def forward(self, *args, **kwargs):
+        with nvtx_range("TransformerLayer.forward"):
+            ret = super().forward(*args, **kwargs)
+        return ret
+
+    def _forward_attention(self, *args, **kwargs):
+        with nvtx_range("TransformerLayer._forward_attention"):
+            ret = super()._forward_attention(*args, **kwargs)
+        return ret
+
+    def _forward_mlp(self, *args, **kwargs):
+        with nvtx_range("TransformerLayer._forward_mlp"):
+            ret = super()._forward_mlp(*args, **kwargs)
+        return ret

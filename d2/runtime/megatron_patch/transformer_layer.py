@@ -58,6 +58,12 @@ def _gather_tensor(tensors: List[torch.Tensor], num_splits: int):
     return torch.cat(tensors, dim=0)
 ####
 
+from contextlib import contextmanager
+@contextmanager
+def nvtx_range(name):
+    torch.cuda.nvtx.range_push(name)
+    yield
+    torch.cuda.nvtx.range_pop()
 
 class TransformerLayer(BaseTransformerLayer):
     ########## Attention Layout <-> MLP Layout Transformation ##########
@@ -152,18 +158,17 @@ class TransformerLayer(BaseTransformerLayer):
         tp_size = self.config.tensor_model_parallel_size
         num_q_heads_local = num_q_heads // tp_size
         num_kv_heads_local = num_kv_heads // tp_size
-        torch.cuda.nvtx.range_push("post_mlp_to_attn")
-        query, key, value = post_all2all_layout_transfer.apply(
-            signal,
-            packed_seq_params.qkv_fwd_metadata,
-            packed_seq_params.qkv_bwd_metadata,
-            packed_seq_params.dispatcher_id,
-            True,  # is_qkv
-        )
-        query = query.view(query.shape[0], num_q_heads_local, head_dim).contiguous()
-        key = key.view(key.shape[0], num_kv_heads_local, head_dim).contiguous()
-        value = value.view(value.shape[0], num_kv_heads_local, head_dim).contiguous()
-        torch.cuda.nvtx.range_pop()
+        with nvtx_range("post_mlp_to_attn"):
+            query, key, value = post_all2all_layout_transfer.apply(
+                signal,
+                packed_seq_params.qkv_fwd_metadata,
+                packed_seq_params.qkv_bwd_metadata,
+                packed_seq_params.dispatcher_id,
+                True,  # is_qkv
+            )
+            query = query.view(query.shape[0], num_q_heads_local, head_dim).contiguous()
+            key = key.view(key.shape[0], num_kv_heads_local, head_dim).contiguous()
+            value = value.view(value.shape[0], num_kv_heads_local, head_dim).contiguous()
         return query, key, value
 
     def _all_to_all(self, signal: torch.Tensor,
@@ -180,12 +185,14 @@ class TransformerLayer(BaseTransformerLayer):
                 packed_seq_params.attn_out_fwd_metadata,
                 packed_seq_params.attn_out_bwd_metadata,
             ]
+        torch.cuda.nvtx.range_push("all_to_all")
         signal = all_to_all.apply(
             signal,
             *metadatas,
             packed_seq_params.dispatcher_id,
             packed_seq_params.stream,
         )
+        torch.cuda.nvtx.range_pop()
         return signal
 
     ########## Ping-Pong ##########
@@ -208,6 +215,7 @@ class TransformerLayer(BaseTransformerLayer):
         """
         In-place Ping-Pang parallel
         """
+        torch.cuda.nvtx.range_push("ping_pang_forward")
         assert inference_params is None, "inference not supported yet"
         assert inference_context is None, "inference not supported yet"
         assert context is None, "cross-attention not supported yet"
@@ -389,6 +397,7 @@ class TransformerLayer(BaseTransformerLayer):
         else:
             output = [mlp_output_0, mlp_output_1]
             context = [context_0, context_1]
+        torch.cuda.nvtx.range_pop()
         return output, context
 
     #### Debug use.
@@ -409,6 +418,7 @@ class TransformerLayer(BaseTransformerLayer):
         inference_params: Optional[Any] = None,
         backward_resend_qkv: bool = False,
     ):
+        torch.cuda.nvtx.range_push("PingPangGPTModel.forward_one_stage")
         """Debug use. Single stage of Ping-Pang parallel."""
         assert inference_params is None, "inference not supported yet"
         assert inference_context is None, "inference not supported yet"
@@ -486,7 +496,7 @@ class TransformerLayer(BaseTransformerLayer):
             context,
             context_mask,
         )
-
+        torch.cuda.nvtx.range_pop()
         return mlp_output, context, debug_tensors
 
 
@@ -513,6 +523,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
+        torch.cuda.nvtx.range_push("PingPangGPTModel.ping_pang_forward")
         assert inference_context is None
         assert inference_params is None
         assert context is None
@@ -585,6 +596,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
 
         # Final layer norm.
         if self.final_layernorm is not None:
+            torch.cuda.nvtx.range_push("PingPangGPTModel.final_layernorm")
             hidden_states = self.final_layernorm(hidden_states)
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
@@ -592,7 +604,9 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
+            torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_pop()
         return hidden_states
 
     def forward_layers(
@@ -602,157 +616,193 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_1: Dict[str, Any],
         compute_stream: torch.cuda.Stream,
     ):
-        layer = self.layers[l_no]
-        prev_layer = self.layers[l_no - 1] if l_no > 0 else None
-        # tick 0, second half
-        arg_group_0 = _forward_pre_core_attn(layer, arg_group_0)
-        if l_no > 0:
-            _tick_sync(
+        with nvtx_range(f"PingPangGPTModel.forward_layers[{l_no}]"):
+        
+            layer = self.layers[l_no]
+            prev_layer = self.layers[l_no - 1] if l_no > 0 else None
+            # tick 0, second half
+            
+            with nvtx_range("PingPangGPTModel._forward_pre_core_attn[0]"):
+                arg_group_0 = _forward_pre_core_attn(layer, arg_group_0)
+            
+            if l_no > 0:
+                with nvtx_range("PingPangGPTModel._tick_sync[0]"):
+                    _tick_sync(
+                        compute_stream, self.comm_stream,
+                        arg_group_0, "signal",  # compute out
+                        arg_group_1, "signal",  # prev layer's comm out,
+                    )
+
+            # tick 1
+            # communication
+            with nvtx_range("PingPangGPTModel._layout_mlp_to_attn[0]"):
+                arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
+            # compute
+            if l_no > 0:
+                with nvtx_range("PingPangGPTModel._forward_post_core_attn[1]"):
+                    arg_group_1 = _forward_post_core_attn(prev_layer, arg_group_1)
+
+            with nvtx_range("PingPangGPTModel._forward_pre_core_attn[1]"):
+                arg_group_1 = _forward_pre_core_attn(layer, arg_group_1)
+            with nvtx_range("PingPangGPTModel._tick_sync[1]"):
+                    _tick_sync(
+                    compute_stream, self.comm_stream,
+                    arg_group_0, "signal",  # comm out
+                    arg_group_1, "signal",  # compute out
+                )
+
+            # tick 2
+            # communication
+            with nvtx_range("PingPangGPTModel._layout_mlp_to_attn[1]"):
+                arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
+            # compute
+            with nvtx_range("PingPangGPTModel._forward_core_attn[0]"):
+                arg_group_0 = _forward_core_attn(layer, arg_group_0)
+
+            with nvtx_range("PingPangGPTModel._tick_sync[2]"):
+                _tick_sync(
+                    compute_stream, self.comm_stream,
+                    arg_group_0, "signal",  # compute out
+                    arg_group_1, "signal",  # comm out.
+                )
+
+            # tick 3
+            # communication
+            with nvtx_range("PingPangGPTModel._layout_attn_to_mlp[0]"):
+                arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
+            # compute
+            with nvtx_range("PingPangGPTModel._forward_core_attn[1]"):
+                arg_group_1 = _forward_core_attn(layer, arg_group_1)
+            with nvtx_range("PingPangGPTModel._tick_sync[3]"):
+                _tick_sync(
                 compute_stream, self.comm_stream,
-                arg_group_0, "signal",  # compute out
-                arg_group_1, "signal",  # prev layer's comm out,
+                arg_group_0, "signal",  # comm out
+                arg_group_1, "signal",  # compute out
             )
 
-        # tick 1
-        # communication
-        arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
-        # compute
-        if l_no > 0:
-            arg_group_1 = _forward_post_core_attn(prev_layer, arg_group_1)
-        arg_group_1 = _forward_pre_core_attn(layer, arg_group_1)
-        _tick_sync(
-            compute_stream, self.comm_stream,
-            arg_group_0, "signal",  # comm out
-            arg_group_1, "signal",  # compute out
-        )
+            # tick 4, also the tick 0 of the next layer
+            # communication
+            with nvtx_range("PingPangGPTModel._layout_attn_to_mlp[1]"):
+                arg_group_1 = _layout_attn_to_mlp(layer, arg_group_1)
+            # compute
+            with nvtx_range("PingPangGPTModel._forward_post_core_attn[0]"):
+                arg_group_0 = _forward_post_core_attn(layer, arg_group_0)
+            # NOTE: communication of this tick is at the next layer.
 
-        # tick 2
-        # communication
-        arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
-        # compute
-        arg_group_0 = _forward_core_attn(layer, arg_group_0)
-        _tick_sync(
-            compute_stream, self.comm_stream,
-            arg_group_0, "signal",  # compute out
-            arg_group_1, "signal",  # comm out.
-        )
-
-        # tick 3
-        # communication
-        arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
-        # compute
-        arg_group_1 = _forward_core_attn(layer, arg_group_1)
-        _tick_sync(
-            compute_stream, self.comm_stream,
-            arg_group_0, "signal",  # comm out
-            arg_group_1, "signal",  # compute out
-        )
-
-        # tick 4, also the tick 0 of the next layer
-        # communication
-        arg_group_1 = _layout_attn_to_mlp(layer, arg_group_1)
-        # compute
-        arg_group_0 = _forward_post_core_attn(layer, arg_group_0)
-        # NOTE: communication of this tick is at the next layer.
-
-        # if the last layer, do the other half of tick 4 and tick 5
-        if l_no == len(self.layers) - 1:
-            # No next layer, do the sync here.
-            _tick_sync(
-                compute_stream, self.comm_stream,
-                arg_group_0, "hidden_states",   # place holder
-                arg_group_1, "signal",          # comm out
-            )
-            arg_group_1 = _forward_post_core_attn(layer, arg_group_1)
-            # gathering the result
-            hidden_states = _gather_tensor([arg_group_0["hidden_states"], arg_group_1["hidden_states"]], 2)
-            context = _gather_tensor([arg_group_0["context"],arg_group_1["context"]], 2)
-        else:
-            hidden_states = None
-            context = None
+            # if the last layer, do the other half of tick 4 and tick 5
+            if l_no == len(self.layers) - 1:
+                # No next layer, do the sync here.
+                with nvtx_range("PingPangGPTModel._tick_sync[4]"):
+                    _tick_sync(
+                        compute_stream, self.comm_stream,
+                        arg_group_0, "hidden_states",   # place holder
+                        arg_group_1, "signal",          # comm out
+                    )
+                with nvtx_range("PingPangGPTModel._forward_post_core_attn[1]"):
+                    arg_group_1 = _forward_post_core_attn(layer, arg_group_1)
+                # gathering the result
+                hidden_states = _gather_tensor([arg_group_0["hidden_states"], arg_group_1["hidden_states"]], 2)
+                context = _gather_tensor([arg_group_0["context"],arg_group_1["context"]], 2)
+            else:
+                hidden_states = None
+                context = None
+        
         return arg_group_0, arg_group_1, hidden_states, context
 
     def _forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        hidden_states = args.pop("hidden_states")
-        query, key, value, residual, attn_mask_type = layer._forward_pre_core_attn(
-            hidden_states,
-            args["rotary_pos_emb"],
-            args["rotary_pos_cos"],
-            args["rotary_pos_sin"],
-            args["mlp_packed_seq_params"],
-            args["sequence_len_offset"],
-        )
-        signal = layer._pre_mlp_to_attn(query, key, value, args["packed_seq_params"])
-        args["query"] = query
-        args["key"] = key
-        args["value"] = value
-        args["residual"] = residual
-        args["attn_mask_type"] = attn_mask_type
-        args["signal"] = signal
-        return args
+        with nvtx_range("PingPangGPTModel._forward_pre_core_attn"):
+            hidden_states = args.pop("hidden_states")
+            query, key, value, residual, attn_mask_type = layer._forward_pre_core_attn(
+                hidden_states,
+                args["rotary_pos_emb"],
+                args["rotary_pos_cos"],
+                args["rotary_pos_sin"],
+                args["mlp_packed_seq_params"],
+                args["sequence_len_offset"],
+            )
+            signal = layer._pre_mlp_to_attn(query, key, value, args["packed_seq_params"])
+            args["query"] = query
+            args["key"] = key
+            args["value"] = value
+            args["residual"] = residual
+            args["attn_mask_type"] = attn_mask_type
+            args["signal"] = signal
+            return args
 
     def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        args.pop("query"), args.pop("key"), args.pop("value")
-        signal = args.pop("signal")
-        args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=True)
+        with nvtx_range("PingPangGPTModel._layout_mlp_to_attn (all_to_all)"):
+            args.pop("query"), args.pop("key"), args.pop("value")
+            signal = args.pop("signal")
+            args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=True)
         return args
 
     def _forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        # pop out to make sure the tensor is freed
-        signal = args.pop("signal")
-        query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
-        core_attn_out = layer._forward_core_attn(
-            query, key, value,
-            args["attention_mask"],
-            args["attention_bias"],
-            args["attn_mask_type"],
-            args["packed_seq_params"],
-        )
-        args["core_attn_out"] = core_attn_out
-        args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
+        with nvtx_range("PingPangGPTModel._forward_core_attn"):
+            # pop out to make sure the tensor is freed
+            signal = args.pop("signal")
+            query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
+            core_attn_out = layer._forward_core_attn(
+                query, key, value,
+                args["attention_mask"],
+                args["attention_bias"],
+                args["attn_mask_type"],
+                args["packed_seq_params"],
+            )
+            args["core_attn_out"] = core_attn_out
+            args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
         return args
 
     def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
-        args.pop("core_attn_out")
-        signal = args.pop("signal")
-        args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=False)
+        with nvtx_range("PingPangGPTModel._layout_attn_to_mlp (all_to_all)"):
+            args.pop("core_attn_out")
+            signal = args.pop("signal")
+            args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=False)
         return args
 
     def _forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        signal = args.pop("signal")
-        core_attn_out = layer._post_attn_to_mlp(signal, args["packed_seq_params"])
-        residual = args.pop("residual")
-        mlp_output, context = layer._forward_post_core_attn(
-            core_attn_out,
-            residual,
-            args["context"],
-            args["context_mask"],
-        )
-        args["hidden_states"] = mlp_output
-        args["context"] = context
+        with nvtx_range("PingPangGPTModel._forward_post_core_attn"):
+            signal = args.pop("signal")
+            core_attn_out = layer._post_attn_to_mlp(signal, args["packed_seq_params"])
+            residual = args.pop("residual")
+            mlp_output, context = layer._forward_post_core_attn(
+                core_attn_out,
+                residual,
+                args["context"],
+                args["context_mask"],
+            )
+            args["hidden_states"] = mlp_output
+            args["context"] = context
+
         return args
 
     def _tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, keys_1):
-        if isinstance(keys_0, str):
-            keys_0 = [keys_0]
-        if isinstance(keys_1, str):
-            keys_1 = [keys_1]
-        tensors_0 = [arg_group_0[key] for key in keys_0]
-        tensors_1 = [arg_group_1[key] for key in keys_1]
-        tensors = tensors_0 + tensors_1
-        out_tensors = TickSync.apply(compute_stream, comm_stream, *tensors)
-        out_tensors_0 = out_tensors[:len(tensors_0)]
-        out_tensors_1 = out_tensors[len(tensors_0):]
-        for key, out_tensor in zip(keys_0, out_tensors_0):
-            arg_group_0[key] = out_tensor
-        for key, out_tensor in zip(keys_1, out_tensors_1):
-            arg_group_1[key] = out_tensor
+        with nvtx_range("PingPangGPTModel._tick_sync"):
+            if isinstance(keys_0, str):
+                keys_0 = [keys_0]
+            if isinstance(keys_1, str):
+                keys_1 = [keys_1]
+            tensors_0 = [arg_group_0[key] for key in keys_0]
+            tensors_1 = [arg_group_1[key] for key in keys_1]
+            tensors = tensors_0 + tensors_1
+            out_tensors = TickSync.apply(compute_stream, comm_stream, *tensors)
+            out_tensors_0 = out_tensors[:len(tensors_0)]
+            out_tensors_1 = out_tensors[len(tensors_0):]
+            for key, out_tensor in zip(keys_0, out_tensors_0):
+                arg_group_0[key] = out_tensor
+            for key, out_tensor in zip(keys_1, out_tensors_1):
+                arg_group_1[key] = out_tensor
+
+        return
 
     def forward(self, *args, **kwargs):
         if self._ping_pang_debug:
-            return self._normal_forward(*args, **kwargs)
+            with nvtx_range("PingPangGPTModel.forward (normal_forward)"):
+                ret = self._normal_forward(*args, **kwargs)
+            return ret
         assert self.ping_pong_comm_initialized
-        return self.ping_pang_forward(*args, **kwargs)
+        ret = self.ping_pang_forward(*args, **kwargs)
+        torch.cuda.nvtx.range_pop()
+        return ret
 
     block.forward_layers = types.MethodType(forward_layers, block)
     block.init_ping_pang_communication_ctx = types.MethodType(init_ping_pang_communication_ctx, block)
