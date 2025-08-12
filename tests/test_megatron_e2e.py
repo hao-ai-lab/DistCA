@@ -61,6 +61,12 @@ class MegatronE2eWorker(MegatronBaseWorker):
         override_model_config = OmegaConf.create()
         override_transformer_config = OmegaConf.create({
             "apply_rope_fusion": True,
+            # bias-act fusion
+            "bias_activation_fusion": True,
+            # no layer norm so no need for that fusion
+            # attention is in FA so no masked_softmax fusion
+            # bias-drop_out-add fusion
+            "bias_dropout_fusion": True,
         })
         # A default optim config
         optim_config = OmegaConf.create({
@@ -259,8 +265,8 @@ def init_megatron_e2e_test(
 ):
     token_bytes_q = hidden_size_q * dtype.itemsize
     token_bytes_kv = hidden_size_kv * dtype.itemsize
-    max_tokens_query = num_tokens * world_size
-    max_tokens_key_value = num_tokens * world_size
+    max_tokens_query = num_tokens * (world_size // tp_size)
+    max_tokens_key_value = num_tokens * (world_size // tp_size)
     buffer_size = (
         token_bytes_q * max_tokens_query +
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
