@@ -21,6 +21,8 @@ generate_filename() {
     fi
 }
 
+# Must turn this flag to 1 for performance test. Otherwise you will see that backward is 5-8x slower than forward.
+# For accuracy test, set it to 0.
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
 
 echo " --- Baseline --- "

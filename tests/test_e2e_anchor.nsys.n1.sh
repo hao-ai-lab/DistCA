@@ -23,6 +23,9 @@ generate_filename() {
 
 echo " --- Baseline --- "
 
+# Must turn this flag to 1 for performance test. Otherwise you will see that backward is 5-8x slower than forward.
+# For accuracy test, set it to 0.
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
 TORCHARGS="--nnodes 1 --nproc_per_node 1 --master_addr ${HOSTNAME} --rdzv_backend=c10d --rdzv_conf read_timeout=120,join_timeout=1200,last_call_timeout=60"
 # NUM_TOKENS=73728
 # NUM_TOKENS=66560
@@ -56,7 +59,7 @@ for NODE_RANK in 0; do
         NSYS_CMD=""
     fi
     
-    echo NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 ${NSYS_CMD} torchrun ${TORCHARGS} --node_rank=${NODE_RANK} --master_port=${MASTER_PORT} test_e2e_anchor.py --num-nodes=1 --num-gpus-per-node=1 --tp-size=1 --num-tokens ${NUM_TOKENS} --num-layers ${NUM_LAYERS} --mode ${MODE} --replan-iter ${REPLAN_ITER} --max-sample-id ${MAX_SAMPLE_ID} --output-file ${OUTPUT_DIR}/${FILENAME}.json ${EXTRA_ARGS}
+    echo NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO} ${NSYS_CMD} torchrun ${TORCHARGS} --node_rank=${NODE_RANK} --master_port=${MASTER_PORT} test_e2e_anchor.py --num-nodes=1 --num-gpus-per-node=1 --tp-size=1 --num-tokens ${NUM_TOKENS} --num-layers ${NUM_LAYERS} --mode ${MODE} --replan-iter ${REPLAN_ITER} --max-sample-id ${MAX_SAMPLE_ID} --output-file ${OUTPUT_DIR}/${FILENAME}.json ${EXTRA_ARGS}
 done
 
 echo " --- D2 without Planner --- "
@@ -73,7 +76,7 @@ for NODE_RANK in 0; do
         NSYS_CMD=""
     fi
 
-    echo NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 ${NSYS_CMD} torchrun ${TORCHARGS} --node_rank=${NODE_RANK}  --master_port=${MASTER_PORT} test_e2e_anchor.py  --num-nodes=1 --num-gpus-per-node=1 --tp-size=1 --num-tokens ${NUM_TOKENS} --num-layers ${NUM_LAYERS} --mode ${MODE} --replan-iter ${REPLAN_ITER} --max-sample-id ${MAX_SAMPLE_ID} --output-file ${OUTPUT_DIR}/${FILENAME}.json ${EXTRA_ARGS}
+    echo NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO} ${NSYS_CMD} torchrun ${TORCHARGS} --node_rank=${NODE_RANK}  --master_port=${MASTER_PORT} test_e2e_anchor.py  --num-nodes=1 --num-gpus-per-node=1 --tp-size=1 --num-tokens ${NUM_TOKENS} --num-layers ${NUM_LAYERS} --mode ${MODE} --replan-iter ${REPLAN_ITER} --max-sample-id ${MAX_SAMPLE_ID} --output-file ${OUTPUT_DIR}/${FILENAME}.json ${EXTRA_ARGS}
 done
 
 
@@ -90,5 +93,5 @@ for NODE_RANK in 0; do
         NSYS_CMD=""
     fi
 
-    echo NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 ${NSYS_CMD} torchrun ${TORCHARGS} --node_rank=${NODE_RANK}  --master_port=32000 test_e2e_anchor.py --num-nodes=1 --num-gpus-per-node=1 --tp-size=1 --num-tokens ${NUM_TOKENS} --num-layers ${NUM_LAYERS} --mode ${MODE} --replan-iter ${REPLAN_ITER} --max-sample-id ${MAX_SAMPLE_ID} --output-file ${OUTPUT_DIR}/${FILENAME}.json ${EXTRA_ARGS}
+    echo NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO} ${NSYS_CMD} torchrun ${TORCHARGS} --node_rank=${NODE_RANK}  --master_port=32000 test_e2e_anchor.py --num-nodes=1 --num-gpus-per-node=1 --tp-size=1 --num-tokens ${NUM_TOKENS} --num-layers ${NUM_LAYERS} --mode ${MODE} --replan-iter ${REPLAN_ITER} --max-sample-id ${MAX_SAMPLE_ID} --output-file ${OUTPUT_DIR}/${FILENAME}.json ${EXTRA_ARGS}
 done
