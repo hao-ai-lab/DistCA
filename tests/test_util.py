@@ -342,6 +342,7 @@ def create_raw_qkv_dispatch(
         (seq_lens, ) if return_mlp_no_shard_seq_lens else (),
     )
 
+
 def create_qkv_dispath_with_backward(
     world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
     hidden_size_q: int, hidden_size_k: int,
@@ -775,9 +776,6 @@ def create_qkv_dispatch_with_custom_mapping(
     if return_mlp_no_shard_seq_lens:
         ret += (seq_lens,)
     return ret
-
-
-
 
 
 # FIXME: remove this function.
