@@ -59,7 +59,9 @@ class MegatronE2eWorker(MegatronBaseWorker):
         set_random_seed(seed)
         self.model_path = model_path
         override_model_config = OmegaConf.create()
-        override_transformer_config = OmegaConf.create()
+        override_transformer_config = OmegaConf.create({
+            "apply_rope_fusion": True,
+        })
         # A default optim config
         optim_config = OmegaConf.create({
             "clip_grad": 1.0,
