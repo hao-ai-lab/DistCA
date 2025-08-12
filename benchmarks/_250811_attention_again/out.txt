@@ -1,0 +1,683 @@
+============================================================
+Testing: seq_len=1K, batch_size=1, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 1 (causal):
+- Forward: 0.21 ± 0.08 ms, Backward: 0.56 ± 0.07 ms, Backward / Forward: 2.65. Total: 0.77 ms. Output shape: torch.Size([1024, 32, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=1, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 1 (causal):
+- Forward: 0.11 ± 0.01 ms, Backward: 0.22 ± 0.02 ms, Backward / Forward: 1.93. Total: 0.33 ms. Output shape: torch.Size([1024, 16, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=1, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 1 (causal):
+- Forward: 0.10 ± 0.01 ms, Backward: 0.19 ± 0.01 ms, Backward / Forward: 1.87. Total: 0.29 ms. Output shape: torch.Size([1024, 8, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=1, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 1 (causal):
+- Forward: 0.17 ± 0.04 ms, Backward: 0.51 ± 0.07 ms, Backward / Forward: 3.05. Total: 0.68 ms. Output shape: torch.Size([1024, 4, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=2, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 2 (causal):
+- Forward: 0.31 ± 0.02 ms, Backward: 0.71 ± 0.02 ms, Backward / Forward: 2.27. Total: 1.02 ms. Output shape: torch.Size([2048, 32, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=2, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 2 (causal):
+- Forward: 0.19 ± 0.06 ms, Backward: 0.51 ± 0.01 ms, Backward / Forward: 2.64. Total: 0.70 ms. Output shape: torch.Size([2048, 16, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=2, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 2 (causal):
+- Forward: 0.15 ± 0.02 ms, Backward: 0.36 ± 0.02 ms, Backward / Forward: 2.50. Total: 0.51 ms. Output shape: torch.Size([2048, 8, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=2, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 2 (causal):
+- Forward: 0.17 ± 0.07 ms, Backward: 0.23 ± 0.06 ms, Backward / Forward: 1.34. Total: 0.40 ms. Output shape: torch.Size([2048, 4, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=4, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 4 (causal):
+- Forward: 0.38 ± 0.02 ms, Backward: 0.98 ± 0.02 ms, Backward / Forward: 2.61. Total: 1.35 ms. Output shape: torch.Size([4096, 32, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=4, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 4 (causal):
+- Forward: 0.27 ± 0.06 ms, Backward: 0.71 ± 0.03 ms, Backward / Forward: 2.65. Total: 0.98 ms. Output shape: torch.Size([4096, 16, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=4, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 4 (causal):
+- Forward: 0.19 ± 0.07 ms, Backward: 0.51 ± 0.01 ms, Backward / Forward: 2.63. Total: 0.71 ms. Output shape: torch.Size([4096, 8, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=4, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 4 (causal):
+- Forward: 0.14 ± 0.01 ms, Backward: 0.37 ± 0.03 ms, Backward / Forward: 2.59. Total: 0.51 ms. Output shape: torch.Size([4096, 4, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=8, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 8 (causal):
+- Forward: 0.78 ± 0.12 ms, Backward: 1.54 ± 0.02 ms, Backward / Forward: 1.96. Total: 2.33 ms. Output shape: torch.Size([8192, 32, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=8, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 8 (causal):
+- Forward: 0.33 ± 0.06 ms, Backward: 0.95 ± 0.03 ms, Backward / Forward: 2.87. Total: 1.28 ms. Output shape: torch.Size([8192, 16, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=8, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 8 (causal):
+- Forward: 0.27 ± 0.07 ms, Backward: 0.71 ± 0.03 ms, Backward / Forward: 2.60. Total: 0.99 ms. Output shape: torch.Size([8192, 8, 128])
+
+============================================================
+Testing: seq_len=1K, batch_size=8, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 1024 x batch_size = 8 (causal):
+- Forward: 0.20 ± 0.06 ms, Backward: 0.51 ± 0.01 ms, Backward / Forward: 2.60. Total: 0.70 ms. Output shape: torch.Size([8192, 4, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=1, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 1 (causal):
+- Forward: 0.38 ± 0.01 ms, Backward: 0.87 ± 0.03 ms, Backward / Forward: 2.30. Total: 1.25 ms. Output shape: torch.Size([2048, 32, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=1, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 1 (causal):
+- Forward: 0.23 ± 0.06 ms, Backward: 0.61 ± 0.01 ms, Backward / Forward: 2.64. Total: 0.85 ms. Output shape: torch.Size([2048, 16, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=1, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 1 (causal):
+- Forward: 0.15 ± 0.01 ms, Backward: 0.41 ± 0.01 ms, Backward / Forward: 2.62. Total: 0.56 ms. Output shape: torch.Size([2048, 8, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=1, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 1 (causal):
+- Forward: 0.18 ± 0.07 ms, Backward: 0.28 ± 0.05 ms, Backward / Forward: 1.54. Total: 0.46 ms. Output shape: torch.Size([2048, 4, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=2, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 2 (causal):
+- Forward: 0.48 ± 0.01 ms, Backward: 1.27 ± 0.02 ms, Backward / Forward: 2.65. Total: 1.75 ms. Output shape: torch.Size([4096, 32, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=2, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 2 (causal):
+- Forward: 0.34 ± 0.07 ms, Backward: 0.88 ± 0.03 ms, Backward / Forward: 2.61. Total: 1.21 ms. Output shape: torch.Size([4096, 16, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=2, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 2 (causal):
+- Forward: 0.23 ± 0.06 ms, Backward: 0.62 ± 0.02 ms, Backward / Forward: 2.64. Total: 0.85 ms. Output shape: torch.Size([4096, 8, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=2, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 2 (causal):
+- Forward: 0.16 ± 0.01 ms, Backward: 0.41 ± 0.01 ms, Backward / Forward: 2.62. Total: 0.57 ms. Output shape: torch.Size([4096, 4, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=4, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 4 (causal):
+- Forward: 0.94 ± 0.11 ms, Backward: 2.11 ± 0.01 ms, Backward / Forward: 2.25. Total: 3.04 ms. Output shape: torch.Size([8192, 32, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=4, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 4 (causal):
+- Forward: 0.43 ± 0.06 ms, Backward: 1.25 ± 0.03 ms, Backward / Forward: 2.88. Total: 1.68 ms. Output shape: torch.Size([8192, 16, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=4, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 4 (causal):
+- Forward: 0.33 ± 0.06 ms, Backward: 0.87 ± 0.03 ms, Backward / Forward: 2.67. Total: 1.20 ms. Output shape: torch.Size([8192, 8, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=4, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 4 (causal):
+- Forward: 0.24 ± 0.06 ms, Backward: 0.61 ± 0.01 ms, Backward / Forward: 2.60. Total: 0.85 ms. Output shape: torch.Size([8192, 4, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=8, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 8 (causal):
+- Forward: 2.01 ± 0.29 ms, Backward: 3.46 ± 0.05 ms, Backward / Forward: 1.72. Total: 5.47 ms. Output shape: torch.Size([16384, 32, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=8, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 8 (causal):
+- Forward: 0.81 ± 0.21 ms, Backward: 2.10 ± 0.02 ms, Backward / Forward: 2.59. Total: 2.91 ms. Output shape: torch.Size([16384, 16, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=8, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 8 (causal):
+- Forward: 0.44 ± 0.06 ms, Backward: 1.27 ± 0.01 ms, Backward / Forward: 2.90. Total: 1.70 ms. Output shape: torch.Size([16384, 8, 128])
+
+============================================================
+Testing: seq_len=2K, batch_size=8, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 2048 x batch_size = 8 (causal):
+- Forward: 0.34 ± 0.06 ms, Backward: 0.87 ± 0.03 ms, Backward / Forward: 2.61. Total: 1.21 ms. Output shape: torch.Size([16384, 4, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=1, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 1 (causal):
+- Forward: 0.69 ± 0.01 ms, Backward: 1.84 ± 0.02 ms, Backward / Forward: 2.68. Total: 2.53 ms. Output shape: torch.Size([4096, 32, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=1, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 1 (causal):
+- Forward: 0.46 ± 0.07 ms, Backward: 1.20 ± 0.03 ms, Backward / Forward: 2.59. Total: 1.66 ms. Output shape: torch.Size([4096, 16, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=1, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 1 (causal):
+- Forward: 0.32 ± 0.06 ms, Backward: 0.82 ± 0.02 ms, Backward / Forward: 2.56. Total: 1.14 ms. Output shape: torch.Size([4096, 8, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=1, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 1 (causal):
+- Forward: 0.21 ± 0.01 ms, Backward: 0.54 ± 0.02 ms, Backward / Forward: 2.65. Total: 0.75 ms. Output shape: torch.Size([4096, 4, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=2, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 2 (causal):
+- Forward: 1.30 ± 0.11 ms, Backward: 3.19 ± 0.02 ms, Backward / Forward: 2.44. Total: 4.49 ms. Output shape: torch.Size([8192, 32, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=2, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 2 (causal):
+- Forward: 0.64 ± 0.06 ms, Backward: 2.38 ± 0.94 ms, Backward / Forward: 3.69. Total: 3.02 ms. Output shape: torch.Size([8192, 16, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=2, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 2 (causal):
+- Forward: 0.46 ± 0.07 ms, Backward: 1.20 ± 0.03 ms, Backward / Forward: 2.61. Total: 1.66 ms. Output shape: torch.Size([8192, 8, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=2, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 2 (causal):
+- Forward: 0.32 ± 0.06 ms, Backward: 0.82 ± 0.02 ms, Backward / Forward: 2.54. Total: 1.14 ms. Output shape: torch.Size([8192, 4, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=4, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 4 (causal):
+- Forward: 3.65 ± 1.71 ms, Backward: 6.11 ± 0.68 ms, Backward / Forward: 1.67. Total: 9.76 ms. Output shape: torch.Size([16384, 32, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=4, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 4 (causal):
+- Forward: 1.18 ± 0.20 ms, Backward: 3.42 ± 0.68 ms, Backward / Forward: 2.89. Total: 4.60 ms. Output shape: torch.Size([16384, 16, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=4, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 4 (causal):
+- Forward: 0.64 ± 0.06 ms, Backward: 1.85 ± 0.02 ms, Backward / Forward: 2.87. Total: 2.49 ms. Output shape: torch.Size([16384, 8, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=4, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 4 (causal):
+- Forward: 0.46 ± 0.06 ms, Backward: 1.20 ± 0.03 ms, Backward / Forward: 2.59. Total: 1.66 ms. Output shape: torch.Size([16384, 4, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=8, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 8 (causal):
+- Forward: 4.48 ± 0.28 ms, Backward: 10.91 ± 0.21 ms, Backward / Forward: 2.44. Total: 15.39 ms. Output shape: torch.Size([32768, 32, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=8, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 8 (causal):
+- Forward: 2.56 ± 0.31 ms, Backward: 6.23 ± 2.08 ms, Backward / Forward: 2.44. Total: 8.79 ms. Output shape: torch.Size([32768, 16, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=8, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 8 (causal):
+- Forward: 1.17 ± 0.19 ms, Backward: 3.31 ± 0.28 ms, Backward / Forward: 2.84. Total: 4.47 ms. Output shape: torch.Size([32768, 8, 128])
+
+============================================================
+Testing: seq_len=4K, batch_size=8, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 4096 x batch_size = 8 (causal):
+- Forward: 0.64 ± 0.07 ms, Backward: 1.85 ± 0.03 ms, Backward / Forward: 2.90. Total: 2.50 ms. Output shape: torch.Size([32768, 4, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=1, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 1 (causal):
+- Forward: 2.04 ± 0.12 ms, Backward: 5.38 ± 0.19 ms, Backward / Forward: 2.64. Total: 7.42 ms. Output shape: torch.Size([8192, 32, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=1, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 1 (causal):
+- Forward: 1.07 ± 0.07 ms, Backward: 2.94 ± 0.02 ms, Backward / Forward: 2.74. Total: 4.01 ms. Output shape: torch.Size([8192, 16, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=1, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 1 (causal):
+- Forward: 0.73 ± 0.07 ms, Backward: 1.81 ± 0.03 ms, Backward / Forward: 2.49. Total: 2.54 ms. Output shape: torch.Size([8192, 8, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=1, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 1 (causal):
+- Forward: 0.50 ± 0.06 ms, Backward: 1.19 ± 0.01 ms, Backward / Forward: 2.40. Total: 1.69 ms. Output shape: torch.Size([8192, 4, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=2, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 2 (causal):
+- Forward: 4.07 ± 0.28 ms, Backward: 9.69 ± 0.05 ms, Backward / Forward: 2.38. Total: 13.76 ms. Output shape: torch.Size([16384, 32, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=2, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 2 (causal):
+- Forward: 1.93 ± 0.20 ms, Backward: 5.49 ± 0.50 ms, Backward / Forward: 2.84. Total: 7.42 ms. Output shape: torch.Size([16384, 16, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=2, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 2 (causal):
+- Forward: 1.08 ± 0.08 ms, Backward: 2.97 ± 0.02 ms, Backward / Forward: 2.76. Total: 4.05 ms. Output shape: torch.Size([16384, 8, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=2, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 2 (causal):
+- Forward: 0.73 ± 0.07 ms, Backward: 1.83 ± 0.03 ms, Backward / Forward: 2.49. Total: 2.56 ms. Output shape: torch.Size([16384, 4, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=4, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 4 (causal):
+- Forward: 7.93 ± 2.18 ms, Backward: 19.39 ± 1.44 ms, Backward / Forward: 2.45. Total: 27.32 ms. Output shape: torch.Size([32768, 32, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=4, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 4 (causal):
+- Forward: 4.18 ± 0.80 ms, Backward: 9.71 ± 0.05 ms, Backward / Forward: 2.32. Total: 13.89 ms. Output shape: torch.Size([32768, 16, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=4, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 4 (causal):
+- Forward: 1.95 ± 0.21 ms, Backward: 5.47 ± 0.35 ms, Backward / Forward: 2.81. Total: 7.42 ms. Output shape: torch.Size([32768, 8, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=4, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 4 (causal):
+- Forward: 1.09 ± 0.08 ms, Backward: 2.97 ± 0.02 ms, Backward / Forward: 2.73. Total: 4.06 ms. Output shape: torch.Size([32768, 4, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=8, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 8 (causal):
+- Forward: 13.48 ± 0.25 ms, Backward: 40.94 ± 11.35 ms, Backward / Forward: 3.04. Total: 54.42 ms. Output shape: torch.Size([65536, 32, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=8, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 8 (causal):
+- Forward: 7.73 ± 1.98 ms, Backward: 20.64 ± 5.07 ms, Backward / Forward: 2.67. Total: 28.36 ms. Output shape: torch.Size([65536, 16, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=8, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 8 (causal):
+- Forward: 3.95 ± 0.29 ms, Backward: 9.68 ± 0.04 ms, Backward / Forward: 2.45. Total: 13.63 ms. Output shape: torch.Size([65536, 8, 128])
+
+============================================================
+Testing: seq_len=8K, batch_size=8, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 8192 x batch_size = 8 (causal):
+- Forward: 1.91 ± 0.19 ms, Backward: 5.60 ± 0.55 ms, Backward / Forward: 2.94. Total: 7.50 ms. Output shape: torch.Size([65536, 4, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=1, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 1 (causal):
+- Forward: 7.18 ± 0.50 ms, Backward: 17.93 ± 0.03 ms, Backward / Forward: 2.50. Total: 25.11 ms. Output shape: torch.Size([16384, 32, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=1, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 1 (causal):
+- Forward: 3.43 ± 0.18 ms, Backward: 9.33 ± 0.10 ms, Backward / Forward: 2.72. Total: 12.76 ms. Output shape: torch.Size([16384, 16, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=1, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 1 (causal):
+- Forward: 1.96 ± 0.12 ms, Backward: 4.91 ± 0.06 ms, Backward / Forward: 2.50. Total: 6.88 ms. Output shape: torch.Size([16384, 8, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=1, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 1 (causal):
+- Forward: 1.23 ± 0.08 ms, Backward: 2.99 ± 0.69 ms, Backward / Forward: 2.44. Total: 4.22 ms. Output shape: torch.Size([16384, 4, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=2, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 2 (causal):
+- Forward: 12.88 ± 0.45 ms, Backward: 35.73 ± 0.56 ms, Backward / Forward: 2.77. Total: 48.61 ms. Output shape: torch.Size([32768, 32, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=2, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 2 (causal):
+- Forward: 7.05 ± 0.70 ms, Backward: 18.07 ± 0.15 ms, Backward / Forward: 2.56. Total: 25.13 ms. Output shape: torch.Size([32768, 16, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=2, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 2 (causal):
+- Forward: 3.74 ± 0.97 ms, Backward: 9.62 ± 0.53 ms, Backward / Forward: 2.57. Total: 13.36 ms. Output shape: torch.Size([32768, 8, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=2, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 2 (causal):
+- Forward: 1.91 ± 0.08 ms, Backward: 4.97 ± 0.01 ms, Backward / Forward: 2.60. Total: 6.88 ms. Output shape: torch.Size([32768, 4, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=4, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 4 (causal):
+- Forward: 25.82 ± 2.62 ms, Backward: 70.75 ± 0.82 ms, Backward / Forward: 2.74. Total: 96.57 ms. Output shape: torch.Size([65536, 32, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=4, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 4 (causal):
+- Forward: 12.50 ± 0.40 ms, Backward: 35.59 ± 0.38 ms, Backward / Forward: 2.85. Total: 48.09 ms. Output shape: torch.Size([65536, 16, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=4, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 4 (causal):
+- Forward: 6.79 ± 0.30 ms, Backward: 17.99 ± 0.07 ms, Backward / Forward: 2.65. Total: 24.79 ms. Output shape: torch.Size([65536, 8, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=4, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 4 (causal):
+- Forward: 3.44 ± 0.21 ms, Backward: 9.49 ± 0.19 ms, Backward / Forward: 2.76. Total: 12.94 ms. Output shape: torch.Size([65536, 4, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=8, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 8 (causal):
+- Forward: 46.35 ± 0.48 ms, Backward: 141.50 ± 1.11 ms, Backward / Forward: 3.05. Total: 187.85 ms. Output shape: torch.Size([131072, 32, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=8, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 8 (causal):
+- Forward: 23.92 ± 0.83 ms, Backward: 70.79 ± 0.43 ms, Backward / Forward: 2.96. Total: 94.71 ms. Output shape: torch.Size([131072, 16, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=8, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 8 (causal):
+- Forward: 12.56 ± 0.40 ms, Backward: 35.52 ± 0.22 ms, Backward / Forward: 2.83. Total: 48.08 ms. Output shape: torch.Size([131072, 8, 128])
+
+============================================================
+Testing: seq_len=16K, batch_size=8, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 16384 x batch_size = 8 (causal):
+- Forward: 6.85 ± 0.29 ms, Backward: 18.13 ± 0.06 ms, Backward / Forward: 2.65. Total: 24.98 ms. Output shape: torch.Size([131072, 4, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=1, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 1 (causal):
+- Forward: 23.91 ± 0.16 ms, Backward: 69.22 ± 0.65 ms, Backward / Forward: 2.90. Total: 93.13 ms. Output shape: torch.Size([32768, 32, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=1, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 1 (causal):
+- Forward: 12.46 ± 0.25 ms, Backward: 34.64 ± 0.43 ms, Backward / Forward: 2.78. Total: 47.10 ms. Output shape: torch.Size([32768, 16, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=1, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 1 (causal):
+- Forward: 6.41 ± 0.19 ms, Backward: 18.98 ± 3.70 ms, Backward / Forward: 2.96. Total: 25.38 ms. Output shape: torch.Size([32768, 8, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=1, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 1 (causal):
+- Forward: 3.56 ± 0.07 ms, Backward: 9.09 ± 0.24 ms, Backward / Forward: 2.55. Total: 12.64 ms. Output shape: torch.Size([32768, 4, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=2, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 2 (causal):
+- Forward: 46.65 ± 0.42 ms, Backward: 138.05 ± 0.73 ms, Backward / Forward: 2.96. Total: 184.70 ms. Output shape: torch.Size([65536, 32, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=2, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 2 (causal):
+- Forward: 23.65 ± 0.42 ms, Backward: 69.56 ± 1.67 ms, Backward / Forward: 2.94. Total: 93.21 ms. Output shape: torch.Size([65536, 16, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=2, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 2 (causal):
+- Forward: 12.53 ± 0.25 ms, Backward: 34.58 ± 0.03 ms, Backward / Forward: 2.76. Total: 47.11 ms. Output shape: torch.Size([65536, 8, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=2, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 2 (causal):
+- Forward: 6.46 ± 0.20 ms, Backward: 17.72 ± 0.03 ms, Backward / Forward: 2.74. Total: 24.18 ms. Output shape: torch.Size([65536, 4, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=4, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 4 (causal):
+- Forward: 92.19 ± 0.77 ms, Backward: 275.20 ± 2.20 ms, Backward / Forward: 2.99. Total: 367.39 ms. Output shape: torch.Size([131072, 32, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=4, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 4 (causal):
+- Forward: 46.02 ± 0.82 ms, Backward: 138.50 ± 2.52 ms, Backward / Forward: 3.01. Total: 184.53 ms. Output shape: torch.Size([131072, 16, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=4, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 4 (causal):
+- Forward: 23.62 ± 0.38 ms, Backward: 68.93 ± 0.34 ms, Backward / Forward: 2.92. Total: 92.55 ms. Output shape: torch.Size([131072, 8, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=4, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 4 (causal):
+- Forward: 12.77 ± 0.81 ms, Backward: 34.73 ± 0.78 ms, Backward / Forward: 2.72. Total: 47.50 ms. Output shape: torch.Size([131072, 4, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=8, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 8 (causal):
+- Forward: 183.08 ± 0.89 ms, Backward: 541.76 ± 1.77 ms, Backward / Forward: 2.96. Total: 724.83 ms. Output shape: torch.Size([262144, 32, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=8, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 8 (causal):
+- Forward: 91.51 ± 0.84 ms, Backward: 276.85 ± 11.55 ms, Backward / Forward: 3.03. Total: 368.36 ms. Output shape: torch.Size([262144, 16, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=8, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 8 (causal):
+- Forward: 45.72 ± 0.81 ms, Backward: 137.45 ± 0.65 ms, Backward / Forward: 3.01. Total: 183.18 ms. Output shape: torch.Size([262144, 8, 128])
+
+============================================================
+Testing: seq_len=32K, batch_size=8, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 32768 x batch_size = 8 (causal):
+- Forward: 23.49 ± 0.49 ms, Backward: 72.24 ± 7.60 ms, Backward / Forward: 3.07. Total: 95.73 ms. Output shape: torch.Size([262144, 4, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=1, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 1 (causal):
+- Forward: 93.22 ± 1.17 ms, Backward: 269.93 ± 0.77 ms, Backward / Forward: 2.90. Total: 363.14 ms. Output shape: torch.Size([65536, 32, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=1, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 1 (causal):
+- Forward: 46.30 ± 0.68 ms, Backward: 137.16 ± 3.38 ms, Backward / Forward: 2.96. Total: 183.46 ms. Output shape: torch.Size([65536, 16, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=1, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 1 (causal):
+- Forward: 23.68 ± 0.28 ms, Backward: 68.15 ± 0.56 ms, Backward / Forward: 2.88. Total: 91.83 ms. Output shape: torch.Size([65536, 8, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=1, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 1 (causal):
+- Forward: 12.27 ± 0.14 ms, Backward: 34.32 ± 0.15 ms, Backward / Forward: 2.80. Total: 46.59 ms. Output shape: torch.Size([65536, 4, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=2, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 2 (causal):
+- Forward: 184.75 ± 1.44 ms, Backward: 536.33 ± 3.02 ms, Backward / Forward: 2.90. Total: 721.09 ms. Output shape: torch.Size([131072, 32, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=2, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 2 (causal):
+- Forward: 92.43 ± 1.38 ms, Backward: 271.06 ± 5.73 ms, Backward / Forward: 2.93. Total: 363.49 ms. Output shape: torch.Size([131072, 16, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=2, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 2 (causal):
+- Forward: 46.64 ± 2.19 ms, Backward: 135.77 ± 1.07 ms, Backward / Forward: 2.91. Total: 182.41 ms. Output shape: torch.Size([131072, 8, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=2, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 2 (causal):
+- Forward: 23.73 ± 0.38 ms, Backward: 68.02 ± 0.57 ms, Backward / Forward: 2.87. Total: 91.75 ms. Output shape: torch.Size([131072, 4, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=4, tp_size=1
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 4 (causal):
+- Forward: 373.36 ± 2.00 ms, Backward: 1064.88 ± 5.39 ms, Backward / Forward: 2.85. Total: 1438.25 ms. Output shape: torch.Size([262144, 32, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=4, tp_size=2
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 4 (causal):
+- Forward: 185.13 ± 0.44 ms, Backward: 533.38 ± 0.79 ms, Backward / Forward: 2.88. Total: 718.51 ms. Output shape: torch.Size([262144, 16, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=4, tp_size=4
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 4 (causal):
+- Forward: 92.44 ± 1.15 ms, Backward: 269.48 ± 0.42 ms, Backward / Forward: 2.92. Total: 361.92 ms. Output shape: torch.Size([262144, 8, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=4, tp_size=8
+============================================================
+Flash Attention Varlen - seq_len = 65536 x batch_size = 4 (causal):
+- Forward: 48.08 ± 4.20 ms, Backward: 138.55 ± 3.96 ms, Backward / Forward: 2.88. Total: 186.63 ms. Output shape: torch.Size([262144, 4, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=8, tp_size=1
+============================================================
+Error: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+============================================================
+Testing: seq_len=64K, batch_size=8, tp_size=2
+============================================================
+Error: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+============================================================
+Testing: seq_len=64K, batch_size=8, tp_size=4
+============================================================
+Error: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+============================================================
+Testing: seq_len=64K, batch_size=8, tp_size=8
+============================================================
+Error: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+

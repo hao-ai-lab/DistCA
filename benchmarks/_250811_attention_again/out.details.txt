@@ -1,0 +1,115 @@
+============================================================
+Testing: seq_len=64K, batch_size=2, tp_size=8
+============================================================
+🟢 Forward: 24.66 ms, Backward: 68.77 ms, Backward / Forward: 2.79
+🟢 Forward: 23.09 ms, Backward: 70.91 ms, Backward / Forward: 3.07
+🟢 Forward: 23.40 ms, Backward: 69.12 ms, Backward / Forward: 2.95
+🟢 Forward: 23.21 ms, Backward: 67.55 ms, Backward / Forward: 2.91
+🟢 Forward: 23.42 ms, Backward: 68.36 ms, Backward / Forward: 2.92
+🟢 Forward: 23.66 ms, Backward: 68.23 ms, Backward / Forward: 2.88
+🟢 Forward: 22.95 ms, Backward: 67.64 ms, Backward / Forward: 2.95
+🟢 Forward: 23.62 ms, Backward: 68.25 ms, Backward / Forward: 2.89
+🟢 Forward: 23.51 ms, Backward: 67.50 ms, Backward / Forward: 2.87
+🟢 Forward: 23.04 ms, Backward: 67.88 ms, Backward / Forward: 2.95
+Flash Attention Varlen - seq_len = 65536 x batch_size = 2 (causal):
+- Forward: 23.46 ± 0.46 ms, Backward: 68.42 ± 0.97 ms, Backward / Forward: 2.92. Total: 91.88 ms. Output shape: torch.Size([131072, 4, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=4, tp_size=1
+============================================================
+🟢 Forward: 375.46 ms, Backward: 1058.25 ms, Backward / Forward: 2.82
+🟢 Forward: 367.12 ms, Backward: 1079.77 ms, Backward / Forward: 2.94
+🟢 Forward: 371.98 ms, Backward: 1063.58 ms, Backward / Forward: 2.86
+🟢 Forward: 373.37 ms, Backward: 1063.74 ms, Backward / Forward: 2.85
+🟢 Forward: 373.57 ms, Backward: 1085.50 ms, Backward / Forward: 2.91
+🟢 Forward: 375.03 ms, Backward: 1064.86 ms, Backward / Forward: 2.84
+🟢 Forward: 372.25 ms, Backward: 1063.22 ms, Backward / Forward: 2.86
+🟢 Forward: 373.44 ms, Backward: 1063.26 ms, Backward / Forward: 2.85
+🟢 Forward: 375.98 ms, Backward: 1063.71 ms, Backward / Forward: 2.83
+🟢 Forward: 375.23 ms, Backward: 1066.02 ms, Backward / Forward: 2.84
+Flash Attention Varlen - seq_len = 65536 x batch_size = 4 (causal):
+- Forward: 373.34 ± 2.44 ms, Backward: 1067.19 ± 8.05 ms, Backward / Forward: 2.86. Total: 1440.53 ms. Output shape: torch.Size([262144, 32, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=4, tp_size=2
+============================================================
+🟢 Forward: 187.06 ms, Backward: 531.18 ms, Backward / Forward: 2.84
+🟢 Forward: 184.22 ms, Backward: 533.47 ms, Backward / Forward: 2.90
+🟢 Forward: 186.10 ms, Backward: 533.33 ms, Backward / Forward: 2.87
+🟢 Forward: 187.00 ms, Backward: 533.57 ms, Backward / Forward: 2.85
+🟢 Forward: 185.76 ms, Backward: 533.94 ms, Backward / Forward: 2.87
+🟢 Forward: 185.81 ms, Backward: 534.02 ms, Backward / Forward: 2.87
+🟢 Forward: 182.70 ms, Backward: 533.27 ms, Backward / Forward: 2.92
+🟢 Forward: 185.85 ms, Backward: 533.30 ms, Backward / Forward: 2.87
+🟢 Forward: 185.86 ms, Backward: 535.85 ms, Backward / Forward: 2.88
+🟢 Forward: 182.11 ms, Backward: 534.25 ms, Backward / Forward: 2.93
+Flash Attention Varlen - seq_len = 65536 x batch_size = 4 (causal):
+- Forward: 185.25 ± 1.61 ms, Backward: 533.62 ± 1.09 ms, Backward / Forward: 2.88. Total: 718.87 ms. Output shape: torch.Size([262144, 16, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=4, tp_size=4
+============================================================
+🟢 Forward: 95.19 ms, Backward: 271.78 ms, Backward / Forward: 2.86
+🟢 Forward: 90.76 ms, Backward: 269.68 ms, Backward / Forward: 2.97
+🟢 Forward: 92.19 ms, Backward: 269.30 ms, Backward / Forward: 2.92
+🟢 Forward: 91.52 ms, Backward: 270.16 ms, Backward / Forward: 2.95
+🟢 Forward: 93.04 ms, Backward: 275.52 ms, Backward / Forward: 2.96
+🟢 Forward: 90.59 ms, Backward: 269.50 ms, Backward / Forward: 2.97
+🟢 Forward: 91.52 ms, Backward: 268.96 ms, Backward / Forward: 2.94
+🟢 Forward: 92.29 ms, Backward: 271.08 ms, Backward / Forward: 2.94
+🟢 Forward: 96.07 ms, Backward: 270.56 ms, Backward / Forward: 2.82
+🟢 Forward: 91.70 ms, Backward: 270.02 ms, Backward / Forward: 2.94
+Flash Attention Varlen - seq_len = 65536 x batch_size = 4 (causal):
+- Forward: 92.49 ± 1.72 ms, Backward: 270.66 ± 1.81 ms, Backward / Forward: 2.93. Total: 363.15 ms. Output shape: torch.Size([262144, 8, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=4, tp_size=8
+============================================================
+🟢 Forward: 47.69 ms, Backward: 135.55 ms, Backward / Forward: 2.84
+🟢 Forward: 45.59 ms, Backward: 137.20 ms, Backward / Forward: 3.01
+🟢 Forward: 46.92 ms, Backward: 135.75 ms, Backward / Forward: 2.89
+🟢 Forward: 46.03 ms, Backward: 141.24 ms, Backward / Forward: 3.07
+🟢 Forward: 51.92 ms, Backward: 136.15 ms, Backward / Forward: 2.62
+🟢 Forward: 46.56 ms, Backward: 135.89 ms, Backward / Forward: 2.92
+🟢 Forward: 45.15 ms, Backward: 136.15 ms, Backward / Forward: 3.02
+🟢 Forward: 47.10 ms, Backward: 136.14 ms, Backward / Forward: 2.89
+🟢 Forward: 46.81 ms, Backward: 139.71 ms, Backward / Forward: 2.98
+🟢 Forward: 45.93 ms, Backward: 135.97 ms, Backward / Forward: 2.96
+Flash Attention Varlen - seq_len = 65536 x batch_size = 4 (causal):
+- Forward: 46.97 ± 1.80 ms, Backward: 136.98 ± 1.83 ms, Backward / Forward: 2.92. Total: 183.95 ms. Output shape: torch.Size([262144, 4, 128])
+
+============================================================
+Testing: seq_len=64K, batch_size=8, tp_size=1
+============================================================
+Error: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+============================================================
+Testing: seq_len=64K, batch_size=8, tp_size=2
+============================================================
+Error: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+============================================================
+Testing: seq_len=64K, batch_size=8, tp_size=4
+============================================================
+Error: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+============================================================
+Testing: seq_len=64K, batch_size=8, tp_size=8
+============================================================
+Error: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
