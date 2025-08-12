@@ -1,6 +1,6 @@
 from dataclasses import dataclass
-from typing import List, Tuple
-
+from typing import List, Tuple, Dict, Any
+import collections
 import torch
 
 from d2.runtime.inplace_metadata import (compute_attn_layout_seqlens,
@@ -17,12 +17,13 @@ class ShardInfo:
         dispatch_rid: The Rank ID where the Attention computation for this shard is performed.
         logical_sid: The logical order ID of this shard in the original complete sequence (starting from 0).
         shard_len: The length of this shard, usually referring to the number of tokens.
+        document_id: The document id this shard belongs to. If not provided, defaults to None.
     """
     rid: int
     dispatch_rid: int
     logical_sid: int
     shard_len: int
-
+    document_id: int = None
 
 
 def handle_planner_metadata(
@@ -115,7 +116,8 @@ def handle_planner_metadata(
 def plan_to_metadata(
     world_size: int,
     sequence_plans: List[List[ShardInfo]],
-    return_intermediate: bool = False
+    return_intermediate: bool = False,
+    return_mlp_no_shard_seq_lens: bool=False,
 ):
     (
         mlp_num_seqs,
@@ -164,10 +166,41 @@ def plan_to_metadata(
     ) = compute_attn_layout_seqlens(
         mlp_seq_lens, q_to_num_kv_tokens, mlp_q_dispatch, shard_to_tuple=True
     )
-    fa_params = (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+    fa_params = (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, num_local_seqs_recv)
 
     ret = fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params
     if return_intermediate:
         ret += (q_intermediates + kv_intermediates,)
+    if return_mlp_no_shard_seq_lens:
+        ret += (mlp_seq_lens,)
     return ret
 
+
+# Transfer Items output from planner to List[List[ShardInfo]]
+# TODO(pb): Planner output List[List[ShardInfo]] directly.
+def items_into_shardinfos(data: List[Dict[str, Any]]) -> List[List[ShardInfo]]:
+    sequences_map = collections.defaultdict(list)
+
+    for shard_dict in data:
+        sequence_key = (shard_dict['src_gpuid'], shard_dict['seqid'])
+        sequences_map[sequence_key].append(shard_dict)
+
+    all_sequences: List[List[ShardInfo]] = []
+
+    for sequence_key, shard_dicts in sequences_map.items():
+        shard_dicts.sort(key=lambda d: d['shard_id'])
+
+        current_sequence_shards: List[ShardInfo] = []
+        for shard_dict in shard_dicts:
+            shard_info = ShardInfo(
+                rid=shard_dict['src_gpuid'],
+                dispatch_rid=shard_dict['gpuid'],
+                logical_sid=shard_dict['shard_id'],
+                shard_len=shard_dict['q'],
+                document_id=shard_dict['seqid']
+            )
+            current_sequence_shards.append(shard_info)
+        
+        all_sequences.append(current_sequence_shards)
+        
+    return all_sequences
