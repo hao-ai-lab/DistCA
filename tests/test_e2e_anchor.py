@@ -1,49 +1,8 @@
 """
-Combined Megatron E2E Test (D2 + Baseline)
-
-This script combines both D2 and baseline approaches for testing:
-- Baseline mode: Uses simple batch generation and normal forward function
-- D2 mode: Uses balanced flops planning and ping-pang parameters
-
-# Debug - Baseline Mode
-
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
-    --master_port=29500 test_e2e_combined.py --mode=baseline --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096 --num-layers 4
-```
-
-# Debug - D2 Mode
-
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
-    --master_port=29500 test_e2e_combined.py --mode=d2 --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096 --num-layers 4
-```
-
-# Benchmark
-
-# 🟢 Passed: Node = 2, TP = 8, DP = 2, SeqLen = 16k (Baseline)
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=baseline --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=baseline --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-```
-
-# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 16k (D2)
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=d2 --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=d2 --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-```
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 4 test_e2e_anchor.py \
+    --num-nodes=1 --num-gpus-per-node=4 --tp-size=2 \
+    --num-tokens 16384 --num-layers 4
 """
 from datetime import datetime
 import os
@@ -219,10 +178,11 @@ class MegatronE2eWorker(MegatronBaseWorker):
             packed_seq_params = batch['packed_seq_params']
             # returns "hidden_states" if not model.post_process (not the last layer)
             # returns "logits" when label is None.
-            with nvtx_range("forward_step")
-                output = gptmodel_forward(
-                    model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel, packed_seq_params
-                )
+            torch.cuda.nvtx.range_push("forward_step")
+            output = gptmodel_forward(
+                model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel, packed_seq_params
+            )
+            torch.cuda.nvtx.range_pop()
             return output, loss_func
 
         batch_generator = make_batch_generator(microbatches, vpp_size=len(self.train_module))
@@ -342,11 +302,10 @@ K = 1024
 iterated_samples = []
 iterated_plans = []
 
-def setup_global_batch_simple(
+def setup_global_batch(
     total_seq_len, 
     up_sample_factor=2,
 ):
-    """Simple batch generation strategy from anchor version."""
     global GLOBAL_BATCH
     if GLOBAL_BATCH is not None:
         return
@@ -356,38 +315,6 @@ def setup_global_batch_simple(
         batches.append([total_seq_len])
     GLOBAL_BATCH = iter(batches)
     return
-
-def setup_global_batch_realistic(
-    total_seq_len, 
-    up_sample_factor=2,
-):
-    """Realistic document-based batch generation strategy."""
-    global GLOBAL_BATCH
-    if GLOBAL_BATCH is not None:
-        return
-    
-    GLOBAL_BATCH = batch_documents(
-        sample_wlbllm_docs_upsample(
-            size=10000,
-            upsample_long_factor=up_sample_factor,
-            filter_threshold=10000,
-            filter_ratio=0.09,
-        ), max_ctx_length=total_seq_len
-    )
-    return
-
-def setup_global_batch(
-    total_seq_len, 
-    up_sample_factor=2,
-    batch_strategy="realistic"
-):
-    """Setup global batch with specified strategy."""
-    if batch_strategy == "simple":
-        setup_global_batch_simple(total_seq_len, up_sample_factor)
-    elif batch_strategy == "realistic":
-        setup_global_batch_realistic(total_seq_len, up_sample_factor)
-    else:
-        raise ValueError(f"Unknown batch strategy: {batch_strategy}")
 
 
 def get_next_batch(dp_size):
@@ -483,6 +410,7 @@ def test_create_qkv_dispatch_balanced_flops(
         items = plan_relocation(items, verbose=False, plot=False)
     if replan_iter > 1:
         items = postprocess_items(items)
+    
 
     world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens) = item_to_intermediate_tensors(items)    
 
@@ -548,9 +476,189 @@ def create_one_batch_balanced_flops(
         cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
     )
     raw_seq_lens = seq_lens
+
+    """
+    Override the metadata
+
+        🟢 [Rank 0] qkv_fwd_fa2a_metadata:
+        FastAlltoAllMetadata(
+            fa2a_metadata=(
+                tensor([[       0, 0],
+                [       0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]]),
+                tensor([[       0,        0],
+                [0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]])
+            ),
+            send_memcpy_metadata=(
+                (tensor([       0, 16777216]), tensor([0])),
+                (tensor([[33554432, 37748736],
+                [41943040,        0]]), tensor([[33554432],
+                [       0]])),
+                (tensor([[46137344, 50331648],
+                [54525952,        0]]), tensor([[41943040],
+                [       0]]))
+            ),
+            recv_memcpy_metadata=(
+                (tensor([       0, 16777216]), tensor([0])),
+                (tensor([33554432, 41943040, 37748736]), tensor([33554432])),
+                (tensor([46137344, 54525952, 50331648]), tensor([41943040]))
+            ),
+            my_rank_send_offset=[0, 0],
+            my_rank_recv_offset=[0, 0],
+            my_rank_send_sz=[58720256, 50331648],
+            seq_lens=[
+                SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768]))),
+                SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384, 16384]), tensor([32768])))
+            ],
+            tensor_shape=[
+                LogicalShape(send_shape=((32768, 512), (32768, 512)), recv_shape=((32768, 512), (32768, 512))),
+                LogicalShape(send_shape=((2, 32768, 128), (2, 32768, 128)), recv_shape=((49152, 128), (32768, 128)))
+            ],
+            kv_replica_mask=(tensor([[1, 1],
+                [1, 0]], dtype=torch.int8), tensor([[1, 0]], dtype=torch.int8)),
+            single_stream=False
+        )
+        🟢 [Rank 0] qkv_rev_fa2a_metadata:
+        FastAlltoAllMetadata(
+            fa2a_metadata=(
+                tensor([[       0, 0],
+                [       0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]]),
+                tensor([[       0,        0],
+                [0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]])
+            ),
+            send_memcpy_metadata=(
+                (tensor([       0, 16777216]), tensor([0])),
+                (tensor([33554432, 41943040, 37748736]), tensor([33554432])),
+                (tensor([46137344, 54525952, 50331648]), tensor([41943040]))
+            ),
+            recv_memcpy_metadata=(
+                (tensor([       0, 16777216]), tensor([0])),
+                (tensor([[33554432, 37748736],
+                [41943040,        0]]), tensor([[33554432],
+                [       0]])),
+                (tensor([[46137344, 50331648],
+                [54525952,        0]]), tensor([[41943040],
+                [       0]]))
+            ),
+            my_rank_send_offset=[0, 0],
+            my_rank_recv_offset=[0, 0],
+            my_rank_send_sz=[58720256, 50331648],
+            seq_lens=(
+                SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768]))),
+                SeqLens(send_seqlens=(tensor([16384, 16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768])))
+            ),
+            tensor_shape=(
+                LogicalShape(send_shape=((32768, 512), (32768, 512)), recv_shape=((32768, 512), (32768, 512))),
+                LogicalShape(send_shape=((49152, 128), (32768, 128)), recv_shape=((2, 32768, 128), (2, 32768, 128)))
+            ),
+            kv_replica_mask=(tensor([[1, 1],
+                [1, 0]], dtype=torch.int8), tensor([[1, 0]], dtype=torch.int8)),
+            single_stream=False
+        )
+        🟢 [Rank 0] attn_out_fwd_fa2a_metadata:
+        FastAlltoAllMetadata(
+            fa2a_metadata=(
+                tensor([[       0, 0],
+                [       0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]]),
+                tensor([[       0,        0],
+                [0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]])
+            ),
+            send_memcpy_metadata=((tensor([       0, 16777216]), tensor([0])),),
+            recv_memcpy_metadata=((tensor([       0, 16777216]), tensor([0, 0])),),
+            my_rank_send_offset=[0, 0],
+            my_rank_recv_offset=[0, 0],
+            my_rank_send_sz=[33554432, 33554432],
+            seq_lens=(SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768]))),),
+            tensor_shape=(LogicalShape(send_shape=((32768, 512), (32768, 512)), recv_shape=((32768, 512), (32768, 512))),),
+            kv_replica_mask=None,
+            single_stream=False
+        )
+        🟢 [Rank 0] attn_out_rev_fa2a_metadata:
+        FastAlltoAllMetadata(
+            fa2a_metadata=(
+                tensor([[       0, 0],
+                [       0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]]),
+                tensor([[       0,        0],
+                [0,        0]]),
+                tensor([[0,        0],
+                [       0, 0]])
+            ),
+            send_memcpy_metadata=((tensor([       0, 16777216]), tensor([0, 0])),),
+            recv_memcpy_metadata=((tensor([       0, 16777216]), tensor([0])),),
+            my_rank_send_offset=[0, 0],
+            my_rank_recv_offset=[0, 0],
+            my_rank_send_sz=[33554432, 33554432],
+            seq_lens=[SeqLens(send_seqlens=(tensor([16384, 16384]), tensor([32768])), recv_seqlens=(tensor([16384, 16384]), tensor([32768])))],
+            tensor_shape=[LogicalShape(send_shape=((32768, 512), (32768, 512)), recv_shape=((32768, 512), (32768, 512)))],
+            kv_replica_mask=None,
+            single_stream=False
+        )
+    """
+
+    # # Rewrite the metadata
+    # from torch import tensor
+    # qkv_fwd_fa2a_metadata.fa2a_metadata = (
+    #     tensor([[       0, 0],
+    #     [       0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]]),
+    #     tensor([[       0,        0],
+    #     [0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]])
+    # )
+
+    # qkv_rev_fa2a_metadata.fa2a_metadata = (
+    #     tensor([[       0, 0],
+    #     [       0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]]),
+    #     tensor([[       0,        0],
+    #     [0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]])
+    # )
+
+    # attn_out_fwd_fa2a_metadata.fa2a_metadata = (
+    #     tensor([[       0, 0],
+    #     [       0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]]),
+    #     tensor([[       0,        0],
+    #     [0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]])
+    # )
+
+    # attn_out_rev_fa2a_metadata.fa2a_metadata = (
+    #     tensor([[       0, 0],
+    #     [       0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]]),
+    #     tensor([[       0,        0],
+    #     [0,        0]]),
+    #     tensor([[0,        0],
+    #     [       0, 0]])
+    # )
+
+
     
     rank = torch.distributed.get_rank()
     if rank == 0:
+        rich.print(f"🟢 [Rank {rank}] items:", items)
         rich.print(f"🟢 [Rank {rank}] cu_seqlens_q: {cu_seqlens_q}")
         rich.print(f"🟢 [Rank {rank}] cu_seqlens_kv: {cu_seqlens_kv}")
         rich.print(f"🟢 [Rank {rank}] max_seqlen_q: {max_seqlen_q}")
@@ -561,6 +669,9 @@ def create_one_batch_balanced_flops(
         rich.print(f"🟢 [Rank {rank}] qkv_rev_fa2a_metadata:", qkv_rev_fa2a_metadata)
         rich.print(f"🟢 [Rank {rank}] attn_out_fwd_fa2a_metadata:", attn_out_fwd_fa2a_metadata)
         rich.print(f"🟢 [Rank {rank}] attn_out_rev_fa2a_metadata:", attn_out_rev_fa2a_metadata)
+
+    
+    # exit(0)
 
     ret_vals = (logical_metadata, fa2a_metadata, attn_metadata, raw_seq_lens)
     if return_items:
@@ -581,13 +692,12 @@ def test(args):
     model_path = args.model_path
     max_sample_id = args.max_sample_id
     up_sample_factor = args.up_sample_factor
-    replan_iter = getattr(args, 'replan_iter', 1)
-    batch_strategy = getattr(args, 'batch_strategy', 'realistic')
+    replan_iter = args.replan_iter
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
     mode = args.mode
-    output_file = getattr(args, 'output_file', None)
+    output_file = args.output_file
     if output_file is None:
         # then store in current directory
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -598,7 +708,7 @@ def test(args):
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
-    setup_global_batch(total_seq_len, up_sample_factor, batch_strategy)
+    setup_global_batch(total_seq_len, up_sample_factor)
 
     hf_config = AutoConfig.from_pretrained(model_path)
     hidden_size_q = hf_config.hidden_size
@@ -630,10 +740,12 @@ def test(args):
     sample_times = []
     for sample_id in range(max_sample_id):
         
+        
         _seq_lens = get_next_batch(as_world_size * 2)
 
         if mode == "baseline":
             # Set forward function mode based on test mode
+            # normal_forward_fn = (mode == "baseline")
             normal_forward_fn = True
             # TODO: Adding proper support for context parallel in megatron.
             # Baseline mode: Use simple batch generation
@@ -675,6 +787,16 @@ def test(args):
                 return_items=True, 
             )
             iterated_plans.append([plan_items_0, plan_items_1])
+
+            # if rank == 0:
+            #     rich.print(f"🟢 [Rank {rank}] fa2a_metadata_0: {fa2a_metadata_0}")
+            #     rich.print(f"🟢 [Rank {rank}] fa2a_metadata_1: {fa2a_metadata_1}")
+            #     rich.print(f"🟢 [Rank {rank}] attn_metadata_0: {attn_metadata_0}")
+            #     rich.print(f"🟢 [Rank {rank}] attn_metadata_1: {attn_metadata_1}")
+            #     rich.print(f"🟢 [Rank {rank}] raw_seq_lens_0: {raw_seq_lens_0}")
+            #     rich.print(f"🟢 [Rank {rank}] raw_seq_lens_1: {raw_seq_lens_1}")
+            #     rich.print(f"🟢 [Rank {rank}] plan_items_0: {plan_items_0}")
+            #     rich.print(f"🟢 [Rank {rank}] plan_items_1: {plan_items_1}")
 
             set_random_seed(seed, set_megatron=False)
             input_ids = torch.randint(0, 100, (as_world_size, total_seq_len * 2))
@@ -786,7 +908,6 @@ def test(args):
             max_sample_id=max_sample_id, 
             up_sample_factor=up_sample_factor, 
             replan_iter=replan_iter,
-            batch_strategy=batch_strategy,
         )
         rich.print(f"🟢 Test Config: ", config)
         rich.print(f"🟢 Test DateTime: ", timestamp)
@@ -868,7 +989,7 @@ def test(args):
         # Immediate force exit with os._exit (bypasses Python cleanup)
         os._exit(0)
 
-    if getattr(args, 'force_exit', False):
+    if args.force_exit:
         exit_program()
 
     rich.print(f"❄️ [Rank {rank}] Right before exit.")
@@ -890,10 +1011,8 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
     parser.add_argument("--max-sample-id", type=int, default=10)
     parser.add_argument("--up-sample-factor", type=int, default=2)
-    parser.add_argument("--output-file", type=str, default=None, help="Output file path for benchmark results")
+    parser.add_argument("--output-file", type=str, default=None)
     parser.add_argument("--replan-iter", type=int, default=1, help="(d2 only) Number of replan iterations for planner")
     parser.add_argument("--force-exit", action="store_true", default=False, help="Force exit the program")
-    parser.add_argument("--batch-strategy", type=str, choices=["simple", "realistic"], default="realistic", 
-                        help="Batch generation strategy: 'simple' for fixed-size batches, 'realistic' for document-based")
     args = parser.parse_args()
     test(args)
