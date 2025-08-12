@@ -29,7 +29,10 @@ from transformer_engine.pytorch.utils import (
     get_device_compute_capability,
     get_cudnn_version,
 )
-from transformer_engine.pytorch.attention.dot_product_attention.utils import tex, FlashAttentionUtils, AttentionLogging, get_qkv_format, _NVTE_FLASH_ATTN, check_set_window_size, _get_supported_versions
+from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+    AttentionLogging, AttentionParams, FlashAttentionUtils,
+    check_set_window_size, get_qkv_format, tex, _NVTE_FLASH_ATTN, _get_supported_versions
+)
 
 
 def get_attention_backend(attention_params):
@@ -739,13 +742,48 @@ def get_padding_mask(
     return attention_mask
 
 
+def attn_params_eq(self, other):
+    """
+    Overwrite the original TE's __eq__, otherwise for ping-pong the
+    batch size, max seqlen q, and max seqlen kv keeps bouncing between the
+    two ping-pong splits.
+
+    Overwrite dataclass.__eq__ so that only fp8_meta["recipe"] is compared,
+    since all other entries of fp8_meta are unused in get_attention_backend.
+    """
+    if not isinstance(other, self.__class__):
+        return NotImplemented
+    for field in fields(self):
+        fname = field.name
+        sf = getattr(self, fname)
+        of = getattr(other, fname)
+        #### Our change
+        # batch_size is only used to compare with alibi_slopes_shape
+        if fname == "batch_size" and self.alibi_slopes_shape is None:
+            continue
+        # TE does not understand that q and kv can have different max seqlen
+        if fname in ["max_seqlen_q", "max_seqlen_kv"]:
+            continue
+        #### End our change
+
+        if fname != "fp8_meta":
+            if sf != of:
+                return False
+        elif sf.get("recipe", None) != of.get("recipe", None):
+            return False
+    return True
+
+
 class MonkeyPatch:
     def __enter__(self):
         self.backup_get_attention_backend = dpa_utils.get_attention_backend
+        self.backup_attn_param_eq = AttentionParams.__eq__
         dpa_utils.get_attention_backend = get_attention_backend
+        AttentionParams.__eq__ = attn_params_eq
     
     def __exit__(self, exc_type, exc_value, traceback):
         dpa_utils.get_attention_backend = self.backup_get_attention_backend
+        AttentionParams.__eq__ = self.backup_attn_param_eq
 
 
 class PerDocCPAttention(TEDotProductAttention):
