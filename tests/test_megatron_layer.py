@@ -63,7 +63,7 @@ class MegatronLayerWorker(MegatronBaseWorker):
         mlp_output, context, debug = self.layer.forward_no_switch(
             tensor_input, packed_seq_params=packed_seq_params
         )
-        mlp_output.mean().backward()
+        mlp_output.sum().backward()
         torch.cuda.synchronize()
         print(self.rank, "normal forward done")
         return (mlp_output, context, *((tensor_input.grad,) if return_grad else ())), debug
@@ -84,7 +84,7 @@ class MegatronLayerWorker(MegatronBaseWorker):
             tensor_input, packed_seq_params=packed_seq_params,
             backward_resend_qkv=backward_resend_qkv
         )
-        mlp_output.mean().backward()
+        mlp_output.sum().backward()
         torch.cuda.synchronize()
         print(self.rank, "ping-pong one stage forward done")
         return (mlp_output, context, *((tensor_input.grad,) if return_grad else ())), debug_tensors

@@ -124,6 +124,7 @@ def _qkv_to_attn_out_bwd(
     dq = dq[..., : dout.shape[-1]]
     dk = dk[..., : dout.shape[-1]]
     dv = dv[..., : dout.shape[-1]]
+    # FIXME: check this slice
     dq = dq.reshape(dq.shape[0], num_heads_q * head_dim)
     dk = dk.reshape(dk.shape[0], num_heads_kv * head_dim)
     dv = dv.reshape(dv.shape[0], num_heads_kv * head_dim)

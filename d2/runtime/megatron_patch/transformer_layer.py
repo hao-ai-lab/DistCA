@@ -467,6 +467,7 @@ class TransformerLayer(BaseTransformerLayer):
                     num_heads_kv=self.config.num_query_groups // self.config.tensor_model_parallel_size,
                     head_dim=self.config.hidden_size // self.config.num_attention_heads,
                     return_attn_probs=True,
+                    deterministic=True,
                 ),
             )
         else:

@@ -243,6 +243,7 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
 def create_raw_qkv_dispatch(
     world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
     return_mlp_no_shard_seq_lens: bool=False,
+    fixed_seq_lens: bool = False,
 ):
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
     # init sequence
@@ -251,6 +252,8 @@ def create_raw_qkv_dispatch(
     seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
     # make sure each sequence is divisible by max_cp_degree.
     seq_lens *= max_cp_degree
+    if fixed_seq_lens:
+        seq_lens[:] = seq_lens[:1]
 
     # init cp degree for each sequence
     log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
@@ -347,14 +350,16 @@ def create_qkv_dispath_with_backward(
     hidden_size_q: int, hidden_size_k: int,
     element_size: int, # dtype's size
     softmax_lse_size: int, # size of the softmax_lse tensor, should be num_heads
-    return_mlp_no_shard_seq_lens: bool=False
+    return_mlp_no_shard_seq_lens: bool=False,
+    fixed_seq_lens: bool = False,
 ):
     (mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
      kv_to_q_mapping, kv_to_q_rank, kv_context_size,
      q_to_num_kv_seq, q_to_num_kv_tokens,
      seq_lens) = create_raw_qkv_dispatch(
         world_size, total_seq_len, num_seqs, max_cp_degree,
-        return_mlp_no_shard_seq_lens
+        return_mlp_no_shard_seq_lens,
+        fixed_seq_lens=fixed_seq_lens,
     )
     mlp_q_dispatch_bwd = torch.randint_like(mlp_q_dispatch_fwd, low=0, high=world_size)
     mask = torch.arange(mlp_q_dispatch_fwd.shape[1])[None].repeat_interleave(world_size, dim=0) >= mlp_num_seqs.reshape(world_size, 1)

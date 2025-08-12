@@ -360,7 +360,8 @@ def test(args):
     ) = create_qkv_dispath_with_backward(
         world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, hf_config.num_attention_heads * torch.float32.itemsize // element_size,
-        return_mlp_no_shard_seq_lens=True
+        return_mlp_no_shard_seq_lens=True,
+        fixed_seq_lens=True,
     )
 
     set_random_seed(seed, set_megatron=False)
@@ -378,6 +379,7 @@ def test(args):
         max_seqlen_q=max_seqlen_q[rank],
         max_seqlen_kv=max_seqlen_kv[rank],
     )
+    mlp_packed_seq_params = mlp_layout_packed_params(seq_lens[rank][:num_seqs])
     (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_fwd_params
 
     ping_pang_params = PingPangSingleStepPackedSeqParams(
@@ -391,6 +393,7 @@ def test(args):
         attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
         attn_out_bwd_metadata=attn_out_qkv_bwd_fa2a_metadata.get_slice(rank),
         bwd_packed_seq_params=bwd_packed_seq_params,
+        mlp_packed_seq_params=mlp_packed_seq_params,
     )
     # ping_pang_params_0 = get_single_step_packed_seq_params(
     #     fa2a_metadata_0, attn_metadata_0, as_rank
