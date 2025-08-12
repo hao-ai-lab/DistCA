@@ -779,6 +779,8 @@ class MonkeyPatch:
         self.backup_get_attention_backend = dpa_utils.get_attention_backend
         self.backup_attn_param_eq = AttentionParams.__eq__
         dpa_utils.get_attention_backend = get_attention_backend
+        # TODO(yonghao): as now max_seqlen is an int, this is cheap, maybe
+        # no need to do the monkey patching
         AttentionParams.__eq__ = attn_params_eq
     
     def __exit__(self, exc_type, exc_value, traceback):

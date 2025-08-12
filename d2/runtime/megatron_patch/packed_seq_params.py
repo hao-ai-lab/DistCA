@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 
@@ -31,8 +31,8 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
             cu_seqlens_kv=_to_cuda_int32(self.cu_seqlens_kv),
             cu_seqlens_q_padded=_to_cuda_int32(self.cu_seqlens_q_padded),
             cu_seqlens_kv_padded=_to_cuda_int32(self.cu_seqlens_kv_padded),
-            max_seqlen_q=_to_cuda_int32(self.max_seqlen_q),
-            max_seqlen_kv=_to_cuda_int32(self.max_seqlen_kv),
+            max_seqlen_q=self.max_seqlen_q.cpu().item(),
+            max_seqlen_kv=self.max_seqlen_kv.cpu().item(),
             qkv_fwd_metadata=self.qkv_fwd_metadata.normalize(),
             qkv_bwd_metadata=self.qkv_bwd_metadata.normalize(),
             attn_out_fwd_metadata=self.attn_out_fwd_metadata.normalize(),
@@ -54,8 +54,8 @@ class PingPangPackedSeqParams:
     # NOTE: These attributes are used for rotary seq len's max length.
     # since we do rope in the MLP layout, it should be the max length
     # at the MLP layout (i.e. the number of tokens).
-    max_seqlen_q: Optional[torch.Tensor] = None
-    max_seqlen_kv: Optional[torch.Tensor] = None
+    max_seqlen_q: Optional[Union[torch.Tensor, int]] = None
+    max_seqlen_kv: Optional[Union[torch.Tensor, int]] = None
     qkv_format: str = "thd"
 
     def to_device(self):
@@ -73,8 +73,8 @@ class PingPangPackedSeqParams:
             ],
             debug=self.debug,
             do_gather=self.do_gather,
-            max_seqlen_q=_to_cuda_int32(max_seqlen_q),
-            max_seqlen_kv=_to_cuda_int32(max_seqlen_kv),
+            max_seqlen_q=max_seqlen_q.cpu().item(),
+            max_seqlen_kv=max_seqlen_kv.cpu().item(),
         )
 
 
