@@ -1,5 +1,8 @@
 """
 Instantiating Megatron with ray so that we can easily create a single worker to do the scheduling.
+
+Debug example:
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 """
 import argparse
 import os
