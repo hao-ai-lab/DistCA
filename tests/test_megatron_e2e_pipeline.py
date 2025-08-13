@@ -447,7 +447,6 @@ def test(args):
             world_size, total_seq_len, num_seqs, max_cp_degree,
             hidden_size_q_tp, hidden_size_k_tp, element_size, hf_config.num_attention_heads * torch.float32.itemsize // element_size,
             return_mlp_no_shard_seq_lens=True,
-            # fixed_seq_lens=True,
             last_seq_lens=seq_lens,
             dummy_first=dummy_first,
             dummy_except_first=seq_lens is None,

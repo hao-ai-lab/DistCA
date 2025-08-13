@@ -243,7 +243,6 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
 def create_raw_qkv_dispatch(
     world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
     return_mlp_no_shard_seq_lens: bool=False,
-    fixed_seq_lens: bool = False,
     reverse_seq_lens: Optional[torch.Tensor] = None,
     last_seq_lens: Optional[torch.Tensor] = None,
     dummy_first: bool = False,
@@ -263,8 +262,6 @@ def create_raw_qkv_dispatch(
     assert total_seq_len % (max_cp_degree) == 0
     _num_tokens_shard = total_seq_len // (max_cp_degree)
     seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
-    if fixed_seq_lens:
-        seq_lens[:] = seq_lens[:1]
     if dummy_first:
         seq_lens[:1] = gen_seq_lens(1, 1, 1).long()
     if dummy_except_first:
@@ -372,7 +369,6 @@ def create_qkv_dispath_with_backward(
     element_size: int, # dtype's size
     softmax_lse_size: int, # size of the softmax_lse tensor, should be num_heads
     return_mlp_no_shard_seq_lens: bool=False,
-    fixed_seq_lens: bool = False,
     last_seq_lens: Optional[torch.Tensor] = None,
     dummy_first: bool = False,
     dummy_except_first: bool = False,
@@ -395,7 +391,6 @@ def create_qkv_dispath_with_backward(
             hidden_size_q, hidden_size_k,
             element_size, softmax_lse_size,
             return_mlp_no_shard_seq_lens,
-            fixed_seq_lens=fixed_seq_lens,
             last_seq_lens=last_seq_lens,
             dummy_first=dummy_first,
             dummy_except_first=dummy_except_first,
@@ -407,7 +402,6 @@ def create_qkv_dispath_with_backward(
         _) = create_raw_qkv_dispatch(
             world_size, total_seq_len, num_seqs, max_cp_degree,
             return_mlp_no_shard_seq_lens,
-            fixed_seq_lens=fixed_seq_lens,
             last_seq_lens=last_seq_lens,
             reverse_seq_lens=seq_lens,
             dummy_first=dummy_first,
@@ -431,7 +425,6 @@ def create_qkv_dispath_with_backward(
      seq_lens) = create_raw_qkv_dispatch(
         world_size, total_seq_len, num_seqs, max_cp_degree,
         return_mlp_no_shard_seq_lens,
-        fixed_seq_lens=fixed_seq_lens,
         last_seq_lens=last_seq_lens,
         dummy_first=dummy_first,
         dummy_except_first=dummy_except_first,
