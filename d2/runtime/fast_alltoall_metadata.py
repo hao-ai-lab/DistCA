@@ -483,7 +483,7 @@ def compute_fa2a_metadata_from_logical_metadata(
     fwd_metadata_kv: Metadata,
     bwd_metadata_kv: Metadata,
     intermediates,
-    mlp_num_tokens: int,
+    mlp_num_tokens: list[int],
     hidden_size_q: int,
     hidden_size_k: int,
     element_size: int,  # dtype's size
@@ -612,7 +612,7 @@ def compute_backward_resend_qkv_from_logical_metadata(
     fwd_metadata_kv: Metadata,
     bwd_metadata_kv: Metadata,
     intermediates,
-    mlp_num_tokens: int,
+    mlp_num_tokens: list[int],
     hidden_size_q: int,
     hidden_size_k: int,
     element_size: int,  # dtype's size
