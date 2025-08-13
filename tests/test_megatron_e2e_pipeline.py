@@ -147,8 +147,6 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self.tf_config = tf_config
 
     def forward_backward_batch(self, microbatches: list[dict], forward_only: bool=False, normal_forward_fn: bool=False):
-        # TODO: for PP, since backward has a different attention layout dispatching order,
-        # we should modify the forward_backward_func here.
 
         microbatches = [{
             k: arg_to_cuda(v) for k, v in microbatch.items()
@@ -377,6 +375,7 @@ def init_megatron_e2e_test(
     max_tokens_key_value = num_tokens * world_size
     buffer_size = (
         token_bytes_q * max_tokens_query * 3 +
+        # lse_norm. TODO: the factor of 2 might be removed
         num_heads * torch.float32.itemsize * 2 * max_tokens_query +
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     )
@@ -385,6 +384,7 @@ def init_megatron_e2e_test(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
     )
+    # TODO: to support TP, merge with main, this still uses world_size instead of as_world_size
     worker = init_worker_torch_distributed(
         world_size, buffer_size, worker_cls, parallel_config
     )

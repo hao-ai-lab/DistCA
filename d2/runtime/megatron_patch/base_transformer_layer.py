@@ -232,6 +232,7 @@ class TransformerLayer(MegatronTransformerLayer):
         return mlp_output, context
 
     ######## Debug ########
+    # TODO: rename forward_no_switch -> forward_orig_impl
     def forward_no_switch(
         self,
         hidden_states: Tensor,

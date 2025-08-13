@@ -394,6 +394,7 @@ class TransformerLayer(BaseTransformerLayer):
         return output, context
 
     #### Debug use.
+    # TODO: rename forward_one_stage -> forward_ping_pong_single_sided
     def forward_one_stage(
         self,
         hidden_states: Tensor,
@@ -410,7 +411,7 @@ class TransformerLayer(BaseTransformerLayer):
         *,
         inference_params: Optional[Any] = None,
     ):
-        """Debug use. Single stage of Ping-Pang parallel."""
+        """Debug use. Single side of Ping-Pang parallel."""
         assert inference_params is None, "inference not supported yet"
         assert inference_context is None, "inference not supported yet"
         assert context is None, "cross-attention not supported yet"
@@ -441,7 +442,7 @@ class TransformerLayer(BaseTransformerLayer):
             return simple_output, context
         else:
             with torch.no_grad():
-                simple_output, context, *_ = self.normal_forward(
+                simple_output, context, *_ = self.forward_no_switch(
                     hidden_states,
                     attention_mask,
                     context,
@@ -527,7 +528,7 @@ class TransformerLayer(BaseTransformerLayer):
         torch.testing.assert_close(mlp_output, simple_output)
 
         return mlp_output, context
-    
+
     forward = forward_one_stage
 
 
@@ -536,6 +537,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         assert not self.ping_pong_comm_initialized
         self.comm_stream = torch.cuda.Stream(device=device, priority=-1)
         self._ping_pang_debug = True
+        self._debug_forward_impl = "orig"
         self.ping_pong_comm_initialized = True
 
     def ping_pang_forward(
@@ -789,10 +791,29 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         for key, out_tensor in zip(keys_1, out_tensors_1):
             arg_group_1[key] = out_tensor
 
+    class _debug_monkey_patch:
+        def __init__(self, layer_forward_impl):
+            self._layer_forward_impl = layer_forward_impl
+        def __enter__(self):
+            self.backup_forward = TransformerLayer.forward
+            TransformerLayer.forward = self._layer_forward_impl
+        def __exit__(self):
+            TransformerLayer.forward = self.backup_forward
+
     def forward(self, *args, **kwargs):
         # print(f'{self._ping_pang_debug=}')
-        # if self._ping_pang_debug:
-        return self._normal_forward(*args, **kwargs)
+        """
+        For Pipeline Parallel debugging, we use single-sided to ease debugging.
+        """
+        if self._ping_pang_debug:
+            assert self._debug_forward_impl in ["orig", "single-sided"]
+            if self._debug_forward_impl == "single-sided":
+                ctx = _debug_monkey_patch(TransformerLayer.forward_one_stage)
+            else:
+                ctx = nullcontext()
+            with ctx:
+                return self._normal_forward(*args, **kwargs)
+
         assert self.ping_pong_comm_initialized
         return self.ping_pang_forward(*args, **kwargs)
 
