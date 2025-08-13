@@ -188,7 +188,6 @@ class MegatronE2eWorker(MegatronBaseWorker):
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
             input_ids = batch['input_ids']
-            print(f'{input_ids.shape=}')
             position_ids = batch['position_ids']
             attention_mask = None
             packed_seq_params = batch['packed_seq_params']
