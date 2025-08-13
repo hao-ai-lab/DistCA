@@ -419,10 +419,10 @@ class TransformerLayer(BaseTransformerLayer):
         setattr(packed_seq_params, "stream", torch.cuda.current_stream())
         backward_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
 
-        # FIXME: support RoPE in this test.
         if rotary_pos_emb is not None:
             rotary_pos_emb = None
-            warnings.warn("ZYHowell says I just put a warning here. You need to calculate rotary_pos_emb somewhere else.")
+            warnings.warn("forward_one_stage is only to debug a single ping-pong "
+                          "stage's correctness, and does not have RoPE supported")
         if getattr(PingPangSingleStepPackedSeqParams, "no_switch", False):
             simple_output, context, *_ = self.forward_no_switch(
                 hidden_states,
@@ -441,7 +441,7 @@ class TransformerLayer(BaseTransformerLayer):
             return simple_output, context
         else:
             with torch.no_grad():
-                simple_output, context, *_ = self.forward_no_switch(
+                simple_output, context, *_ = self.normal_forward(
                     hidden_states,
                     attention_mask,
                     context,
