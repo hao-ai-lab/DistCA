@@ -82,7 +82,6 @@ class MegatronLayerWorker(MegatronBaseWorker):
         self.layer.train()
         mlp_output, context, debug_tensors = self.layer.forward_one_stage(
             tensor_input, packed_seq_params=packed_seq_params,
-            backward_resend_qkv=backward_resend_qkv
         )
         mlp_output.sum().backward()
         torch.cuda.synchronize()

@@ -523,7 +523,6 @@ def test(args):
         packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
         packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
         packed_seq_params.bwd_packed_seq_params = bwd_packed_seq_params
-    # microbatches = [microbatch, microbatch, microbatch, microbatch]
     worker.forward_backward_batch(
         microbatches=microbatches,
         normal_forward_fn=False,

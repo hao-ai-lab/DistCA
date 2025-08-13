@@ -141,7 +141,7 @@ def test_forward(
         torch.testing.assert_close(ans_debug_core_attn_out_post_transfer, ref_attn_outs)
         print("post transfer debug attn out allclose")
 
-        torch.testing.assert_close(normal_forward_out, ping_pang_out)
+        torch.testing.assert_close(normal_forward_out, ping_pang_out, atol=0, rtol=0)
         print("pass final result")
 
 
