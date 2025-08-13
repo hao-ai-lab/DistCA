@@ -231,7 +231,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
                 forward_only=forward_only,
             )
         print(f'{losses_reduced=}')
-        ans = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad
+        ans = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad.clone()
         
         for param in unwrap_model(self.train_module[0]).parameters():
             param.main_grad.zero_()
@@ -262,7 +262,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
                 forward_only=forward_only,
             )
         print(f'{losses_reduced=}')
-        ref = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad
+        ref = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad.clone()
 
         if self.as_rank == 0:
             print(f'{ans=}, {ref=}')
@@ -298,7 +298,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
                 forward_only=forward_only,
             )
         print(f'{losses_reduced=}')
-        megatron_ref = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad
+        megatron_ref = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad.clone()
 
         if self.as_rank == 0:
             print(f'{ans=}, {megatron_ref=}')
