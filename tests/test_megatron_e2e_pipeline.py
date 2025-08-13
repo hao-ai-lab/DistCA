@@ -4,23 +4,19 @@ Instantiating Megatron with ray so that we can easily create a single worker to 
 import argparse
 import os
 
-from d2.runtime import inplace_metadata
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from omegaconf import OmegaConf
-from tensordict import TensorDict
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 
-from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
-from d2.runtime.inplace_metadata import (
-    compute_attn_layout_seqlens, mlp_layout_packed_params,
-)
+from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams
+from d2.runtime.inplace_metadata import mlp_layout_packed_params
 from d2.runtime.megatron_patch.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
 
-from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch, create_fast_a2a_metadata_from_qkv_dispatch, create_qkv_dispath_with_backward
+from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, create_qkv_dispath_with_backward
 from megatron_test_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
@@ -152,7 +148,8 @@ class MegatronE2eWorker(MegatronBaseWorker):
             k: arg_to_cuda(v) for k, v in microbatch.items()
         } for microbatch in microbatches]
         for module in self.train_module:
-            unwrap_model(module).set_debug(normal_forward_fn)
+            # TODO(yonghao): enable this. Currently we force it to use debug
+            # unwrap_model(module).set_debug(normal_forward_fn)
             unwrap_model(module).train()
         assert len(self.train_module) == 1, "only support one module"
 
