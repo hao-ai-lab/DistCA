@@ -330,6 +330,8 @@ def dummy_backward(
     dtype: torch.dtype,
     device: torch.device,
 ):
+    if PingPangSingleStepPackedSeqParams.no_switch:
+        return
     assert packed_seq_params.bwd_packed_seq_params is not None
 
     # create some dummy data

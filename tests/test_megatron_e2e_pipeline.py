@@ -155,6 +155,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
         } for microbatch in microbatches]
         for module in self.train_module:
             unwrap_model(module).set_debug(normal_forward_fn)
+            unwrap_model(module).train()
         assert len(self.train_module) == 1, "only support one module"
 
         # forward_backward_func = get_forward_backward_func()
@@ -203,11 +204,12 @@ class MegatronE2eWorker(MegatronBaseWorker):
             (microbatches[-self.as_world_size + self.as_rank + 1:][:self.as_world_size - self.as_rank - 1] + microbatches[:self.as_rank])
         ]
         dummy_bwd_packed_seq_params = dummy_bwd_packed_seq_params[self.as_rank:] + dummy_bwd_packed_seq_params[:self.as_rank]
-        dummy_bwd_packed_seq_params = iter(dummy_bwd_packed_seq_params)
 
         def dummy_backward_step(model):
-            unwrap_model(model).dummy_backward(next(dummy_bwd_packed_seq_params))
+            unwrap_model(model).dummy_backward(next(dummy_bwd_packed_seq_params_iter))
 
+        PingPangSingleStepPackedSeqParams.no_switch = False
+        dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
         batch_generator = make_batch_generator(microbatches, vpp_size=len(self.train_module))
         batch_generator = wrap_iter(batch_generator)
         if mpu.get_pipeline_model_parallel_world_size() > 1:
@@ -232,6 +234,53 @@ class MegatronE2eWorker(MegatronBaseWorker):
                 forward_only=forward_only,
             )
         print(f'{losses_reduced=}')
+        # if self.rank == 0:
+            # for params in unwrap_model(self.train_module[0]).parameters():
+            #     if params.grad is not None:
+            #         print(f'{params.name} grad: {params.grad.shape}, {params.grad.device}')
+        # print(f'{unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad=}')
+        # torch.save(unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad, f'ref_grad_{self.rank}.pt')
+        ans = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad
+        
+        for param in unwrap_model(self.train_module[0]).parameters():
+            param.main_grad.zero_()
+
+        PingPangSingleStepPackedSeqParams.no_switch = True
+        dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
+        batch_generator = make_batch_generator(microbatches, vpp_size=len(self.train_module))
+        batch_generator = wrap_iter(batch_generator)
+        if mpu.get_pipeline_model_parallel_world_size() > 1:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=batch_generator,
+                model=self.train_module,
+                num_microbatches=n_micro_batch,
+                seq_length=total_seqlen,  # no use, since variable_seq_lengths=True
+                micro_batch_size=1,  # no use when input_shapes was set
+                forward_only=forward_only,
+                dummy_bwd_func=dummy_backward_step,
+            )
+        else:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=batch_generator,
+                model=self.train_module,
+                num_microbatches=n_micro_batch,
+                seq_length=total_seqlen,  # in use for pp = 1
+                micro_batch_size=1,  # in use for pp = 1
+                forward_only=forward_only,
+            )
+        print(f'{losses_reduced=}')
+        # if self.rank == 0:
+            # for params in unwrap_model(self.train_module[0]).parameters():
+            #     if params.grad is not None:
+            #         print(f'{params.name} grad: {params.grad.shape}, {params.grad.device}')
+        # print(f'{unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad=}')
+        # torch.save(unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad, f'ref_grad_{self.rank}.pt')
+        ref = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad
+
+        print(f'{ans=}, {ref=}')
+        torch.testing.assert_close(ans, ref, rtol=0, atol=0)
         return losses_reduced
 
     def _build_model_optimizer(self,
@@ -443,13 +492,14 @@ def test(args):
         return microbatch
     # print(rank, microbatch["packed_seq_params"])
     microbatches = [get_microbatch(dummy_first=False) for _ in range(8)] + [
-        get_microbatch(dummy_first=True) for _ in range(3)
+        get_microbatch(dummy_first=True) for _ in range(as_world_size - 1)
     ]
     for i, microbatch in enumerate(microbatches):
         qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[(i + as_world_size - 1 - as_rank * 2) % len(bwd_metadata)]
-        microbatch["packed_seq_params"].qkv_bwd_metadata = qkv_bwd_metadata
-        microbatch["packed_seq_params"].attn_out_bwd_metadata = attn_out_bwd_metadata
-        microbatch["packed_seq_params"].bwd_packed_seq_params = bwd_packed_seq_params
+        packed_seq_params = microbatch["packed_seq_params"]
+        packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
+        packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
+        packed_seq_params.bwd_packed_seq_params = bwd_packed_seq_params
     # microbatches = [microbatch, microbatch, microbatch, microbatch]
     worker.forward_backward_batch(
         microbatches=microbatches,
@@ -468,7 +518,7 @@ def test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1024)
-    parser.add_argument("--cp-degree", type=int, default=1)
+    parser.add_argument("--cp-degree", type=int, default=2)
     parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-nodes", type=int, default=1)

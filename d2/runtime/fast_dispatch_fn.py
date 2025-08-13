@@ -49,7 +49,7 @@ class pre_all2all_layout_transfer(torch.autograd.Function):
                 *metadata.send_memcpy_metadata,
                 is_fwd=True, instance_id=dispatcher_id,
             )
-            save_tensors.append(metadata.kv_replica_mask)
+            save_tensors.append(bwd_metadata.kv_replica_mask)
         else:
             q = q.contiguous()
             assert k is None and v is None

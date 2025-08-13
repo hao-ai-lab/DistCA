@@ -410,7 +410,6 @@ class TransformerLayer(BaseTransformerLayer):
         *,
         inference_params: Optional[Any] = None,
     ):
-        # print(f'{parallel_state.get_pipeline_model_parallel_rank()=}, {self.layer_number=}, {hidden_states.shape=}, {self.current_microbatch=}')
         """Debug use. Single stage of Ping-Pang parallel."""
         assert inference_params is None, "inference not supported yet"
         assert inference_context is None, "inference not supported yet"
@@ -424,8 +423,8 @@ class TransformerLayer(BaseTransformerLayer):
         if rotary_pos_emb is not None:
             rotary_pos_emb = None
             warnings.warn("ZYHowell says I just put a warning here. You need to calculate rotary_pos_emb somewhere else.")
-        with torch.no_grad():
-            simple_output, *_ = self.forward_no_switch(
+        if getattr(PingPangSingleStepPackedSeqParams, "no_switch", False):
+            simple_output, context, *_ = self.forward_no_switch(
                 hidden_states,
                 attention_mask,
                 context,
@@ -439,6 +438,23 @@ class TransformerLayer(BaseTransformerLayer):
                 sequence_len_offset,
                 inference_params=inference_params,
             )
+            return simple_output, context
+        else:
+            with torch.no_grad():
+                simple_output, context, *_ = self.forward_no_switch(
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    attention_bias,
+                    inference_context,
+                    packed_seq_params.mlp_packed_seq_params,
+                    sequence_len_offset,
+                    inference_params=inference_params,
+                )
         query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
             hidden_states,
             rotary_pos_emb,
@@ -507,10 +523,8 @@ class TransformerLayer(BaseTransformerLayer):
             context,
             context_mask,
         )
-        # breakpoint()
 
         torch.testing.assert_close(mlp_output, simple_output)
-        print(f'rank {mlp_output.device.index} layer {self.layer_number} passed test')
 
         return mlp_output, context
     

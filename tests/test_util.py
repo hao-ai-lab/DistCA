@@ -244,11 +244,20 @@ def create_raw_qkv_dispatch(
     world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
     return_mlp_no_shard_seq_lens: bool=False,
     fixed_seq_lens: bool = False,
+    reverse_seq_lens: Optional[torch.Tensor] = None,
     last_seq_lens: Optional[torch.Tensor] = None,
     dummy_first: bool = False,
     dummy_except_first: bool = False,
     reverse: bool = False,
 ):
+    '''
+    reverse_seq_lens: the forward seq_lens used to reverse (see reverse)
+    last_seq_lens: the seq_lens from last microbatch in pp, ensuring the same microbatch has the same seq_lens on different ranks
+    dummy_first: the first microbatch will have minimal seq_len, used for dummy forward in pp cooldown
+    dummy_except_first: all microbatches except the first one will have minimal seq_len, used for dummy forward in pp warmup
+    reverse: comparing pp forward and backward, the same group of microbatches have reversed ranks,
+             so we reverse the seq_lens in forwad pass to get that in backward pass.
+    '''
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
     # init sequence
     assert total_seq_len % (max_cp_degree) == 0
@@ -265,7 +274,7 @@ def create_raw_qkv_dispatch(
     if last_seq_lens is not None:
         seq_lens[1:] = last_seq_lens[:-1]
     if reverse:
-        seq_lens = seq_lens.flip(0)
+        seq_lens = reverse_seq_lens.flip(0)
 
     # init cp degree for each sequence
     log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
@@ -369,15 +378,38 @@ def create_qkv_dispath_with_backward(
     dummy_except_first: bool = False,
     reverse: bool = False,
 ):
+    '''
+    reverse_seq_lens, last_seq_lens, dummy_first, dummy_except_first, reverse:
+    see create_raw_qkv_dispatch for details.
+
+    reverse:
+    comparing pp forward and backward, the same group of microbatches have reversed ranks,
+    so we reverse the seq_lens in forwad pass to get that in backward pass.
+
+    Thus, we first run a pass with reverse=False to get the forward metadata,
+    then run anothe pass, forcing the seqlens to be the reverse,
+    '''
     if reverse:
+        f1, _, f2, _, f3, _, f4, _, f5, _, seq_lens = create_qkv_dispath_with_backward(
+            world_size, total_seq_len, num_seqs, max_cp_degree,
+            hidden_size_q, hidden_size_k,
+            element_size, softmax_lse_size,
+            return_mlp_no_shard_seq_lens,
+            fixed_seq_lens=fixed_seq_lens,
+            last_seq_lens=last_seq_lens,
+            dummy_first=dummy_first,
+            dummy_except_first=dummy_except_first,
+            reverse=False,
+        )
         (mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
         kv_to_q_mapping, kv_to_q_rank, kv_context_size,
         q_to_num_kv_seq, q_to_num_kv_tokens,
-        seq_lens) = create_raw_qkv_dispatch(
+        _) = create_raw_qkv_dispatch(
             world_size, total_seq_len, num_seqs, max_cp_degree,
             return_mlp_no_shard_seq_lens,
             fixed_seq_lens=fixed_seq_lens,
             last_seq_lens=last_seq_lens,
+            reverse_seq_lens=seq_lens,
             dummy_first=dummy_first,
             dummy_except_first=dummy_except_first,
             reverse=True
@@ -392,19 +424,7 @@ def create_qkv_dispath_with_backward(
             q_to_num_kv_seq, q_to_num_kv_tokens,
             hidden_size_q, hidden_size_k, element_size, softmax_lse_size,
         )
-        f1, _, f2, _, f3, _, f4, _, f5, _, *rem = create_qkv_dispath_with_backward(
-            world_size, total_seq_len, num_seqs, max_cp_degree,
-            hidden_size_q, hidden_size_k,
-            element_size, softmax_lse_size,
-            return_mlp_no_shard_seq_lens,
-            fixed_seq_lens=fixed_seq_lens,
-            last_seq_lens=last_seq_lens,
-            dummy_first=dummy_first,
-            dummy_except_first=dummy_except_first,
-            reverse=False,
-        )
-        # torch.distributed.breakpoint()
-        return f1, r1, f2, r2, f3, r3, f4, r4, f5, r5, *rem
+        return f1, r1, f2, r2, f3, r3, f4, r4, f5, r5, seq_lens
     (mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
      kv_to_q_mapping, kv_to_q_rank, kv_context_size,
      q_to_num_kv_seq, q_to_num_kv_tokens,
