@@ -797,7 +797,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         def __enter__(self):
             self.backup_forward = TransformerLayer.forward
             TransformerLayer.forward = self._layer_forward_impl
-        def __exit__(self):
+        def __exit__(self, exc_type, exc_value, traceback):
             TransformerLayer.forward = self.backup_forward
 
     def forward(self, *args, **kwargs):
@@ -806,9 +806,11 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         For Pipeline Parallel debugging, we use single-sided to ease debugging.
         """
         if self._ping_pang_debug:
-            assert self._debug_forward_impl in ["orig", "single-sided"]
-            if self._debug_forward_impl == "single-sided":
+            assert self._debug_forward_impl in ["orig", "single_sided", "orig_reimpl"], self._debug_forward_impl
+            if self._debug_forward_impl == "single_sided":
                 ctx = _debug_monkey_patch(TransformerLayer.forward_one_stage)
+            elif self._debug_forward_impl == "orig_reimpl":
+                ctx = _debug_monkey_patch(TransformerLayer.forward_no_switch)
             else:
                 ctx = nullcontext()
             with ctx:
@@ -832,8 +834,10 @@ class PingPangGPTModel(GPTModel):
         add_ping_pang_forward(self.decoder)
         self.set_debug(True)
 
-    def set_debug(self, debug: bool):
+    def set_debug(self, debug: bool, debug_fwd_impl: str = None):
         self.decoder._ping_pang_debug = debug
+        if debug_fwd_impl:
+            self.decoder._debug_forward_impl = debug_fwd_impl
 
     # very ugly hardcode here:
     # If the forward is a dummy forward, then:
