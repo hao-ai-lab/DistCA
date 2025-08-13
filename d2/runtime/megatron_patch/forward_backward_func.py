@@ -416,7 +416,7 @@ def forward_backward_pipelining_without_interleaving(
                     input_tensor, output_tensor, output_tensor_grad, model_type, config
                 )
 
-                print(f'{rank=}, {input_tensor_grad=}', flush=True)
+                # print(f'{rank=}, {input_tensor_grad=}', flush=True)
 
             # send_backward(input_tensor_grad, recv_tensor_shapes, config)
         # if forward_dummy:
@@ -482,7 +482,7 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor_grad = backward_step(
                     input_tensor, output_tensor, output_tensor_grad, model_type, config
                 )
-                print(f'{rank=}, {input_tensor_grad=}', flush=True)
+                # print(f'{rank=}, {input_tensor_grad=}', flush=True)
 
                 output_tensor_grad = send_backward_recv_backward(
                     input_tensor_grad, not parallel_state.is_pipeline_last_stage() and not next_dummy, recv_tensor_shapes, config

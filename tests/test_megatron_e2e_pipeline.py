@@ -158,7 +158,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
         assert len(self.train_module) == 1, "only support one module"
 
         # forward_backward_func = get_forward_backward_func()
-        n_micro_batch = len(microbatches)
+        n_micro_batch = len(microbatches) - self.as_world_size + 1
         # thd layout
         total_seqlen = microbatches[0]['input_ids'].shape[0]
 
@@ -167,21 +167,22 @@ class MegatronE2eWorker(MegatronBaseWorker):
             loss = ((output - 1)**2).mean()
             return loss, {'loss': loss}
 
-        dummy_microbatch = microbatches[0]  # FIXME: this is important for all-to-all
+        # dummy_microbatch = microbatches[0]  # FIXME: this is important for all-to-all
 
         def wrap_iter(batch_iter):
-            if False:  #mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
-                # hardcode here: pipeline parallel add this number of dummy forwards
-                for _ in range(mpu.get_data_parallel_rank()):
-                    print('yield pre dummy')
-                    yield dummy_microbatch
-                yield from batch_iter
-                for _ in range(mpu.get_pipeline_model_parallel_world_size() - mpu.get_data_parallel_rank() - 1):
-                    print('yield post dummy')
-                    yield dummy_microbatch
-            else:
-                while True:
-                    yield dummy_microbatch
+            yield from batch_iter  # should work for now
+            # if False:  #mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
+            #     # hardcode here: pipeline parallel add this number of dummy forwards
+            #     for _ in range(mpu.get_data_parallel_rank()):
+            #         print('yield pre dummy')
+            #         yield dummy_microbatch
+            #     yield from batch_iter
+            #     for _ in range(mpu.get_pipeline_model_parallel_world_size() - mpu.get_data_parallel_rank() - 1):
+            #         print('yield post dummy')
+            #         yield dummy_microbatch
+            # else:
+            #     while True:
+                    # yield dummy_microbatch
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
@@ -197,8 +198,15 @@ class MegatronE2eWorker(MegatronBaseWorker):
             )
             return output, loss_func
 
+        dummy_bwd_packed_seq_params = [
+            microbatch['packed_seq_params'] for microbatch in
+            (microbatches[-self.as_world_size + self.as_rank + 1:][:self.as_world_size - self.as_rank - 1] + microbatches[:self.as_rank])
+        ]
+        dummy_bwd_packed_seq_params = dummy_bwd_packed_seq_params[self.as_rank:] + dummy_bwd_packed_seq_params[:self.as_rank]
+        dummy_bwd_packed_seq_params = iter(dummy_bwd_packed_seq_params)
+
         def dummy_backward_step(model):
-            unwrap_model(model).dummy_backward(dummy_microbatch['packed_seq_params'])
+            unwrap_model(model).dummy_backward(next(dummy_bwd_packed_seq_params))
 
         batch_generator = make_batch_generator(microbatches, vpp_size=len(self.train_module))
         batch_generator = wrap_iter(batch_generator)
@@ -349,77 +357,100 @@ def test(args):
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
 
-    (
-        # fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        # attention_metadata_attn_layout, intermediates, seq_lens
-        fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
-        fa_fwd_params, fa_bwd_params,
-        qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
-        attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
-        seq_lens,
-    ) = create_qkv_dispath_with_backward(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
-        hidden_size_q_tp, hidden_size_k_tp, element_size, hf_config.num_attention_heads * torch.float32.itemsize // element_size,
-        return_mlp_no_shard_seq_lens=True,
-        fixed_seq_lens=True,
-    )
+    seq_lens = None
+    bwd_metadata = []
 
-    set_random_seed(seed, set_megatron=False)
-    # input_ids = torch.randint(0, 100, (as_world_size, total_seq_len))
-    # position_ids = torch.arange(total_seq_len).repeat(as_world_size, 1)
-    # input_ids_local = input_ids[as_rank]
-    # position_ids_local = position_ids[as_rank]
-    # print(input_ids_local.shape, position_ids_local.shape)
-    input_ids_local = torch.randint(0, 100, (total_seq_len,))
-    position_ids_local = torch.arange(total_seq_len)
-    (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_bwd_params
-    bwd_packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens_q[rank],
-        cu_seqlens_kv=cu_seqlens_kv[rank],
-        max_seqlen_q=max_seqlen_q[rank],
-        max_seqlen_kv=max_seqlen_kv[rank],
-    )
-    mlp_packed_seq_params = mlp_layout_packed_params(seq_lens[rank][:num_seqs])
-    (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_fwd_params
+    def get_microbatch(dummy_first):
+        nonlocal seq_lens
+        (
+            # fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+            # attention_metadata_attn_layout, intermediates, seq_lens
+            fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
+            fa_fwd_params, fa_bwd_params,
+            qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
+            attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
+            seq_lens,
+        ) = create_qkv_dispath_with_backward(
+            world_size, total_seq_len, num_seqs, max_cp_degree,
+            hidden_size_q_tp, hidden_size_k_tp, element_size, hf_config.num_attention_heads * torch.float32.itemsize // element_size,
+            return_mlp_no_shard_seq_lens=True,
+            # fixed_seq_lens=True,
+            last_seq_lens=seq_lens,
+            dummy_first=dummy_first,
+            dummy_except_first=seq_lens is None,
+            reverse=True,
+        )
+        actual_total_seq_len = seq_lens[rank].sum().item()
 
-    ping_pang_params = PingPangSingleStepPackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_q[rank],
-        cu_seqlens_kv=cu_seqlens_kv[rank],
-        max_seqlen_q=max_seqlen_q[rank],
-        max_seqlen_kv=max_seqlen_kv[rank],
-        qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(rank),
-        qkv_bwd_metadata=qkv_bwd_fa2a_metadata.get_slice(rank),
-        attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
-        attn_out_bwd_metadata=attn_out_qkv_bwd_fa2a_metadata.get_slice(rank),
-        bwd_packed_seq_params=bwd_packed_seq_params,
-        mlp_packed_seq_params=mlp_packed_seq_params,
-    )
-    # ping_pang_params_0 = get_single_step_packed_seq_params(
-    #     fa2a_metadata_0, attn_metadata_0, as_rank
-    # )
-    # ping_pang_params_1 = get_single_step_packed_seq_params(
-    #     fa2a_metadata_1, attn_metadata_1, as_rank
-    # )
+        # set_random_seed(seed, set_megatron=False)
+        # input_ids = torch.randint(0, 100, (as_world_size, total_seq_len))
+        # position_ids = torch.arange(total_seq_len).repeat(as_world_size, 1)
+        # input_ids_local = input_ids[as_rank]
+        # position_ids_local = position_ids[as_rank]
+        # print(input_ids_local.shape, position_ids_local.shape)
+        rev_rank = as_world_size - rank - 1
+        input_ids_local = torch.randint(0, 100, (actual_total_seq_len,))
+        position_ids_local = torch.arange(actual_total_seq_len)
+        (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_bwd_params
+        bwd_packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_q[rank],
+            cu_seqlens_kv=cu_seqlens_kv[rank],
+            max_seqlen_q=max_seqlen_q[rank],
+            max_seqlen_kv=max_seqlen_kv[rank],
+        )
+        mlp_packed_seq_params = mlp_layout_packed_params(seq_lens[rank][:num_seqs])
+        (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_fwd_params
 
-    # NOTE: we don't consider that seq_lens var has padding because our data generation
-    # guarantees so. However, in practice, this is not true.
-    # mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
-    # mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
-    # ping_pang_params = PingPangPackedSeqParams(
-    #     seq_params=[ping_pang_params_0, ping_pang_params_1],
-    #     mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
-    #     max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-    #     max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-    #     qkv_format="thd",
-    # )
-    microbatch = {
-        "input_ids": input_ids_local,
-        "position_ids": position_ids_local,
-        "packed_seq_params": ping_pang_params,
-    }
+        ping_pang_params = PingPangSingleStepPackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q[rank],
+            cu_seqlens_kv=cu_seqlens_kv[rank],
+            max_seqlen_q=max_seqlen_q[rank],
+            max_seqlen_kv=max_seqlen_kv[rank],
+            qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(rank),
+            # qkv_bwd_metadata=qkv_bwd_fa2a_metadata.get_slice(rev_rank),
+            attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
+            # attn_out_bwd_metadata=attn_out_qkv_bwd_fa2a_metadata.get_slice(rev_rank),
+            # bwd_packed_seq_params=bwd_packed_seq_params,
+            mlp_packed_seq_params=mlp_packed_seq_params,
+        )
+        bwd_metadata.append(
+            (qkv_bwd_fa2a_metadata.get_slice(rank), attn_out_qkv_bwd_fa2a_metadata.get_slice(rank), bwd_packed_seq_params)
+        )
+        # ping_pang_params_0 = get_single_step_packed_seq_params(
+        #     fa2a_metadata_0, attn_metadata_0, as_rank
+        # )
+        # ping_pang_params_1 = get_single_step_packed_seq_params(
+        #     fa2a_metadata_1, attn_metadata_1, as_rank
+        # )
+
+        # NOTE: we don't consider that seq_lens var has padding because our data generation
+        # guarantees so. However, in practice, this is not true.
+        # mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
+        # mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
+        # ping_pang_params = PingPangPackedSeqParams(
+        #     seq_params=[ping_pang_params_0, ping_pang_params_1],
+        #     mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
+        #     max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+        #     max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+        #     qkv_format="thd",
+        # )
+        microbatch = {
+            "input_ids": input_ids_local,
+            "position_ids": position_ids_local,
+            "packed_seq_params": ping_pang_params,
+        }
+        return microbatch
     # print(rank, microbatch["packed_seq_params"])
-    microbatches = [microbatch, microbatch, microbatch, microbatch]
+    microbatches = [get_microbatch(dummy_first=False) for _ in range(8)] + [
+        get_microbatch(dummy_first=True) for _ in range(3)
+    ]
+    for i, microbatch in enumerate(microbatches):
+        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[(i + as_world_size - 1 - as_rank * 2) % len(bwd_metadata)]
+        microbatch["packed_seq_params"].qkv_bwd_metadata = qkv_bwd_metadata
+        microbatch["packed_seq_params"].attn_out_bwd_metadata = attn_out_bwd_metadata
+        microbatch["packed_seq_params"].bwd_packed_seq_params = bwd_packed_seq_params
+    # microbatches = [microbatch, microbatch, microbatch, microbatch]
     worker.forward_backward_batch(
         microbatches=microbatches,
         normal_forward_fn=False,
@@ -437,7 +468,7 @@ def test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1024)
-    parser.add_argument("--cp-degree", type=int, default=2)
+    parser.add_argument("--cp-degree", type=int, default=1)
     parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-nodes", type=int, default=1)

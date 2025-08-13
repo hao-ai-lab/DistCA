@@ -244,16 +244,28 @@ def create_raw_qkv_dispatch(
     world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
     return_mlp_no_shard_seq_lens: bool=False,
     fixed_seq_lens: bool = False,
+    last_seq_lens: Optional[torch.Tensor] = None,
+    dummy_first: bool = False,
+    dummy_except_first: bool = False,
+    reverse: bool = False,
 ):
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
     # init sequence
     assert total_seq_len % (max_cp_degree) == 0
     _num_tokens_shard = total_seq_len // (max_cp_degree)
     seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
-    # make sure each sequence is divisible by max_cp_degree.
-    seq_lens *= max_cp_degree
     if fixed_seq_lens:
         seq_lens[:] = seq_lens[:1]
+    if dummy_first:
+        seq_lens[:1] = gen_seq_lens(1, 1, 1).long()
+    if dummy_except_first:
+        seq_lens[1:] = gen_seq_lens(world_size - 1, 1, 1).long()
+    # make sure each sequence is divisible by max_cp_degree.
+    seq_lens *= max_cp_degree
+    if last_seq_lens is not None:
+        seq_lens[1:] = last_seq_lens[:-1]
+    if reverse:
+        seq_lens = seq_lens.flip(0)
 
     # init cp degree for each sequence
     log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
@@ -352,7 +364,47 @@ def create_qkv_dispath_with_backward(
     softmax_lse_size: int, # size of the softmax_lse tensor, should be num_heads
     return_mlp_no_shard_seq_lens: bool=False,
     fixed_seq_lens: bool = False,
+    last_seq_lens: Optional[torch.Tensor] = None,
+    dummy_first: bool = False,
+    dummy_except_first: bool = False,
+    reverse: bool = False,
 ):
+    if reverse:
+        (mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
+        kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+        q_to_num_kv_seq, q_to_num_kv_tokens,
+        seq_lens) = create_raw_qkv_dispatch(
+            world_size, total_seq_len, num_seqs, max_cp_degree,
+            return_mlp_no_shard_seq_lens,
+            fixed_seq_lens=fixed_seq_lens,
+            last_seq_lens=last_seq_lens,
+            dummy_first=dummy_first,
+            dummy_except_first=dummy_except_first,
+            reverse=True
+        )
+        mlp_q_dispatch_bwd = torch.randint_like(mlp_q_dispatch_fwd, low=0, high=world_size)
+        mask = torch.arange(mlp_q_dispatch_fwd.shape[1])[None].repeat_interleave(world_size, dim=0) >= mlp_num_seqs.reshape(world_size, 1)
+        mlp_q_dispatch_bwd[mask] = -1
+
+        _, r1, _, r2, _, r3, _, r4, _, r5 = forward_backward_with_resend_e2e_metadata(
+            mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd, mlp_q_dispatch_bwd,
+            kv_to_q_mapping, kv_to_q_rank, kv_context_size,
+            q_to_num_kv_seq, q_to_num_kv_tokens,
+            hidden_size_q, hidden_size_k, element_size, softmax_lse_size,
+        )
+        f1, _, f2, _, f3, _, f4, _, f5, _, *rem = create_qkv_dispath_with_backward(
+            world_size, total_seq_len, num_seqs, max_cp_degree,
+            hidden_size_q, hidden_size_k,
+            element_size, softmax_lse_size,
+            return_mlp_no_shard_seq_lens,
+            fixed_seq_lens=fixed_seq_lens,
+            last_seq_lens=last_seq_lens,
+            dummy_first=dummy_first,
+            dummy_except_first=dummy_except_first,
+            reverse=False,
+        )
+        # torch.distributed.breakpoint()
+        return f1, r1, f2, r2, f3, r3, f4, r4, f5, r5, *rem
     (mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
      kv_to_q_mapping, kv_to_q_rank, kv_context_size,
      q_to_num_kv_seq, q_to_num_kv_tokens,
@@ -360,6 +412,9 @@ def create_qkv_dispath_with_backward(
         world_size, total_seq_len, num_seqs, max_cp_degree,
         return_mlp_no_shard_seq_lens,
         fixed_seq_lens=fixed_seq_lens,
+        last_seq_lens=last_seq_lens,
+        dummy_first=dummy_first,
+        dummy_except_first=dummy_except_first,
     )
     mlp_q_dispatch_bwd = torch.randint_like(mlp_q_dispatch_fwd, low=0, high=world_size)
     mask = torch.arange(mlp_q_dispatch_fwd.shape[1])[None].repeat_interleave(world_size, dim=0) >= mlp_num_seqs.reshape(world_size, 1)

@@ -71,20 +71,20 @@ class LogicalShape:
     @staticmethod
     def get_shape(
         mlp_to_attn_metadata: Metadata, hidden_size: int,
-        mlp_num_tokens: int
+        mlp_num_tokens: list[int]
     ):
         world_size = mlp_to_attn_metadata.world_size
         assert mlp_to_attn_metadata.dst_rank.shape[0] == world_size
         if mlp_to_attn_metadata.dst_rank.ndim == 2:
-            token_layout = (mlp_num_tokens,)
+            token_layout = [(i,) for i in mlp_num_tokens]
         else:
             assert mlp_to_attn_metadata.dst_rank.ndim == 3
             max_cp = mlp_to_attn_metadata.dst_rank.shape[2]
-            token_layout = (max_cp, mlp_num_tokens)
+            token_layout = [(max_cp, i) for i in mlp_num_tokens]
 
         send_shape = tuple(
-            token_layout + (hidden_size,)
-            for _ in range(world_size)
+            layout + (hidden_size,)
+            for layout in token_layout
         )
         recv_shape = tuple(
             (nt, hidden_size)
@@ -595,7 +595,7 @@ def compute_e2e_fa2a_metadata(
         q_to_num_kv_token,
         return_intermediate=True
     )
-    mlp_num_tokens = mlp_seq_len.sum(dim=1).max().item()
+    mlp_num_tokens = mlp_seq_len.sum(dim=1).tolist()
     fa2a_metadata = compute_fa2a_metadata_from_logical_metadata(
         fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
         intermediates, mlp_num_tokens, hidden_size_q, hidden_size_k,
@@ -677,7 +677,7 @@ def forward_backward_with_resend_e2e_metadata(
         q_to_num_kv_token,
         return_intermediate=True,
     )
-    mlp_num_tokens=mlp_seq_len.sum(dim=1).max().item()
+    mlp_num_tokens = mlp_seq_len.sum(dim=1).tolist()
     (attn_out_qkv_bwd_fa2a_metadata, qkv_bwd_fa2a_metadata
      ) = compute_backward_resend_qkv_from_logical_metadata(
         attn_out_grad_fwd_metadata_q, attn_out_grad_bwd_metadata_q,
