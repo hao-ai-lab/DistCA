@@ -5,9 +5,9 @@ Debug example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 """
 import argparse
+from functools import partial
 import os
 
-from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 import torch
@@ -32,7 +32,7 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         torch.set_default_device(torch.device("cuda", local_rank))
 
     def forward_backward_batch(self, microbatches: list[dict], forward_only: bool=False,
-                               mode: str="ping_pong"):
+                               mode: str="ping_pong", with_dummy: bool=True):
 
         microbatches = [{
             k: arg_to_cuda(v) for k, v in microbatch.items()
@@ -61,13 +61,12 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
             )
             return output, loss_func
 
-        def dummy_backward_step(model):
-            unwrap_model(model).dummy_backward(next(dummy_bwd_packed_seq_params_iter))
+        def dummy_backward_step(model, dummy_bwd_iter, skip: bool):
+            next_iter_args = next(dummy_bwd_iter)
+            if skip:
+                return
+            unwrap_model(model).dummy_backward(next_iter_args)
 
-        for module in self.train_module:
-            # TODO(yonghao): enable this. Currently we force it to use debug
-            # unwrap_model(module).set_debug(normal_forward_fn)
-            unwrap_model(module).train()
         assert len(self.train_module) == 1, "only support one module"
 
         dummy_bwd_packed_seq_params = [
@@ -76,10 +75,8 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         ]
         dummy_bwd_packed_seq_params = dummy_bwd_packed_seq_params[self.as_rank:] + dummy_bwd_packed_seq_params[:self.as_rank]
 
-
-        ### no_switch is False: running the single sided ping-pong forward
         assert mode in ["ping_pong", "orig_reimpl", "single_sided"]
-        mode = "single_sided"
+
         for module in self.train_module:
             debug = (mode != "ping_pong")
             debug_fwd_impl = mode if debug else None
@@ -87,81 +84,42 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
             unwrap_model(module).train()
         assert len(self.train_module) == 1, "only support one module"
 
-        PingPangSingleStepPackedSeqParams.no_switch = False
         dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
-        batch_generator = make_batch_generator(microbatches, vpp_size=len(self.train_module))
-        # if mpu.get_pipeline_model_parallel_world_size() > 1:
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=batch_generator,
-            model=self.train_module,
-            num_microbatches=n_micro_batch,
-            seq_length=total_seqlen,  # no use, since variable_seq_lengths=True
-            micro_batch_size=1,  # no use when input_shapes was set
-            forward_only=forward_only,
-            dummy_bwd_func=dummy_backward_step,
+        batch_generator = make_batch_generator(
+            microbatches if with_dummy else microbatches[self.as_rank:],
+            vpp_size=len(self.train_module)
         )
-        print(f'{losses_reduced=}')
-        ans = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad.clone()
-        
+        # if mpu.get_pipeline_model_parallel_world_size() > 1:
+        if with_dummy:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=batch_generator,
+                model=self.train_module,
+                num_microbatches=n_micro_batch,
+                seq_length=total_seqlen,  # no use, since variable_seq_lengths=True
+                micro_batch_size=1,  # no use when input_shapes was set
+                forward_only=forward_only,
+                dummy_bwd_func=partial(
+                    dummy_backward_step,
+                    dummy_bwd_iter=dummy_bwd_packed_seq_params_iter,
+                    skip="orig" in mode,
+                ),
+            )
+        else:
+            losses_reduced = get_forward_backward_func()(
+                forward_step_func=forward_step,
+                data_iterator=batch_generator,
+                model=self.train_module,
+                num_microbatches=n_micro_batch,
+                seq_length=total_seqlen,  # no use, since variable_seq_lengths=True
+                micro_batch_size=1,  # no use when input_shapes was set
+                forward_only=forward_only,
+            )
+        grad_sample = unwrap_model(self.train_module[0]).decoder.layers[-1].self_attention.linear_proj.weight.main_grad.clone()
+
         for param in unwrap_model(self.train_module[0]).parameters():
             param.main_grad.zero_()
-
-        ### no_switch is True: running the normal forward
-        mode = "orig_reimpl"
-        for module in self.train_module:
-            debug = (mode != "ping_pong")
-            debug_fwd_impl = mode if debug else None
-            unwrap_model(module).set_debug(debug=debug, debug_fwd_impl=debug_fwd_impl)
-            unwrap_model(module).train()
-        PingPangSingleStepPackedSeqParams.no_switch = True
-        dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
-        batch_generator = make_batch_generator(microbatches, vpp_size=len(self.train_module))
-        # if mpu.get_pipeline_model_parallel_world_size() > 1:
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=batch_generator,
-            model=self.train_module,
-            num_microbatches=n_micro_batch,
-            seq_length=total_seqlen,  # no use, since variable_seq_lengths=True
-            micro_batch_size=1,  # no use when input_shapes was set
-            forward_only=forward_only,
-            dummy_bwd_func=dummy_backward_step,
-        )
-        print(f'{losses_reduced=}')
-        ref = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad.clone()
-
-        if self.as_rank == 0:
-            print(f'{ans=}, {ref=}')
-        torch.testing.assert_close(ans, ref, rtol=0, atol=0)
-        
-        for param in unwrap_model(self.train_module[0]).parameters():
-            param.main_grad.zero_()
-
-
-        PingPangSingleStepPackedSeqParams.no_switch = True
-        dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
-        # remove dummy microbatches
-        batch_generator = make_batch_generator(microbatches[self.as_rank:], vpp_size=len(self.train_module))
-        # if mpu.get_pipeline_model_parallel_world_size() > 1:
-        losses_reduced = get_forward_backward_func()(
-            forward_step_func=forward_step,
-            data_iterator=batch_generator,
-            model=self.train_module,
-            num_microbatches=n_micro_batch,
-            seq_length=total_seqlen,  # no use, since variable_seq_lengths=True
-            micro_batch_size=1,  # no use when input_shapes was set
-            forward_only=forward_only,
-        )
-        print(f'{losses_reduced=}')
-        megatron_ref = unwrap_model(self.train_module[0]).decoder.layers[0].self_attention.linear_proj.weight.main_grad.clone()
-
-        if self.as_rank == 0:
-            print(f'{ans=}, {megatron_ref=}')
-        torch.testing.assert_close(ans, megatron_ref, rtol=0, atol=0)
-
-
-        return losses_reduced
+        return losses_reduced, grad_sample
 
 
 def init_megatron_e2e_test(
@@ -300,11 +258,27 @@ def test(args):
         packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
         packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
         packed_seq_params.bwd_packed_seq_params = bwd_packed_seq_params
-    worker.forward_backward_batch(
+    loss_one_sided, grad_one_sided = worker.forward_backward_batch(
+        microbatches=microbatches,
+        forward_only=False,
+        mode="single_sided",
+        with_dummy=True,
+    )
+    loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
         microbatches=microbatches,
         forward_only=False,
         mode="orig_reimpl",
+        with_dummy=True,
     )
+    loss_orig, grad_orig = worker.forward_backward_batch(
+        microbatches=microbatches,
+        forward_only=False,
+        mode="orig_reimpl",
+        with_dummy=False,
+    )
+    print(f"{loss_one_sided=}, {loss_orig_reimpl=}, {loss_orig=}")
+    torch.testing.assert_close(grad_orig_reimpl, grad_orig)
+    torch.testing.assert_close(grad_orig_reimpl, grad_one_sided, rtol=1e-3, atol=1e-3)
 
     print("=" * 20 + "forward_backward_batch attention server, done")
 
