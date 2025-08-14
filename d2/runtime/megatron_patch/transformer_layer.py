@@ -798,7 +798,6 @@ class PingPangGPTModel(GPTModel):
         print("PingPangGPTModel init")
         super().__init__(*args, **kwargs)
         add_ping_pang_forward(self.decoder)
-        self.set_debug(True)
 
     def set_debug(self, debug: bool, debug_fwd_impl: str = None):
         self.decoder._ping_pang_debug = debug
