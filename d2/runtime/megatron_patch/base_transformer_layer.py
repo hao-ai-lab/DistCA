@@ -256,15 +256,8 @@ class TransformerLayer(MegatronTransformerLayer):
         assert context_mask is None, "cross-attention not supported yet"
 
         setattr(packed_seq_params, "stream", torch.cuda.current_stream())
-        return_debug = True
-        if (isinstance(packed_seq_params, PingPangSingleStepPackedSeqParams) and
-            packed_seq_params.mlp_packed_seq_params is not None):
-            # NOTE: this is for end-to-end debug mode. (cannot control input as easy as single layer numerical test.)
-            # should design a better API later.
-            packed_seq_params = packed_seq_params.mlp_packed_seq_params
-            return_debug = False
-            if rotary_pos_emb is not None:
-                rotary_pos_emb = None
+        # FIXME(yonghao): fix rope
+        rotary_pos_emb = None
 
         query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
             hidden_states,
@@ -292,8 +285,6 @@ class TransformerLayer(MegatronTransformerLayer):
             context,
             context_mask,
         )
-        if not return_debug:
-            return mlp_output, context
 
         return mlp_output, context, debug_tensors
 

@@ -37,6 +37,9 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         microbatches = [{
             k: arg_to_cuda(v) for k, v in microbatch.items()
         } for microbatch in microbatches]
+        if "orig" in mode:
+            for mb in microbatches:
+                mb["packed_seq_params"] = mb["packed_seq_params"].mlp_packed_seq_params
 
         # forward_backward_func = get_forward_backward_func()
         n_micro_batch = len(microbatches) - self.as_world_size + 1

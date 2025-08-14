@@ -494,9 +494,7 @@ class TransformerLayer(BaseTransformerLayer):
             context_mask,
         )
 
-        return mlp_output, context
-
-    forward = forward_one_stage
+        return mlp_output, context, debug_tensors
 
 
 def add_ping_pang_forward(block: MegatronTransformerBlock):
@@ -763,7 +761,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             self._layer_forward_impl = layer_forward_impl
         def __enter__(self):
             self.backup_forward = TransformerLayer.forward
-            TransformerLayer.forward = self._layer_forward_impl
+            TransformerLayer.forward = lambda *args, **kwargs: self._layer_forward_impl(*args, **kwargs)[:2]
         def __exit__(self, exc_type, exc_value, traceback):
             TransformerLayer.forward = self.backup_forward
 
