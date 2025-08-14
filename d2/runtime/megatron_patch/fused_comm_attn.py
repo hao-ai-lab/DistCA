@@ -6,7 +6,7 @@ from flash_attn.flash_attn_interface import (
     _wrapped_flash_attn_varlen_forward, _wrapped_flash_attn_varlen_backward
 )
 from d2.runtime.attn_kernels.ops import FastDispatcherWrapper, fast_a2a
-from d2.runtime.megatron_patch.packed_seq_params import PingPangSingleStepPackedSeqParams
+from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.transformer_config import TransformerConfig
 import torch
@@ -323,11 +323,13 @@ class post_a2a_attn_out_with_lse(torch.autograd.Function):
 
 
 @torch.no_grad()
-def dummy_backward(
+def dummy_backward_single_sided(
     config: TransformerConfig,
     packed_seq_params: PingPangSingleStepPackedSeqParams,
     dtype: torch.dtype,
     device: torch.device,
+    attn_out_grad_all2all: bool=True,
+    qkv_grad_all2all: bool=True,
 ):
     """
     Dummy backward for a single layer. This is exactly the backward of FusedCommAttn + All2All.
@@ -344,16 +346,19 @@ def dummy_backward(
     bwd_qkv_metadata = packed_seq_params.qkv_bwd_metadata
     bwd_fa_params = packed_seq_params.bwd_packed_seq_params
 
-    with torch.cuda.stream(packed_seq_params.stream):
-        fast_a2a(
-            *bwd_attn_out_qkv_metadata.fa2a_metadata,
-            bwd_attn_out_qkv_metadata.my_rank_send_offset,
-            bwd_attn_out_qkv_metadata.my_rank_recv_offset,
-            bwd_attn_out_qkv_metadata.my_rank_send_sz,
-            instance_id=dispatcher_id,
-        )
-    if packed_seq_params.stream is not None:
-        torch.cuda.current_stream().wait_stream(packed_seq_params.stream)
+    if attn_out_grad_all2all:
+        with torch.cuda.stream(packed_seq_params.stream):
+            fast_a2a(
+                *bwd_attn_out_qkv_metadata.fa2a_metadata,
+                bwd_attn_out_qkv_metadata.my_rank_send_offset,
+                bwd_attn_out_qkv_metadata.my_rank_recv_offset,
+                bwd_attn_out_qkv_metadata.my_rank_send_sz,
+                instance_id=dispatcher_id,
+            )
+        if packed_seq_params.stream is not None:
+            torch.cuda.current_stream().wait_stream(packed_seq_params.stream)
+    else:
+        assert dispatcher_id is not None
 
     recv_k_shape = bwd_attn_out_qkv_metadata.tensor_shape[1].recv_shape
     recv_k = torch.empty(recv_k_shape, dtype=dtype, device=device)
@@ -398,6 +403,26 @@ def dummy_backward(
         instance_id=dispatcher_id,
     )
 
+    if qkv_grad_all2all:
+        with torch.cuda.stream(packed_seq_params.stream):
+            fast_a2a(
+                *bwd_qkv_metadata.fa2a_metadata,
+                bwd_qkv_metadata.my_rank_send_offset,
+                bwd_qkv_metadata.my_rank_recv_offset,
+                bwd_qkv_metadata.my_rank_send_sz,
+                instance_id=dispatcher_id,
+            )
+        if dispatcher_id is None:
+            FastDispatcherWrapper.switch_buffer()
+    else:
+        assert dispatcher_id is not None
+
+
+def dummy_backward_send_qkv(packed_seq_params: PingPangSingleStepPackedSeqParams):
+    dispatcher_id = packed_seq_params.dispatcher_id
+    assert dispatcher_id is not None
+
+    bwd_qkv_metadata = packed_seq_params.qkv_bwd_metadata
     with torch.cuda.stream(packed_seq_params.stream):
         fast_a2a(
             *bwd_qkv_metadata.fa2a_metadata,
@@ -406,8 +431,30 @@ def dummy_backward(
             bwd_qkv_metadata.my_rank_send_sz,
             instance_id=dispatcher_id,
         )
-    if packed_seq_params.stream is not None:
-        torch.cuda.current_stream().wait_stream(packed_seq_params.stream)
 
-    if dispatcher_id is None:
-        FastDispatcherWrapper.switch_buffer()
+
+@torch.no_grad()
+def dummy_backward(
+    config: TransformerConfig,
+    packed_seq_params,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    if isinstance(packed_seq_params, PingPangSingleStepPackedSeqParams):
+        dummy_backward_single_sided(config, packed_seq_params, dtype, device,)
+        return
+    assert isinstance(packed_seq_params, PingPangPackedSeqParams)
+    # PingPong schedule:
+    # Compute:              Attn_1      Attn_0
+    # Comm:     out_grad_1  out_grad_0  qkv_grad_1  qkv_grad_0
+    # Launch out_grad_1 and Attn_1
+    dummy_backward_single_sided(config, packed_seq_params.seq_params[1],
+                                dtype, device,
+                                qkv_grad_all2all=False)
+    # Launch out_grad_0 and Attn_0
+    dummy_backward_single_sided(config, packed_seq_params.seq_params[0],
+                                dtype, device,
+                                qkv_grad_all2all=False)
+    # Launch qkv_grad_1
+    dummy_backward_send_qkv(packed_seq_params.seq_params[1])
+    dummy_backward_send_qkv(packed_seq_params.seq_params[0])
