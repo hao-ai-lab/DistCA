@@ -290,14 +290,6 @@ def create_raw_qkv_dispatch(
     return_mlp_no_shard_seq_lens: bool=False,
     seq_lens = None,
 ):
-    '''
-    reverse_seq_lens: the forward seq_lens used to reverse (see reverse)
-    last_seq_lens: the seq_lens from last microbatch in pp, ensuring the same microbatch has the same seq_lens on different ranks
-    dummy_first: the first microbatch will have minimal seq_len, used for dummy forward in pp cooldown
-    dummy_except_first: all microbatches except the first one will have minimal seq_len, used for dummy forward in pp warmup
-    reverse: comparing pp forward and backward, the same group of microbatches have reversed ranks,
-             so we reverse the seq_lens in forwad pass to get that in backward pass.
-    '''
     """NOTE: this is currently a dispatch tensor of not consider the 2CP optimization."""
     # init sequence
     if seq_lens is None:

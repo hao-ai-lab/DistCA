@@ -74,6 +74,12 @@ class LogicalShape:
         mlp_num_tokens: list[int]
     ):
         world_size = mlp_to_attn_metadata.world_size
+
+        if isinstance(mlp_num_tokens, int):
+            # For a PP tick, dummy stages have fewer tokens than others
+            # For pure DP-CP, each rank has the same number of tokens.
+            mlp_num_tokens = [mlp_num_tokens] * world_size
+
         assert mlp_to_attn_metadata.dst_rank.shape[0] == world_size
         if mlp_to_attn_metadata.dst_rank.ndim == 2:
             token_layout = [(i,) for i in mlp_num_tokens]
