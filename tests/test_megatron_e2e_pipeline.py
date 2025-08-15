@@ -11,7 +11,7 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 import torch
 from transformers import AutoConfig
 
-from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams
+from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
 from d2.runtime.inplace_metadata import mlp_layout_packed_params
 from d2.runtime.megatron_patch.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
 
@@ -37,7 +37,11 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         } for microbatch in microbatches]
         if "orig" in mode:
             for mb in microbatches:
-                mb["packed_seq_params"] = mb["packed_seq_params"].mlp_packed_seq_params
+                psp = mb["packed_seq_params"]
+                if isinstance(psp, PingPangSingleStepPackedSeqParams):
+                    mb["packed_seq_params"] = mb["packed_seq_params"].mlp_packed_seq_params
+                else:
+                    assert isinstance(psp, PackedSeqParams)
 
         # forward_backward_func = get_forward_backward_func()
         n_micro_batch = len(microbatches) - self.as_world_size + 1
@@ -275,32 +279,75 @@ def test(args):
     num_head_in_dtype = (hf_config.num_attention_heads *
                          torch.float32.itemsize // element_size)
 
-    microbatches = create_pp_microbatches(
+    microbatches_0 = create_pp_microbatches(
         args.num_microbatch, pp_size, worker.as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype
     )
-    loss_one_sided, grad_one_sided = worker.forward_backward_batch(
-        microbatches=microbatches,
-        forward_only=False,
-        mode="single_sided",
-        with_dummy=True,
+    microbatches_1 = create_pp_microbatches(
+        args.num_microbatch, pp_size, worker.as_rank,
+        as_world_size, total_seq_len, num_seqs, max_cp_degree,
+        hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype
     )
+    microbatches = []
+    orig_impl_microbatches = []
+    for mb_0, mb_1 in zip(microbatches_0, microbatches_1):
+        mb_0_psp = mb_0["packed_seq_params"]
+        mb_1_psp = mb_1["packed_seq_params"]
+        mb_0_mlp_psp = mb_0_psp.mlp_packed_seq_params
+        mb_1_mlp_psp = mb_1_psp.mlp_packed_seq_params
+        ping_pong_params = PingPangPackedSeqParams(
+            seq_params = [mb_0_psp, mb_1_psp],
+            mlp_layout_seq_params = [mb_0_mlp_psp, mb_1_mlp_psp],
+            max_seqlen_q = max(mb_0_mlp_psp.max_seqlen_q, mb_1_mlp_psp.max_seqlen_q),
+            max_seqlen_kv = max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
+        )
+        mb = {
+            "input_ids": torch.concat([mb_0["input_ids"], mb_1["input_ids"]]),
+            "position_ids": torch.concat([mb_0["position_ids"], mb_1["position_ids"]]),
+            "packed_seq_params": ping_pong_params,
+        }
+        microbatches.append(mb)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q = torch.concat([
+                mb_0_mlp_psp.cu_seqlens_q, mb_1_mlp_psp.cu_seqlens_q[1:] + mb_0_mlp_psp.cu_seqlens_q[-1]
+            ]),
+            cu_seqlens_kv = torch.concat([
+                mb_0_mlp_psp.cu_seqlens_kv, mb_1_mlp_psp.cu_seqlens_kv[1:] + mb_0_mlp_psp.cu_seqlens_kv[-1]
+            ]),
+            max_seqlen_q = ping_pong_params.max_seqlen_q,
+            max_seqlen_kv = ping_pong_params.max_seqlen_kv,
+        )
+        orig_mb = {
+            "input_ids": mb["input_ids"],
+            "position_ids": mb["position_ids"],
+            "packed_seq_params": packed_seq_params,
+        }
+        orig_impl_microbatches.append(orig_mb)
+
     loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
-        microbatches=microbatches,
+        microbatches=orig_impl_microbatches,
         forward_only=False,
         mode="orig_reimpl",
         with_dummy=True,
     )
     loss_orig, grad_orig = worker.forward_backward_batch(
-        microbatches=microbatches,
+        microbatches=orig_impl_microbatches,
         forward_only=False,
         mode="orig_reimpl",
         with_dummy=False,
     )
-    print(f"{loss_one_sided=}, {loss_orig_reimpl=}, {loss_orig=}")
+    print("finish baseline")
+    loss_reduced, grad_sample = worker.forward_backward_batch(
+        microbatches=microbatches,
+        forward_only=False,
+        mode="ping_pong",
+        with_dummy=True,
+    )
+    print(f"{loss_reduced=}, {loss_orig_reimpl=}, {loss_orig=}")
     torch.testing.assert_close(grad_orig_reimpl, grad_orig)
-    torch.testing.assert_close(grad_orig_reimpl, grad_one_sided, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(grad_orig_reimpl, grad_sample, rtol=1e-3, atol=1e-3)
 
     print("=" * 20 + "forward_backward_batch attention server, done")
 

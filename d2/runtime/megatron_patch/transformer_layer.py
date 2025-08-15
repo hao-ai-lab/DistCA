@@ -702,7 +702,10 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         return args
 
     def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        args.pop("query"), args.pop("key"), args.pop("value")
+        bwd_resend_qkv = args["packed_seq_params"].bwd_packed_seq_params is not None
+        if not bwd_resend_qkv:
+            # qkv are stored until attn_out to resend at backward.
+            args.pop("query"), args.pop("key"), args.pop("value")
         signal = args.pop("signal")
         args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=True)
         return args
@@ -710,27 +713,59 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
     def _forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         # pop out to make sure the tensor is freed
         signal = args.pop("signal")
-        query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
-        core_attn_out = layer._forward_core_attn(
-            query, key, value,
-            args["attention_mask"],
-            args["attention_bias"],
-            args["attn_mask_type"],
-            args["packed_seq_params"],
-        )
-        args["core_attn_out"] = core_attn_out
-        args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
+        packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
+        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
+        if bwd_resend_qkv:
+            signal = FusedCommAttn.apply(
+                signal,
+                packed_seq_params.qkv_fwd_metadata,
+                packed_seq_params.qkv_bwd_metadata,
+                packed_seq_params.attn_out_fwd_metadata,
+                packed_seq_params.attn_out_bwd_metadata,
+                packed_seq_params,
+                packed_seq_params.bwd_packed_seq_params,
+                packed_seq_params.dispatcher_id,
+                FlashAttnArgs(
+                    num_heads_q=layer.config.num_attention_heads // layer.config.tensor_model_parallel_size,
+                    num_heads_kv=layer.config.num_query_groups // layer.config.tensor_model_parallel_size,
+                    head_dim=layer.config.hidden_size // layer.config.num_attention_heads,
+                    return_attn_probs=True,
+                    deterministic=True,
+                ),
+            )
+            args["signal"] = signal
+        else:
+            query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
+            core_attn_out = layer._forward_core_attn(
+                query, key, value,
+                args["attention_mask"],
+                args["attention_bias"],
+                args["attn_mask_type"],
+                args["packed_seq_params"],
+            )
+            args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
         return args
 
     def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
-        args.pop("core_attn_out")
         signal = args.pop("signal")
         args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=False)
         return args
 
     def _forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         signal = args.pop("signal")
-        core_attn_out = layer._post_attn_to_mlp(signal, args["packed_seq_params"])
+        packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
+        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
+        if bwd_resend_qkv:
+            core_attn_out = post_a2a_attn_out_with_lse.apply(
+                signal, args["query"], args["key"], args["value"],
+                layer.config.num_attention_heads // layer.config.tensor_model_parallel_size,
+                packed_seq_params.attn_out_fwd_metadata,
+                packed_seq_params.attn_out_bwd_metadata,
+                packed_seq_params.dispatcher_id,
+            )
+            args.pop("query"), args.pop("key"), args.pop("value")
+        else:
+            core_attn_out = layer._post_attn_to_mlp(signal, args["packed_seq_params"])
         residual = args.pop("residual")
         mlp_output, context = layer._forward_post_core_attn(
             core_attn_out,
