@@ -1,6 +1,4 @@
 """
-Instantiating Megatron with ray so that we can easily create a single worker to do the scheduling.
-
 Debug example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 """
@@ -60,7 +58,8 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
             # returns "hidden_states" if not model.post_process (not the last layer)
             # returns "logits" when label is None.
             output = gptmodel_forward(
-                model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel, packed_seq_params, labels=input_ids.unsqueeze(0),
+                model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel,
+                packed_seq_params, labels=input_ids.unsqueeze(0),
             )
             return output, loss_func
 
@@ -118,10 +117,12 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
                 micro_batch_size=1,  # no use when input_shapes was set
                 forward_only=forward_only,
             )
-        grad_sample = unwrap_model(self.train_module[0]).decoder.layers[-1].self_attention.linear_proj.weight.main_grad.clone()
+        grad_sample = unwrap_model(self.train_module[0]).decoder.layers[-2].self_attention.linear_proj.weight.main_grad.clone()
 
-        for param in unwrap_model(self.train_module[0]).parameters():
-            param.main_grad.zero_()
+        # when testing numerical correctness, instead of running optimizer step, reset grads.
+        for tm in self.train_module:
+            for param in unwrap_model(tm).parameters():
+                param.main_grad.zero_()
         return losses_reduced, grad_sample
 
 
@@ -151,6 +152,89 @@ def init_megatron_e2e_test(
     )
     print("Communication groups initialized")
     return worker
+
+
+def create_pp_microbatches(num_microbatch: int, pp_degree: int, rank: int,
+                           as_world_size: int, total_seq_len: int, num_seqs: int,
+                           max_cp_degree: int, hidden_size_q_tp: int,
+                           hidden_size_k_tp: int, element_size: int,
+                           num_head_in_dtype: int):
+    tick_seq_lens = None
+    bwd_metadata = []
+    microbatches = []
+    for i in range(num_microbatch + pp_degree - 1):
+        # For the last few ticks (drain-out ticks)
+        # add a dummy forward microbatch at PP rank 0.
+        add_dummy_forward = i >= num_microbatch
+
+        (
+            fa_fwd_params, fa_bwd_params,
+            qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
+            attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
+            tick_seq_lens,
+        ) = create_qkv_dispatch_pipeline_tick(
+            as_world_size, total_seq_len, num_seqs, max_cp_degree,
+            hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
+            ref_seq_lens=tick_seq_lens,
+            add_dummy=add_dummy_forward,
+        )
+        this_rank_num_tokens = tick_seq_lens[rank].sum().item()
+
+        (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_bwd_params
+        bwd_packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_q[rank],
+            cu_seqlens_kv=cu_seqlens_kv[rank],
+            max_seqlen_q=max_seqlen_q[rank],
+            max_seqlen_kv=max_seqlen_kv[rank],
+        )
+        mlp_packed_seq_params = mlp_layout_packed_params(tick_seq_lens[rank][:num_seqs])
+        (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_fwd_params
+
+        # Create packed_params. Note that we do not add backward params here.
+        ping_pang_params = PingPangSingleStepPackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q[rank],
+            cu_seqlens_kv=cu_seqlens_kv[rank],
+            max_seqlen_q=max_seqlen_q[rank],
+            max_seqlen_kv=max_seqlen_kv[rank],
+            qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(rank),
+            attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
+            mlp_packed_seq_params=mlp_packed_seq_params,
+        )
+
+        input_ids_local = torch.randint(0, 100, (this_rank_num_tokens,))
+        position_ids_local = torch.arange(this_rank_num_tokens)
+        microbatch = {
+            "input_ids": input_ids_local,
+            "position_ids": position_ids_local,
+            "packed_seq_params": ping_pang_params,
+        }
+        microbatches.append(microbatch)
+
+        # store the corresponding bwd metadata (for later ticks)
+        bwd_metadata.append(
+            (qkv_bwd_fa2a_metadata.get_slice(rank), attn_out_qkv_bwd_fa2a_metadata.get_slice(rank), bwd_packed_seq_params)
+        )
+
+    # put bwd metadata to the corresponding side
+    for i, microbatch in enumerate(microbatches):
+        # When mb i is computed on rank at forward tick t, assume the backward right after it
+        # is at tick t'.
+        # it requires another (pp_degree - 1 - rank) forward steps to reach the last PP stage,
+        # and another (pp_degree - 1 - rank) + 1 backward steps to compute its own backward.
+        # Since in 1F1B, a forward follows a backward, so at backward tick
+        # t' + 2 * (pp_degree - 1 - rank) + 1, it starts to compute this microbatch's backward
+        # at this rank.
+        # Note that at the end of PP warmup, forward tick is pp_degree - 1, while backward tick
+        # is 0. Therefore, t - t' = pp_degree - 1, and thus
+        # t' + 2 * (pp_degree - 1 - rank) + 1 == t + pp_degree - 1 - rank * 2
+        bwd_metadata_idx = (i + pp_degree - 1 - rank * 2) % len(bwd_metadata)
+        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[bwd_metadata_idx]
+        packed_seq_params = microbatch["packed_seq_params"]
+        packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
+        packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
+        packed_seq_params.bwd_packed_seq_params = bwd_packed_seq_params
+    return microbatches
 
 
 def test(args):
@@ -193,70 +277,11 @@ def test(args):
     num_head_in_dtype = (hf_config.num_attention_heads *
                          torch.float32.itemsize // element_size)
 
-    seq_lens = None
-    bwd_metadata = []
-
-    def get_microbatch(dummy_first):
-        nonlocal seq_lens
-        (
-            fa_fwd_params, fa_bwd_params,
-            qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
-            attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
-            seq_lens,
-        ) = create_qkv_dispatch_pipeline_tick(
-            world_size, total_seq_len, num_seqs, max_cp_degree,
-            hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-            ref_seq_lens=seq_lens,
-            add_dummy=dummy_first,
-        )
-        actual_total_seq_len = seq_lens[rank].sum().item()
-
-        rev_rank = as_world_size - rank - 1
-        input_ids_local = torch.randint(0, 100, (actual_total_seq_len,))
-        position_ids_local = torch.arange(actual_total_seq_len)
-        (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_bwd_params
-        bwd_packed_seq_params = PackedSeqParams(
-            cu_seqlens_q=cu_seqlens_q[rank],
-            cu_seqlens_kv=cu_seqlens_kv[rank],
-            max_seqlen_q=max_seqlen_q[rank],
-            max_seqlen_kv=max_seqlen_kv[rank],
-        )
-        mlp_packed_seq_params = mlp_layout_packed_params(seq_lens[rank][:num_seqs])
-        (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_fwd_params
-
-        ping_pang_params = PingPangSingleStepPackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_q[rank],
-            cu_seqlens_kv=cu_seqlens_kv[rank],
-            max_seqlen_q=max_seqlen_q[rank],
-            max_seqlen_kv=max_seqlen_kv[rank],
-            qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(rank),
-            # qkv_bwd_metadata=qkv_bwd_fa2a_metadata.get_slice(rev_rank),
-            attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
-            # attn_out_bwd_metadata=attn_out_qkv_bwd_fa2a_metadata.get_slice(rev_rank),
-            # bwd_packed_seq_params=bwd_packed_seq_params,
-            mlp_packed_seq_params=mlp_packed_seq_params,
-        )
-        bwd_metadata.append(
-            (qkv_bwd_fa2a_metadata.get_slice(rank), attn_out_qkv_bwd_fa2a_metadata.get_slice(rank), bwd_packed_seq_params)
-        )
-
-        microbatch = {
-            "input_ids": input_ids_local,
-            "position_ids": position_ids_local,
-            "packed_seq_params": ping_pang_params,
-        }
-        return microbatch
-    # print(rank, microbatch["packed_seq_params"])
-    microbatches = [get_microbatch(dummy_first=False) for _ in range(args.num_microbatch)] + [
-        get_microbatch(dummy_first=True) for _ in range(as_world_size - 1)
-    ]
-    for i, microbatch in enumerate(microbatches):
-        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[(i + as_world_size - 1 - as_rank * 2) % len(bwd_metadata)]
-        packed_seq_params = microbatch["packed_seq_params"]
-        packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
-        packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
-        packed_seq_params.bwd_packed_seq_params = bwd_packed_seq_params
+    microbatches = create_pp_microbatches(
+        args.num_microbatch, pp_size, worker.as_rank,
+        as_world_size, total_seq_len, num_seqs, max_cp_degree,
+        hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype
+    )
     loss_one_sided, grad_one_sided = worker.forward_backward_batch(
         microbatches=microbatches,
         forward_only=False,
