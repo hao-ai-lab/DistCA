@@ -180,8 +180,9 @@ class FusedCommAttn(torch.autograd.Function):
         )
         saved_tensors.extend([
             bwd_fa_params.cu_seqlens_q, bwd_fa_params.cu_seqlens_kv,
-            bwd_fa_params.max_seqlen_q, bwd_fa_params.max_seqlen_kv,
         ])
+        ctx.bwd_attn_max_seqlen_q = bwd_fa_params.max_seqlen_q
+        ctx.bwd_attn_max_seqlen_kv = bwd_fa_params.max_seqlen_kv
         ctx.fa_args = flash_attn_args
 
         # Step 3: pre-dispatch attn out
@@ -200,7 +201,7 @@ class FusedCommAttn(torch.autograd.Function):
             bwd_attn_out_qkv_metadata.seq_lens[1].recv_seqlens,
             *bwd_attn_out_qkv_metadata.recv_memcpy_metadata,
         ])
-        recv_seqlens_q_total = bwd_attn_out_qkv_metadata.seq_lens[0].recv_seqlens.sum().item()
+        recv_seqlens_q_total = bwd_attn_out_qkv_metadata.tensor_shape[0].recv_shape[0]
         ctx.bwd_q_shape = ctx.attn_out_shape = recv_seqlens_q_total, recv_q_shape[1]
         ctx.softmax_lse_shape = recv_seqlens_q_total, softmax_lse.shape[1]
         ctx.softmax_lse_dtype = softmax_lse_dtype
@@ -215,7 +216,6 @@ class FusedCommAttn(torch.autograd.Function):
         (bwd_qkv_grad_send_seqlens_q, bwd_qkv_grad_send_seqlens_k,
          bwd_q_grad_send_offset, bwd_k_grad_send_offset, bwd_v_grad_send_offset,
          bwd_attn_cu_seqlens_q, bwd_attn_cu_seqlens_kv,
-         bwd_attn_max_seqlen_q, bwd_attn_max_seqlen_kv,
          bwd_attn_out_qkv_recv_seqlens_q, bwd_attn_out_qkv_recv_seqlens_k,
          bwd_attn_out_qkv_recv_q_offset, bwd_attn_out_qkv_recv_k_offset,
          bwd_attn_out_qkv_recv_v_offset
@@ -245,7 +245,7 @@ class FusedCommAttn(torch.autograd.Function):
         dq, dk, dv = _qkv_to_attn_out_bwd(
             recv_q, recv_k, recv_v, recv_attn_out, recv_attn_out_grad,
             recv_lse, ctx.fa_args, bwd_attn_cu_seqlens_q, bwd_attn_cu_seqlens_kv,
-            bwd_attn_max_seqlen_q, bwd_attn_max_seqlen_kv,
+            ctx.bwd_attn_max_seqlen_q, ctx.bwd_attn_max_seqlen_kv,
         )
         # Step 3: pre-dispatch q_grad, k_grad, v_grad
         dq, dk, dv = pre_fast_a2a_qkv(

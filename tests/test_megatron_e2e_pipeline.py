@@ -55,6 +55,7 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
+            torch.cuda.nvtx.range_push("forward_step")
             input_ids = batch['input_ids']
             position_ids = batch['position_ids']
             attention_mask = None
@@ -65,8 +66,7 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
                 model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel,
                 packed_seq_params, labels=input_ids.unsqueeze(0),
             )
-            # FIXME: why we need a sync here to avoid nan loss in ping-pong pp?
-            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
             return output, loss_func
 
         def dummy_backward_step(model, dummy_bwd_iter, skip: bool):
@@ -139,8 +139,8 @@ def init_megatron_e2e_test(
 ):
     token_bytes_q = hidden_size_q * dtype.itemsize
     token_bytes_kv = hidden_size_kv * dtype.itemsize
-    max_tokens_query = num_tokens * world_size
-    max_tokens_key_value = num_tokens * world_size
+    max_tokens_query = num_tokens * (world_size // tp_size)
+    max_tokens_key_value = num_tokens * (world_size // tp_size)
     buffer_size = (
         token_bytes_q * max_tokens_query * 3 +
         # lse_norm. TODO: the factor of 2 might be removed
@@ -190,8 +190,8 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, rank: int,
         bwd_packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens_q[rank],
             cu_seqlens_kv=cu_seqlens_kv[rank],
-            max_seqlen_q=max_seqlen_q[rank],
-            max_seqlen_kv=max_seqlen_kv[rank],
+            max_seqlen_q=max_seqlen_q[rank].item(),
+            max_seqlen_kv=max_seqlen_kv[rank].item(),
         )
         mlp_packed_seq_params = mlp_layout_packed_params(tick_seq_lens[rank][:num_seqs])
         (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_fwd_params
@@ -201,8 +201,8 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, rank: int,
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_q[rank],
             cu_seqlens_kv=cu_seqlens_kv[rank],
-            max_seqlen_q=max_seqlen_q[rank],
-            max_seqlen_kv=max_seqlen_kv[rank],
+            max_seqlen_q=max_seqlen_q[rank].item(),
+            max_seqlen_kv=max_seqlen_kv[rank].item(),
             qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(rank),
             attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
             mlp_packed_seq_params=mlp_packed_seq_params,

@@ -14,6 +14,13 @@ def _to_cuda_int32(tensor: Optional[torch.Tensor]):
     return tensor.cuda().to(torch.int32).contiguous()
 
 
+def _to_int(tensor):
+    if isinstance(tensor, torch.Tensor):
+        return tensor.cpu().item()
+    assert isinstance(tensor, int)
+    return tensor
+
+
 @dataclass
 class PingPangSingleStepPackedSeqParams(PackedSeqParams):
     qkv_fwd_metadata: FastAlltoAllMetadata = None
@@ -34,8 +41,8 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
             cu_seqlens_kv=_to_cuda_int32(self.cu_seqlens_kv),
             cu_seqlens_q_padded=_to_cuda_int32(self.cu_seqlens_q_padded),
             cu_seqlens_kv_padded=_to_cuda_int32(self.cu_seqlens_kv_padded),
-            max_seqlen_q=self.max_seqlen_q.cpu().item(),
-            max_seqlen_kv=self.max_seqlen_kv.cpu().item(),
+            max_seqlen_q=_to_int(self.max_seqlen_q),
+            max_seqlen_kv=_to_int(self.max_seqlen_kv),
             qkv_fwd_metadata=self.qkv_fwd_metadata.normalize(),
             qkv_bwd_metadata=self.qkv_bwd_metadata.normalize(),
             attn_out_fwd_metadata=self.attn_out_fwd_metadata.normalize(),
@@ -96,8 +103,8 @@ def arg_to_cuda(v):
             qkv_format=v.qkv_format,
             cu_seqlens_q=_to_cuda_int32(v.cu_seqlens_q),
             cu_seqlens_kv=_to_cuda_int32(v.cu_seqlens_kv),
-            max_seqlen_q=_to_cuda_int32(v.max_seqlen_q),
-            max_seqlen_kv=_to_cuda_int32(v.max_seqlen_kv),
+            max_seqlen_q=_to_int(v.max_seqlen_q),
+            max_seqlen_kv=_to_int(v.max_seqlen_kv),
             cu_seqlens_q_padded=_to_cuda_int32(v.cu_seqlens_q_padded),
             cu_seqlens_kv_padded=_to_cuda_int32(v.cu_seqlens_kv_padded),
         )
