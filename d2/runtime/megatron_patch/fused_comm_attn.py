@@ -227,6 +227,7 @@ class FusedCommAttn(torch.autograd.Function):
             recv_k_shape, dtype=signal_grad.dtype, device=signal_grad.device
         )
         recv_v = torch.empty_like(recv_k)
+        torch.cuda.nvtx.range_push("post_fast_a2a_attn_out_grad_resend_qkv")
         (recv_attn_out_grad, recv_attn_out, recv_lse, recv_q, recv_k, recv_v
          ) = post_fast_a2a_attn_out_grad_resend_qkv(
             ctx.attn_out_shape, ctx.softmax_lse_shape, ctx.bwd_q_shape,
@@ -241,18 +242,23 @@ class FusedCommAttn(torch.autograd.Function):
             instance_id=dispatcher_id,
         )
         recv_lse = recv_lse.T.contiguous()
+        torch.cuda.nvtx.range_pop()
         # Step 2: call FA bwd.
+        torch.cuda.nvtx.range_push("manual_bwd_fa")
         dq, dk, dv = _qkv_to_attn_out_bwd(
             recv_q, recv_k, recv_v, recv_attn_out, recv_attn_out_grad,
             recv_lse, ctx.fa_args, bwd_attn_cu_seqlens_q, bwd_attn_cu_seqlens_kv,
             ctx.bwd_attn_max_seqlen_q, ctx.bwd_attn_max_seqlen_kv,
         )
+        torch.cuda.nvtx.range_pop()
         # Step 3: pre-dispatch q_grad, k_grad, v_grad
+        torch.cuda.nvtx.range_push("pre_a2a_qkv_grad_memcpy")
         dq, dk, dv = pre_fast_a2a_qkv(
             dq, dk, dv, None, bwd_qkv_grad_send_seqlens_q, bwd_qkv_grad_send_seqlens_k,
             bwd_q_grad_send_offset, bwd_k_grad_send_offset, bwd_v_grad_send_offset,
             is_fwd=False, instance_id=dispatcher_id
         )
+        torch.cuda.nvtx.range_pop()
         signal_grad = torch.empty((1,), device=recv_q.device, dtype=recv_q.dtype)
         return signal_grad, *((None,) * 8)
 
@@ -339,6 +345,7 @@ def dummy_backward_single_sided(
 
     # create some dummy data
     num_heads = config.num_attention_heads // config.tensor_model_parallel_size
+    hidden_size_tp = config.hidden_size // config.tensor_model_parallel_size
 
     dispatcher_id = packed_seq_params.dispatcher_id
 
@@ -348,6 +355,7 @@ def dummy_backward_single_sided(
 
     if attn_out_grad_all2all:
         with torch.cuda.stream(packed_seq_params.stream):
+            torch.cuda.nvtx.range_push("dummy_backward_a2a_attn_grad")
             fast_a2a(
                 *bwd_attn_out_qkv_metadata.fa2a_metadata,
                 bwd_attn_out_qkv_metadata.my_rank_send_offset,
@@ -355,6 +363,7 @@ def dummy_backward_single_sided(
                 bwd_attn_out_qkv_metadata.my_rank_send_sz,
                 instance_id=dispatcher_id,
             )
+            torch.cuda.nvtx.range_pop()
         if packed_seq_params.stream is not None:
             torch.cuda.current_stream().wait_stream(packed_seq_params.stream)
     else:
@@ -363,9 +372,10 @@ def dummy_backward_single_sided(
     recv_k_shape = bwd_attn_out_qkv_metadata.tensor_shape[1].recv_shape
     recv_k = torch.empty(recv_k_shape, dtype=dtype, device=device)
     recv_v = torch.empty_like(recv_k)
-    recv_q_len = bwd_attn_out_qkv_metadata.seq_lens[0].recv_seqlens.sum().item()
-    recv_q_shape = recv_q_len, config.hidden_size // config.tensor_model_parallel_size
+    recv_q_len = bwd_attn_out_qkv_metadata.tensor_shape[0].recv_shape[0]
+    recv_q_shape = recv_q_len, hidden_size_tp
     softmax_lse_shape = recv_q_len, num_heads
+    torch.cuda.nvtx.range_push("dummy_backward_post_a2a_attn_grad")
     (recv_attn_out_grad, recv_attn_out, recv_lse, recv_q, recv_k, recv_v
     ) = post_fast_a2a_attn_out_grad_resend_qkv(
         recv_q_shape, softmax_lse_shape, recv_q_shape, torch.float32,
@@ -378,22 +388,26 @@ def dummy_backward_single_sided(
         switch_buffer=dispatcher_id is None,
         instance_id=dispatcher_id,
     )
-
     recv_lse = recv_lse.T.contiguous()
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("dummy_backward_bwd_attn")
     dq, dk, dv = _qkv_to_attn_out_bwd(
         recv_q, recv_k, recv_v, recv_attn_out, recv_attn_out_grad,
         recv_lse,
         FlashAttnArgs(
-            num_heads_q=config.num_attention_heads // config.tensor_model_parallel_size,
+            num_heads_q=num_heads,
             num_heads_kv=config.num_query_groups // config.tensor_model_parallel_size,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            head_dim=hidden_size_tp,
             return_attn_probs=True,
             deterministic=True,
         ),
         bwd_fa_params.cu_seqlens_q, bwd_fa_params.cu_seqlens_kv,
         bwd_fa_params.max_seqlen_q, bwd_fa_params.max_seqlen_kv,
     )
+    torch.cuda.nvtx.range_pop()
 
+    torch.cuda.nvtx.range_push("dummy_backward_pre_qkv_grad_all2all")
     pre_fast_a2a_qkv(
         dq, dk, dv, None,
         bwd_qkv_metadata.seq_lens[0].send_seqlens,
@@ -402,6 +416,7 @@ def dummy_backward_single_sided(
         is_fwd=False,
         instance_id=dispatcher_id,
     )
+    torch.cuda.nvtx.range_pop()
 
     if qkv_grad_all2all:
         with torch.cuda.stream(packed_seq_params.stream):
@@ -448,13 +463,17 @@ def dummy_backward(
     # Compute:              Attn_1      Attn_0
     # Comm:     out_grad_1  out_grad_0  qkv_grad_1  qkv_grad_0
     # Launch out_grad_1 and Attn_1
-    dummy_backward_single_sided(config, packed_seq_params.seq_params[1],
-                                dtype, device,
-                                qkv_grad_all2all=False)
+    with torch.cuda.nvtx.range("dummy_bwd_ping_pong_1"):
+        dummy_backward_single_sided(config, packed_seq_params.seq_params[1],
+                                    dtype, device,
+                                    qkv_grad_all2all=False)
     # Launch out_grad_0 and Attn_0
-    dummy_backward_single_sided(config, packed_seq_params.seq_params[0],
-                                dtype, device,
-                                qkv_grad_all2all=False)
+    with torch.cuda.nvtx.range("dummy_bwd_ping_pong_0"):
+        dummy_backward_single_sided(config, packed_seq_params.seq_params[0],
+                                    dtype, device,
+                                    qkv_grad_all2all=False)
     # Launch qkv_grad_1
-    dummy_backward_send_qkv(packed_seq_params.seq_params[1])
-    dummy_backward_send_qkv(packed_seq_params.seq_params[0])
+    with torch.cuda.nvtx.range("dummy_bwd_ping_pong_qkv_all2all_1"):
+        dummy_backward_send_qkv(packed_seq_params.seq_params[1])
+    with torch.cuda.nvtx.range("dummy_bwd_ping_pong_qkv_all2all_0"):
+        dummy_backward_send_qkv(packed_seq_params.seq_params[0])
