@@ -663,7 +663,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
 
         # tick 2
         # communication
-        arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
+        with torch.cuda.nvtx.range("all2all_mlp_to_attn.1"):
+            arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
         # compute
         with torch.cuda.nvtx.range("core_attn.0"):
             arg_group_0 = _forward_core_attn(layer, arg_group_0)
