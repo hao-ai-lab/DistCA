@@ -1,8 +1,16 @@
 """
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
-    --num-nodes=1 --num-gpus-per-node=4 --tp-size=2
+    --num-nodes 1 --num-gpus-per-node 4 --tp-size 2 \
+    --create-batch-fn-name create_one_batch_balanced_flops
+
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
+    --num-nodes 1 --num-gpus-per-node 4 --tp-size 2 \
+    --create-batch-fn-name create_one_batch
+# 
 """
+import rich
 import argparse
 import os
 from megatron.core import mpu
@@ -280,6 +288,136 @@ def init_megatron_e2e_test(
     print("Communication groups initialized")
     return worker
 
+# TODO: (Refactor) Refactor this and move it to datagen_utils.py
+# TODO: (Refactor) This function name is just wrong.
+from test_util import create_qkv_dispatch_with_custom_mapping
+from d2.runtime.fast_alltoall_metadata import compute_fa2a_metadata_from_logical_metadata
+
+def test_create_qkv_dispatch_balanced_flops(
+    world_size_, total_seq_len_, seq_lens, max_cp_degree_, 
+    verbose=False, return_intermediate=False, return_mlp_no_shard_seq_lens=False,
+    replan_iter: int=1,
+):
+    K = 1024
+
+    from d2.planner.equal_flops import (
+        batch_to_items, 
+        plan_relocation,
+        item_to_intermediate_tensors,
+        postprocess_items,
+        calculate_flops_factor_in_each_gpu
+
+    )
+
+    items_list = seq_lens
+    
+    total_seq_len = max(sum(batch) for batch in items_list)
+    assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = {total_seq_len_}, got {total_seq_len=}"
+
+    items = batch_to_items(items_list)
+    # for _ in range(replan_iter):
+    max_replan_iter = replan_iter
+    actually_replan_iter = 0
+    try:
+        for _ in range(max_replan_iter):
+            gpu_flops = calculate_flops_factor_in_each_gpu(items)
+            diff = max(gpu_flops) - min(gpu_flops)
+            if diff < ((8*K) ** 2): # max - min < 1k
+                break
+            items = plan_relocation(items, verbose=False, plot=False)
+            actually_replan_iter += 1
+    except Exception as e:
+        # prevent exception forfeit the replanning of the whole batch.
+        print(f"Replanning at step {_} failed with exception: {e}. Exception will be ignored and use the previous items for forward pass.")
+        pass
+    if actually_replan_iter > 0:
+        items = postprocess_items(items)
+
+    world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens) = item_to_intermediate_tensors(items)    
+
+    world_size = world_info["world_size"]
+
+    assert world_size == world_size_, f"world_size mismatch, got {world_size}, expected {world_size_}"
+
+    ret = create_qkv_dispatch_with_custom_mapping(
+        world_size, 
+        seq_lens,
+        cp_num,
+        cp_dst,
+        seq_shard_lens,
+        verbose=verbose, return_intermediate=return_intermediate,
+    )
+    if return_mlp_no_shard_seq_lens:
+        ret += (seq_lens,)
+    return ret
+
+
+
+def create_one_batch_balanced_flops(
+    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
+    hidden_size_q: int, hidden_size_k: int, element_size: int
+):
+    K = 1024
+    assert total_seq_len % 8 == 0, f"total_seq_len must be divisible by 8, got {total_seq_len}"
+    seq_lens = items_list = [
+        [total_seq_len] * 1,
+        [total_seq_len // 2] * 2,
+        [total_seq_len // 4] * 4,
+        [total_seq_len // 8] * 8,
+        
+        [total_seq_len] * 1,
+        [total_seq_len // 2] * 2,
+        [total_seq_len // 4] * 4,
+        [total_seq_len // 8] * 8,
+    ]
+    items_list = items_list[:world_size]
+
+    (
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+        attention_metadata_attn_layout, intermediates, item_list
+    ) = test_create_qkv_dispatch_balanced_flops(
+        world_size, total_seq_len, items_list, max_cp_degree,
+        return_intermediate=True, return_mlp_no_shard_seq_lens=True
+    )
+    # NOTE: this already adds prepended zeros and is sharded to tuples (remove padding seqs)
+    (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+     num_local_seqs_recv) = attention_metadata_attn_layout
+
+    (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
+     attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
+    ) = compute_fa2a_metadata_from_logical_metadata(
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+        intermediates, total_seq_len, hidden_size_q, hidden_size_k,
+        element_size,
+    )
+    logical_metadata = (
+        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+    )
+    fa2a_metadata = (
+        qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
+        attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
+    )
+
+    # Only for debug!
+    # Intentionally set the sender_transfer_sz and receiver_transfer_sz to 0 
+    # to evaluate the network overhead
+    # os.environ["D2_FA2A_DISABLE_SEND_RECV"]
+    if os.environ.get("D2_FA2A_DISABLE_SEND_RECV", "0") == "1":
+        rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
+        qkv_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
+        qkv_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
+        qkv_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
+        qkv_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
+        attn_out_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
+        attn_out_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
+        attn_out_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
+        attn_out_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
+    
+    attn_metadata = (
+        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+    )
+    raw_seq_lens = seq_lens
+    return logical_metadata, fa2a_metadata, attn_metadata, raw_seq_lens
 
 def test(args):
     seed = args.seed
@@ -289,6 +427,14 @@ def test(args):
     tp_size = args.tp_size
     world_size = args.num_nodes * args.num_gpus_per_node
     total_seq_len = args.num_tokens
+    create_batch_fn_name = args.create_batch_fn_name
+
+    if create_batch_fn_name == "create_one_batch":
+        create_batch_fn = create_one_batch
+    elif create_batch_fn_name == "create_one_batch_balanced_flops":
+        create_batch_fn = create_one_batch_balanced_flops
+    else:
+        raise ValueError(f"Invalid create_batch_fn_name: {create_batch_fn_name}")
 
     dtype = torch.bfloat16
     element_size = dtype.itemsize
@@ -318,11 +464,11 @@ def test(args):
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
 
-    _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_one_batch(
+    _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_batch_fn(
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size
     )
-    _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_one_batch(
+    _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_batch_fn(
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size
     )
@@ -341,8 +487,8 @@ def test(args):
 
     # NOTE: we don't consider that seq_lens var has padding because our data generation
     # guarantees so. However, in practice, this is not true.
-    mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
-    mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
+    mlp_seq_params_0 = mlp_layout_packed_params(torch.tensor(raw_seq_lens_0[as_rank], dtype=torch.int32))
+    mlp_seq_params_1 = mlp_layout_packed_params(torch.tensor(raw_seq_lens_1[as_rank], dtype=torch.int32))
     ping_pang_params = PingPangPackedSeqParams(
         seq_params=[ping_pang_params_0, ping_pang_params_1],
         mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
@@ -390,6 +536,7 @@ if __name__ == "__main__":
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--profile-memory", action="store_true", default=False,)
     parser.add_argument("--profile-memory-output-path", type=str, default="profile")
+    parser.add_argument("--create-batch-fn-name", type=str, default="create_one_batch", choices=["create_one_batch", "create_one_batch_balanced_flops"])
     args = parser.parse_args()
 
     if args.profile_memory:
