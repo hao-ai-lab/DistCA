@@ -4,7 +4,7 @@ torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
     --num-nodes=1 --num-gpus-per-node=4 --tp-size=2
 """
 import argparse
-
+import os
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
@@ -388,5 +388,42 @@ if __name__ == "__main__":
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--num-gpus-per-node", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--profile-memory", action="store_true", default=False,)
+    parser.add_argument("--profile-memory-output-path", type=str, default="profile")
     args = parser.parse_args()
-    test(args)
+
+    if args.profile_memory:
+        os.makedirs(args.profile_memory_output_path, exist_ok=True)
+        import torch
+        torch.cuda.memory._record_memory_history()
+        
+
+    
+    if args.profile_memory:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=6, repeat=1),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            try:
+                test(args)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                pass
+    else:
+        test(args)
+    
+    if args.profile_memory:
+        print("Dumping memory snapshot")
+        rank = torch.distributed.get_rank()
+        torch.cuda.memory._dump_snapshot(f"{args.profile_memory_output_path}/mem_snapshot_{rank}.pickle")
+        prof.export_memory_timeline(f"{args.profile_memory_output_path}/mem_timeline_{rank}.html", device="cuda:0")
+        print("Memory snapshot dumped")
+
+

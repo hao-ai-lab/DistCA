@@ -156,6 +156,7 @@ def sample_wlbllm_docs_upsample(
     filter_threshold: int = 10000,
     filter_ratio: float = 1.0,
     upsample_long_factor: int = 2,
+    elongate_factor: int = 1,
 ) -> list[int]:
     """
     Sample `size` documents from the WLB-LLM distribution, upsampling long docs.
@@ -172,7 +173,8 @@ def sample_wlbllm_docs_upsample(
         Fraction of short docs to keep (for downsampling).
     upsample_long_factor : float
         Multiplicative upsampling factor for long docs (≥ threshold).
-
+    elongate_factor : int
+        Elongate the sequence length by this factor.
     Returns
     -------
     list[int]
@@ -197,6 +199,7 @@ def sample_wlbllm_docs_upsample(
 
     rng = np.random.default_rng(seed)
     sampled_docs = rng.choice(combined_docs, size=size, replace=False)
+    sampled_docs = sampled_docs * elongate_factor
     return sampled_docs.tolist()
 
 def batch_documents(

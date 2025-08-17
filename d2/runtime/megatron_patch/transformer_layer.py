@@ -3,7 +3,7 @@ import functools
 from typing import Any, Dict, List, Optional, Union
 import types
 import warnings
-
+import time
 import torch
 from torch import Tensor
 
@@ -60,6 +60,15 @@ def _gather_tensor(tensors: List[torch.Tensor], num_splits: int):
     return torch.cat(tensors, dim=0)
 ####
 
+stack = []
+def nvtx_range_push(name: str):
+    stack.append(name)
+    torch.cuda.nvtx.range_push(name)
+
+def nvtx_range_pop(name: str):
+    assert stack[-1] == name, f"stack = {stack}"
+    stack.pop()
+    torch.cuda.nvtx.range_pop()
 
 class TransformerLayer(BaseTransformerLayer):
     ########## Attention Layout <-> MLP Layout Transformation ##########
@@ -610,74 +619,144 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_1: Dict[str, Any],
         compute_stream: torch.cuda.Stream,
     ):
+        if getattr(self, "rank", None) is None:
+            self.rank = torch.distributed.get_rank()
+
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}]")
         layer = self.layers[l_no]
         prev_layer = self.layers[l_no - 1] if l_no > 0 else None
+        
+        
+        
         # tick 0, second half
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_0")
+
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_0.forward_pre_core_attn")
         arg_group_0 = _forward_pre_core_attn(layer, arg_group_0)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_0.forward_pre_core_attn")
         if l_no > 0:
+            nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_0.tick_sync")
             _tick_sync(
                 compute_stream, self.comm_stream,
                 arg_group_0, "signal",  # compute out
                 arg_group_1, "signal",  # prev layer's comm out,
             )
+            nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_0.tick_sync")
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_0")
 
         # tick 1
         # communication
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_1")
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_1.layout_mlp_to_attn")
         arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_1.layout_mlp_to_attn")
         # compute
         if l_no > 0:
+            nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_1.forward_post_core_attn")
             arg_group_1 = _forward_post_core_attn(prev_layer, arg_group_1)
+            nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_1.forward_post_core_attn")
+
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_1.forward_pre_core_attn")
         arg_group_1 = _forward_pre_core_attn(layer, arg_group_1)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_1.forward_pre_core_attn")
+
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_1.tick_sync")
         _tick_sync(
             compute_stream, self.comm_stream,
             arg_group_0, "signal",  # comm out
             arg_group_1, "signal",  # compute out
         )
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_1.tick_sync")
+
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_1")
+
 
         # tick 2
         # communication
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_2")
+        
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_2.layout_mlp_to_attn")
         arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_2.layout_mlp_to_attn")
         # compute
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_2.forward_core_attn")
         arg_group_0 = _forward_core_attn(layer, arg_group_0)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_2.forward_core_attn")
+
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_2.tick_sync")
         _tick_sync(
             compute_stream, self.comm_stream,
             arg_group_0, "signal",  # compute out
             arg_group_1, "signal",  # comm out.
         )
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_2.tick_sync")
 
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_2")
+        
         # tick 3
         # communication
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_3")
+
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_3.layout_attn_to_mlp")
         arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_3.layout_attn_to_mlp")
         # compute
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_3.forward_core_attn")
         arg_group_1 = _forward_core_attn(layer, arg_group_1)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_3.forward_core_attn")
+
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_3.tick_sync")
         _tick_sync(
             compute_stream, self.comm_stream,
             arg_group_0, "signal",  # comm out
             arg_group_1, "signal",  # compute out
         )
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_3.tick_sync")
+
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_3")
 
         # tick 4, also the tick 0 of the next layer
         # communication
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_4")
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_4.layout_attn_to_mlp")
         arg_group_1 = _layout_attn_to_mlp(layer, arg_group_1)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_4.layout_attn_to_mlp")
         # compute
+        nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_4.forward_post_core_attn")
         arg_group_0 = _forward_post_core_attn(layer, arg_group_0)
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_4.forward_post_core_attn")
         # NOTE: communication of this tick is at the next layer.
-
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_4")
+        
         # if the last layer, do the other half of tick 4 and tick 5
         if l_no == len(self.layers) - 1:
+            nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_4.last_layer")
+            
             # No next layer, do the sync here.
+            nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_4.last_layer.tick_sync")
             _tick_sync(
                 compute_stream, self.comm_stream,
                 arg_group_0, "hidden_states",   # place holder
                 arg_group_1, "signal",          # comm out
             )
+            nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_4.last_layer.tick_sync")
+            
+            nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_4.last_layer.forward_post_core_attn")
             arg_group_1 = _forward_post_core_attn(layer, arg_group_1)
+            nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_4.last_layer.forward_post_core_attn")
+            
+            nvtx_range_push(f"PingPang.forward_layers[{l_no}].tick_4.last_layer.gather_result")
             # gathering the result
             hidden_states = _gather_tensor([arg_group_0["hidden_states"], arg_group_1["hidden_states"]], 2)
             context = _gather_tensor([arg_group_0["context"],arg_group_1["context"]], 2)
+            nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_4.last_layer.gather_result")
+
+            nvtx_range_pop(f"PingPang.forward_layers[{l_no}].tick_4.last_layer")
         else:
             hidden_states = None
             context = None
+        
+        nvtx_range_pop(f"PingPang.forward_layers[{l_no}]")
         return arg_group_0, arg_group_1, hidden_states, context
 
     def _forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):

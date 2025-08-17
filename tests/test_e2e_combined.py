@@ -23,26 +23,42 @@ torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
 
 # Benchmark
 
-# 🟢 Passed: Node = 2, TP = 8, DP = 2, SeqLen = 16k (Baseline)
+# 🟢 Passed: Node = 2, TP = 8, DP = 2, SeqLen = 32k (Baseline)
 ```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=baseline --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=baseline --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
+NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 \
+torchrun \
+  --nnodes=2:2 \
+  --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=<host_of_node0>:29400 \
+  --rdzv_id=megatron_d2_unique_id \
+  --max_restarts=0 \
+  test_e2e_combined.py \
+    --mode baseline \
+    --num-nodes 2 \
+    --num-gpus-per-node 8 \
+    --tp-size 8 \
+    --max-sample-id 16384 \
+    --num-tokens 32768
 ```
 
-# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 16k (D2)
+# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 32k (D2P1)
 ```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=d2 --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
-
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 --master_addr=<master_addr> --master_port=29500 \
-    test_e2e_combined.py --mode=d2 --num-nodes=2 --num-gpus-per-node=8 --tp-size=8 --num-tokens 16384 --num-layers 4
+NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 \
+torchrun \
+  --nnodes=2:2 \
+  --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=<host_of_node0>:29400 \
+  --rdzv_id=megatron_d2_unique_id \
+  --max_restarts=0 \
+  test_e2e_combined.py \
+    --mode d2 \
+    --replan-iter 1 \
+    --num-nodes 2 \
+    --num-gpus-per-node 8 \
+    --tp-size 8 \
+    --num-tokens 32768
 ```
 """
 import os
@@ -109,7 +125,16 @@ class MegatronE2eWorker(MegatronBaseWorker):
         set_random_seed(seed)
         self.model_path = model_path
         override_model_config = OmegaConf.create()
-        override_transformer_config = OmegaConf.create()
+        override_transformer_config = OmegaConf.create({
+            "apply_rope_fusion": True,
+            # bias-act fusion
+            "bias_activation_fusion": True,
+            # no layer norm so no need for that fusion
+            # attention is in FA so no masked_softmax fusion
+            # bias-drop_out-add fusion
+            "bias_dropout_fusion": True,
+
+        })
         # A default optim config
         optim_config = OmegaConf.create({
             "clip_grad": 1.0,
@@ -199,9 +224,8 @@ class MegatronE2eWorker(MegatronBaseWorker):
         # thd layout
         total_seqlen = microbatches[0]['input_ids'].shape[0]
 
-        def loss_func(output):
-            # NOTE: this is a dummy loss function.
-            loss = ((output - 1)**2).mean()
+        def loss_func(logits):
+            loss = logits.sum()  # no gradient, but can trigger backward
             return loss, {'loss': loss}
 
         def forward_step(batch_iter, model):
@@ -307,8 +331,8 @@ def init_megatron_e2e_test(
 ):
     token_bytes_q = hidden_size_q * dtype.itemsize
     token_bytes_kv = hidden_size_kv * dtype.itemsize
-    max_tokens_query = num_tokens * world_size
-    max_tokens_key_value = num_tokens * world_size
+    max_tokens_query = num_tokens * (world_size // tp_size)
+    max_tokens_key_value = num_tokens * (world_size // tp_size)
     buffer_size = (
         token_bytes_q * max_tokens_query +
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
@@ -336,19 +360,35 @@ iterated_samples = []
 def setup_global_batch(
     total_seq_len, 
     up_sample_factor=2,
+    elongate_factor=1,
+    filter_threshold=64 * 1024,
+    filter_ratio=0.90,
+
 ):
     global GLOBAL_BATCH
     if GLOBAL_BATCH is not None:
         return
-    
+
     GLOBAL_BATCH = batch_documents(
         sample_wlbllm_docs_upsample(
             size=10000,
+            filter_threshold=filter_threshold,
+            filter_ratio=filter_ratio,
             upsample_long_factor=up_sample_factor,
-            filter_threshold=10000,
-            filter_ratio=0.09,
+            elongate_factor=elongate_factor,
         ), max_ctx_length=total_seq_len
     )
+    GLOBAL_BATCH = list(GLOBAL_BATCH)
+
+    # # DP2 case
+    # manual_case = [
+    #     [total_seq_len],
+    #     [total_seq_len // 8] * 8,
+    #     [total_seq_len],
+    #     [total_seq_len // 8] * 8,
+    # ]
+    # GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH 
+    GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
 
 
@@ -417,9 +457,23 @@ def create_qkv_dispatch(
 
 # ========== D2 Specific Functions ==========
 
+def calculate_flops_factor_in_each_gpu(items):
+    ngpus = set(
+        item["gpuid"] for item in items
+    )
+    gpu_flops = [0] * len(ngpus)
+    for item in items:
+        q = item["q"]
+        kv = item["kv"]
+        gpuid = item["gpuid"]
+        gpu_flops[gpuid] += (kv + kv - q) * q / 2
+    return gpu_flops
+
+
 def test_create_qkv_dispatch_balanced_flops(
     world_size_, total_seq_len_, seq_lens, max_cp_degree_, 
     verbose=False, return_intermediate=False, return_mlp_no_shard_seq_lens=False,
+    replan_iter: int=1,
 ):
     K = 1024
 
@@ -427,6 +481,7 @@ def test_create_qkv_dispatch_balanced_flops(
         batch_to_items, 
         plan_relocation,
         item_to_intermediate_tensors,
+        postprocess_items,
     )
 
     items_list = seq_lens
@@ -439,7 +494,23 @@ def test_create_qkv_dispatch_balanced_flops(
     assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = {total_seq_len_}, got {total_seq_len=}"
 
     items = batch_to_items(items_list)
-    items = plan_relocation(items, verbose=False, plot=False)
+    # for _ in range(replan_iter):
+    max_replan_iter = replan_iter
+    actually_replan_iter = 0
+    try:
+        for _ in range(max_replan_iter):
+            gpu_flops = calculate_flops_factor_in_each_gpu(items)
+            diff = max(gpu_flops) - min(gpu_flops)
+            if diff < ((8*K) ** 2): # max - min < 1k
+                break
+            items = plan_relocation(items, verbose=False, plot=False)
+            actually_replan_iter += 1
+    except Exception as e:
+        # prevent exception forfeit the replanning of the whole batch.
+        print(f"Replanning at step {_} failed with exception: {e}. Exception will be ignored and use the previous items for forward pass.")
+        pass
+    if actually_replan_iter > 0:
+        items = postprocess_items(items)
 
     world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens) = item_to_intermediate_tensors(items)    
 
@@ -462,14 +533,16 @@ def test_create_qkv_dispatch_balanced_flops(
 
 def create_one_batch_balanced_flops(
     world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
-    hidden_size_q: int, hidden_size_k: int, element_size: int
+    hidden_size_q: int, hidden_size_k: int, element_size: int,
+    replan_iter: int=1,
 ):
     (
         fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
         attention_metadata_attn_layout, intermediates, seq_lens
     ) = test_create_qkv_dispatch_balanced_flops(
         world_size, total_seq_len, num_seqs, max_cp_degree,
-        return_intermediate=True, return_mlp_no_shard_seq_lens=True
+        return_intermediate=True, return_mlp_no_shard_seq_lens=True,
+        replan_iter=replan_iter,
     )
     # NOTE: this already adds prepended zeros and is sharded to tuples (remove padding seqs)
     (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
@@ -489,6 +562,23 @@ def create_one_batch_balanced_flops(
         qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
         attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
     )
+    
+    # Only for debug!
+    # Intentionally set the sender_transfer_sz and receiver_transfer_sz to 0 
+    # to evaluate the network overhead
+    # os.environ["D2_FA2A_DISABLE_SEND_RECV"]
+    if os.environ.get("D2_FA2A_DISABLE_SEND_RECV", "0") == "1":
+        rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
+        qkv_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
+        qkv_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
+        qkv_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
+        qkv_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
+        attn_out_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
+        attn_out_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
+        attn_out_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
+        attn_out_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
+
+
     attn_metadata = (
         cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
     )
@@ -496,6 +586,7 @@ def create_one_batch_balanced_flops(
     return logical_metadata, fa2a_metadata, attn_metadata, raw_seq_lens
 
 
+# from transformer_engine.pytorch.attention.dot_product_attention.backends import get_attention_duration
 
 def test(args):
     seed = args.seed
@@ -509,6 +600,10 @@ def test(args):
     model_path = args.model_path
     max_sample_id = args.max_sample_id
     up_sample_factor = args.up_sample_factor
+    replan_iter = args.replan_iter
+    elongate_factor = args.elongate_factor
+    filter_threshold = args.filter_threshold
+    filter_ratio = args.filter_ratio
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
@@ -520,7 +615,7 @@ def test(args):
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
-    setup_global_batch(total_seq_len, up_sample_factor)
+    setup_global_batch(total_seq_len, up_sample_factor, elongate_factor)
 
     hf_config = AutoConfig.from_pretrained(model_path)
     hidden_size_q = hf_config.hidden_size
@@ -557,7 +652,8 @@ def test(args):
         if mode == "baseline":
             # TODO: Adding proper support for context parallel in megatron.
             # Baseline mode: Use simple batch generation
-            seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
+            # seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
+            seq_lens = _seq_lens[as_rank] + _seq_lens[as_rank + as_world_size]
 
             total_seq_len_x2 = total_seq_len * 2
             input_ids = torch.randint(100, 10000, (as_world_size, total_seq_len_x2))
@@ -583,11 +679,13 @@ def test(args):
             seq_lens = seq_lens_0 + seq_lens_1 # Not used for logging in D2 mode
             _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_one_batch_balanced_flops(
                 as_world_size, total_seq_len, seq_lens_0, max_cp_degree,
-                hidden_size_q_tp, hidden_size_k_tp, element_size
+                hidden_size_q_tp, hidden_size_k_tp, element_size,
+                replan_iter=replan_iter,
             )
             _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_one_batch_balanced_flops(
                 as_world_size, total_seq_len, seq_lens_1, max_cp_degree,
-                hidden_size_q_tp, hidden_size_k_tp, element_size
+                hidden_size_q_tp, hidden_size_k_tp, element_size,
+                replan_iter=replan_iter,
             )
 
             set_random_seed(seed, set_megatron=False)
@@ -644,7 +742,36 @@ def test(args):
         # Real Experiment
         N = 5
         torch.cuda.synchronize()
+        # torch.distributed.barrier()
 
+        # # Calculate per-rank duration for forward_backward_batch
+        # my_rank_durations = []
+        # for _ in range(N):
+        #     torch.cuda.nvtx.range_push(f"PerRank-sample_{sample_id}(repeat={N})")
+        #     start_time = time.time()
+        #     ref = worker.forward_backward_batch(
+        #         microbatches=microbatches,
+        #         normal_forward_fn=normal_forward_fn,
+        #         forward_only=False,
+        #     )
+        #     torch.cuda.synchronize()
+        #     end_time = time.time()
+        #     duration = end_time - start_time
+        #     torch.cuda.nvtx.range_pop()
+        #     duration_ms = duration * 1000
+        #     my_rank_durations.append(duration_ms)
+        #     torch.distributed.barrier()
+            
+        # my_rank_avg_duration_ms = sum(my_rank_durations) / len(my_rank_durations)
+        # # all gather across all ranks and print out the times
+        # all_rank_durations = [0] * world_size
+        # torch.distributed.all_gather_object(all_rank_durations, my_rank_avg_duration_ms)
+        # if rank == 0:
+        #     rich.print(f"[Sample ID=({sample_id})] Sequence Lengths: {_seq_lens}")
+        #     for this_rank, duration in enumerate(all_rank_durations):
+        #         rich.print(f"[Sample ID=({sample_id})] Rank {this_rank} duration: {duration:.2f} ms")
+
+        # Calculate the average duration of the forward_backward_batch
         start_time = time.time()
         torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
         for _ in range(N):
@@ -664,8 +791,8 @@ def test(args):
         sample_times.append(avg_duration_ms)
         if rank == 0:
             if mode == "baseline":
-                rich.print(f"[Sample ID=({2*sample_id+1}-{2*sample_id+2})] seq_lens = {seq_lens}")
-            rich.print(f"[Sample ID=({2*sample_id+1}-{2*sample_id+2})] Mode={mode} forward_backward_batch: avg_time_per_iteration = {avg_duration_ms:.2f} ms")
+                rich.print(f"[Sample ID=({sample_id})] seq_lens = {seq_lens}")
+            rich.print(f"[Sample ID=({sample_id})] Mode={mode} forward_backward_batch: avg_time_per_iteration = {avg_duration_ms:.2f} ms")
 
         time.sleep(2) # to ensure the profile sees a better profiling result
         torch.cuda.synchronize()
@@ -675,17 +802,31 @@ def test(args):
     torch.distributed.barrier()
     print("=" * 20 + "forward_backward_batch attention server, done")
 
+    # Collect attention start and end events and calculate the average duration.
+    from datetime import datetime
+    pst = pytz.timezone('US/Pacific')
+    timestamp = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S PST")
+    now_ts = datetime.now(pst).strftime("%Y%m%d_%H%M%S")
+    
+    file_dir = os.path.dirname(os.path.abspath(__file__))
+    benchmark_dir = os.path.join(file_dir, "..", "benchmarks", "_250809_e2e_benchmark", "data")
+    os.makedirs(benchmark_dir, exist_ok=True)
+    benchmark_file = os.path.join(benchmark_dir, f"benchmark.{now_ts}.{mode}.json")
+
+    attn_output_file = os.path.join(benchmark_dir, f"attention_durations.{now_ts}.{mode}.json")
+    
+    # rank = torch.distributed.get_rank()
+    # with open(attn_output_file, "w") as f:
+    #     attention_durations = get_attention_duration()
+    #     json.dump(attention_durations, f)
+    #     formatted_durations = [f"{duration:.2f}" for duration in attention_durations]
+    #     rich.print(f"🟢 Attention durations: {formatted_durations}")
+
     if rank == 0:
-        from datetime import datetime
-        
-        
-        pst = pytz.timezone('US/Pacific')
-        timestamp = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S PST")
-        now_ts = datetime.now(pst).strftime("%Y%m%d_%H%M%S")
         
         rich.print(f"🟢 Test {__file__} passed")
         dp_size = as_world_size
-        config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, max_sample_id=max_sample_id, up_sample_factor=up_sample_factor)
+        config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, replan_iter=replan_iter, elongate_factor=elongate_factor)
         rich.print(f"🟢 Test Config: ", config)
         rich.print(f"🟢 Test DateTime: ", timestamp)
         
@@ -710,10 +851,7 @@ def test(args):
         
         # Write benchmark results to file
         # TODO: Make the output directory configurable.
-        file_dir = os.path.dirname(os.path.abspath(__file__))
-        benchmark_dir = os.path.join(file_dir, "..", "benchmarks", "_250809_e2e_benchmark", "data")
-        os.makedirs(benchmark_dir, exist_ok=True)
-        benchmark_file = os.path.join(benchmark_dir, f"benchmark.{now_ts}.{mode}.json")
+        
         
         with open(benchmark_file, 'w') as f:
             json.dump(benchmark_data, f, indent=2)
@@ -722,6 +860,7 @@ def test(args):
 
         # for idx, (sample, duration) in enumerate(zip(iterated_samples, sample_times)):
         #     rich.print(f"🟢 Sample {idx}: {sample}, duration: {duration} ms")
+
     
     # Cleanup and exit
     rich.print(f"❄️ [Rank {rank}] Finished test and exit.")
@@ -731,31 +870,35 @@ def test(args):
     # NO BARRIER - this is what was causing the hang!
     # Instead, each process cleans up independently and exits
     
-    # Clear CUDA cache first
-    try:
-        if torch.cuda.is_available():
-            print(f"[Rank {rank}] Clearing CUDA cache...")
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            torch.cuda.ipc_collect()
-            print(f"[Rank {rank}] CUDA cleanup completed")
-    except Exception as e:
-        print(f"[Rank {rank}] Error in CUDA cleanup: {e}")
-    
-    # Force garbage collection
-    try:
+    if False: # Only use it when force exit
+        # Clear CUDA cache first
+        try:
+            if torch.cuda.is_available():
+                print(f"[Rank {rank}] Clearing CUDA cache...")
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                torch.cuda.ipc_collect()
+                print(f"[Rank {rank}] CUDA cleanup completed")
+        except Exception as e:
+            print(f"[Rank {rank}] Error in CUDA cleanup: {e}")
         
-        gc.collect()
-        print(f"[Rank {rank}] Garbage collection completed")
-    except Exception as e:
-        print(f"[Rank {rank}] Error in garbage collection: {e}")
-    
-    # Just force exit immediately - don't try to clean up distributed stuff
-    # as it often hangs in complex setups like Megatron + NVSHMEM
-    print(f"[Rank {rank}] Force exiting now...")
-    
-    # Immediate force exit with os._exit (bypasses Python cleanup)
-    os._exit(0)
+        # Force garbage collection
+        try:
+            
+            gc.collect()
+            print(f"[Rank {rank}] Garbage collection completed")
+        except Exception as e:
+            print(f"[Rank {rank}] Error in garbage collection: {e}")
+        
+        # Just force exit immediately - don't try to clean up distributed stuff
+        # as it often hangs in complex setups like Megatron + NVSHMEM
+        print(f"[Rank {rank}] Force exiting now... nsys may not dump the cuda hw")
+        
+        # Immediate force exit with os._exit (bypasses Python cleanup)
+        # os._exit(0)
+    if args.force_exit: 
+        import sys
+        sys.exit(0)  # or raise SystemExit
 
 
 if __name__ == "__main__":
@@ -773,5 +916,10 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
     parser.add_argument("--max-sample-id", type=int, default=10)
     parser.add_argument("--up-sample-factor", type=int, default=2)
+    parser.add_argument("--replan-iter", type=int, default=1)
+    parser.add_argument("--elongate-factor", type=int, default=1)
+    parser.add_argument("--filter-threshold", type=int, default=64 * 1024)
+    parser.add_argument("--filter-ratio", type=float, default=0.90)
+    parser.add_argument("--force-exit", action="store_true")
     args = parser.parse_args()
     test(args)

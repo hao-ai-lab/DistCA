@@ -92,12 +92,14 @@ def arg_to_cuda(v):
     elif isinstance(v, PingPangSingleStepPackedSeqParams):
         return v.to_device()
     elif isinstance(v, PackedSeqParams):
+        max_seqlen_q = v.max_seqlen_q.item() if isinstance(v.max_seqlen_q, torch.Tensor) else v.max_seqlen_q
+        max_seqlen_kv = v.max_seqlen_kv.item() if isinstance(v.max_seqlen_kv, torch.Tensor) else v.max_seqlen_kv
         return PackedSeqParams(
             qkv_format=v.qkv_format,
             cu_seqlens_q=_to_cuda_int32(v.cu_seqlens_q),
             cu_seqlens_kv=_to_cuda_int32(v.cu_seqlens_kv),
-            max_seqlen_q=_to_cuda_int32(v.max_seqlen_q),
-            max_seqlen_kv=_to_cuda_int32(v.max_seqlen_kv),
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
             cu_seqlens_q_padded=_to_cuda_int32(v.cu_seqlens_q_padded),
             cu_seqlens_kv_padded=_to_cuda_int32(v.cu_seqlens_kv_padded),
         )

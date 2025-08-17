@@ -673,6 +673,19 @@ def item_to_metadata(
     return ret
 
 
+def calculate_flops_factor_in_each_gpu(items):
+    ngpus = set(
+        item["gpuid"] for item in items
+    )
+    print("ngpus", ngpus)
+    gpu_flops = [0] * len(ngpus)
+    for item in items:
+        q = item["q"]
+        kv = item["kv"]
+        gpuid = item["gpuid"]
+        gpu_flops[gpuid] += (kv + kv - q) * q / 2
+    return gpu_flops
+
 def test_plan_to_metadata():
     
     # Prepare the sequences and items to be sent.
