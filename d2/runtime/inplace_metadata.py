@@ -514,7 +514,7 @@ def mlp_layout_packed_params(seq_lens: torch.Tensor):
     NOTE: this is the seq lens on the local rank.
     """
     cu_seqlens = prepend_zero_fn(seq_lens.cumsum(dim=0))
-    max_seqlen = seq_lens.max().item() # int
+    max_seqlen = seq_lens.max()
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens,
