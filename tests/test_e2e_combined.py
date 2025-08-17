@@ -7,7 +7,7 @@ This script combines both D2 and baseline approaches for testing:
 
 Usage:
 ```bash
-bash test_e2e_combined.multi.sh <rzv_endpoint>
+bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
 
 """
