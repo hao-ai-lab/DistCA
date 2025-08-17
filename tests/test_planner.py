@@ -286,9 +286,11 @@ def test_planner_equal_flops():
     ]
     # for item in expected_items:
     #     assert item in items, f"item = {item} not in items: {expected_items = }\n{items = }"
-    
+    try:
+        model_config = AutoConfig.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
+    except Exception as e:
+        model_config = AutoConfig.from_pretrained("/mnt/moonfs/public-models-m2/meta-llama/Llama-3.1-8B/")
 
-    model_config = AutoConfig.from_pretrained("/mnt/moonfs/public-models-m2/meta-llama/Llama-3.1-8B/")
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
