@@ -1,5 +1,6 @@
+import collections
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -171,3 +172,30 @@ def plan_to_metadata(
         ret += (q_intermediates + kv_intermediates,)
     return ret
 
+# Transfer Items output from planner to List[List[ShardInfo]]
+def items_into_shardinfos(data: List[Dict[str, Any]]) -> List[List[ShardInfo]]:
+    sequences_map = collections.defaultdict(list)
+
+    for shard_dict in data:
+        sequence_key = (shard_dict['src_gpuid'], shard_dict['seqid'])
+        sequences_map[sequence_key].append(shard_dict)
+
+    all_sequences: List[List[ShardInfo]] = []
+
+    for sequence_key, shard_dicts in sequences_map.items():
+        shard_dicts.sort(key=lambda d: d['shard_id'])
+
+        current_sequence_shards: List[ShardInfo] = []
+        for shard_dict in shard_dicts:
+            shard_info = ShardInfo(
+                rid=shard_dict['src_gpuid'],
+                dispatch_rid=shard_dict['gpuid'],
+                logical_sid=shard_dict['shard_id'],
+                shard_len=shard_dict['q'],
+                document_id=shard_dict['seqid']
+            )
+            current_sequence_shards.append(shard_info)
+        
+        all_sequences.append(current_sequence_shards)
+        
+    return all_sequences
