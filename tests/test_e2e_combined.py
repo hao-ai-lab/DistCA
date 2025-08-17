@@ -5,61 +5,11 @@ This script combines both D2 and baseline approaches for testing:
 - Baseline mode: Uses simple batch generation and normal forward function
 - D2 mode: Uses balanced flops planning and ping-pang parameters
 
-# Debug - Baseline Mode
-
+Usage:
 ```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
-    --master_port=29500 test_e2e_combined.py --mode=baseline --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096 --num-layers 4
+bash test_e2e_combined.multi.sh <rzv_endpoint>
 ```
 
-# Debug - D2 Mode
-
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
-torchrun --nnodes=1 --nproc_per_node=4 --node_rank=0 --master_addr=$(hostname) \
-    --master_port=29500 test_e2e_combined.py --mode=d2 --num-nodes=1 --num-gpus-per-node=4 --tp-size=1 --num-tokens 4096 --num-layers 4
-```
-
-# Benchmark
-
-# 🟢 Passed: Node = 2, TP = 8, DP = 2, SeqLen = 32k (Baseline)
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 \
-torchrun \
-  --nnodes=2:2 \
-  --nproc_per_node=8 \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint=<host_of_node0>:29400 \
-  --rdzv_id=megatron_d2_unique_id \
-  --max_restarts=0 \
-  test_e2e_combined.py \
-    --mode baseline \
-    --num-nodes 2 \
-    --num-gpus-per-node 8 \
-    --tp-size 8 \
-    --max-sample-id 16384 \
-    --num-tokens 32768
-```
-
-# 🟢 Passed: Node = 2, TP = 8, CPDP = 2, SeqLen = 32k (D2P1)
-```bash
-NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 \
-torchrun \
-  --nnodes=2:2 \
-  --nproc_per_node=8 \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint=<host_of_node0>:29400 \
-  --rdzv_id=megatron_d2_unique_id \
-  --max_restarts=0 \
-  test_e2e_combined.py \
-    --mode d2 \
-    --replan-iter 1 \
-    --num-nodes 2 \
-    --num-gpus-per-node 8 \
-    --tp-size 8 \
-    --num-tokens 32768
-```
 """
 import os
 import gc

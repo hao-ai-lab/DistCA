@@ -5,18 +5,20 @@ export NVSHMEM_IB_ENABLE_IBGDA=true
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-NNODES=2
 NPROC_PER_NODE=8
 RZV_BACKEND=c10d
 RZV_ENDPOINT=$1
+NNODES=${2:-1}
 if [ -z "${RZV_ENDPOINT}" ]; then
-    echo "Usage: bash $0 <rzv_endpoint>"
+    echo "Usage: bash $0 <rzv_endpoint> <n_nodes>"
     echo "   - rzv_endpoint: the endpoint of the master node. For example, <node_address:29400>"
+    echo "   - n_nodes: the number of nodes to use. (default: 1)"
     exit 1
 fi
 
+
 echo
-echo "bash $0 $1"
+echo "bash $0 $1 $2"
 echo
 
 RZV_ID=megatron_d2_unique_id
