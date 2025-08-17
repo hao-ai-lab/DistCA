@@ -212,7 +212,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 lse,
                 dq_chunk, dk_chunk, dv_chunk,
                 cu_q, cu_k, int(max_q), int(max_k),
-                0.0, ctx.softmax_scale, True, (-1,-1), None, False, None
+                0.0, ctx.softmax_scale, True, -1, -1, 0.0, None, False, None
             )
 
             dq_local[ sum(ctx.q_chunk_sizes[:i]) : sum(ctx.q_chunk_sizes[:i+1]) ] = dq_chunk

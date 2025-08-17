@@ -428,13 +428,16 @@ def run(rank: int, world_size: int, args, return_dict):
         output_shape=list(out.shape),
     )
 
+import torch.multiprocessing as mp
+
 if __name__ == "__main__":
     args = parser.parse_args()
+    return_dict = mp.Manager().dict()
 
     world_size = args.cp_size
     mp.spawn(
         run,
         nprocs=world_size,
-        args=(world_size, args),
+        args=(world_size, args, return_dict),
         join=True,
     )

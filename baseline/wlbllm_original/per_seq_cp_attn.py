@@ -259,7 +259,7 @@ class PerSequenceCPAttention(torch.autograd.Function):
                 lse,
                 dq_chunk, dk_chunk, dv_chunk,
                 cu_q, cu_k, int(max_q), int(max_k),
-                0.0, ctx.softmax_scale, True, (-1,-1), None, False, None
+                0.0, ctx.softmax_scale, True, -1, -1, 0.0, None, False, None
             )
 
             dq_local[ sum(ctx.q_chunk_sizes[:i]) : sum(ctx.q_chunk_sizes[:i+1]) ] = dq_chunk
@@ -291,6 +291,9 @@ class PerSequenceCPAttention(torch.autograd.Function):
             None,  # cu_seqlens_kv_list
             None,  # max_seqlen_q_list
             None,  # max_seqlen_kv_list
+            None,  # ?
+            None,  # ?
+            None,  # ?
             None,  # k_offsets
             None,  # dropout_p
             None,  # softmax_scale
