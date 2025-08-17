@@ -11,7 +11,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("vllm-flash-attn")
     .pip_install("tqdm")
-    .add_local_dir("../", "/workspace/WLB-LLM-CP", ignore=[
+    .add_local_dir("../wlbllm", "/workspace/WLB-LLM-CP", ignore=[
         "*.pyc", "__pycache__", ".git", "modal-scripts/"
     ])
 )

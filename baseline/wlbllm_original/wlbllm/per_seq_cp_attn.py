@@ -16,7 +16,7 @@ from torch.cuda.nvtx import range_push as nvtx_range_push
 from torch.cuda.nvtx import range_pop  as nvtx_range_pop
 
 
-from attn_module import (
+from wlbllm.attn_module import (
     flash_attn_varlen_func, 
     _flash_attn_varlen_forward,
     _flash_attn_varlen_backward

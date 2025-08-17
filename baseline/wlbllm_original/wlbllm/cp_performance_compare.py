@@ -21,19 +21,19 @@ parser.add_argument("--fix_seed",      type=int,  default=1)
 parser.add_argument("--include_backward",   type=bool,  default=True)
 parser.add_argument("--gqa",           type=int,  default=1)
 
-from attn_module import (
+from wlbllm.attn_module import (
     flash_attn_varlen_func, 
     _flash_attn_varlen_forward,
     _flash_attn_varlen_backward,
 )
 
-from utils import(
+from wlbllm.utils import(
     compute_per_doc_cp_shard_doc_len,
     generate_doc_lens
 )
 
-from per_seq_cp_attn import PerSequenceCPAttention
-from per_doc_cp_attn import PerDocumentCPAttention
+from wlbllm.per_seq_cp_attn import PerSequenceCPAttention
+from wlbllm.per_doc_cp_attn import PerDocumentCPAttention
 
 
 def print_on_main(rank, content):

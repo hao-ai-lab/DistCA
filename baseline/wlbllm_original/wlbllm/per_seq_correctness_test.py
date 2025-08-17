@@ -19,13 +19,13 @@ parser.add_argument("--cp_size",       type=int,  default=4)
 parser.add_argument("--fix_seed",      type=int,  default=1)
 
 
-from attn_module import (
+from wlbllm.attn_module import (
     flash_attn_varlen_func, 
     _flash_attn_varlen_forward,
     _flash_attn_varlen_backward,
 )
 
-from utils import(
+from wlbllm.utils import(
     compute_per_seq_metadate_combined,
     compute_per_doc_metadate_combined,
     compute_per_doc_cp_shard_doc_len,
@@ -34,8 +34,8 @@ from utils import(
     generate_doc_lens
 )
 
-from per_seq_cp_attn import PerSequenceCPAttention
-from per_doc_cp_attn import PerDocumentCPAttention
+from wlbllm.per_seq_cp_attn import PerSequenceCPAttention
+from wlbllm.per_doc_cp_attn import PerDocumentCPAttention
 
 
 def compute_global_fwd_bwd( 
@@ -75,13 +75,13 @@ def compute_global_fwd_bwd(
         lse,                    # softmax_lse
         dq, dk, dv,
         cu_seqlens_q, cu_seqlens_k,     # cu_seqlens_q / cu_seqlens_k
-        max_seqlen_q, max_seqlen_k, # max_seqlen_q / max_seqlen_k
+        int(max_seqlen_q), int(max_seqlen_k), # max_seqlen_q / max_seqlen_k
         dropout_p=0.0,                        
         softmax_scale=softmax_scale,
         causal=True,                      
         window_size=(-1, -1),               
         alibi_slopes=None,    
-        deterministic=False,  
+        deterministic=True,  
         rng_state=None,                   
         zero_tensors=False
     )
@@ -127,10 +127,10 @@ def run(rank: int, world_size: int, args):
 
     # ======= Generate and sync random QKV tensor =======
     if rank == 0:
-        q_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16)
-        k_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16)
-        v_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16)
-        d_out_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+        q_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16) - 0.5
+        k_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16) - 0.5
+        v_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16) - 0.5
+        d_out_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16) - 0.5
     else:
         doc_lens_tensor = torch.empty(n_doc_tensor[0].item(), dtype=torch.int32, device=device)
         q_global = torch.empty(context_length, num_heads, head_dim, dtype=torch.bfloat16, device=device)
@@ -147,40 +147,37 @@ def run(rank: int, world_size: int, args):
 
     dist.barrier(device_ids=[rank])
     print_on_main(rank, "Random input generation finished")
+    # print("rank:{}, doc_lens: {}, q_global:{}".format(rank, doc_lens, q_global[0]))
 
     # ======= Compute reference output and gradients =======
     out_ref, dq_ref, dk_ref, dv_ref = compute_global_fwd_bwd(q_global, k_global, v_global, d_out_global, doc_lens, softmax_scale)
     dist.barrier(device_ids=[rank])
     print_on_main(rank, "Reference results finished")
 
-    # ======= Per-Doc sharding fwd & bwd and correctness evaluation =======
-    doc_shards = compute_per_doc_cp_shard_doc_len(doc_lens, context_length, cp_size)
-    local_q_doc, local_k_doc, local_v_doc, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, kv_idx_list, local_d_out = compute_per_doc_metadate_combined(    
+    # ======= Per-Seq sharding fwd & bwd and correctness evaluation =======
+    local_q, local_k, local_v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, k_offsets, local_d_out = compute_per_seq_metadate_combined(
         context_length, 
         q_global, 
         k_global, 
         v_global, 
         doc_lens, 
-        doc_shards,
         cp_size, 
         rank, 
         d_out=d_out_global
     )
-
-    local_q_doc.retain_grad() 
-    local_k_doc.retain_grad()
-    local_v_doc.retain_grad()
-    out = PerDocumentCPAttention.apply(
-        local_q_doc, 
-        local_k_doc, 
-        local_v_doc,
+    
+    local_q.retain_grad() 
+    local_k.retain_grad()
+    local_v.retain_grad()
+    out = PerSequenceCPAttention.apply(
+        local_q, 
+        local_k, 
+        local_v,
         cu_seqlens_q, 
         cu_seqlens_k,
         max_seqlen_q, 
         max_seqlen_k,
-        doc_lens,
-        doc_shards,
-        kv_idx_list, 
+        k_offsets, 
         0.0, # dropout_p
         softmax_scale, 
         "causal",
@@ -189,11 +186,11 @@ def run(rank: int, world_size: int, args):
     )
     out.backward(local_d_out)
     torch.cuda.synchronize()
-    per_doc_correctness_evaluate(out_ref, out, context_length, cp_size, rank, doc_lens, doc_shards)
-    per_doc_correctness_evaluate(dq_ref, local_q_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards, rtol=1e-1, atol=1e-1)
-    per_doc_correctness_evaluate(dk_ref, local_k_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards, rtol=1e-1, atol=1e-1)
-    per_doc_correctness_evaluate(dv_ref, local_v_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards, rtol=1e-1, atol=1e-1)
-    print("Per-Doc forward & backward correntness check passed on rank:", rank)
+    per_seq_correctness_evaluate(out_ref, out, context_length, cp_size, rank)
+    per_seq_correctness_evaluate(dq_ref, local_q.grad, context_length, cp_size, rank, rtol=1e-1, atol=1e-1)
+    per_seq_correctness_evaluate(dk_ref, local_k.grad, context_length, cp_size, rank, rtol=1e-1, atol=1e-1)
+    per_seq_correctness_evaluate(dv_ref, local_v.grad, context_length, cp_size, rank, rtol=1e-1, atol=1e-1)
+    print("Per-Seq forward & backward correntness check passed on rank:", rank)
     dist.barrier(device_ids=[rank])
     dist.destroy_process_group()
 
