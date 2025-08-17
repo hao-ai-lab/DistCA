@@ -79,7 +79,9 @@ def compute_global_fwd_bwd(
         dropout_p=0.0,                        
         softmax_scale=softmax_scale,
         causal=True,                      
-        window_size=(-1, -1),               
+        window_size_left=-1, 
+        window_size_right=-1, 
+        softcap=0.0,              
         alibi_slopes=None,    
         deterministic=False,  
         rng_state=None,                   
@@ -166,6 +168,28 @@ def run(rank: int, world_size: int, args):
         rank, 
         d_out=d_out_global
     )
+
+    import rich
+    rich.print("context_length", context_length)
+    rich.print("q_global", q_global.shape)
+    rich.print("k_global", k_global.shape)
+    rich.print("v_global", v_global.shape)
+    rich.print("doc_lens", doc_lens)
+    rich.print("doc_shards", doc_shards)
+    rich.print("cp_size", cp_size)
+    rich.print("rank", rank)
+    rich.print("d_out_global", d_out_global.shape)
+    rich.print("local_q_doc", local_q_doc.shape)
+    rich.print("local_k_doc", local_k_doc.shape)
+    rich.print("local_v_doc", local_v_doc.shape)
+    rich.print("cu_seqlens_q", cu_seqlens_q)
+    rich.print("cu_seqlens_k", cu_seqlens_k)
+    rich.print("max_seqlen_q", max_seqlen_q)
+    rich.print("max_seqlen_k", max_seqlen_k)
+    rich.print("kv_idx_list", kv_idx_list)
+    rich.print("local_d_out", local_d_out.shape)
+
+    exit(0)
 
     local_q_doc.retain_grad() 
     local_k_doc.retain_grad()
