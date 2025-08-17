@@ -22,8 +22,8 @@ pwd = os.getcwd()
 # baseline_path = f"{pwd}/../data/benchmark.20250813_015721.baseline.json"
 # benchmark.20250813_014357.d2.json
 seq_len = "128k (upsample = 2)"
-d2_path       = f"{pwd}/../data/benchmark.20250813_104749.d2.json"
-baseline_path = f"{pwd}/../data/benchmark.20250813_110401.baseline.json"
+d2_path       = f"{pwd}/../data/128kup2/benchmark.20250813_104749.d2.json"
+baseline_path = f"{pwd}/../data/128kup2/benchmark.20250813_110401.baseline.json"
 
 # seq_len = "128k (upsample = 4)"
 # d2_path       = f"{pwd}/../data/benchmark.20250813_235630.d2.json"

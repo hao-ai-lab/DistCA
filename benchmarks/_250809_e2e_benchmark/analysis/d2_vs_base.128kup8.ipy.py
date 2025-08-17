@@ -28,8 +28,8 @@ pwd = os.getcwd()
 seq_len = "128k (upsample = 8)"
 # benchmark.20250815_120652.d2.json
 # benchmark.20250815_122959.baseline.json
-d2_path       = f"{pwd}/../data/benchmark.20250815_120652.d2.json"
-baseline_path = f"{pwd}/../data/benchmark.20250815_122959.baseline.json"
+d2_path       = f"{pwd}/../data/d2_vs_base.128kup8/benchmark.20250815_120652.d2.json"
+baseline_path = f"{pwd}/../data/d2_vs_base.128kup8/benchmark.20250815_122959.baseline.json"
 
 # Output dir (same ../data as inputs)
 out_dir = Path(pwd).joinpath("../data").resolve()

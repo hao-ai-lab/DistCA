@@ -6,10 +6,10 @@ import os
 
 pwd = os.getcwd()
 # Load the uploaded JSON files
-with open(f"{pwd}/../data/benchmark.20250813_014357.d2.json") as f:
+with open(f"{pwd}/../data/64k/benchmark.20250813_014357.d2.json") as f:
     d2_data = json.load(f)
 
-with open(f"{pwd}/../data/benchmark.20250813_015721.baseline.json") as f:
+with open(f"{pwd}/../data/64k/benchmark.20250813_015721.baseline.json") as f:
     baseline_data = json.load(f)
 
 # Convert samples to DataFrames
@@ -24,7 +24,7 @@ merged_df["Difference (ms)"] = merged_df["D2 Duration (ms)"] - merged_df["Baseli
 merged_df["Speedup (%)"] = (merged_df["Baseline Duration (ms)"] - merged_df["D2 Duration (ms)"]) / merged_df["Baseline Duration (ms)"] * 100
 
 # Save to CSV
-csv_path_json_compare = "/mnt/data/baseline_vs_d2_from_json.csv"
+csv_path_json_compare = f"{pwd}/../data/baseline_vs_d2_from_json.csv"
 merged_df.to_csv(csv_path_json_compare, index=False)
 
 # Plot 1: Duration comparison
