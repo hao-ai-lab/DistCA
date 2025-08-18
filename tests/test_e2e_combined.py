@@ -24,6 +24,8 @@ import sys
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.packed_seq_params import PackedSeqParams
+
 from omegaconf import OmegaConf
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
@@ -39,6 +41,17 @@ from megatron_test_utils import (
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
 )
 
+import wlbllm
+import wlbllm.utils
+import wlbllm.registry
+
+
+def debug_print(*args, **kwargs):
+    if os.getenv("D2_DEBUG_PRINT", "0") == "1":
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            rich.print(f"[Rank {rank}]", *args, **kwargs)
+    return
 
 def set_random_seed(seed, set_megatron: bool=True):
     """Set worker side random seed."""
@@ -549,7 +562,9 @@ def test(args):
     mode = args.mode
 
     # Set forward function mode based on test mode
-    normal_forward_fn = (mode == "baseline")
+    normal_forward_fn = (mode in ["baseline", "wlbllm"])
+    # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
+    os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
 
     dtype = torch.bfloat16
     element_size = dtype.itemsize
@@ -610,6 +625,89 @@ def test(args):
                 "position_ids": position_ids_local,
                 "packed_seq_params": packed_seq_params,
             }
+            assert isinstance(microbatch["packed_seq_params"], PackedSeqParams)
+
+        elif mode == "wlbllm":
+            # TODO: Adding proper support for context parallel in megatron.
+            # Baseline mode: Use simple batch generation
+            # seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
+            # seq_lens = _seq_lens[as_rank] + _seq_lens[as_rank + as_world_size]
+            def flatten(a):
+                return [y for x in a for y in x]
+            seq_lens = _seq_lens
+            # debug_print(f"seq_lens", seq_lens)
+            doc_lens = flatten(seq_lens)
+            # debug_print(f"doc_lens", doc_lens)
+            # TODO: Make the cp size as world size for now...
+            cp_size = as_world_size
+            cp_rank = as_rank
+            local_context_length = total_seq_len * 2
+            context_length = local_context_length * cp_size
+            # debug_print(f"cp_size", cp_size)
+            # debug_print(f"context_length", context_length)
+            doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
+                doc_lens, context_length, cp_size
+            )
+            # debug_print(f"doc_shards", doc_shards)
+            (
+                cu_seqlens_q_list, cu_seqlens_k_list, 
+                max_seqlen_q_list, max_seqlen_k_list, 
+                kv_idx_list,
+            ) = wlbllm.utils.compute_per_doc_metadate_combined__metadata_only(    
+                context_length, 
+                doc_lens, 
+                doc_shards,
+                cp_size, 
+                cp_rank, 
+                device=torch.cuda.current_device()
+            )
+            # debug_print(f"cu_seqlens_q_list", cu_seqlens_q_list)
+            # debug_print(f"cu_seqlens_k_list", cu_seqlens_k_list)
+            # debug_print(f"max_seqlen_q_list", max_seqlen_q_list)
+            # debug_print(f"max_seqlen_k_list", max_seqlen_k_list)
+            # debug_print(f"kv_idx_list", kv_idx_list)
+
+            input_ids = torch.randint(100, 10000, (as_world_size, local_context_length))
+            input_ids_local = input_ids[cp_rank]
+            position_ids = torch.arange(total_seq_len, dtype=torch.int64).repeat(as_world_size, 2)
+            position_ids_local = position_ids[cp_rank]
+            # debug_print(f"input_ids_local", input_ids_local.shape)
+            # debug_print(f"position_ids_local", position_ids_local.shape)
+
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens_q_list[cp_rank],
+                cu_seqlens_kv=cu_seqlens_k_list[cp_rank],
+                max_seqlen_q=max_seqlen_q_list[cp_rank],
+                max_seqlen_kv=max_seqlen_k_list[cp_rank],
+            )
+
+            microbatch = {
+                "input_ids": input_ids_local,
+                "position_ids": position_ids_local,
+                "packed_seq_params": packed_seq_params,
+            }
+            assert isinstance(microbatch["packed_seq_params"], PackedSeqParams)
+
+            
+            # Now save some context for the use of WLBLLM function
+
+            import d2.runtime.megatron_patch.create_group
+            cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
+            cp_stream = torch.cuda.current_stream()
+
+            wlbllm.registry.clear()
+            wlbllm.registry.set("doc_lens", doc_lens)
+            wlbllm.registry.set("doc_shards", doc_shards)
+            wlbllm.registry.set("kv_idx_list", kv_idx_list)
+            wlbllm.registry.set("cp_group", cp_group)
+            wlbllm.registry.set("cp_stream", cp_stream)
+            wlbllm.registry.set("cu_seqlens_q_list", cu_seqlens_q_list)
+            wlbllm.registry.set("cu_seqlens_kv_list", cu_seqlens_k_list)
+            wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
+            wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
+
+
             
         elif mode == "d2":
             # D2 mode: Use balanced flops planning and ping-pang parameters
@@ -842,8 +940,8 @@ def test(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, choices=["baseline", "d2"], default="baseline", 
-                        help="Test mode: 'baseline' for simple batch generation, 'd2' for balanced flops planning")
+    parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm"], default="baseline", 
+                        help="Test mode: 'baseline' for simple batch generation, 'd2' for balanced flops planning, 'wlbllm' for wlbllm")
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--cp-degree", type=int, default=2)
     parser.add_argument("--num-seqs", type=int, default=3)

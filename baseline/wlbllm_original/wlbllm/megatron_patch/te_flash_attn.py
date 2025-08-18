@@ -1,0 +1,55 @@
+import wlbllm
+import wlbllm.registry
+from wlbllm.per_doc_cp_attn import PerDocumentCPAttention
+import rich
+
+def wlbllm_func(*args, **kwargs):
+    """
+    Patch to 
+        TransformerEngine/transformer_engine/pytorch/attention/dot_product_attention/backends.py
+    
+    This is a wrapper of PerDocumentCPAttention.apply()
+    """
+    (
+        q, 
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q, 
+        max_seqlen_k,
+        dropout_p,
+    ) = args
+    softmax_scale = kwargs["softmax_scale"]
+
+    doc_lens = wlbllm.registry.get("doc_lens")
+    doc_shards = wlbllm.registry.get("doc_shards")
+    kv_idx_list = wlbllm.registry.get("kv_idx_list")
+    cp_group = wlbllm.registry.get("cp_group")
+    cp_stream = wlbllm.registry.get("cp_stream")
+
+    cu_seqlens_q_list = wlbllm.registry.get("cu_seqlens_q_list")
+    cu_seqlens_kv_list = wlbllm.registry.get("cu_seqlens_kv_list")
+    max_seqlen_q_list = wlbllm.registry.get("max_seqlen_q_list")
+    max_seqlen_kv_list = wlbllm.registry.get("max_seqlen_kv_list")
+
+    out = PerDocumentCPAttention.apply(
+        q, 
+        k, 
+        v,
+        cu_seqlens_q_list, 
+        cu_seqlens_kv_list,
+        max_seqlen_q_list, 
+        max_seqlen_kv_list,
+        doc_lens,
+        doc_shards,
+        kv_idx_list, 
+        dropout_p,
+        softmax_scale, 
+        "causal",
+        cp_group,
+        cp_stream ,
+        None, None, None,
+    )
+    # torch.cuda.synchronize()
+    return out
