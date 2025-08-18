@@ -3,9 +3,163 @@ from copy import deepcopy
 
 import rich
 
+from typing import List
 from d2.runtime.shard_info import items_into_shardinfos, plan_to_metadata
 
 K = 1024
+
+
+
+# give a batch. return 
+# example1 :
+def batch_to_items(batches):
+    items = []
+    for gpuid, batch in enumerate(batches):
+        for seqid, seq_len in enumerate(batch):
+            items.append(dict(
+                q=seq_len, kv=seq_len, 
+                gpuid=gpuid, seqid=seqid, src_gpuid=gpuid, 
+                is_original=True
+            ))
+    return items
+
+
+def get_flops(q=None, kv=None, **kwargs):
+    assert q is not None and kv is not None, "q and kv must be provided"
+    return sum(kv - i for i in range(q))
+
+# Represent a part of sequence.
+# item_dicts: {'q': ... , 'kv': ..}
+class Item:
+    def __init__(self, 
+                model_config,
+                seq_len, seqid, gpuid, src_gpuid,
+                *item_dicts, 
+                is_original = True):
+        self.model_config = model_config
+        for item in item_dicts:
+            assert 'q' in item and 'kv' in item, "Each item must have 'q' and 'kv' keys"
+
+        self.seq_len = seq_len
+        self.seqid = seqid
+        self.gpuid = gpuid
+        self.src_gpuid = src_gpuid
+        self.is_original = is_original
+
+        self.items = [item for item in item_dicts]
+        self.total_flops = get_flops()
+        # 是否需要一个矩阵，来进行通信latency的模拟。
+        self.communication_speed = None
+
+    def get_flops(self):
+        flops = 0
+        for item in self.items:
+            q = item['q']
+            kv = item['kv']
+            flops += sum(kv - i for i in range(q))
+        return flops
+
+    def get_q_size(self, length):
+        hidden_size = self.model_config.hidden_size
+        q_size = length * hidden_size
+        return q_size
+
+    def get_kv_size(self, length):
+        hidden_size = self.model_config.hidden_size
+        num_attention_heads = self.model_config.num_attention_heads
+        num_key_value_heads = self.model_config.num_key_value_heads
+        
+        head_dim = hidden_size // num_attention_heads
+        kv_size = 2 * length * num_key_value_heads * head_dim
+        return kv_size
+
+    def get_priority(self, local_surplus, remote_deficit):
+        max_possible_flops = min(local_surplus, remote_deficit, self.total_flops)
+        q_len = max_possible_flops / (self.seq_len + 1)
+        kv_len = self.seq_len + 1       # this can be improve if use memcpy instead of transfering all kvs.
+        communication_volume = self.get_q_size(q_len) + self.get_kv_size(kv_len)
+        # latency = communication_volume / transfer_speed, if we know current rank_id, remote rank_id, network speed. We can compute communication latency.
+        priority = communication_volume / max_possible_flops
+        return priority
+
+    def split_item(self, flops, remote_gpuid):
+        """
+        Split the Item according to the specified amount of FLOPs.
+
+        - If flops >= self.total_flops, return a new Item representing the entire Item being moved.
+        - If flops < self.total_flops, split the Item and return a new Item containing the head and tail chunks.
+          The original Item (self) will be updated accordingly.
+
+        Args:
+            flops (float): The amount of computation (FLOPs) to move.
+            remote_gpuid (int): The target GPU ID.
+
+        Returns:
+            Item or None: The newly created Item object; returns None if splitting is not possible.
+            actual_flops_moved (float): The actual amount of FLOPs moved.
+        """
+        # If the current Item is empty or has no FLOPs to move, splitting is not possible
+        if not self.items or self.total_flops <= 0:
+            return None
+
+        # --- Case 1: Move the entire Item ---
+        # If the requested flops is greater than or equal to the total FLOPs, move the whole Item
+        if flops >= self.total_flops:
+            # Update the gpuid and is_original status to reflect the move
+            self.gpuid = remote_gpuid
+            self.is_original = False
+            # All FLOPs are moved; nothing else to do
+            return self, self.total_flops
+
+        # Need to Modify this part !!!
+        else:
+            import math
+            # For simplicity, only split the first chunk in the list
+            item_to_split = self.items[0]
+            original_q = item_to_split['q']
+            original_kv = item_to_split['kv']
+
+            max_flops_to_move = self.total_flops
+            flops_per_q = self.seq_len + 1
+            q_to_move = int(max_flops_to_move / flops_per_q)
+
+            if q_to_move <= 0:
+                return None, 0
+
+            moved_flops_actual = q_to_move * flops_per_q
+
+            # Prepare head and tail chunk dictionaries for the split
+            head_chunk_dict = {
+                'q': q_to_move,
+                'kv': original_kv - original_q + q_to_move
+            }
+            tail_chunk_dict = {
+                'q': q_to_move,
+                'kv': original_kv
+            }
+
+            # Create a new Item object containing the split head and tail chunks
+            newly_split_item = Item(
+                model_config=self.model_config,
+                seq_len=self.seq_len,
+                seqid=self.seqid,
+                gpuid=remote_gpuid,
+                src_gpuid=self.gpuid,
+                *[head_chunk_dict, tail_chunk_dict],
+                is_original=False
+            )
+
+            # Update the original Item's state if needed (not implemented here)
+            # self.items[0]['q'] -= (2 * q_to_move)
+            # self.items[0]['kv'] -= q_to_move
+            # self.is_original = False
+
+            self.total_flops = self.get_flops()
+
+            return newly_split_item, moved_flops_actual
+
+
+
 
 class Planner:
     def __init__(self,
@@ -27,7 +181,8 @@ class Planner:
         """        
         items = self.plan_items(items_, verbose, plot)
         items = self.postprocess_items(items)
-        return self.item_to_metadata(items)
+        metadata = self.item_to_metadata(items)
+        return metadata
 
     def plan_items(self, items_, verbose=False, plot=False) -> list[dict]:
         """
