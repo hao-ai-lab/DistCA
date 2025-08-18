@@ -635,9 +635,9 @@ def test(args):
             def flatten(a):
                 return [y for x in a for y in x]
             seq_lens = _seq_lens
-            debug_print(f"seq_lens", seq_lens)
+            # debug_print(f"seq_lens", seq_lens)
             doc_lens = flatten(seq_lens)
-            debug_print(f"doc_lens", doc_lens)
+            # debug_print(f"doc_lens", doc_lens)
             # TODO: Make the cp size as world size for now...
             cp_size = as_world_size
             cp_rank = as_rank
@@ -648,7 +648,7 @@ def test(args):
             doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
                 doc_lens, context_length, cp_size
             )
-            debug_print(f"doc_shards", doc_shards)
+            # debug_print(f"doc_shards", doc_shards)
             (
                 cu_seqlens_q_list, cu_seqlens_k_list, 
                 max_seqlen_q_list, max_seqlen_k_list, 
