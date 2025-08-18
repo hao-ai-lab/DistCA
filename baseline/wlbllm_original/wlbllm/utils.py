@@ -150,6 +150,102 @@ def compute_per_doc_metadate_combined(context_length, q, k, v, doc_lens, doc_sha
 
     return local_q, local_k, local_v, cu_seqlens_q_list, cu_seqlens_k_list, max_seqlen_q_list, max_seqlen_k_list, kv_idx_list, local_d_out
 
+
+def debug_print(*args, **kwargs):
+    import os
+    import rich
+    if os.getenv("D2_DEBUG_PRINT", "0") == "1":
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            rich.print(f"[Rank {rank}]", *args, **kwargs)
+    return
+
+def compute_per_doc_metadate_combined__metadata_only(context_length, doc_lens, doc_shards, cp_size, rank, device):
+    """
+    Compute the metadata (e.g., cumulative sequence lengths) for per-document CP.
+    """
+    # ============== Compute metadata =================
+    chunk_size = context_length // (2 * cp_size)
+    global_cu_lens =  [0] + list(accumulate(doc_lens))
+
+    local_q_chunks = []
+    local_k_chunks = []
+    local_v_chunks = []
+    local_d_out_chunks = []
+    cu_seqlens_q_list = []
+    max_seqlen_q_list = []
+    cu_seqlens_k_list = []
+    max_seqlen_k_list = []
+    kv_idx_list = []
+    # debug_print(f"doc_shards", doc_shards)
+    for chunk_id in range(2):
+        if chunk_id == 0:
+            chunk_index = rank
+        else:
+            chunk_index = 2 * cp_size - 1 - rank
+
+        # try:
+        this_doc_shards = doc_shards[chunk_index]
+        # except Exception as e:
+        #     debug_print(f"Causing index error: chunk_index", chunk_index)
+        #     raise e
+        
+        this_chunk_docs = []
+
+        local_q_list = []
+        local_k_list = []
+        local_v_list = []
+        local_d_out_list = []
+        kv_len_list = []
+        kv_idx = []
+
+        for doc_shard_i in this_doc_shards:
+            if doc_shard_i is None:
+                continue
+            else:
+                this_chunk_docs.append(doc_shard_i.shard_len)
+                q_chunk_start = global_cu_lens[doc_shard_i.doc_id] + doc_shard_i.prefix_len
+                q_chunk_end = q_chunk_start + doc_shard_i.shard_len
+                # local_q_list.append(q[q_chunk_start:q_chunk_end, :, :]) # qkv input should have the same format
+                # local_k_list.append(k[q_chunk_start:q_chunk_end, :, :])
+                # local_v_list.append(v[q_chunk_start:q_chunk_end, :, :])
+                # if d_out is not None:
+                #     local_d_out_list.append(d_out[q_chunk_start:q_chunk_end, :, :])
+
+                k_chunk_start = global_cu_lens[doc_shard_i.doc_id]
+                k_chunk_end = k_chunk_start + doc_shard_i.prefix_len + doc_shard_i.shard_len
+                kv_idx.append((k_chunk_start, k_chunk_end))
+                kv_len_list.append(doc_shard_i.prefix_len + doc_shard_i.shard_len)
+    
+        assert sum(this_chunk_docs) == chunk_size, f"Total length {sum(this_chunk_docs)} must equals chunk_size {chunk_size}."
+
+    
+        # local_q_chunks.append(torch.cat(local_q_list, dim=0))
+        # local_k_chunks.append(torch.cat(local_k_list, dim=0))
+        # local_v_chunks.append(torch.cat(local_v_list, dim=0))
+
+        cu_seqlens_q_list.append(torch.tensor([0] + list(accumulate(this_chunk_docs)), dtype=torch.int32).to(device))
+        max_seqlen_q_list.append(torch.tensor([max(this_chunk_docs)], dtype=torch.int32).to(device))
+        cu_seqlens_k_list.append(torch.tensor([0] + list(accumulate(kv_len_list)), dtype=torch.int32).to(device))
+        max_seqlen_k_list.append(torch.tensor([max(kv_len_list)], dtype=torch.int32).to(device))
+        kv_idx_list.append(kv_idx)
+
+    # local_q = torch.cat(local_q_chunks, dim=0).clone()
+    # local_k = torch.cat(local_k_chunks, dim=0).clone()
+    # local_v = torch.cat(local_v_chunks, dim=0).clone()
+    # local_q.requires_grad_(True)
+    # local_k.requires_grad_(True)
+    # local_v.requires_grad_(True)
+    # if d_out is not None:
+    #     local_d_out = torch.cat(local_d_out_chunks, dim=0)
+    #     local_d_out.requires_grad_(True)
+    # else:
+    #     local_d_out = None
+    local_q, local_k, local_v, local_d_out = None, None, None, None
+
+    # return local_q, local_k, local_v, cu_seqlens_q_list, cu_seqlens_k_list, max_seqlen_q_list, max_seqlen_k_list, kv_idx_list, local_d_out
+    return cu_seqlens_q_list, cu_seqlens_k_list, max_seqlen_q_list, max_seqlen_k_list, kv_idx_list
+
 def get_per_doc_local_result(context_length, global_result, doc_lens, doc_shards, cp_size, rank, chunk_id):
     """
     Get the local result for per-doc CP based on the global result.

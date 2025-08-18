@@ -1,6 +1,7 @@
 import torch
 from itertools import accumulate
-
+import os
+import rich
 import torch.distributed as dist
 
 from torch.distributed import (
@@ -32,6 +33,14 @@ def cat_slices(tensor, starts, lens):
                               for s, l in zip(starts.tolist(), lens.tolist())],
                              dim=0)   
 
+import rich
+def debug_print(*args, **kwargs):
+    if os.getenv("D2_DEBUG_PRINT", "0") == "1":
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            rich.print(f"[Rank {rank}]", *args, **kwargs)
+    return
+
 class PerDocumentCPAttention(torch.autograd.Function):
     """
     Attention with per‑document context parallelism.
@@ -57,9 +66,9 @@ class PerDocumentCPAttention(torch.autograd.Function):
         attn_mask_type,
         cp_group,
         cp_stream,
-        allgather_events,
-        allreduce_events,
-        attn_events,
+        allgather_events: 'Optional[List[torch.cuda.Event]]',
+        allreduce_events: 'Optional[List[torch.cuda.Event]]',
+        attn_events: 'Optional[List[torch.cuda.Event]]',
     ):
         nvtx_range_push("PerDocumentCPAttention.fwd")
         assert attn_mask_type == "causal", "Only causal attention is supported"
@@ -73,9 +82,10 @@ class PerDocumentCPAttention(torch.autograd.Function):
         # allgather kv, then shuffle back to global order
         if allgather_events is not None:
             allgather_events[0].record()
+
         if cp_size > 1:
-            gather_k_list = [torch.empty_like(local_q) for _ in range(cp_size)]
-            gather_v_list = [torch.empty_like(local_q) for _ in range(cp_size)]
+            gather_k_list = [torch.empty_like(local_k) for _ in range(cp_size)]
+            gather_v_list = [torch.empty_like(local_v) for _ in range(cp_size)]
             with torch.cuda.stream(cp_stream):
                 local_k = local_k.contiguous()
                 local_v = local_v.contiguous()
@@ -169,7 +179,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
             v_L, v_R,
             cu_q_L, cu_q_R, cu_k_L, cu_k_R,
             maxq_L, maxq_R, maxk_L, maxk_R,
-        ) = ctx.saved_tensors
+            ) = ctx.saved_tensors
 
         cp_group   = ctx.cp_group
         kv_idx_list = ctx.kv_idx_list 
@@ -183,6 +193,9 @@ class PerDocumentCPAttention(torch.autograd.Function):
         dq_local = torch.zeros_like(local_q)
         dk_global = torch.zeros_like(gathered_k)
         dv_global = torch.zeros_like(gathered_v)
+        # debug_print(f"💜 dq_local = {dq_local.shape}")
+        # debug_print(f"💜 dk_global = {dk_global.shape}")
+        # debug_print(f"💜 dv_global = {dv_global.shape}")
 
         # split incoming d_out into the two logical chunks
         d_out_L, d_out_R   = d_out_cat.split([qlen_L, qlen_R], dim=0)
@@ -203,6 +216,9 @@ class PerDocumentCPAttention(torch.autograd.Function):
             dq_chunk = torch.zeros_like(local_q[:q_len])
             dk_chunk = torch.zeros_like(kv_k)
             dv_chunk = torch.zeros_like(kv_v)
+            # debug_print(f"💜 dq_chunk = {dq_chunk.shape}")
+            # debug_print(f"💜 dk_chunk = {dk_chunk.shape}")
+            # debug_print(f"💜 dv_chunk = {dv_chunk.shape}")
 
             _ = _flash_attn_varlen_backward(
                 d_out,
@@ -225,9 +241,21 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         dk_global, dv_global = kv_unshuffle_for_per_doc_cp(context_length, dk_global, dv_global, doc_lens, doc_shards, cp_size)
  
+        # TODO: Fix GQA here...
         # now do reduce_scatter for dk/dv
-        dk_local = torch.empty_like(dq_local)
-        dv_local = torch.empty_like(dq_local)
+        shape = list(dk_global.shape)
+        shape[0] = shape[0] // cp_size
+        # debug_print(f"💜 shape =", shape)
+
+        # dk_local = torch.empty_like(dq_local)
+        # dv_local = torch.empty_like(dq_local)
+        dk_local = torch.empty(shape, device=dk_global.device, dtype=dk_global.dtype)
+        dv_local = torch.empty(shape, device=dv_global.device, dtype=dv_global.dtype)
+        # debug_print(f"💜 dk_global =", dk_global.shape, dk_global.dtype)
+        # debug_print(f"💜 dv_global =", dv_global.shape, dv_global.dtype)
+        # debug_print(f"💜 dk_local =", dk_local.shape, dk_local.dtype)
+        # debug_print(f"💜 dv_local =", dv_local.shape, dv_local.dtype)
+
         with torch.cuda.stream(ctx.cp_stream):
             dk_global = dk_global.contiguous()
             dv_global = dv_global.contiguous()
@@ -255,5 +283,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
             None,  # attn_mask_type
             None,  # cp_group
             None,  # cp_stream
+            None,  # allgather_events
+            None,  # allreduce_events
+            None,  # attn_events
         )
-
