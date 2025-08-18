@@ -50,7 +50,7 @@ from transformer_engine.pytorch.attention.dot_product_attention.backends import 
 )
 
 from transformer_engine.pytorch.utils import nvtx_range_push, nvtx_range_pop
-
+import transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention as dpa
 
 @no_torch_dynamo(recursive=False)
 def forward(
@@ -346,7 +346,8 @@ def forward(
         nvtx_range_push("te.DotProductAttention.set_alibi_attributes")
 
         # set ALiBi attributes
-        global _alibi_cache
+        # global _alibi_cache
+        _alibi_cache = dpa._alibi_cache
         if alibi_slopes is not None:
             assert (
                 core_attention_bias_type == "alibi"
@@ -438,7 +439,8 @@ def forward(
             fp8_meta=self.fp8_meta,
             inference_params=inference_params,
         )
-        global _attention_backends
+        _attention_backends = dpa._attention_backends
+        # global _attention_backends
         if (
             _attention_backends["attention_params"] is None
             or attention_params != _attention_backends["attention_params"]
