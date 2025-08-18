@@ -70,7 +70,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
         allreduce_events: 'Optional[List[torch.cuda.Event]]',
         attn_events: 'Optional[List[torch.cuda.Event]]',
     ):
-        nvtx_range_push("PerDocumentCPAttention.fwd")
+        nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd")
         assert attn_mask_type == "causal", "Only causal attention is supported"
         assert cp_group is not None, "cp_group must be provided"
         assert cp_stream is not None, "cp_stream must be provided"
@@ -168,7 +168,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
         """
         Backward pass for PerDocumentCPAttention.
         """
-        nvtx_range_push("PerDocumentCPAttention.bwd")
+        nvtx_range_push("wlbllm.PerDocumentCPAttention.bwd")
 
         (
             local_q,
