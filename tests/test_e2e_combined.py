@@ -566,6 +566,13 @@ def test(args):
     # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
     os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
 
+    if mode == "wlbllm":
+        import wlbllm.megatron_patch.dot_product_attention
+        wlbllm.megatron_patch.dot_product_attention.monkey_patch()
+        import wlbllm.megatron_patch.backends
+        wlbllm.megatron_patch.backends.monkey_patch()
+        pass
+
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
