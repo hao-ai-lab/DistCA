@@ -367,7 +367,7 @@ def test(args):
     torch.cuda.synchronize()
     print("finish pingpong")
     torch.testing.assert_close(grad_orig_reimpl, grad_orig)
-    if worker.rank == 1:
+    if worker.as_rank == 1:
         torch.testing.assert_close(grad_orig_reimpl, grad_sample, rtol=1e-3, atol=1e-3)
 
     print("=" * 20 + "forward_backward_batch attention server, done")
