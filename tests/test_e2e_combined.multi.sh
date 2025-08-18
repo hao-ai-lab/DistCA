@@ -1,3 +1,6 @@
+export CUDA_LAUNCH_BLOCKING=1 
+export D2_DEBUG_PRINT=1
+
 export NVTE_NVTX_ENABLED=1
 export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
 export D2_FA2A_DISABLE_SEND_RECV=0 
@@ -5,29 +8,38 @@ export NVSHMEM_IB_ENABLE_IBGDA=true
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-NPROC_PER_NODE=8
 RZV_BACKEND=c10d
 RZV_ENDPOINT=$1
 NNODES=${2:-1}
+NPROC_PER_NODE=${3:-8}
+TP_SIZE=${4:-8}
+
+MODE=${5:-baseline}
+# MODE=d2
+
 if [ -z "${RZV_ENDPOINT}" ]; then
-    echo "Usage: bash $0 <rzv_endpoint> <n_nodes>"
+    echo "Usage: bash $0 <rzv_endpoint> <n_nodes> <n_gpus_per_node> <tp_size> <mode>"
     echo "   - rzv_endpoint: the endpoint of the master node. For example, <node_address:29400>"
     echo "   - n_nodes: the number of nodes to use. (default: 1)"
+    echo "   - n_gpus_per_node: the number of GPUs per node. (default: 8)"
+    echo "   - tp_size: the tensor parallel size. (default: 8)"
+    echo "   - mode: the mode to use. (default: baseline; choices: baseline, d2, wlbllm)"
     exit 1
 fi
 
 
 echo
-echo "bash $0 $1 $2"
+echo "Executing: bash $0 rzv_endpoint=$1 n_nodes=$2 n_gpus_per_node=$3 tp_size=$4 mode=$5"
+echo 
+echo "bash $0 $1 $2 $3 $4 $5"
 echo
 
 RZV_ID=megatron_d2_unique_id
 
 # Tweek the mode between baseline vs d2.
-MODE=baseline
-# MODE=d2
 REPLAN_ITER=10
-NUM_TOKENS=32768
+NUM_TOKENS=2048
+# NUM_TOKENS=32768
 # NUM_TOKENS=65536
 # NUM_TOKENS=131072
 # NUM_TOKENS=174080
@@ -66,7 +78,7 @@ TORCHRUN_CMD=(
     --replan-iter ${REPLAN_ITER} \
     --num-nodes ${NNODES} \
     --num-gpus-per-node ${NPROC_PER_NODE} \
-    --tp-size ${NPROC_PER_NODE} \
+    --tp-size ${TP_SIZE} \
     --num-layers ${NUM_LAYERS} \
     --max-sample-id ${MAX_SAMPLE_ID} \
     --up-sample-factor ${UP_SAMPLE_FACTOR} \

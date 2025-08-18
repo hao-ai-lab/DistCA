@@ -1,0 +1,3 @@
+python per_seq_correctness_test.py
+
+python per_doc_correctness_test.py
