@@ -250,6 +250,8 @@ def create_pipeline_seqlens(
     total_seq_len: int,
     num_seqs: int,
     max_cp_degree: int,
+    tp_size: int,
+    dp_size: int,
 ):
     """
     For a forward tick, its sequence length follows:
@@ -262,26 +264,29 @@ def create_pipeline_seqlens(
     For a backward tick, its sequence length is the reverse of a forward tick.
     """
     if is_backward:
-        return ref_seq_lens.flip(0)
-    # TODO: handle DP+PP
-    dp_degree = 1
+        return ref_seq_lens.reshape(-1, dp_size, num_seqs).flip(0).reshape(-1, num_seqs)
     # Create new microbatches for the first PP stage
     if add_dummy:
-        new_seqlen = gen_seq_lens(dp_degree, 1, 1).long().reshape(dp_degree, 1).repeat(1, num_seqs)
+        # should be at least 'tp_size' tokens
+        _dummy_tokens = max(1, tp_size // max_cp_degree)
+        # NOTE: we should avoid this repeat in a real case. The same applies for repeat below.
+        new_seqlen = gen_seq_lens(dp_size, 1, _dummy_tokens).long().reshape(dp_size, 1).repeat(1, num_seqs)
     else:
         assert total_seq_len % max_cp_degree == 0
         _num_tokens_shard = total_seq_len // (max_cp_degree)
-        new_seqlen = gen_seq_lens(dp_degree, num_seqs, _num_tokens_shard).long()
+        new_seqlen = gen_seq_lens(dp_size, num_seqs, _num_tokens_shard).long()
     new_seqlen *= max_cp_degree
     # Get existing microbatch seqlens
     if ref_seq_lens is not None:
         # Not the first microbatch
-        prev_seqlen = ref_seq_lens[:-dp_degree]
+        prev_seqlen = ref_seq_lens[:-dp_size]
     else:
-        dummy_fwd_num = world_size - dp_degree
-        prev_seqlen = gen_seq_lens(dummy_fwd_num, 1, 1).long().reshape(dummy_fwd_num, 1).repeat(1, num_seqs)
+        dummy_fwd_num = world_size - dp_size
+        _dummy_tokens = max(1, tp_size // max_cp_degree)
+        prev_seqlen = gen_seq_lens(dummy_fwd_num, 1, _dummy_tokens).long().reshape(dummy_fwd_num, 1).repeat(1, num_seqs)
         prev_seqlen *= max_cp_degree
     seq_len = torch.cat([new_seqlen, prev_seqlen], dim=0)
+    assert torch.all(seq_len.sum(-1) % tp_size == 0), "tot_seqlen_on_rank % tp_size should be 0 for sequence parallel"
     return seq_len
 
 
@@ -424,6 +429,7 @@ def create_qkv_dispatch_pipeline_tick(
     softmax_lse_size: int, # size of the softmax_lse tensor, should be num_heads
     ref_seq_lens: Optional[torch.Tensor],
     add_dummy: bool,
+    tp_size: int, dp_size: int,
 ):
     create_pp_seqlen_kwargs = dict(
         world_size=world_size,
@@ -433,7 +439,9 @@ def create_qkv_dispatch_pipeline_tick(
     )
     seq_lens = create_pipeline_seqlens(
         ref_seq_lens, add_dummy, is_backward=False,
-        **create_pp_seqlen_kwargs
+        **create_pp_seqlen_kwargs,
+        tp_size=tp_size,
+        dp_size=dp_size,
     )
     (mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
      kv_to_q_mapping, kv_to_q_rank, kv_context_size,
@@ -457,10 +465,11 @@ def create_qkv_dispatch_pipeline_tick(
 
     reversed_seqlens = create_pipeline_seqlens(
         seq_lens, add_dummy=False, is_backward=True,
-        **create_pp_seqlen_kwargs
+        **create_pp_seqlen_kwargs,
+        tp_size=tp_size,
+        dp_size=dp_size,
     )
-    # NOTE: those begin with bwd_ is mostly the filp of the original
-    # value's flip.
+    # NOTE: those begin with bwd_ is mostly the flip of the original value.
     (bwd_mlp_seq_len, bwd_mlp_num_seqs, mlp_q_dispatch_bwd,
      bwd_kv_to_q_mapping, bwd_kv_to_q_rank, bwd_kv_context_size,
      bwd_q_to_num_kv_seq, bwd_q_to_num_kv_tokens

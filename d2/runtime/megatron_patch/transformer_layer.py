@@ -622,17 +622,11 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_1: Dict[str, Any],
         compute_stream: torch.cuda.Stream,
     ):
-        nvtx_range_push(f"PingPang.forward_layers[{l_no}]")
+        nvtx_range_push(f"PingPong.forward_layers[{l_no}]")
 
-        if getattr(self, "rank", None) is None:
-            self.rank = torch.distributed.get_rank()
-
-        # nvtx_range_push(f"PingPang.forward_layers[{l_no}]")
         layer = self.layers[l_no]
         prev_layer = self.layers[l_no - 1] if l_no > 0 else None
-        
-        
-        
+
         # tick 0, second half
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].pre_core_attn.0"):
             arg_group_0 = _forward_pre_core_attn(layer, arg_group_0)
@@ -699,7 +693,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         # NOTE: sync of this tick is at the next layer.
 
         # if the last layer, do the other half of tick 4 and tick 5
-        if l_no == len(self.layers) - 1:            
+        if l_no == len(self.layers) - 1:
             # No next layer, do the sync here.
             with torch.cuda.nvtx.range(f"forward_layers[{l_no}].sync_tick.4"):
                 _tick_sync(
@@ -717,8 +711,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             hidden_states = None
             context = None
 
-        nvtx_range_pop(f"PingPang.forward_layers[{l_no}]")
-        
+        nvtx_range_pop(f"PingPong.forward_layers[{l_no}]")
+
         return arg_group_0, arg_group_1, hidden_states, context
 
     def _forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
@@ -912,6 +906,8 @@ class PingPangGPTModel(GPTModel):
             # create a dummy decoder_input
             sl = input_ids.shape[-1]
             hs = self.config.hidden_size
+            if self.config.sequence_parallel:
+                sl //= self.config.tensor_model_parallel_size
             kwargs['decoder_input'] = torch.zeros((sl, 1, hs), dtype=dtype, device='cuda')
 
         with self._reset_stage_for_dummy_forward(reset=is_dummy_forward):
