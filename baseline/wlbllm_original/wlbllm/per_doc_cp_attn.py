@@ -133,7 +133,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
             
             rank = torch.distributed.get_rank()
             # if rank % 8 == 0:
-            #     debug_print("🟡 Inside WLBLLM's PerDocumentCPAttention.forward()")
+            #     debug_print("🟡 Inside WLBLLM's PerDocumentCPAttention.forward(). Printing this may mean we have performance issue.")
             #     debug_print(f"  - q_chunks[chunk_id].shape = {q_chunks[chunk_id].shape}")
             #     debug_print(f"  - local_k.shape = {local_k.shape}")
             #     debug_print(f"  - local_v.shape = {local_v.shape}")
@@ -145,56 +145,26 @@ class PerDocumentCPAttention(torch.autograd.Function):
             
             # TODO:(Hack) PerDocumentCPAttention performance degrade significantly when returning LSE.
             # We create an env var to disable it only for performance testing.
-            
-            should_disable_lse = os.getenv("WLBLLM_DISABLE_LSE", "0") == "1"
             should_sync_time_flash_attn = os.getenv("WLBLLM_SYNC_TIME_FLASH_ATTN", "0") == "1"
-            
-            if should_disable_lse:
-                warnings.warn("🔴 WLBLLM_DISABLE_LSE is enabled, using fake LSE", UserWarning, stacklevel=2)
-            else:
-                
-                warnings.warn("🟡 WLBLLM_DISABLE_LSE is disabled", UserWarning, stacklevel=2)
             
             start_time = time.time()
             if should_sync_time_flash_attn:
                 torch.cuda.synchronize()
-            if should_disable_lse:
-                out = flash_attn_varlen_func(
-                    q=q_chunks[chunk_id],
-                    k=local_k,
-                    v=local_v,
-                    cu_seqlens_q=cu_seqlens_q_list [chunk_id],
-                    cu_seqlens_k=cu_seqlens_kv_list[chunk_id],
-                    max_seqlen_q=max_seqlen_q_list [chunk_id],
-                    max_seqlen_k=max_seqlen_kv_list[chunk_id],
-                    dropout_p=0.0,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    return_attn_probs=False,
-                    deterministic=False, # do not turn on this flag - performance will degrade!
-                )
-                if fake_lse is None:
-                    (d_total, d_nheads, d_headdim) = list(out.shape)
-                    fake_lse = torch.ones((d_nheads, d_total), dtype=out.dtype, device=out.device)
-                
-                lses.append(fake_lse)
-            else:
-                out, lse, _ = flash_attn_varlen_func(
-                    q=q_chunks[chunk_id],
-                    k=local_k,
-                    v=local_v,
-                    cu_seqlens_q=cu_seqlens_q_list [chunk_id],
-                    cu_seqlens_k=cu_seqlens_kv_list[chunk_id],
-                    max_seqlen_q=max_seqlen_q_list [chunk_id],
-                    max_seqlen_k=max_seqlen_kv_list[chunk_id],
-                    dropout_p=0.0,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    return_attn_probs=True,
-                    deterministic=False, # do not turn on this flag - performance will degrade!
-                )
-                lses.append(lse)
-                pass
+
+            out, lse, _ = flash_attn_varlen_func(
+                q=q_chunks[chunk_id],
+                k=local_k,
+                v=local_v,
+                cu_seqlens_q=cu_seqlens_q_list [chunk_id],
+                cu_seqlens_k=cu_seqlens_kv_list[chunk_id],
+                max_seqlen_q=max_seqlen_q_list [chunk_id],
+                max_seqlen_k=max_seqlen_kv_list[chunk_id],
+                dropout_p=0.0,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+                deterministic=False, # do not turn on this flag - performance will degrade!
+            )
             
             if should_sync_time_flash_attn:
                 torch.cuda.synchronize()
@@ -202,6 +172,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
             duration_ms = (end_time - start_time) * 1000
             debug_print(f"🟡 FlashAttnVarlenFunc time: {duration_ms} ms")
             outputs.append(out)
+            lses.append(lse)
 
         final_out = torch.cat(outputs, dim=0)
         if attn_events is not None:
