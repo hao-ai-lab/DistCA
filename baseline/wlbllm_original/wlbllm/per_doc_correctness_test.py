@@ -189,7 +189,7 @@ def run(rank: int, world_size: int, args):
     rich.print("kv_idx_list", kv_idx_list)
     rich.print("local_d_out", local_d_out.shape)
 
-    exit(0)
+    # exit(0)
 
     local_q_doc.retain_grad() 
     local_k_doc.retain_grad()
