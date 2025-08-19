@@ -292,8 +292,8 @@ def init_megatron_e2e_test(
     world_size: int, max_cp_degree: int, tp_size: int,
     dtype, worker_cls=MegatronE2eWorker
 ):
-    token_bytes_q = hidden_size_q * dtype.itemsize
-    token_bytes_kv = hidden_size_kv * dtype.itemsize
+    token_bytes_q = hidden_size_q * dtype.itemsize // tp_size
+    token_bytes_kv = hidden_size_kv * dtype.itemsize // tp_size
     max_tokens_query = num_tokens * (world_size // tp_size)
     max_tokens_key_value = num_tokens * (world_size // tp_size)
     buffer_size = (
@@ -609,9 +609,10 @@ def test(args):
 
     worker: MegatronE2eWorker = init_megatron_e2e_test(
         hidden_size_q, hidden_size_kv, num_tokens,
-        world_size, max_cp_degree, tp_size,
+        world_size, max_cp_degree * 1, tp_size,
         dtype, MegatronE2eWorker
     )
+
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
     # set again to potentially adapt to the ray launch case.
@@ -672,6 +673,10 @@ def test(args):
             cp_rank = as_rank
             local_context_length = total_seq_len * 2
             context_length = local_context_length * cp_size
+
+            import d2.runtime.megatron_patch.create_group
+            cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
+            # cp_group = mpu.get_context_parallel_group()
             # debug_print(f"cp_size", cp_size)
             # debug_print(f"context_length", context_length)
             doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
@@ -691,11 +696,11 @@ def test(args):
                 device=torch.cuda.current_device()
             )
             
-            # if rank % 8 == 0:
-            #     debug_print(f"doc_lens", doc_lens)
-            #     debug_print(f"doc_shards", doc_shards)
-            #     debug_print(f"cu_seqlens_q_list", cu_seqlens_q_list)
-            #     debug_print(f"cu_seqlens_k_list", cu_seqlens_k_list)
+            if rank % 8 == 0:
+                # debug_print(f"doc_lens", doc_lens)
+                # debug_print(f"doc_shards", doc_shards)
+                debug_print(f"cu_seqlens_q_list", cu_seqlens_q_list)
+                debug_print(f"cu_seqlens_k_list", cu_seqlens_k_list)
             #     debug_print(f"max_seqlen_q_list", max_seqlen_q_list)
             #     debug_print(f"max_seqlen_k_list", max_seqlen_k_list)
             #     debug_print(f"kv_idx_list", kv_idx_list)
@@ -710,10 +715,13 @@ def test(args):
 
             packed_seq_params = PackedSeqParams(
                 qkv_format="thd",
-                cu_seqlens_q=cu_seqlens_q_list[cp_rank],
-                cu_seqlens_kv=cu_seqlens_k_list[cp_rank],
-                max_seqlen_q=max_seqlen_q_list[cp_rank],
-                max_seqlen_kv=max_seqlen_k_list[cp_rank],
+                # TODO(HACK): These variables are not used in the WLBLLM functions.
+                # If anywhere we used them, we will fail.
+                # See PerDocCPAttention in the wlbllm/per_doc_cp_attn.py
+                cu_seqlens_q=cu_seqlens_q_list[-1],
+                cu_seqlens_kv=cu_seqlens_k_list[-1],
+                max_seqlen_q=max_seqlen_q_list[-1],
+                max_seqlen_kv=max_seqlen_k_list[-1],
             )
 
             microbatch = {
@@ -726,8 +734,7 @@ def test(args):
             
             # Now save some context for the use of WLBLLM function
 
-            import d2.runtime.megatron_patch.create_group
-            cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
+            
 
             wlbllm.registry.clear()
             wlbllm.registry.set("doc_lens", doc_lens)
@@ -940,7 +947,8 @@ def test(args):
     # NO BARRIER - this is what was causing the hang!
     # Instead, each process cleans up independently and exits
     
-    if False: # Only use it when force exit
+    # if False: # Only use it when force exit
+    if args.force_exit: 
         # Clear CUDA cache first
         try:
             if torch.cuda.is_available():
@@ -965,10 +973,9 @@ def test(args):
         print(f"[Rank {rank}] Force exiting now... nsys may not dump the cuda hw")
         
         # Immediate force exit with os._exit (bypasses Python cleanup)
-        # os._exit(0)
-    if args.force_exit: 
-        import sys
-        sys.exit(0)  # or raise SystemExit
+        os._exit(0)
+        # import sys
+        # sys.exit(0)  # or raise SystemExit
 
 
 if __name__ == "__main__":

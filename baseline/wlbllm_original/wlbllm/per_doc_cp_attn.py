@@ -84,6 +84,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
         nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.prepare")
         cp_size = get_world_size(cp_group)
         rank = get_rank(cp_group)
+        world_rank = torch.distributed.get_rank()
         context_length = local_q.shape[0] * cp_size
         
         # allgather kv, then shuffle back to global order
@@ -170,7 +171,8 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 torch.cuda.synchronize()
             end_time = time.time()
             duration_ms = (end_time - start_time) * 1000
-            debug_print(f"🟡 FlashAttnVarlenFunc time: {duration_ms} ms")
+            if world_rank % 8 == 0:
+                debug_print(f"🟡 FlashAttnVarlenFunc time: {duration_ms} ms")
             outputs.append(out)
             lses.append(lse)
 
