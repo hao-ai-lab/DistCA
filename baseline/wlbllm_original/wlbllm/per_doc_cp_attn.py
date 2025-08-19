@@ -1,9 +1,10 @@
+import time
 import torch
 from itertools import accumulate
 import os
 import rich
 import torch.distributed as dist
-
+import warnings
 from torch.distributed import (
     get_world_size,
     get_rank,
@@ -41,6 +42,9 @@ def debug_print(*args, **kwargs):
             rich.print(f"[Rank {rank}]", *args, **kwargs)
     return
 
+
+fake_lse = None
+
 class PerDocumentCPAttention(torch.autograd.Function):
     """
     Attention with per‑document context parallelism.
@@ -70,11 +74,14 @@ class PerDocumentCPAttention(torch.autograd.Function):
         allreduce_events: 'Optional[List[torch.cuda.Event]]',
         attn_events: 'Optional[List[torch.cuda.Event]]',
     ):
+        global fake_lse
+
         nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd")
         assert attn_mask_type == "causal", "Only causal attention is supported"
         assert cp_group is not None, "cp_group must be provided"
         assert cp_stream is not None, "cp_stream must be provided"
 
+        nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.prepare")
         cp_size = get_world_size(cp_group)
         rank = get_rank(cp_group)
         context_length = local_q.shape[0] * cp_size
@@ -99,6 +106,10 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         if allgather_events is not None:
             allgather_events[1].record()
+        nvtx_range_pop()
+        
+        
+        nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.flash_attn")
 
 
         if attn_events is not None:
@@ -119,6 +130,27 @@ class PerDocumentCPAttention(torch.autograd.Function):
             local_ks.append(local_k)
             local_vs.append(local_v)
 
+            
+            rank = torch.distributed.get_rank()
+            # if rank % 8 == 0:
+            #     debug_print("🟡 Inside WLBLLM's PerDocumentCPAttention.forward(). Printing this may mean we have performance issue.")
+            #     debug_print(f"  - q_chunks[chunk_id].shape = {q_chunks[chunk_id].shape}")
+            #     debug_print(f"  - local_k.shape = {local_k.shape}")
+            #     debug_print(f"  - local_v.shape = {local_v.shape}")
+            #     debug_print(f"  - cu_seqlens_q_list[chunk_id] = {cu_seqlens_q_list[chunk_id]}")
+            #     debug_print(f"  - cu_seqlens_kv_list[chunk_id] = {cu_seqlens_kv_list[chunk_id]}")
+            #     debug_print(f"  - max_seqlen_q_list[chunk_id] = {max_seqlen_q_list[chunk_id]}")
+            #     debug_print(f"  - max_seqlen_kv_list[chunk_id] = {max_seqlen_kv_list[chunk_id]}")
+
+            
+            # TODO:(Hack) PerDocumentCPAttention performance degrade significantly when returning LSE.
+            # We create an env var to disable it only for performance testing.
+            should_sync_time_flash_attn = os.getenv("WLBLLM_SYNC_TIME_FLASH_ATTN", "0") == "1"
+            
+            start_time = time.time()
+            if should_sync_time_flash_attn:
+                torch.cuda.synchronize()
+
             out, lse, _ = flash_attn_varlen_func(
                 q=q_chunks[chunk_id],
                 k=local_k,
@@ -130,15 +162,24 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 dropout_p=0.0,
                 softmax_scale=softmax_scale,
                 causal=True,
-                return_attn_probs=True
+                return_attn_probs=True,
+                deterministic=False, # do not turn on this flag - performance will degrade!
             )
             
+            if should_sync_time_flash_attn:
+                torch.cuda.synchronize()
+            end_time = time.time()
+            duration_ms = (end_time - start_time) * 1000
+            debug_print(f"🟡 FlashAttnVarlenFunc time: {duration_ms} ms")
             outputs.append(out)
             lses.append(lse)
 
         final_out = torch.cat(outputs, dim=0)
         if attn_events is not None:
             attn_events[1].record()
+        nvtx_range_pop()
+
+        nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.save_for_backward")
 
         ctx.save_for_backward(
             local_q,
@@ -159,7 +200,9 @@ class PerDocumentCPAttention(torch.autograd.Function):
         ctx.attn_mask_type = attn_mask_type
         ctx.cp_group       = cp_group
         ctx.cp_stream      = cp_stream
-        
+
+        nvtx_range_pop()
+
         nvtx_range_pop()
         return final_out
 

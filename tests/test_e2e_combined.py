@@ -320,13 +320,16 @@ K = 1024
 # TODO(Refactor): Remove this global variable.
 iterated_samples = []
 
+
+
+
 def setup_global_batch(
     total_seq_len, 
     up_sample_factor=2,
     elongate_factor=1,
     filter_threshold=64 * 1024,
     filter_ratio=0.90,
-
+    should_add_debug_cases=False,
 ):
     global GLOBAL_BATCH
     if GLOBAL_BATCH is not None:
@@ -341,16 +344,19 @@ def setup_global_batch(
             elongate_factor=elongate_factor,
         ), max_ctx_length=total_seq_len
     )
-    GLOBAL_BATCH = list(GLOBAL_BATCH)
 
-    # # DP2 case
-    # manual_case = [
-    #     [total_seq_len],
-    #     [total_seq_len // 8] * 8,
-    #     [total_seq_len],
-    #     [total_seq_len // 8] * 8,
-    # ]
-    # GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH 
+    
+    if should_add_debug_cases:
+        GLOBAL_BATCH = list(GLOBAL_BATCH)
+        # DP2 case
+        manual_case = [
+            [total_seq_len],
+            [total_seq_len // 8] * 8,
+            [total_seq_len],
+            [total_seq_len // 8] * 8,
+        ]
+        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH 
+
     GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
 
@@ -556,6 +562,7 @@ def test(args):
     elongate_factor = args.elongate_factor
     filter_threshold = args.filter_threshold
     filter_ratio = args.filter_ratio
+    should_add_debug_cases = args.should_add_debug_cases
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
@@ -573,10 +580,24 @@ def test(args):
         wlbllm.megatron_patch.backends.monkey_patch()
         pass
 
+
+    # Create for wlbllm
+    # cp_stream = torch.cuda.Stream()
+    cp_stream = torch.cuda.current_stream()
+
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
-    setup_global_batch(total_seq_len, up_sample_factor, elongate_factor)
+    setup_global_batch(
+        total_seq_len, 
+        up_sample_factor=up_sample_factor,
+        elongate_factor=elongate_factor,
+        filter_threshold=filter_threshold,
+        filter_ratio=filter_ratio,
+        should_add_debug_cases=should_add_debug_cases,
+    )
+    print(f"🟡 setup_global_batch (mode={mode}): ")
+    print(f"  - total_seq_len = {total_seq_len}")
 
     hf_config = AutoConfig.from_pretrained(model_path)
     hidden_size_q = hf_config.hidden_size
@@ -609,6 +630,7 @@ def test(args):
     for sample_id in range(max_sample_id):
         
         _seq_lens = get_next_batch(as_world_size * 2)
+        print(f"🟡 sample_id={sample_id}: {_seq_lens}")
 
         if mode == "baseline":
             # TODO: Adding proper support for context parallel in megatron.
@@ -642,8 +664,8 @@ def test(args):
             def flatten(a):
                 return [y for x in a for y in x]
             seq_lens = _seq_lens
-            # debug_print(f"seq_lens", seq_lens)
             doc_lens = flatten(seq_lens)
+            rank = torch.distributed.get_rank()
             # debug_print(f"doc_lens", doc_lens)
             # TODO: Make the cp size as world size for now...
             cp_size = as_world_size
@@ -668,11 +690,16 @@ def test(args):
                 cp_rank, 
                 device=torch.cuda.current_device()
             )
-            # debug_print(f"cu_seqlens_q_list", cu_seqlens_q_list)
-            # debug_print(f"cu_seqlens_k_list", cu_seqlens_k_list)
-            # debug_print(f"max_seqlen_q_list", max_seqlen_q_list)
-            # debug_print(f"max_seqlen_k_list", max_seqlen_k_list)
-            # debug_print(f"kv_idx_list", kv_idx_list)
+            
+            # if rank % 8 == 0:
+            #     debug_print(f"doc_lens", doc_lens)
+            #     debug_print(f"doc_shards", doc_shards)
+            #     debug_print(f"cu_seqlens_q_list", cu_seqlens_q_list)
+            #     debug_print(f"cu_seqlens_k_list", cu_seqlens_k_list)
+            #     debug_print(f"max_seqlen_q_list", max_seqlen_q_list)
+            #     debug_print(f"max_seqlen_k_list", max_seqlen_k_list)
+            #     debug_print(f"kv_idx_list", kv_idx_list)
+            # exit(0)
 
             input_ids = torch.randint(100, 10000, (as_world_size, local_context_length))
             input_ids_local = input_ids[cp_rank]
@@ -701,7 +728,6 @@ def test(args):
 
             import d2.runtime.megatron_patch.create_group
             cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
-            cp_stream = torch.cuda.current_stream()
 
             wlbllm.registry.clear()
             wlbllm.registry.set("doc_lens", doc_lens)
@@ -965,5 +991,7 @@ if __name__ == "__main__":
     parser.add_argument("--filter-threshold", type=int, default=64 * 1024)
     parser.add_argument("--filter-ratio", type=float, default=0.90)
     parser.add_argument("--force-exit", action="store_true")
+    parser.add_argument("--should-add-debug-cases", action="store_true")
+    
     args = parser.parse_args()
     test(args)
