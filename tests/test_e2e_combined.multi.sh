@@ -1,5 +1,7 @@
-export CUDA_LAUNCH_BLOCKING=1 
+# export CUDA_LAUNCH_BLOCKING=1 
 export D2_DEBUG_PRINT=1
+# export WLBLLM_DISABLE_LSE=1
+# export WLBLLM_SYNC_TIME_FLASH_ATTN=1
 
 export NVTE_NVTX_ENABLED=1
 export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
@@ -38,9 +40,9 @@ RZV_ID=megatron_d2_unique_id
 
 # Tweek the mode between baseline vs d2.
 REPLAN_ITER=10
-NUM_TOKENS=2048
+# NUM_TOKENS=2048
 # NUM_TOKENS=32768
-# NUM_TOKENS=65536
+NUM_TOKENS=65536
 # NUM_TOKENS=131072
 # NUM_TOKENS=174080
 NUM_LAYERS=4
@@ -59,9 +61,10 @@ MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 THIS_HOST=$(hostname)
 
 OUTPUT_DIR=nsys-profile
+now=$(date +%Y%m%d_%H%M%S)
 mkdir -p ${OUTPUT_DIR}
-NSYS_PROFILE_PATH=${OUTPUT_DIR}/${MODE}${REPLAN_ITER}.${THIS_HOST}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.nsys-rep
-
+NSYS_PROFILE_PATH=${OUTPUT_DIR}/${now}.${MODE}${REPLAN_ITER}.${THIS_HOST}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.nsys-rep
+LOG_PATH=${OUTPUT_DIR}/${now}.${MODE}${REPLAN_ITER}.${THIS_HOST}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.log
 ENABLE_NSYS=0
 
 # Prepare the common torchrun command and arguments
@@ -85,7 +88,8 @@ TORCHRUN_CMD=(
     --num-tokens ${NUM_TOKENS} \
     --elongate-factor ${ELONGATE_FACTOR} \
     --filter-threshold ${FILTER_THRESHOLD} \
-    --filter-ratio ${FILTER_RATIO} \
+    --filter-ratio ${FILTER_RATIO} 
+    # --should-add-debug-cases
 )
 
 set -x
@@ -96,8 +100,8 @@ if [ ${ENABLE_NSYS} -eq 1 ]; then
       -o ${NSYS_PROFILE_PATH} \
       --sample=none \
       -t cuda,nvtx \
-    torchrun "${TORCHRUN_CMD[@]}"
+    torchrun "${TORCHRUN_CMD[@]}" | tee ${LOG_PATH} 2>&1
 else
-    torchrun "${TORCHRUN_CMD[@]}" --force-exit
+    torchrun "${TORCHRUN_CMD[@]}" --force-exit | tee ${LOG_PATH} 2>&1
 fi
 set +x
