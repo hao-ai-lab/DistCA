@@ -1,9 +1,9 @@
 from collections import defaultdict
 from copy import deepcopy
+from typing import List
 
 import rich
 
-from typing import List
 from d2.runtime.shard_info import items_into_shardinfos, plan_to_metadata
 
 K = 1024
@@ -24,10 +24,6 @@ def batch_to_items(batches):
     return items
 
 
-def get_flops(q=None, kv=None, **kwargs):
-    assert q is not None and kv is not None, "q and kv must be provided"
-    return sum(kv - i for i in range(q))
-
 # Represent a part of sequence.
 # item_dicts: {'q': ... , 'kv': ..}
 class Item:
@@ -47,9 +43,15 @@ class Item:
         self.is_original = is_original
 
         self.items = [item for item in item_dicts]
-        self.total_flops = get_flops()
-        # 是否需要一个矩阵，来进行通信latency的模拟。
-        self.communication_speed = None
+        if len(self.items) == 1:
+            self.complete = True
+            self.complete_item = self.items[0]
+        else:
+            self.complete = False
+            self.head = self.items[0]
+            self.tail = self.items[1]
+        self.total_flops = self.get_flops()
+
 
     def get_flops(self):
         flops = 0
@@ -80,13 +82,14 @@ class Item:
         communication_volume = self.get_q_size(q_len) + self.get_kv_size(kv_len)
         # latency = communication_volume / transfer_speed, if we know current rank_id, remote rank_id, network speed. We can compute communication latency.
         priority = communication_volume / max_possible_flops
+        # maybe we can have a matrix in the planner to compute the latency of communication.
         return priority
 
-    def split_item(self, flops, remote_gpuid):
+    def split_item(self, flops, remote_gpuid, verbose = False):
         """
         Split the Item according to the specified amount of FLOPs.
 
-        - If flops >= self.total_flops, return a new Item representing the entire Item being moved.
+        - If flops >= self.total_flops, move entire item to remote_gpuid.
         - If flops < self.total_flops, split the Item and return a new Item containing the head and tail chunks.
           The original Item (self) will be updated accordingly.
 
@@ -95,12 +98,16 @@ class Item:
             remote_gpuid (int): The target GPU ID.
 
         Returns:
-            Item or None: The newly created Item object; returns None if splitting is not possible.
+            Item or None: The newly created Item object; returns None if move entire item.
             actual_flops_moved (float): The actual amount of FLOPs moved.
         """
         # If the current Item is empty or has no FLOPs to move, splitting is not possible
         if not self.items or self.total_flops <= 0:
             return None
+
+        def rlog(message):
+            if verbose:
+                rich.print(message)
 
         # --- Case 1: Move the entire Item ---
         # If the requested flops is greater than or equal to the total FLOPs, move the whole Item
@@ -109,56 +116,81 @@ class Item:
             self.gpuid = remote_gpuid
             self.is_original = False
             # All FLOPs are moved; nothing else to do
-            return self, self.total_flops
+            # There is no new items. Return None.
+            rlog(f"    - [bold]Move entire item[/bold]: Actual Moving ({self.total_flops:.2f} FLOPs) to satisfy need.")
+            return None, self.total_flops
 
-        # Need to Modify this part !!!
         else:
-            import math
-            # For simplicity, only split the first chunk in the list
-            item_to_split = self.items[0]
-            original_q = item_to_split['q']
-            original_kv = item_to_split['kv']
-
-            max_flops_to_move = self.total_flops
             flops_per_q = self.seq_len + 1
-            q_to_move = int(max_flops_to_move / flops_per_q)
+            q_to_move = int(flops / flops_per_q)
 
             if q_to_move <= 0:
                 return None, 0
-
             moved_flops_actual = q_to_move * flops_per_q
+            rlog(f"    - [bold]Splitting item[/bold]: Actual Moving q={q_to_move*2} ({moved_flops_actual:.2f} FLOPs) to satisfy need.")
+            
+            # TODO(Pb): Current flops_per_q only support even seq_len. Need to support odd seq_len in the future.
+            if self.complete:
+                # Split current Item
+                head_dict = {}
+                tail_dict = {}
+                head_dict['q'] = (self.complete_item['q'] + 1) // 2  - q_to_move
+                head_dict['kv'] = head_dict['q']
 
-            # Prepare head and tail chunk dictionaries for the split
-            head_chunk_dict = {
-                'q': q_to_move,
-                'kv': original_kv - original_q + q_to_move
-            }
-            tail_chunk_dict = {
-                'q': q_to_move,
-                'kv': original_kv
-            }
+                tail_dict['q'] = self.complete_item['q'] // 2  - q_to_move
+                tail_dict['kv'] = self.complete_item['kv']       # Unchanged
 
-            # Create a new Item object containing the split head and tail chunks
+                self.head = head_dict
+                self.tail = tail_dict
+                self.complete = False
+                self.complete_item = None
+            else:
+                # Split head
+                self.head['q'] = self.head['q'] - q_to_move
+                self.head['kv'] = self.head['kv'] - q_to_move
+
+                # Split tail
+                self.tail['q'] = self.tail['q'] - q_to_move
+                self.tail['kv'] = self.tail['kv']   # Unchanged
+            self.items = [self.head, self.tail]
+            rlog(f"Origin flops {self.total_flops}, moved flops: {moved_flops_actual}, current flops: {self.get_flops()}")
+
+            assert self.total_flops == self.get_flops() + moved_flops_actual, "Total flops should be equal"
+            self.total_flops = self.get_flops()
+            rlog(f"    - [bold]Splitting item[/bold]: Actual Moving q={q_to_move} ({moved_flops_actual:.2f} FLOPs) to satisfy need.")
+
+            new_head_dict = {}
+            new_tail_dict = {}
+            new_head_dict['q'] = q_to_move
+            new_head_dict['kv'] = self.head['kv'] + new_head_dict['q']
+
+            new_tail_dict['q'] = q_to_move
+            new_tail_dict['kv'] = self.tail['kv'] - self.tail['q']
+
+            rlog(f"    - Created head chunk: q={new_head_dict['q']}, kv={new_head_dict['kv']}, on GPU {remote_gpuid}")
+            rlog(f"    - Created tail chunk: q={new_tail_dict['q']}, kv={new_tail_dict['kv']}, on GPU {remote_gpuid}")
+
             newly_split_item = Item(
-                model_config=self.model_config,
-                seq_len=self.seq_len,
-                seqid=self.seqid,
-                gpuid=remote_gpuid,
-                src_gpuid=self.gpuid,
-                *[head_chunk_dict, tail_chunk_dict],
+                self.model_config,
+                self.seq_len, self.seqid, remote_gpuid, self.src_gpuid, 
+                new_head_dict, new_tail_dict,
                 is_original=False
             )
-
-            # Update the original Item's state if needed (not implemented here)
-            # self.items[0]['q'] -= (2 * q_to_move)
-            # self.items[0]['kv'] -= q_to_move
-            # self.is_original = False
-
-            self.total_flops = self.get_flops()
-
+            assert newly_split_item.total_flops == moved_flops_actual, "Total moved flops should be equal"
             return newly_split_item, moved_flops_actual
 
-
+    def to_dicts(self):
+        items = []
+        for item in self.items:
+            item_dict = {}
+            item_dict['q'] = item['q']
+            item_dict['kv'] = item['kv']
+            item_dict['gpuid'] = self.gpuid
+            item_dict['seqid'] = self.seqid
+            item_dict['src_gpuid'] = self.src_gpuid
+            item_dict['is_original'] = self.is_original
+            items.append(item_dict)
+        return items
 
 
 class Planner:

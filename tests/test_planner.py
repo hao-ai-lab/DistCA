@@ -251,6 +251,13 @@ def generate_random_rank_batches(
 
 
 
+class MockConfig:
+    def __init__(self):
+        self.hidden_size = 4096
+        self.num_attention_heads = 32
+        self.num_key_value_heads = 8
+        self.num_hidden_layers = 32
+
 def test_planner_equal_flops():
     rich.print("⚪ Testing planner equal flops...")
     num_seq = 4
@@ -286,11 +293,8 @@ def test_planner_equal_flops():
     ]
     # for item in expected_items:
     #     assert item in items, f"item = {item} not in items: {expected_items = }\n{items = }"
-    try:
-        model_config = AutoConfig.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
-    except Exception as e:
-        model_config = AutoConfig.from_pretrained("/mnt/moonfs/public-models-m2/meta-llama/Llama-3.1-8B/")
-
+    model_config = MockConfig()
+    
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
