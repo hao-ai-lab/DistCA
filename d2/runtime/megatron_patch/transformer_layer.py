@@ -693,7 +693,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         # NOTE: sync of this tick is at the next layer.
 
         # if the last layer, do the other half of tick 4 and tick 5
-        if l_no == len(self.layers) - 1:            
+        if l_no == len(self.layers) - 1:
             # No next layer, do the sync here.
             with torch.cuda.nvtx.range(f"forward_layers[{l_no}].sync_tick.4"):
                 _tick_sync(
