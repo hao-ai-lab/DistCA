@@ -26,6 +26,26 @@ def batch_to_items(batches):
     return items
 
 
+def batch_to_items_class(batches, model_config=None):
+    items = []
+    seqid = 0
+    for gpuid, batch in enumerate(batches):
+        for seq_len in batch:
+            item_dict = {'q': seq_len, 'kv': seq_len}
+            item = Item(
+                model_config,
+                seq_len,
+                seqid,
+                gpuid,
+                gpuid,
+                item_dict,
+                is_original=True
+            )
+            items.append(item)
+            seqid += 1
+    return items
+
+
 """
 Partition and place a batch of variable-length documents onto GPU ranks under a
 hybrid Data-Parallel (DP) and Context-Parallel (CP) policy, returning a list of
@@ -614,7 +634,26 @@ class Planner:
 
         metadata = self.item_to_metadata(items)
         return metadata
-
+    
+    def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False):
+        items = self.plan_items(items_, verbose, plot)
+        items = self.postprocess_items(items)
+        shard_infos = self.items_into_shardinfos(items)
+        from d2.runtime.shard_info import handle_planner_metadata
+        
+        # (
+        # mlp_num_seqs,
+        # mlp_q_dispatch,
+        # mlp_seq_lens,
+        # kv_to_q_mapping,
+        # kv_to_q_rank,
+        # kv_context_size,
+        # q_to_num_kv_seq,
+        # q_to_num_kv_tokens,
+        # ) 
+        ret = handle_planner_metadata(self.num_dispatch_instances, shard_infos)
+        return ret
+    
     def plan_items(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
         items = deepcopy(items_)
 
@@ -690,9 +729,16 @@ class Planner:
                     break
 
         final_items = [item for item in items if item.total_flops > 0]
-        
-        rlog("\n[bold green]Relocation planning finished.[/bold green]")
 
+        if verbose:
+            final_flops_per_gpu = [0.0] * self.num_dispatch_instances
+            for item in final_items:
+                final_flops_per_gpu[item.gpuid] += item.get_flops()
+            
+            rlog("Final FLOPs distribution per GPU:")
+            for i, f in enumerate(final_flops_per_gpu):
+                rlog(f"  - GPU {i}: {f:.2f} FLOPs (Target: {avg_flops_per_gpu:.2f})")
+        rlog("\n[bold green]Relocation planning finished.[/bold green]")
         return final_items
     
     def postprocess_items(self, items: list[Item]) -> list[Item]:
@@ -714,7 +760,7 @@ class Planner:
     def item_to_metadata(self, items: list[dict]):
         shard_infos = self.items_into_shardinfos(items)
         metadatas = plan_to_metadata(
-            self.world_size, shard_infos, return_intermediate=True
+            self.num_dispatch_instances, shard_infos, return_intermediate=True
         )
         return metadatas
 

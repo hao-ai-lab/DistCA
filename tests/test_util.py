@@ -6,6 +6,7 @@ import math
 
 
 from megatron.core import parallel_state as mpu
+from transformers import AutoConfig
 import ray
 import torch
 
@@ -26,6 +27,8 @@ from d2.runtime.megatron_patch.create_group import (
     initialize_attention_server_comm, get_attn_server_group_gloo,
     get_attn_server_rank, get_attn_server_group_src_rank
 )
+from d2.planner.planner import Planner, batch_to_items_class
+
 
 
 ######## Workers
@@ -303,7 +306,7 @@ def create_raw_qkv_dispatch(
         seq_lens = gen_seq_lens(world_size, num_seqs, _num_tokens_shard).long()
         # make sure each sequence is divisible by max_cp_degree.
         seq_lens *= max_cp_degree
-
+    
     # init cp degree for each sequence
     log_cp_num = torch.randint(0, int(math.log2(max_cp_degree)) + 1, (world_size, num_seqs))
     cp_num = torch.pow(2, log_cp_num)
@@ -451,6 +454,97 @@ def create_qkv_dispatch_pipeline_tick(
         return_mlp_no_shard_seq_lens=False,
         seq_lens=seq_lens,
     )
+
+    (_, _, _, _,
+     fa_fwd_params, fa2a_fwd_metadata) = compute_e2e_fa2a_metadata(
+        mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
+        kv_to_q_mapping, kv_to_q_rank,
+        kv_context_size, q_to_num_kv_seq, q_to_num_kv_tokens,
+        hidden_size_q, hidden_size_k,
+        element_size, softmax_lse_size
+    )
+    (qkv_fwd_fa2a_metadata, _, attn_out_fwd_fa2a_metadata, _,
+    ) = fa2a_fwd_metadata
+
+    reversed_seqlens = create_pipeline_seqlens(
+        seq_lens, add_dummy=False, is_backward=True,
+        **create_pp_seqlen_kwargs,
+        tp_size=tp_size,
+        dp_size=dp_size,
+    )
+    # NOTE: those begin with bwd_ is mostly the flip of the original value.
+    (bwd_mlp_seq_len, bwd_mlp_num_seqs, mlp_q_dispatch_bwd,
+     bwd_kv_to_q_mapping, bwd_kv_to_q_rank, bwd_kv_context_size,
+     bwd_q_to_num_kv_seq, bwd_q_to_num_kv_tokens
+    ) = create_raw_qkv_dispatch(
+        world_size, total_seq_len, num_seqs, max_cp_degree,
+        return_mlp_no_shard_seq_lens=False,
+        seq_lens=reversed_seqlens,
+    )
+
+    (fa_bwd_params, attn_out_qkv_bwd_fa2a_metadata, qkv_bwd_fa2a_metadata
+     ) = compute_backward_resend_e2e_metadata(
+        bwd_mlp_seq_len, bwd_mlp_num_seqs, mlp_q_dispatch_bwd,
+        bwd_kv_to_q_mapping, bwd_kv_to_q_rank, bwd_kv_context_size,
+        bwd_q_to_num_kv_seq, bwd_q_to_num_kv_tokens,
+        hidden_size_q, hidden_size_k, element_size, softmax_lse_size,
+    )
+    return (fa_fwd_params, fa_bwd_params,
+            qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
+            attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
+            seq_lens,)
+
+
+def create_qkv_dispatch_pipeline_tick_planned(
+    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
+    hidden_size_q: int, hidden_size_k: int,
+    element_size: int, # dtype's size
+    softmax_lse_size: int, # size of the softmax_lse tensor, should be num_heads
+    ref_seq_lens: Optional[torch.Tensor],
+    add_dummy: bool,
+    tp_size: int, dp_size: int,
+    hf_config: Optional[AutoConfig] = None,
+):
+    create_pp_seqlen_kwargs = dict(
+        world_size=world_size,
+        total_seq_len=total_seq_len,
+        num_seqs=num_seqs,
+        max_cp_degree=max_cp_degree,
+    )
+    seq_lens = create_pipeline_seqlens(
+        ref_seq_lens, add_dummy, is_backward=False,
+        **create_pp_seqlen_kwargs,
+        tp_size=tp_size,
+        dp_size=dp_size,
+    )
+    # Create parallel config for the planner.
+    parallel_config = ParallelConfig(
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=dp_size,
+        context_parallel_size=1,
+    )
+    
+
+    planner = Planner(
+            world_size=world_size,
+            parallel_config = parallel_config,
+            tolerance_factor = 0.1,
+            model_config = None)
+    batch = seq_lens.tolist()
+    print("batch =", batch)
+    
+    items = batch_to_items_class(batch,model_config=hf_config)
+
+    (
+        mlp_num_seqs,
+        mlp_q_dispatch_fwd,
+        mlp_seq_len,
+        kv_to_q_mapping,
+        kv_to_q_rank,
+        kv_context_size,
+        q_to_num_kv_seq,
+        q_to_num_kv_tokens
+    ) = planner.plan_to_raw_qkv_dispatch(items, verbose=True)
 
     (_, _, _, _,
      fa_fwd_params, fa2a_fwd_metadata) = compute_e2e_fa2a_metadata(
