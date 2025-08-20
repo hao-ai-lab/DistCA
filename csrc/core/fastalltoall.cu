@@ -18,7 +18,7 @@ __global__ void spreadout_alltoallv_internode_kernel(
   // nvshmem memory for RDMA data exchange
   uint8_t * send_buffer,
   uint8_t * recv_buffer,
-  uint64_t * sync_signal,  
+  uint64_t * sync_signal,
   // metadata for internode transfer
   const uint64_t * inter_sender_send_disp,
   const uint64_t * inter_sender_transfer_sz,
@@ -27,7 +27,7 @@ __global__ void spreadout_alltoallv_internode_kernel(
 ) {
   const uint32_t warp_id = threadIdx.x / THREAD_N_PER_WARP;
   const uint32_t lane_id = threadIdx.x % THREAD_N_PER_WARP;
-  
+
   const uint32_t server_id = this_rank / local_rank_n;
   const uint32_t local_rank_id = this_rank % local_rank_n;
   const uint32_t server_n = rank_n / local_rank_n;
@@ -79,7 +79,49 @@ __global__ void spreadout_alltoallv_internode_kernel(
   }
 }
 
+
+// Notify peers that this buffer is locally released
+__global__ void notify_release_buffer(
+  uint64_t * buffer_available_signal,
+  const uint32_t this_rank,
+  const uint32_t local_rank_n,
+  const uint32_t rank_n
+) {
+  const uint32_t lane_id = threadIdx.x % THREAD_N_PER_WARP;
+  const uint32_t server_id = this_rank / local_rank_n;
+  const uint32_t inter_node_rank_n = rank_n - local_rank_n;
+
+  for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP){
+    const uint32_t send_rank_id = (
+      (server_id + 1) * local_rank_n + i
+    ) % rank_n;
+    nvshmemx_signal_op(&buffer_available_signal[this_rank], 1, NVSHMEM_SIGNAL_ADD, send_rank_id);
+  }
+  nvshmem_quiet();
+}
+
+
+// Assure that all peers have already released this buffer
+// and acquire it.
+__global__ void wait_and_consume_buffer(
+  uint64_t * buffer_available_signal,
+  const uint32_t this_rank,
+  const uint32_t local_rank_n,
+  const uint32_t rank_n
+) {
+  const uint32_t lane_id = threadIdx.x % THREAD_N_PER_WARP;
+  const uint32_t server_id = this_rank / local_rank_n;
+  const uint32_t inter_node_rank_n = rank_n - local_rank_n;
+
+  
+  for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP){
+    const uint32_t src_rank = ((server_id + 1) * local_rank_n + i) % rank_n;
+    nvshmem_uint64_wait_until(&buffer_available_signal[src_rank], NVSHMEM_CMP_EQ, 1);
+    buffer_available_signal[src_rank] = 0;
+  }
+}
 }; // namespace
+
 
 int launch_alltoallv(
   uint32_t this_rank,
@@ -131,4 +173,29 @@ int launch_alltoallv(
   // CUDACHECK(cudaStreamSynchronize(stream1));
   return NVSHMEMX_SUCCESS;
 }
+
+
+void launch_buffer_availability_kernel(
+  uint32_t this_rank,
+  uint32_t rank_n_per_node,
+  uint32_t rank_n,
+  struct fanout_nvshmem_buffer_t * buf,
+  bool is_release,
+  cudaStream_t stream
+) {
+  // Launch the memcpy done notification kernel
+  dim3 grid(1, 1, 1);
+  dim3 block(THREAD_N_PER_WARP, 1, 1);
+  void* args[] = {
+    &buf->buffer_available_signal,
+    &this_rank,
+    &rank_n_per_node,
+    &rank_n
+  };
+  void *func = is_release ? (void *)&notify_release_buffer : (void *)&wait_and_consume_buffer;
+  CUDACHECK(cudaLaunchKernel(
+    func, grid, block, args, 0, stream
+  ));
+}
+
 }; // namespace attn

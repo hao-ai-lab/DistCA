@@ -62,6 +62,7 @@ class FastDispatcherWrapper:
     instance: Tuple[
         "FastDispatcherWrapper", "FastDispatcherWrapper"
     ] = None
+    is_acquired: list[bool] = [False, False]
     cur_instance: int = 0
 
     def __init__(self, rank, local_rank, world_size, buffer_size):
@@ -72,6 +73,11 @@ class FastDispatcherWrapper:
         self.handle = _ops.create_fast_a2a_dispatch_helper(
             rank, local_rank, world_size, buffer_size
         )
+        # the buffer_released is initialized by all zeros. We should
+        # manually release them here once.
+        _ops.release_buffer(self.handle)
+        self.release_event = torch.cuda.Event()
+        self.release_event.record(torch.cuda.current_stream())
 
     def __del__(self):
         _ops.destroy_fast_a2a_dispatch_helper(self.handle)
@@ -105,8 +111,30 @@ class FastDispatcherWrapper:
 
     @staticmethod
     def update_buffer_size(buffer_size: int):
-        for instance in FastDispatcherWrapper.instance:
+        # sync to ensure that all operations on the buffer are done.
+        torch.cuda.synchronize()
+        for iid, instance in enumerate(FastDispatcherWrapper.instance):
+            assert not FastDispatcherWrapper.is_acquired[iid]
             instance._update_buffer_size(buffer_size)
+
+    # Acquire and release a dispatcher's receive buffer. Note that we do not
+    # monitor the send buffer, because its availibility is guaranteed locally.
+    # However, for receive buffer, we need to monitor a singal to know whether
+    # the remote receive buffer is ready as well.
+    def acquire(instance_id: int):
+        # TODO: acquire should be on the same stream as the all2all. Try to check it.
+        assert not FastDispatcherWrapper.is_acquired[instance_id]
+        FastDispatcherWrapper.is_acquired[instance_id] = True
+        torch.cuda.current_stream().wait_event(
+            FastDispatcherWrapper.get_instance(instance_id).release_event
+        )
+        _ops.wait_and_consume_buffer(FastDispatcherWrapper.get_instance(instance_id).handle)
+
+    def release(instance_id: int):
+        assert FastDispatcherWrapper.is_acquired[instance_id]
+        FastDispatcherWrapper.is_acquired[instance_id] = False
+        _ops.release_buffer(FastDispatcherWrapper.get_instance(instance_id).handle)
+        FastDispatcherWrapper.get_instance(instance_id).release_event.record(torch.cuda.current_stream())
 
 
 def fast_a2a_memcpy_non_cp(
@@ -119,6 +147,14 @@ def fast_a2a_memcpy_non_cp(
         return _ops.fast_a2a_memcpy_non_cp_debug(
             tensor, nvshmem_offset, seq_tokens, to_nvshmem, buffer
         )
+
+    if instance_id is not None:
+        if to_nvshmem:
+            # Ensure a strong order that "post_a2a_memcpy - release - pre_a2a_memcpy"
+            assert not FastDispatcherWrapper.is_acquired[instance_id]
+        else:
+            assert FastDispatcherWrapper.is_acquired[instance_id]
+
     return _ops.fast_a2a_memcpy_non_cp(
         FastDispatcherWrapper.get_instance(instance_id).handle,
         tensor, nvshmem_offset, seq_tokens, to_nvshmem
@@ -137,6 +173,13 @@ def fast_a2a_memcpy_cp(
             tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem, buffer
         )
 
+    if instance_id is not None:
+        if to_nvshmem:
+            # Ensure a strong order that "post_a2a_memcpy - release - pre_a2a_memcpy"
+            assert not FastDispatcherWrapper.is_acquired[instance_id]
+        else:
+            assert FastDispatcherWrapper.is_acquired[instance_id]
+
     return _ops.fast_a2a_memcpy_cp(
         FastDispatcherWrapper.get_instance(instance_id).handle,
         tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem
@@ -149,6 +192,11 @@ def fast_a2a(
     my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
     instance_id: int=None,
 ):
+    if instance_id is not None:
+        assert not FastDispatcherWrapper.is_acquired[instance_id]
+        # acquiring here ensures the sync in acquire is always on the same stream as all2all
+        FastDispatcherWrapper.acquire(instance_id)
+
     return _ops.fast_a2a(
         FastDispatcherWrapper.get_instance(instance_id).handle,
         sender_send_disp, sender_transfer_sz,

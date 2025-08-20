@@ -233,6 +233,36 @@ void fast_a2a(
   );
 }
 
+void release_buffer(
+  fptr_t fptr
+) {
+  auto dispatch_helper = (FastA2aDispatchHelper*)fptr;
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  launch_buffer_availability_kernel(
+    dispatch_helper->_rank,
+    1,
+    dispatch_helper->_world_size,
+    &dispatch_helper->buffer,
+    true, // is_release
+    stream
+  );
+}
+
+void wait_and_consume_buffer(
+  fptr_t fptr
+) {
+  auto dispatch_helper = (FastA2aDispatchHelper*)fptr;
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  launch_buffer_availability_kernel(
+    dispatch_helper->_rank,
+    1,
+    dispatch_helper->_world_size,
+    &dispatch_helper->buffer,
+    false, // is_release
+    stream
+  );
+}
+
 void _debug_nvshmem_buffer(
   fptr_t fptr,
   bool get_send,
@@ -295,6 +325,8 @@ void register_all_to_all_ops(torch::Library &m) {
   m.def("fast_a2a_memcpy_cp", &fast_a2a_memcpy_cp);
   m.def("fast_a2a_memcpy_cp_debug", &fast_a2a_memcpy_cp_debug);
   m.def("fast_a2a", &fast_a2a);
+  m.def("release_buffer", &release_buffer);
+  m.def("wait_and_consume_buffer", &wait_and_consume_buffer);
   m.def("_debug_nvshmem_buffer", &_debug_nvshmem_buffer);
 }
 }; // namespace attn

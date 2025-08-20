@@ -50,6 +50,7 @@ def post_fast_a2a_qkv(
     q_recv_buffer_offset: Tensor, k_recv_buffer_offset: Tensor, v_recv_buffer_offset: Tensor,
     is_fwd: bool, switch_buffer: bool = True, instance_id: int=None
 ):
+    """NOTE: dispatcher is released here"""
     to_nvshmem = False
     fast_a2a_memcpy_non_cp(
         recv_q, q_recv_buffer_offset, q_recv_seq_tokens, to_nvshmem,
@@ -75,6 +76,8 @@ def post_fast_a2a_qkv(
         )
     if switch_buffer:
         FastDispatcherWrapper.switch_buffer()
+    if instance_id is not None:
+        FastDispatcherWrapper.release(instance_id)
     return recv_q, recv_k, recv_v
 
 
@@ -131,6 +134,7 @@ def post_fast_a2a_attn_out(
     recv_q: Tensor, q_recv_seq_tokens: Tensor, q_recv_buffer_offset: Tensor,
     switch_buffer: bool = True, instance_id: int=None,
 ):
+    """NOTE: dispatcher is released here"""
     to_nvshmem = False
     fast_a2a_memcpy_non_cp(
         recv_q, q_recv_buffer_offset, q_recv_seq_tokens, to_nvshmem,
@@ -138,6 +142,8 @@ def post_fast_a2a_attn_out(
     )
     if switch_buffer:
         FastDispatcherWrapper.switch_buffer()
+    if instance_id is not None:
+        FastDispatcherWrapper.release(instance_id)
     return recv_q
 
 
@@ -233,6 +239,7 @@ def post_fast_a2a_attn_out_grad_resend_qkv(
     q_recv_buffer_offset: Tensor, k_recv_buffer_offset: Tensor, v_recv_buffer_offset: Tensor,
     is_fwd: bool, switch_buffer: bool = True, instance_id: int=None
 ):
+    """NOTE: dispatcher is returned internally in post_fast_a2a_qkv"""
     is_fwd = True
     assert len(recv_attn_out_shape) == 2
     assert len(recv_lse_shape) == 2 and recv_lse_shape[0] == recv_attn_out_shape[0]

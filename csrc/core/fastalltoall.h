@@ -15,6 +15,7 @@ struct fanout_nvshmem_buffer_t {
     uint8_t * send_buffer;
     uint8_t * recv_buffer;
     uint64_t * sync_signal;
+    uint64_t * buffer_available_signal;
 };
 
 struct internode_transfer_params_t {
@@ -41,6 +42,14 @@ int launch_alltoallv(
   cudaStream_t stream
 );
 
+void launch_buffer_availability_kernel(
+  uint32_t this_rank,
+  uint32_t rank_n_per_node,
+  uint32_t rank_n,
+  struct fanout_nvshmem_buffer_t * buf,
+  bool is_release,
+  cudaStream_t stream
+);
 
 struct FastA2aDispatchHelper {
   // Dispatch Helper for a faster all2all.
@@ -58,13 +67,16 @@ struct FastA2aDispatchHelper {
     buffer.send_buffer = (uint8_t *)nvshmem_malloc(_buffer_size);
     buffer.recv_buffer = (uint8_t *)nvshmem_malloc(_buffer_size);
     buffer.sync_signal = (uint64_t *)nvshmem_malloc(sizeof(uint64_t) * world_size);
+    buffer.buffer_available_signal = (uint64_t *)nvshmem_malloc(sizeof(uint64_t) * world_size);
     cudaMemset(buffer.sync_signal, 0, sizeof(uint64_t) * world_size);
+    cudaMemset(buffer.buffer_available_signal, 0, sizeof(uint64_t) * world_size);
   }
 
   ~FastA2aDispatchHelper() {
     nvshmem_free(buffer.send_buffer);
     nvshmem_free(buffer.recv_buffer);
     nvshmem_free(buffer.sync_signal);
+    nvshmem_free(buffer.buffer_available_signal);
   }
 
   void update_buffer_size (int64_t target_size) {

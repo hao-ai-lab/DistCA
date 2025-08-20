@@ -396,9 +396,7 @@ if __name__ == "__main__":
         os.makedirs(args.profile_memory_output_path, exist_ok=True)
         import torch
         torch.cuda.memory._record_memory_history()
-        
 
-    
     if args.profile_memory:
         with torch.profiler.profile(
             activities=[
@@ -418,7 +416,7 @@ if __name__ == "__main__":
                 pass
     else:
         test(args)
-    
+
     if args.profile_memory:
         print("Dumping memory snapshot")
         rank = torch.distributed.get_rank()
