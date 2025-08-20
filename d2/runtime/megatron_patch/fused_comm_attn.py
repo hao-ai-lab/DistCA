@@ -455,6 +455,9 @@ def dummy_backward_send_qkv(packed_seq_params: PingPangSingleStepPackedSeqParams
             bwd_qkv_metadata.my_rank_send_sz,
             instance_id=dispatcher_id,
         )
+        all2all_event = torch.cuda.Event()
+        all2all_event.record(packed_seq_params.stream)
+    return all2all_event
 
 
 @torch.no_grad()
@@ -488,6 +491,15 @@ def dummy_backward(
     # for ping-pong split 0 instead of split 1, so we cannot ask comm stream wait for compute
     # stream. Instead, we use a previously recorded event to synchronize.
     with torch.cuda.nvtx.range("dummy_bwd_ping_pong_qkv_all2all_1"):
-        dummy_backward_send_qkv(packed_seq_params.seq_params[1], compute_done_1)
+        all2all_event = dummy_backward_send_qkv(packed_seq_params.seq_params[1], compute_done_1)
+
+        # Dummy backward does not have a qkv grad to receive, so we should manually release the buffer
+        torch.cuda.current_stream().wait_event(all2all_event)
+        FastDispatcherWrapper.release(packed_seq_params.seq_params[1].dispatcher_id)
+
     with torch.cuda.nvtx.range("dummy_bwd_ping_pong_qkv_all2all_0"):
-        dummy_backward_send_qkv(packed_seq_params.seq_params[0], compute_done_0)
+        all2all_event = dummy_backward_send_qkv(packed_seq_params.seq_params[0], compute_done_0)
+
+        # Same as above.
+        torch.cuda.current_stream().wait_event(all2all_event)
+        FastDispatcherWrapper.release(packed_seq_params.seq_params[0].dispatcher_id)
