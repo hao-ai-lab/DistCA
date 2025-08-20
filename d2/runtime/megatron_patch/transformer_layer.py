@@ -923,6 +923,11 @@ class PingPangGPTModel(GPTModel):
         """
         dtype = self.decoder.layers[0].self_attention.linear_qkv.weight.dtype
         device = self.decoder.layers[0].self_attention.linear_qkv.weight.device
+        if isinstance(packed_seq_params, PingPangPackedSeqParams):
+            packed_seq_params.seq_params[0].dispatcher_id = 0
+            packed_seq_params.seq_params[1].dispatcher_id = 1
+            packed_seq_params.seq_params[0].stream = self.decoder.comm_stream
+            packed_seq_params.seq_params[1].stream = self.decoder.comm_stream
         for _ in self.decoder.layers:
             dummy_backward(self.config, packed_seq_params, dtype, device)
 

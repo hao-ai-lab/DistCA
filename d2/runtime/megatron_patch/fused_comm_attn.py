@@ -354,6 +354,7 @@ def dummy_backward_single_sided(
     bwd_fa_params = packed_seq_params.bwd_packed_seq_params
 
     if attn_out_grad_all2all:
+        # This operation does not need to wait for any prior message.
         with torch.cuda.stream(packed_seq_params.stream):
             torch.cuda.nvtx.range_push("dummy_backward_a2a_attn_grad")
             fast_a2a(
@@ -419,6 +420,8 @@ def dummy_backward_single_sided(
     torch.cuda.nvtx.range_pop()
 
     if qkv_grad_all2all:
+        if packed_seq_params.stream is not None:
+            packed_seq_params.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(packed_seq_params.stream):
             fast_a2a(
                 *bwd_qkv_metadata.fa2a_metadata,
@@ -429,16 +432,22 @@ def dummy_backward_single_sided(
             )
         if dispatcher_id is None:
             FastDispatcherWrapper.switch_buffer()
+        return None
     else:
         assert dispatcher_id is not None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        return event
 
 
-def dummy_backward_send_qkv(packed_seq_params: PingPangSingleStepPackedSeqParams):
+def dummy_backward_send_qkv(packed_seq_params: PingPangSingleStepPackedSeqParams, event: torch.cuda.Event):
     dispatcher_id = packed_seq_params.dispatcher_id
     assert dispatcher_id is not None
+    assert event is not None
 
     bwd_qkv_metadata = packed_seq_params.qkv_bwd_metadata
     with torch.cuda.stream(packed_seq_params.stream):
+        packed_seq_params.stream.wait_event(event)
         fast_a2a(
             *bwd_qkv_metadata.fa2a_metadata,
             bwd_qkv_metadata.my_rank_send_offset,
@@ -446,6 +455,9 @@ def dummy_backward_send_qkv(packed_seq_params: PingPangSingleStepPackedSeqParams
             bwd_qkv_metadata.my_rank_send_sz,
             instance_id=dispatcher_id,
         )
+        all2all_event = torch.cuda.Event()
+        all2all_event.record(packed_seq_params.stream)
+    return all2all_event
 
 
 @torch.no_grad()
@@ -464,16 +476,30 @@ def dummy_backward(
     # Comm:     out_grad_1  out_grad_0  qkv_grad_1  qkv_grad_0
     # Launch out_grad_1 and Attn_1
     with torch.cuda.nvtx.range("dummy_bwd_ping_pong_1"):
-        dummy_backward_single_sided(config, packed_seq_params.seq_params[1],
-                                    dtype, device,
-                                    qkv_grad_all2all=False)
+        compute_done_1 = dummy_backward_single_sided(
+            config, packed_seq_params.seq_params[1], dtype, device,
+            qkv_grad_all2all=False,
+        )
     # Launch out_grad_0 and Attn_0
     with torch.cuda.nvtx.range("dummy_bwd_ping_pong_0"):
-        dummy_backward_single_sided(config, packed_seq_params.seq_params[0],
-                                    dtype, device,
-                                    qkv_grad_all2all=False)
+        compute_done_0 = dummy_backward_single_sided(
+            config, packed_seq_params.seq_params[0], dtype, device,
+            qkv_grad_all2all=False,
+        )
     # Launch qkv_grad_1
+    # At this moment, the last operation on the compute stream is the attention & memcpy
+    # for ping-pong split 0 instead of split 1, so we cannot ask comm stream wait for compute
+    # stream. Instead, we use a previously recorded event to synchronize.
     with torch.cuda.nvtx.range("dummy_bwd_ping_pong_qkv_all2all_1"):
-        dummy_backward_send_qkv(packed_seq_params.seq_params[1])
+        all2all_event = dummy_backward_send_qkv(packed_seq_params.seq_params[1], compute_done_1)
+
+        # Dummy backward does not have a qkv grad to receive, so we should manually release the buffer
+        torch.cuda.current_stream().wait_event(all2all_event)
+        FastDispatcherWrapper.release(packed_seq_params.seq_params[1].dispatcher_id)
+
     with torch.cuda.nvtx.range("dummy_bwd_ping_pong_qkv_all2all_0"):
-        dummy_backward_send_qkv(packed_seq_params.seq_params[0])
+        all2all_event = dummy_backward_send_qkv(packed_seq_params.seq_params[0], compute_done_0)
+
+        # Same as above.
+        torch.cuda.current_stream().wait_event(all2all_event)
+        FastDispatcherWrapper.release(packed_seq_params.seq_params[0].dispatcher_id)
