@@ -309,6 +309,53 @@ def init_megatron_e2e_test(
     print("Communication groups initialized")
     return worker
 
+def init_wlbllm_e2e_test(
+    hidden_size_q: int, hidden_size_kv: int, num_tokens: int,
+    world_size: int, max_cp_degree: int, tp_size: int,
+    dtype, worker_cls=MegatronE2eWorker
+):
+    token_bytes_q = hidden_size_q * dtype.itemsize // tp_size
+    token_bytes_kv = hidden_size_kv * dtype.itemsize // tp_size
+    max_tokens_query = num_tokens * (world_size // tp_size)
+    max_tokens_key_value = num_tokens * (world_size // tp_size)
+    buffer_size = (
+        token_bytes_q * max_tokens_query +
+        token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
+    )
+    parallel_config = ParallelConfig(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=max_cp_degree,
+    )
+    # TODO(HACK): We bypass some logic in init_worker_torch_distributed.
+    # worker = init_worker_torch_distributed(
+    #     world_size, buffer_size, worker_cls, parallel_config, skip_nvshmem_init=True
+    # )
+    assert world_size == int(os.environ.get("WORLD_SIZE"))
+    rank = int(os.environ.get("RANK"))
+    local_rank = int(os.environ.get("LOCAL_RANK"))
+    worker = worker_cls(
+        rank, world_size
+    )
+    assert parallel_config is not None
+    # worker.init_comm(buffer_size, parallel_config, local_rank)
+    # -- if use the original one, it will hit the nvshmem init logic, 
+    # which needs to assert that other group initialization is not called.
+    worker.init_torch_distributed()
+    mpu.initialize_model_parallel(
+        tensor_model_parallel_size=parallel_config.tensor_model_parallel_size,
+        pipeline_model_parallel_size=parallel_config.pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size=parallel_config.virtual_pipeline_model_parallel_size,
+        pipeline_model_parallel_split_rank=None,
+        use_sharp=False,
+        context_parallel_size=parallel_config.context_parallel_size,
+        expert_model_parallel_size=parallel_config.expert_model_parallel_size,
+        expert_tensor_parallel_size=parallel_config.expert_tensor_parallel_size,
+        nccl_communicator_config_path=None,
+        # order="tp-cp-ep-dp-pp",
+    )
+    print("Communication groups initialized")
+    return worker
+
 
 from typing import Iterable, List, Optional
 from d2.simulator.optimizers.samples import sample_wlbllm_docs_upsample, batch_documents
@@ -350,12 +397,15 @@ def setup_global_batch(
         GLOBAL_BATCH = list(GLOBAL_BATCH)
         # DP2 case
         manual_case = [
-            [total_seq_len],
-            [total_seq_len // 8] * 8,
-            [total_seq_len],
-            [total_seq_len // 8] * 8,
+            # [total_seq_len],
+            # [total_seq_len // 8] * 8,
+            # [total_seq_len],
+            # [total_seq_len // 8] * 8,
         ]
-        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH 
+        manual_case = [
+            [2 * K] * (total_seq_len // (2 * K)),
+        ] * 8
+        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH   
 
     GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
@@ -549,7 +599,7 @@ def create_one_batch_balanced_flops(
 def test(args):
     seed = args.seed
     num_tokens = args.num_tokens
-    max_cp_degree = args.cp_degree
+    cp_degree = max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
     tp_size = args.tp_size
     world_size = args.num_nodes * args.num_gpus_per_node
@@ -607,20 +657,35 @@ def test(args):
         hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
                           hf_config.num_attention_heads)
 
-    worker: MegatronE2eWorker = init_megatron_e2e_test(
-        hidden_size_q, hidden_size_kv, num_tokens,
-        world_size, max_cp_degree * 1, tp_size,
-        dtype, MegatronE2eWorker
-    )
+    # TODO(HACK): WLBLLM and Megatron have different comm group initialization process.
+    # This is a code divergence. We need to consolidate the comm group.
+    if mode == "wlbllm":
+        worker: MegatronE2eWorker = init_wlbllm_e2e_test(
+            hidden_size_q, hidden_size_kv, num_tokens,
+            world_size, max_cp_degree * 1, tp_size,
+            dtype, MegatronE2eWorker
+        )
+    else:
+        worker: MegatronE2eWorker = init_megatron_e2e_test(
+            hidden_size_q, hidden_size_kv, num_tokens,
+            world_size, max_cp_degree * 1, tp_size,
+            dtype, MegatronE2eWorker
+        )
 
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
-    rank = worker.rank
-    as_rank = worker.as_rank
-    as_world_size = worker.as_world_size
+    if mode == "wlbllm":
+        rank = torch.distributed.get_rank()
+        as_rank = mpu.get_context_parallel_rank()
+        as_world_size = mpu.get_context_parallel_world_size() * mpu.get_data_parallel_world_size()
+        pass
+    else:
+        rank = worker.rank
+        as_rank = worker.as_rank
+        as_world_size = worker.as_world_size
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
@@ -630,7 +695,7 @@ def test(args):
     sample_times = []
     for sample_id in range(max_sample_id):
         
-        _seq_lens = get_next_batch(as_world_size * 2)
+        _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
         print(f"🟡 sample_id={sample_id}: {_seq_lens}")
 
         if mode == "baseline":
@@ -662,21 +727,26 @@ def test(args):
             # Baseline mode: Use simple batch generation
             # seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
             # seq_lens = _seq_lens[as_rank] + _seq_lens[as_rank + as_world_size]
+            cp_rank = mpu.get_context_parallel_rank()
+            cp_size = mpu.get_context_parallel_world_size()
+            dp_rank = mpu.get_data_parallel_rank()
+            dp_size = mpu.get_data_parallel_world_size()
+
             def flatten(a):
                 return [y for x in a for y in x]
-            seq_lens = _seq_lens
+            seq_lens = _seq_lens[dp_rank * cp_size:(dp_rank + 1) * cp_size]
             doc_lens = flatten(seq_lens)
             rank = torch.distributed.get_rank()
-            # debug_print(f"doc_lens", doc_lens)
-            # TODO: Make the cp size as world size for now...
-            cp_size = as_world_size
-            cp_rank = as_rank
+            
+            debug_print(f"doc_lens", doc_lens)
+            assert cp_size == cp_degree
+
             local_context_length = total_seq_len * 2
             context_length = local_context_length * cp_size
 
             import d2.runtime.megatron_patch.create_group
-            cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
-            # cp_group = mpu.get_context_parallel_group()
+            # cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
+            cp_group = mpu.get_context_parallel_group()
             # debug_print(f"cp_size", cp_size)
             # debug_print(f"context_length", context_length)
             doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
@@ -734,8 +804,6 @@ def test(args):
             
             # Now save some context for the use of WLBLLM function
 
-            
-
             wlbllm.registry.clear()
             wlbllm.registry.set("doc_lens", doc_lens)
             wlbllm.registry.set("doc_shards", doc_shards)
@@ -746,9 +814,9 @@ def test(args):
             wlbllm.registry.set("cu_seqlens_kv_list", cu_seqlens_k_list)
             wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
             wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
+            wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
+    
 
-
-            
         elif mode == "d2":
             # D2 mode: Use balanced flops planning and ping-pang parameters
             seq_lens_0 = _seq_lens[:as_world_size]
@@ -949,6 +1017,7 @@ def test(args):
     
     # if False: # Only use it when force exit
     if args.force_exit: 
+        os._exit(0)
         # Clear CUDA cache first
         try:
             if torch.cuda.is_available():
