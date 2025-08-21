@@ -523,7 +523,7 @@ def create_qkv_dispatch(
     if return_intermediate:
         intermediates = q_intermediates + kv_intermediates
         ret += (intermediates,)
-    ret += seq_lens
+    ret += (seq_lens,)
     return ret
 
 

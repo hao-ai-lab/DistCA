@@ -176,8 +176,9 @@ def plan_to_metadata(
 def items_into_shardinfos(data: List[Dict[str, Any]]) -> List[List[ShardInfo]]:
     sequences_map = collections.defaultdict(list)
 
+
     for shard_dict in data:
-        sequence_key = (shard_dict['src_gpuid'], shard_dict['seqid'])
+        sequence_key = (shard_dict['seqid']) # sequence_key = (shard_dict['src_gpuid'], shard_dict['seqid'])
         sequences_map[sequence_key].append(shard_dict)
 
     all_sequences: List[List[ShardInfo]] = []
@@ -192,7 +193,7 @@ def items_into_shardinfos(data: List[Dict[str, Any]]) -> List[List[ShardInfo]]:
                 dispatch_rid=shard_dict['gpuid'],
                 logical_sid=shard_dict['shard_id'],
                 shard_len=shard_dict['q'],
-                document_id=shard_dict['seqid']
+                # document_id=shard_dict['seqid']
             )
             current_sequence_shards.append(shard_info)
         
