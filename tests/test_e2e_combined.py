@@ -350,12 +350,15 @@ def setup_global_batch(
         GLOBAL_BATCH = list(GLOBAL_BATCH)
         # DP2 case
         manual_case = [
-            [total_seq_len],
-            [total_seq_len // 8] * 8,
-            [total_seq_len],
-            [total_seq_len // 8] * 8,
+            # [total_seq_len],
+            # [total_seq_len // 8] * 8,
+            # [total_seq_len],
+            # [total_seq_len // 8] * 8,
         ]
-        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH 
+        manual_case = [
+            [2 * K] * (total_seq_len // (2 * K)),
+        ] * 8
+        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH   
 
     GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
@@ -733,9 +736,6 @@ def test(args):
 
             
             # Now save some context for the use of WLBLLM function
-
-            
-
             wlbllm.registry.clear()
             wlbllm.registry.set("doc_lens", doc_lens)
             wlbllm.registry.set("doc_shards", doc_shards)
@@ -746,9 +746,8 @@ def test(args):
             wlbllm.registry.set("cu_seqlens_kv_list", cu_seqlens_k_list)
             wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
             wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
-
-
-            
+            wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
+    
         elif mode == "d2":
             # D2 mode: Use balanced flops planning and ping-pang parameters
             seq_lens_0 = _seq_lens[:as_world_size]
@@ -949,6 +948,7 @@ def test(args):
     
     # if False: # Only use it when force exit
     if args.force_exit: 
+        os._exit(0)
         # Clear CUDA cache first
         try:
             if torch.cuda.is_available():

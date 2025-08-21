@@ -69,6 +69,7 @@ FILTER_RATIO=${FILTER_RATIO:-0.50}
 MAX_SAMPLE_ID=${MAX_SAMPLE_ID:-20}
 # MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 MODEL_PATH=${MODEL_PATH:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}
+SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-0}
 
 THIS_HOST=$(hostname)
 
@@ -77,7 +78,6 @@ now=$(date +%Y%m%d_%H%M%S)
 mkdir -p ${OUTPUT_DIR}
 NSYS_PROFILE_PATH=${OUTPUT_DIR}/${now}.${MODE}${REPLAN_ITER}.${THIS_HOST}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.nsys-rep
 LOG_PATH=${OUTPUT_DIR}/${now}.${MODE}${REPLAN_ITER}.${THIS_HOST}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.log
-
 
 echo "Running with the following parameters:"
 echo "  REPLAN_ITER=${REPLAN_ITER}"
@@ -96,6 +96,7 @@ echo "  TP_SIZE=${TP_SIZE}"
 echo "  ENABLE_NSYS=${ENABLE_NSYS}"
 echo "  NSYS_PROFILE_PATH=${NSYS_PROFILE_PATH}"
 echo "  LOG_PATH=${LOG_PATH}"
+echo "  SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES}"
 
 # Prepare the common torchrun command and arguments
 TORCHRUN_CMD=(
@@ -118,9 +119,17 @@ TORCHRUN_CMD=(
     --num-tokens ${NUM_TOKENS} \
     --elongate-factor ${ELONGATE_FACTOR} \
     --filter-threshold ${FILTER_THRESHOLD} \
-    --filter-ratio ${FILTER_RATIO} 
-    # --should-add-debug-cases
+    --filter-ratio ${FILTER_RATIO}    
 )
+
+
+if [ ${SHOULD_ADD_DEBUG_CASES} -eq 1 ]; then
+    TORCHRUN_CMD+=(--should-add-debug-cases)
+fi
+
+if [ ${SHOULD_FORCE_EXIT} -eq 1 ]; then
+    TORCHRUN_CMD+=(--force-exit)
+fi
 
 set -x
 if [ ${ENABLE_NSYS} -eq 1 ]; then
@@ -132,6 +141,6 @@ if [ ${ENABLE_NSYS} -eq 1 ]; then
       -t cuda,nvtx \
     torchrun "${TORCHRUN_CMD[@]}" | tee ${LOG_PATH} 2>&1
 else
-    torchrun "${TORCHRUN_CMD[@]}" --force-exit | tee ${LOG_PATH} 2>&1
+    torchrun "${TORCHRUN_CMD[@]}" | tee ${LOG_PATH} 2>&1
 fi
 set +x
