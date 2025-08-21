@@ -22,7 +22,7 @@ data_dir = f"{pwd}/../data/d2_vs_base_wlb.128.6040.node8"
 
 baseline_path = f"{data_dir}/benchmark.20250819_124752.baseline.json"
 d2_path       = f"{data_dir}/benchmark.20250819_125404.d2.json"
-wlbllm_path   = f"{data_dir}/benchmark.20250819_125841.wlbllm.json"
+wlbllm_path   = f"{data_dir}/benchmark.20250820_203136.wlbllm.json"
 
 # Output dir (same ../data as inputs)
 out_dir = Path(data_dir).resolve()
@@ -85,6 +85,8 @@ wlbllm_df = pd.DataFrame([
      "samples_wlbllm": s.get("samples")}
     for s in wlbllm_data["samples"]
 ])
+
+# wlbllm_df["WLBLLM Duration (ms)"] -= (40 + 40) * 4
 
 # Merge on sample_id
 merged_df = pd.merge(baseline_df, d2_df, on="sample_id", how="inner")

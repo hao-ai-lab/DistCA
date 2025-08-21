@@ -1,6 +1,12 @@
 import torch
 import random
 from itertools import accumulate
+import time
+from torch.cuda.nvtx import (
+    range as nvtx_range,
+    range_push as nvtx_range_push,
+    range_pop as nvtx_range_pop,
+)
 
 class doc_shard:
     def __init__(self, shard_len, shard_id, doc_id, doc_len, prefix_len):
@@ -290,6 +296,7 @@ def kv_shuffle_for_per_doc_cp(context_length, k_tensor_list, v_tensor_list, doc_
     * (1) Use the kv tensors gathered from all ranks and shuffle them to original order (order in global kv tensor).
     * (2) It can also used to shuffle the result on each rank to compare with the original result.
     """
+    # start_time__shuffle = time.time()
     chunk_size = context_length // (2 * cp_size)
     global_cu_lens =  [0] + list(accumulate(doc_lens))
     global_k = [[] for _ in range(len(doc_lens))]
@@ -321,6 +328,9 @@ def kv_shuffle_for_per_doc_cp(context_length, k_tensor_list, v_tensor_list, doc_
     # Concatenate the tensors for each chunk
     flat_k = [k_chunk for sub in global_k for k_chunk in sub]
     flat_v = [v_chunk for sub in global_v for v_chunk in sub] if v_tensor_list is not None else None
+    # end_time__shuffle = time.time()
+    # duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
+    # debug_print(f"🟡 kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
 
     # Concatenate the tensors for each chunk
     shuffled_k_tensor = torch.cat(flat_k, dim=0)

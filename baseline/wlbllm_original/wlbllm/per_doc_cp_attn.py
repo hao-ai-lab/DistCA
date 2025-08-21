@@ -12,6 +12,7 @@ from torch.distributed import (
 
 from torch.cuda.nvtx import range_push as nvtx_range_push
 from torch.cuda.nvtx import range_pop  as nvtx_range_pop
+from torch.cuda.nvtx import range  as nvtx_range
 
 
 from wlbllm.attn_module import (
@@ -25,6 +26,8 @@ from wlbllm.utils import (
     kv_unshuffle_for_per_doc_cp,
     compute_per_doc_cp_shard_doc_len,
 )
+
+import wlbllm.registry
 
 def cat_slices(tensor, starts, lens):
             if starts.numel() == 1:
@@ -74,6 +77,17 @@ class PerDocumentCPAttention(torch.autograd.Function):
         allreduce_events: 'Optional[List[torch.cuda.Event]]',
         attn_events: 'Optional[List[torch.cuda.Event]]',
     ):
+        # TODO(HACK): obviously cursor don't know how to use warning to do log the first time...
+        print("👻 Inside PerDocumentCPAttention.forward()")
+        should_sync_time_flash_attn = os.getenv("WLBLLM_SYNC_TIME_FLASH_ATTN", "0") == "1"
+        should_sync_time_perdocattn = os.getenv("WLBLLM_SYNC_TIME_PERDOC_ATTN", "0") == "1"
+        ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "1") == "1"
+
+        if should_sync_time_perdocattn:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            start_time__fwd = time.time()
+
         global fake_lse
 
         nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd")
@@ -91,6 +105,11 @@ class PerDocumentCPAttention(torch.autograd.Function):
         if allgather_events is not None:
             allgather_events[0].record()
 
+        if should_sync_time_perdocattn:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            start_time__gather = time.time()
+
         if cp_size > 1:
             gather_k_list = [torch.empty_like(local_k) for _ in range(cp_size)]
             gather_v_list = [torch.empty_like(local_v) for _ in range(cp_size)]
@@ -99,8 +118,36 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 local_v = local_v.contiguous()
                 dist.all_gather(gather_k_list, local_k, group=cp_group)
                 dist.all_gather(gather_v_list, local_v, group=cp_group)
+                print("🟡 All gather local_k.shape =", local_k.shape)
 
-            k_global, v_global = kv_shuffle_for_per_doc_cp(context_length, gather_k_list, gather_v_list, doc_lens, doc_shards, cp_size)
+            start_time__shuffle = time.time()
+            
+            with nvtx_range("wlbllm.PerDocumentCPAttention.fwd.shuffle"):
+
+                if ENABLE_SHUFFLE:
+                    start_time__shuffle = time.time()
+                    k_global, v_global = kv_shuffle_for_per_doc_cp(context_length, gather_k_list, gather_v_list, doc_lens, doc_shards, cp_size)
+                    end_time__shuffle = time.time()
+                    duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
+                    debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
+                    # print("k_global.shape =", k_global.shape)
+                    # print("v_global.shape =", v_global.shape)
+                    # context_length = max(max(i) for i in cu_seqlens_kv_list)
+                    # print("🟡 kv_idx_list =", kv_idx_list)
+                else:
+                    # Simply using a random global tensor for testing. This avoids a significant performance issue introduced by the shuffle logic.
+                    context_length = wlbllm.registry.get("global_tensor_length")
+                    # print("🟡 context_length =", context_length)
+                    nkvheads = local_k.shape[1]
+                    # print("🟡 nkvheads =", nkvheads)
+                    d_head = local_k.shape[2]
+                    # print("🟡 d_head =", d_head)
+                    k_global = torch.randn(context_length, nkvheads, d_head, device=local_k.device, dtype=local_k.dtype)
+                    v_global = torch.randn(context_length, nkvheads, d_head, device=local_v.device, dtype=local_v.dtype)
+            
+            end_time__shuffle = time.time()
+            duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
+            debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
         else:
             k_global = local_k.contiguous()
             v_global = local_v.contiguous() if local_v is not None else None
@@ -108,6 +155,13 @@ class PerDocumentCPAttention(torch.autograd.Function):
         if allgather_events is not None:
             allgather_events[1].record()
         nvtx_range_pop()
+
+        if should_sync_time_perdocattn:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            end_time__gather = time.time()
+            duration_ms__gather = (end_time__gather - start_time__gather) * 1000
+            debug_print(f"🟡 PerDocumentCPAttention allgather time (with barrier): {duration_ms__gather} ms")
         
         
         nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.flash_attn")
@@ -146,11 +200,11 @@ class PerDocumentCPAttention(torch.autograd.Function):
             
             # TODO:(Hack) PerDocumentCPAttention performance degrade significantly when returning LSE.
             # We create an env var to disable it only for performance testing.
-            should_sync_time_flash_attn = os.getenv("WLBLLM_SYNC_TIME_FLASH_ATTN", "0") == "1"
             
-            start_time = time.time()
+            
             if should_sync_time_flash_attn:
                 torch.cuda.synchronize()
+                start_time = time.time()
 
             out, lse, _ = flash_attn_varlen_func(
                 q=q_chunks[chunk_id],
@@ -169,10 +223,10 @@ class PerDocumentCPAttention(torch.autograd.Function):
             
             if should_sync_time_flash_attn:
                 torch.cuda.synchronize()
-            end_time = time.time()
-            duration_ms = (end_time - start_time) * 1000
-            if world_rank % 8 == 0:
-                debug_print(f"🟡 FlashAttnVarlenFunc time: {duration_ms} ms")
+                end_time = time.time()
+                duration_ms = (end_time - start_time) * 1000
+                if world_rank % 8 == 0:
+                    debug_print(f"🟡 PerDocumentCPAttention FlashAttnVarlenFunc time: {duration_ms} ms")
             outputs.append(out)
             lses.append(lse)
 
@@ -206,6 +260,13 @@ class PerDocumentCPAttention(torch.autograd.Function):
         nvtx_range_pop()
 
         nvtx_range_pop()
+        if should_sync_time_perdocattn:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            end_time__fwd = time.time()
+            duration_ms__fwd = (end_time__fwd - start_time__fwd) * 1000
+            debug_print(f"🟡 PerDocumentCPAttention total forward time (with barrier): {duration_ms__fwd} ms")
+            
         return final_out
 
     @staticmethod
@@ -213,6 +274,8 @@ class PerDocumentCPAttention(torch.autograd.Function):
         """
         Backward pass for PerDocumentCPAttention.
         """
+        ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "1") == "1"
+
         nvtx_range_push("wlbllm.PerDocumentCPAttention.bwd")
 
         (
@@ -284,7 +347,12 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 dv_global[start:end] += dv_chunk[local_idx:local_idx + chunk_len] 
                 local_idx += chunk_len
 
-        dk_global, dv_global = kv_unshuffle_for_per_doc_cp(context_length, dk_global, dv_global, doc_lens, doc_shards, cp_size)
+        if ENABLE_SHUFFLE:
+            start_time__unshuffle = time.time()
+            dk_global, dv_global = kv_unshuffle_for_per_doc_cp(context_length, dk_global, dv_global, doc_lens, doc_shards, cp_size)
+            end_time__unshuffle = time.time()
+            duration_ms__unshuffle = (end_time__unshuffle - start_time__unshuffle) * 1000
+            debug_print(f"🟡 PerDocumentCPAttention kv_unshuffle_for_per_doc_cp time: {duration_ms__unshuffle} ms")
  
         # TODO: Fix GQA here...
         # now do reduce_scatter for dk/dv
