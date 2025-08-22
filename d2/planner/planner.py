@@ -3,11 +3,11 @@ from copy import deepcopy
 from typing import List
 
 import rich
+from d2.runtime.shard_info import (handle_planner_metadata,
+                                   items_into_shardinfos, plan_to_metadata)
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-
-from d2.runtime.shard_info import items_into_shardinfos, plan_to_metadata
 
 K = 1024
 
@@ -22,6 +22,26 @@ def batch_to_items(batches):
                 gpuid=gpuid, seqid=seqid, src_gpuid=gpuid, seq_len=seq_len,
                 is_original=True
             ))
+            seqid += 1
+    return items
+
+
+def batch_to_items_class(batches, model_config=None):
+    items = []
+    seqid = 0
+    for gpuid, batch in enumerate(batches):
+        for seq_len in batch:
+            item_dict = {'q': seq_len, 'kv': seq_len}
+            item = Item(
+                model_config,
+                seq_len,
+                seqid,
+                gpuid,
+                gpuid,
+                item_dict,
+                is_original=True
+            )
+            items.append(item)
             seqid += 1
     return items
 
@@ -606,6 +626,8 @@ class Planner:
         self.parallel_config = parallel_config
         self.data_parallel = world_size // (parallel_config.pipeline_model_parallel_size * parallel_config.tensor_model_parallel_size)
         self.num_dispatch_instances = self.data_parallel * parallel_config.pipeline_model_parallel_size
+        rich.print(f"[bold green] world_size: {self.world_size}, DP: {self.data_parallel}[/bold green], PP: {parallel_config.pipeline_model_parallel_size}, TP: {parallel_config.tensor_model_parallel_size}, num_dispatch_instances: {self.num_dispatch_instances}")
+        
         self.tolerance_factor = tolerance_factor
 
     def plan(self, items_: list[Item], verbose=False, plot=False):
@@ -614,7 +636,15 @@ class Planner:
 
         metadata = self.item_to_metadata(items)
         return metadata
-
+    
+    def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False):
+        items = self.plan_items(items_, verbose, plot)
+        items = self.postprocess_items(items)
+        shard_infos = self.items_into_shardinfos(items)
+        
+        ret = handle_planner_metadata(self.num_dispatch_instances, shard_infos)
+        return ret
+    
     def plan_items(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
         items = deepcopy(items_)
 
@@ -624,6 +654,7 @@ class Planner:
 
         flops_per_gpu = [0.0] * self.num_dispatch_instances
         for item in items:
+            print(f"item.gpuid: {item.gpuid}, item.total_flops: {item.total_flops}")
             flops_per_gpu[item.gpuid] += item.total_flops
         total_flops = sum(flops_per_gpu)
         
@@ -654,6 +685,8 @@ class Planner:
                 for item in items:
                     if item.gpuid in donor_gpus:
                         donor_id = item.gpuid
+                        if item.total_flops <= 0:
+                            continue
                         priority = item.get_priority(surplus_deficit[donor_id], needed_flops)
                         max_flops_to_move = min(needed_flops, item.total_flops, surplus_deficit[donor_id])
                         
@@ -690,9 +723,16 @@ class Planner:
                     break
 
         final_items = [item for item in items if item.total_flops > 0]
-        
-        rlog("\n[bold green]Relocation planning finished.[/bold green]")
 
+        if verbose:
+            final_flops_per_gpu = [0.0] * self.num_dispatch_instances
+            for item in final_items:
+                final_flops_per_gpu[item.gpuid] += item.get_flops()
+            
+            rlog("Final FLOPs distribution per GPU:")
+            for i, f in enumerate(final_flops_per_gpu):
+                rlog(f"  - GPU {i}: {f:.2f} FLOPs (Target: {avg_flops_per_gpu:.2f})")
+        rlog("\n[bold green]Relocation planning finished.[/bold green]")
         return final_items
     
     def postprocess_items(self, items: list[Item]) -> list[Item]:
@@ -714,7 +754,7 @@ class Planner:
     def item_to_metadata(self, items: list[dict]):
         shard_infos = self.items_into_shardinfos(items)
         metadatas = plan_to_metadata(
-            self.world_size, shard_infos, return_intermediate=True
+            self.num_dispatch_instances, shard_infos, return_intermediate=True
         )
         return metadatas
 
