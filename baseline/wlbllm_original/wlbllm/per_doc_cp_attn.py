@@ -147,7 +147,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
             
             end_time__shuffle = time.time()
             duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
-            debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
+            # debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
         else:
             k_global = local_k.contiguous()
             v_global = local_v.contiguous() if local_v is not None else None
@@ -352,7 +352,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
             dk_global, dv_global = kv_unshuffle_for_per_doc_cp(context_length, dk_global, dv_global, doc_lens, doc_shards, cp_size)
             end_time__unshuffle = time.time()
             duration_ms__unshuffle = (end_time__unshuffle - start_time__unshuffle) * 1000
-            debug_print(f"🟡 PerDocumentCPAttention kv_unshuffle_for_per_doc_cp time: {duration_ms__unshuffle} ms")
+            # debug_print(f"🟡 PerDocumentCPAttention kv_unshuffle_for_per_doc_cp time: {duration_ms__unshuffle} ms")
  
         # TODO: Fix GQA here...
         # now do reduce_scatter for dk/dv

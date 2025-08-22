@@ -22,7 +22,10 @@ data_dir = f"{pwd}/../data/d2_vs_base_wlb.128.6040.node8"
 
 baseline_path = f"{data_dir}/benchmark.20250819_124752.baseline.json"
 d2_path       = f"{data_dir}/benchmark.20250819_125404.d2.json"
-wlbllm_path   = f"{data_dir}/benchmark.20250820_203136.wlbllm.json"
+wlbllm_dp1cp8_path   = f"{data_dir}/benchmark.20250820_203136.wlbllm.json"
+wlbllm_dp2cp4_path = f"{data_dir}/benchmark.20250821_122652.wlbllm.dp2cp4.json"
+wlbllm_dp4cp2_path = f"{data_dir}/benchmark.20250821_122226.wlbllm.dp4cp2.json"
+wlbllm_dp8cp1_path = f"{data_dir}/benchmark.20250821_121825.wlbllm.dp8cp1.json"
 
 # Output dir (same ../data as inputs)
 out_dir = Path(data_dir).resolve()
@@ -35,8 +38,15 @@ with open(d2_path, "r") as f:
     file_a = json.load(f)
 with open(baseline_path, "r") as f:
     file_b = json.load(f)
-with open(wlbllm_path, "r") as f:
+with open(wlbllm_dp1cp8_path, "r") as f:
     file_c = json.load(f)
+with open(wlbllm_dp2cp4_path, "r") as f:
+    file_d = json.load(f)
+with open(wlbllm_dp4cp2_path, "r") as f:
+    file_e = json.load(f)
+with open(wlbllm_dp8cp1_path, "r") as f:
+    file_f = json.load(f)
+
 # %%
 
 def normalize_role(x):
@@ -51,14 +61,20 @@ def normalize_role(x):
 mode_a = normalize_role(file_a)
 mode_b = normalize_role(file_b)
 mode_c = normalize_role(file_c)
+mode_d = normalize_role(file_d)
+mode_e = normalize_role(file_e)
+mode_f = normalize_role(file_f)
 
 # Validate and assign roles
-if mode_a is None or mode_b is None or mode_c is None:
-    raise ValueError("Could not find 'mode' in one or both files.")
+if mode_a is None or mode_b is None or mode_c is None or mode_d is None or mode_e is None or mode_f is None:
+    raise ValueError("Could not find 'mode' in one or more files.")
 
 d2_data = file_a
 baseline_data = file_b
-wlbllm_data = file_c
+wlbllm_dp1cp8_data = file_c
+wlbllm_dp2cp4_data = file_d
+wlbllm_dp4cp2_data = file_e
+wlbllm_dp8cp1_data = file_f
 
 
 print(f"[info] baseline mode: {normalize_role(baseline_data)}, d2 mode: {normalize_role(d2_data)}")
@@ -79,35 +95,78 @@ d2_df = pd.DataFrame([
     for s in d2_data["samples"]
 ])
 
-wlbllm_df = pd.DataFrame([
+wlbllm_dp1cp8_df = pd.DataFrame([
     {"sample_id": s["sample_id"], 
-     "WLBLLM Duration (ms)": s["duration_ms"],
-     "samples_wlbllm": s.get("samples")}
-    for s in wlbllm_data["samples"]
+     "WLBLLM DP1CP8 Duration (ms)": s["duration_ms"],
+     "samples_wlbllm_dp1cp8": s.get("samples")}
+    for s in wlbllm_dp1cp8_data["samples"]
+])
+
+wlbllm_dp2cp4_df = pd.DataFrame([
+    {"sample_id": s["sample_id"], 
+     "WLBLLM DP2CP4 Duration (ms)": s["duration_ms"],
+     "samples_wlbllm_dp2cp4": s.get("samples")}
+    for s in wlbllm_dp2cp4_data["samples"]
+])
+
+wlbllm_dp4cp2_df = pd.DataFrame([
+    {"sample_id": s["sample_id"], 
+     "WLBLLM DP4CP2 Duration (ms)": s["duration_ms"],
+     "samples_wlbllm_dp4cp2": s.get("samples")}
+    for s in wlbllm_dp4cp2_data["samples"]
+])
+
+wlbllm_dp8cp1_df = pd.DataFrame([
+    {"sample_id": s["sample_id"], 
+     "WLBLLM DP8CP1 Duration (ms)": s["duration_ms"],
+     "samples_wlbllm_dp8cp1": s.get("samples")}
+    for s in wlbllm_dp8cp1_data["samples"]
 ])
 
 # wlbllm_df["WLBLLM Duration (ms)"] -= (40 + 40) * 4
 
 # Merge on sample_id
 merged_df = pd.merge(baseline_df, d2_df, on="sample_id", how="inner")
-merged_df = pd.merge(merged_df, wlbllm_df, on="sample_id", how="inner")
+merged_df = pd.merge(merged_df, wlbllm_dp1cp8_df, on="sample_id", how="inner")
+merged_df = pd.merge(merged_df, wlbllm_dp2cp4_df, on="sample_id", how="inner")
+merged_df = pd.merge(merged_df, wlbllm_dp4cp2_df, on="sample_id", how="inner")
+merged_df = pd.merge(merged_df, wlbllm_dp8cp1_df, on="sample_id", how="inner")
 
 # Compute metrics
 merged_df["Difference (ms)"] = merged_df["D2 Duration (ms)"] - merged_df["Baseline Duration (ms)"]
-merged_df["WLBLLM Difference (ms)"] = merged_df["D2 Duration (ms)"] - merged_df["WLBLLM Duration (ms)"]
+merged_df["WLBLLM DP1CP8 Difference (ms)"] = merged_df["D2 Duration (ms)"] - merged_df["WLBLLM DP1CP8 Duration (ms)"]
+merged_df["WLBLLM DP2CP4 Difference (ms)"] = merged_df["D2 Duration (ms)"] - merged_df["WLBLLM DP2CP4 Duration (ms)"]
+merged_df["WLBLLM DP4CP2 Difference (ms)"] = merged_df["D2 Duration (ms)"] - merged_df["WLBLLM DP4CP2 Duration (ms)"]
+merged_df["WLBLLM DP8CP1 Difference (ms)"] = merged_df["D2 Duration (ms)"] - merged_df["WLBLLM DP8CP1 Duration (ms)"]
 merged_df["Speedup (%)"] = (
     (merged_df["Baseline Duration (ms)"] - merged_df["D2 Duration (ms)"])
     / merged_df["Baseline Duration (ms)"] * 100
 )
-merged_df["WLBLLM Speedup (%)"] = (
-    (merged_df["WLBLLM Duration (ms)"] - merged_df["D2 Duration (ms)"])
-    / merged_df["WLBLLM Duration (ms)"] * 100
+merged_df["WLBLLM DP1CP8 Speedup (%)"] = (
+    (merged_df["WLBLLM DP1CP8 Duration (ms)"] - merged_df["D2 Duration (ms)"])
+    / merged_df["WLBLLM DP1CP8 Duration (ms)"] * 100
+)
+merged_df["WLBLLM DP2CP4 Speedup (%)"] = (
+    (merged_df["WLBLLM DP2CP4 Duration (ms)"] - merged_df["D2 Duration (ms)"])
+    / merged_df["WLBLLM DP2CP4 Duration (ms)"] * 100
+)
+merged_df["WLBLLM DP4CP2 Speedup (%)"] = (
+    (merged_df["WLBLLM DP4CP2 Duration (ms)"] - merged_df["D2 Duration (ms)"])
+    / merged_df["WLBLLM DP4CP2 Duration (ms)"] * 100
+)
+merged_df["WLBLLM DP8CP1 Speedup (%)"] = (
+    (merged_df["WLBLLM DP8CP1 Duration (ms)"] - merged_df["D2 Duration (ms)"])
+    / merged_df["WLBLLM DP8CP1 Duration (ms)"] * 100
 )
 
 # Pretty helper (optional): shorten giant sample configs for printing
 def shorten_cfg(cfg, max_len=200):
     text = json.dumps(cfg, separators=(",", ":"))
     return text if len(text) <= max_len else text[:max_len] + " …"
+
+
+# %%
+
 
 # # A single column showing the baseline sample config (you could diff with samples_d2 if needed)
 # merged_df["sample_config"] = merged_df["samples_baseline"].apply(shorten_cfg)
@@ -119,15 +178,18 @@ def shorten_cfg(cfg, max_len=200):
 
 # %%
 # Plots
-plt.figure(figsize=(12, 6))
-bar_width = 0.25
+plt.figure(figsize=(18, 6))
+bar_width = 0.12
 indices = range(len(merged_df))
-plt.bar([i - bar_width for i in indices], merged_df["Baseline Duration (ms)"], width=bar_width, label="Baseline")
-plt.bar([i for i in indices], merged_df["D2 Duration (ms)"], width=bar_width, label="D2")
-plt.bar([i + bar_width for i in indices], merged_df["WLBLLM Duration (ms)"], width=bar_width, label="WLBLLM")
+plt.bar([i - 2.5*bar_width for i in indices], merged_df["Baseline Duration (ms)"], width=bar_width, label="Baseline")
+plt.bar([i - 1.5*bar_width for i in indices], merged_df["D2 Duration (ms)"], width=bar_width, label="D2")
+plt.bar([i - 0.5*bar_width for i in indices], merged_df["WLBLLM DP1CP8 Duration (ms)"], width=bar_width, label="WLBLLM DP1CP8")
+plt.bar([i + 0.5*bar_width for i in indices], merged_df["WLBLLM DP2CP4 Duration (ms)"], width=bar_width, label="WLBLLM DP2CP4")
+plt.bar([i + 1.5*bar_width for i in indices], merged_df["WLBLLM DP4CP2 Duration (ms)"], width=bar_width, label="WLBLLM DP4CP2")
+plt.bar([i + 2.5*bar_width for i in indices], merged_df["WLBLLM DP8CP1 Duration (ms)"], width=bar_width, label="WLBLLM DP8CP1")
 plt.xlabel("Sample ID")
 plt.ylabel("Duration (ms)")
-plt.title(f"Baseline vs D2 vs WLBLLM Duration Comparison - {seq_len}")
+plt.title(f"Baseline vs D2 vs WLBLLM DP1CP8 vs WLBLLM DP2CP4 vs WLBLLM DP4CP2 vs WLBLLM DP8CP1 Duration Comparison - {seq_len}")
 plt.xticks(list(indices), merged_df["sample_id"])
 plt.legend()
 plt.tight_layout()
@@ -135,15 +197,18 @@ plt.savefig(out_dir.joinpath(f"plot_abs_time.png"))
 plt.show()
 
 # %%
-plt.figure(figsize=(12, 6))
-bar_width = 0.35
+plt.figure(figsize=(18, 6))
+bar_width = 0.16
 indices = range(len(merged_df))
-plt.bar([i - bar_width/2 for i in indices], -merged_df["Difference (ms)"], width=bar_width, label="Baseline - D2")
-plt.bar([i + bar_width/2 for i in indices], -merged_df["WLBLLM Difference (ms)"], width=bar_width, label="WLBLLM - D2")
+plt.bar([i - 2*bar_width for i in indices], -merged_df["Difference (ms)"], width=bar_width, label="Baseline - D2")
+plt.bar([i - bar_width for i in indices], -merged_df["WLBLLM DP1CP8 Difference (ms)"], width=bar_width, label="WLBLLM DP1CP8 - D2")
+plt.bar([i for i in indices], -merged_df["WLBLLM DP2CP4 Difference (ms)"], width=bar_width, label="WLBLLM DP2CP4 - D2")
+plt.bar([i + bar_width for i in indices], -merged_df["WLBLLM DP4CP2 Difference (ms)"], width=bar_width, label="WLBLLM DP4CP2 - D2")
+plt.bar([i + 2*bar_width for i in indices], -merged_df["WLBLLM DP8CP1 Difference (ms)"], width=bar_width, label="WLBLLM DP8CP1 - D2")
 plt.axhline(0, linewidth=1)
 plt.xlabel("Sample ID")
 plt.ylabel("Difference (ms)")
-plt.title(f"Difference in Duration (Baseline - D2) or (WLBLLM - D2) - {seq_len}")
+plt.title(f"Difference in Duration (vs D2) - {seq_len}")
 plt.xticks(indices, merged_df["sample_id"])
 plt.legend()
 # Add minor ticks at 1/5 of major tick intervals
@@ -157,28 +222,43 @@ plt.show()
 # %%
 # Summary stats
 avg_speedup = merged_df["Speedup (%)"].mean()
-avg_wlbllm_speedup = merged_df["WLBLLM Speedup (%)"].mean()
+avg_wlbllm_dp1cp8_speedup = merged_df["WLBLLM DP1CP8 Speedup (%)"].mean()
+avg_wlbllm_dp2cp4_speedup = merged_df["WLBLLM DP2CP4 Speedup (%)"].mean()
+avg_wlbllm_dp4cp2_speedup = merged_df["WLBLLM DP4CP2 Speedup (%)"].mean()
+avg_wlbllm_dp8cp1_speedup = merged_df["WLBLLM DP8CP1 Speedup (%)"].mean()
 print(f"Average speedup of D2 over Baseline - {seq_len}: {avg_speedup:.4f}%")
-print(f"Average speedup of D2 over WLBLLM - {seq_len}: {avg_wlbllm_speedup:.4f}%")
+print(f"Average speedup of D2 over WLBLLM DP1CP8 - {seq_len}: {avg_wlbllm_dp1cp8_speedup:.4f}%")
+print(f"Average speedup of D2 over WLBLLM DP2CP4 - {seq_len}: {avg_wlbllm_dp2cp4_speedup:.4f}%")
+print(f"Average speedup of D2 over WLBLLM DP4CP2 - {seq_len}: {avg_wlbllm_dp4cp2_speedup:.4f}%")
+print(f"Average speedup of D2 over WLBLLM DP8CP1 - {seq_len}: {avg_wlbllm_dp8cp1_speedup:.4f}%")
 
 # Plot speedup
-plt.figure(figsize=(12, 6))
-bar_width = 0.35
+plt.figure(figsize=(18, 6))
+bar_width = 0.16
 indices = range(len(merged_df))
-plt.bar([i - bar_width/2 for i in indices], merged_df["Speedup (%)"], width=bar_width, color='blue', label='D2 vs Baseline')
-plt.bar([i + bar_width/2 for i in indices], merged_df["WLBLLM Speedup (%)"], width=bar_width, color='red', label='D2 vs WLBLLM')
+plt.bar([i - 2*bar_width for i in indices], merged_df["Speedup (%)"], width=bar_width, color='blue', label='D2 vs Baseline')
+plt.bar([i - bar_width for i in indices], merged_df["WLBLLM DP1CP8 Speedup (%)"], width=bar_width, color='red', label='D2 vs WLBLLM DP1CP8')
+plt.bar([i for i in indices], merged_df["WLBLLM DP2CP4 Speedup (%)"], width=bar_width, color='green', label='D2 vs WLBLLM DP2CP4')
+plt.bar([i + bar_width for i in indices], merged_df["WLBLLM DP4CP2 Speedup (%)"], width=bar_width, color='orange', label='D2 vs WLBLLM DP4CP2')
+plt.bar([i + 2*bar_width for i in indices], merged_df["WLBLLM DP8CP1 Speedup (%)"], width=bar_width, color='purple', label='D2 vs WLBLLM DP8CP1')
 plt.axhline(0, linewidth=1)
 plt.xlabel("Sample ID")
 plt.ylabel("Speedup (%)")
-plt.title(f"Speedup of D2 over Baseline or WLBLLM - {seq_len}")
+plt.title(f"Speedup of D2 over Different Baselines - {seq_len}")
 plt.xticks(indices, merged_df["sample_id"])
 plt.legend()
 # add horizontal lines at means
 plt.axhline(avg_speedup, color='blue', linewidth=1, linestyle='--')
-plt.axhline(avg_wlbllm_speedup, color='red', linewidth=1, linestyle='--')
+plt.axhline(avg_wlbllm_dp1cp8_speedup, color='red', linewidth=1, linestyle='--')
+plt.axhline(avg_wlbllm_dp2cp4_speedup, color='green', linewidth=1, linestyle='--')
+plt.axhline(avg_wlbllm_dp4cp2_speedup, color='orange', linewidth=1, linestyle='--')
+plt.axhline(avg_wlbllm_dp8cp1_speedup, color='purple', linewidth=1, linestyle='--')
 # add annotations for the average speedups
-plt.text(-1.0, avg_speedup, f"avg={avg_speedup:.2f}%", color='blue', ha='center', va='bottom')
-plt.text(-1.0, avg_wlbllm_speedup, f"avg={avg_wlbllm_speedup:.2f}%", color='red', ha='center', va='bottom')
+plt.text(-1.5, avg_speedup, f"avg={avg_speedup:.2f}%", color='blue', ha='center', va='bottom')
+plt.text(-1.5, avg_wlbllm_dp1cp8_speedup, f"avg={avg_wlbllm_dp1cp8_speedup:.2f}%", color='red', ha='center', va='bottom')
+plt.text(-1.5, avg_wlbllm_dp2cp4_speedup, f"avg={avg_wlbllm_dp2cp4_speedup:.2f}%", color='green', ha='center', va='bottom')
+plt.text(-1.5, avg_wlbllm_dp4cp2_speedup, f"avg={avg_wlbllm_dp4cp2_speedup:.2f}%", color='orange', ha='center', va='bottom')
+plt.text(-1.5, avg_wlbllm_dp8cp1_speedup, f"avg={avg_wlbllm_dp8cp1_speedup:.2f}%", color='purple', ha='center', va='bottom')
 # Add minor ticks every 1%
 from matplotlib.ticker import MultipleLocator
 plt.gca().yaxis.set_minor_locator(MultipleLocator(1))

@@ -25,7 +25,6 @@ NNODES=${2:-1}
 NPROC_PER_NODE=${3:-8}
 TP_SIZE=${4:-8}
 MODE=${5:-baseline}
-
 RZV_ID=$6
 
 # MODE=d2
@@ -49,6 +48,7 @@ echo "bash $0 $1 $2 $3 $4 $5 $6"
 echo
 
 
+CP_DEGREE=${CP_DEGREE:-1}
 
 # Tweek the mode between baseline vs d2.
 REPLAN_ITER=${REPLAN_ITER:-10}
@@ -76,8 +76,8 @@ THIS_HOST=$(hostname)
 OUTPUT_DIR=nsys-profile
 now=$(date +%Y%m%d_%H%M%S)
 mkdir -p ${OUTPUT_DIR}
-NSYS_PROFILE_PATH=${OUTPUT_DIR}/${now}.${MODE}${REPLAN_ITER}.${THIS_HOST}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.nsys-rep
-LOG_PATH=${OUTPUT_DIR}/${now}.${MODE}${REPLAN_ITER}.${THIS_HOST}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.log
+NSYS_PROFILE_PATH=${OUTPUT_DIR}/${now}.${MODE}${REPLAN_ITER}.${THIS_HOST}.nnodes${NNODES}.tp${TP_SIZE}.cp${CP_DEGREE}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.nsys-rep
+LOG_PATH=${OUTPUT_DIR}/${now}.${MODE}${REPLAN_ITER}.${THIS_HOST}.nnodes${NNODES}.tp${TP_SIZE}.cp${CP_DEGREE}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}.log
 
 echo "Running with the following parameters:"
 echo "  REPLAN_ITER=${REPLAN_ITER}"
@@ -93,6 +93,7 @@ echo "  MODE=${MODE}"
 echo "  NNODES=${NNODES}"
 echo "  NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "  TP_SIZE=${TP_SIZE}"
+echo "  CP_DEGREE=${CP_DEGREE}"
 echo "  ENABLE_NSYS=${ENABLE_NSYS}"
 echo "  NSYS_PROFILE_PATH=${NSYS_PROFILE_PATH}"
 echo "  LOG_PATH=${LOG_PATH}"
@@ -112,9 +113,10 @@ TORCHRUN_CMD=(
     --replan-iter ${REPLAN_ITER} \
     --num-nodes ${NNODES} \
     --num-gpus-per-node ${NPROC_PER_NODE} \
-    --tp-size ${TP_SIZE} \
     --num-layers ${NUM_LAYERS} \
     --max-sample-id ${MAX_SAMPLE_ID} \
+    --tp-size ${TP_SIZE} \
+    --cp-degree ${CP_DEGREE} \
     --up-sample-factor ${UP_SAMPLE_FACTOR} \
     --num-tokens ${NUM_TOKENS} \
     --elongate-factor ${ELONGATE_FACTOR} \

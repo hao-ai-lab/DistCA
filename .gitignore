@@ -177,4 +177,4 @@ cython_debug/
 wandb/
 
 # nsys profile
-.nsys-rep
+*.nsys-rep

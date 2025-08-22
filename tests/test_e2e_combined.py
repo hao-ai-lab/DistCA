@@ -226,7 +226,8 @@ class MegatronE2eWorker(MegatronBaseWorker):
                 forward_only=forward_only,
             )
 
-        update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        with torch.cuda.nvtx.range("optimizer_step"):
+            update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
         return losses_reduced, grad_norm
 
     def _build_model_optimizer(self,
@@ -333,6 +334,7 @@ def init_wlbllm_e2e_test(
     assert world_size == int(os.environ.get("WORLD_SIZE"))
     rank = int(os.environ.get("RANK"))
     local_rank = int(os.environ.get("LOCAL_RANK"))
+    torch.cuda.set_device(local_rank)
     worker = worker_cls(
         rank, world_size
     )
@@ -506,12 +508,17 @@ def test_create_qkv_dispatch_balanced_flops(
     max_replan_iter = replan_iter
     actually_replan_iter = 0
     try:
+        rich.print("Start replanning...")
         for _ in range(max_replan_iter):
+            rich.print(f"Replanning at step {_}...")
             gpu_flops = calculate_flops_factor_in_each_gpu(items)
+            rich.print(f"gpu_flops={gpu_flops}")
             diff = max(gpu_flops) - min(gpu_flops)
-            if diff < ((8*K) ** 2): # max - min < 1k
+            rich.print(f"diff={diff}")
+            if diff < ((8*K) ** 2): # max - min < 8k's seqlen's workload
                 break
             items = plan_relocation(items, verbose=False, plot=False)
+            rich.print(f"Replanning at step {_}... done: items=", items)
             actually_replan_iter += 1
     except Exception as e:
         # prevent exception forfeit the replanning of the whole batch.
@@ -519,7 +526,9 @@ def test_create_qkv_dispatch_balanced_flops(
         pass
     if actually_replan_iter > 0:
         items = postprocess_items(items)
+    rich.print(f"Actually replanning {actually_replan_iter} times")
 
+    # Calculate the expected communication needed...
     world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens) = item_to_intermediate_tensors(items)    
 
     world_size = world_info["world_size"]
@@ -570,6 +579,11 @@ def create_one_batch_balanced_flops(
         qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
         attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
     )
+
+    rich.print(f"qkv_fwd_fa2a_metadata.fa2a_metadata=", qkv_fwd_fa2a_metadata.fa2a_metadata)
+    rich.print(f"qkv_rev_fa2a_metadata.fa2a_metadata=", qkv_rev_fa2a_metadata.fa2a_metadata)
+    rich.print(f"attn_out_fwd_fa2a_metadata.fa2a_metadata=", attn_out_fwd_fa2a_metadata.fa2a_metadata)
+    rich.print(f"attn_out_rev_fa2a_metadata.fa2a_metadata=", attn_out_rev_fa2a_metadata.fa2a_metadata)
     
     # Only for debug!
     # Intentionally set the sender_transfer_sz and receiver_transfer_sz to 0 
@@ -731,24 +745,99 @@ def test(args):
             cp_size = mpu.get_context_parallel_world_size()
             dp_rank = mpu.get_data_parallel_rank()
             dp_size = mpu.get_data_parallel_world_size()
+            cp_group = mpu.get_context_parallel_group()
+
+            rank = torch.distributed.get_rank()
+            device = torch.cuda.current_device()
+
+            print(f"🟡 [Rank {rank}] cp_rank={cp_rank}, cp_size={cp_size}, dp_rank={dp_rank}, dp_size={dp_size}, as_rank={as_rank}, as_world_size={as_world_size}, device={device}")
+            # test an all reduce to ensure things are doing good
+            # exit(0)
+
+            print(f"🟡 _seq_lens={_seq_lens}")
 
             def flatten(a):
                 return [y for x in a for y in x]
-            seq_lens = _seq_lens[dp_rank * cp_size:(dp_rank + 1) * cp_size]
+            
+            # Balance the data here for WLBLLM.
+            # TODO: This only works for DP+CP.
+            # ENABLE_BALANCED_FLOS_NO_DEFER = False
+            ENABLE_BALANCED_FLOS_NO_DEFER = True
+            if ENABLE_BALANCED_FLOS_NO_DEFER and dp_size > 1:
+                Lmax = total_seq_len * 2 # 128 * K * 2 -- the batch of this dp rank.
+
+                all_docs = flatten(_seq_lens)
+                all_docs.sort(reverse=True)
+                new_batch = []
+                for r in range(dp_size):
+                    new_batch.append([])
+                
+                def get_workload(micro_batch: list[int]) -> int:
+                    a = [ i / (64 * K) for i in micro_batch]
+                    return sum(i ** 2 + i for i in a)
+
+                def get_length(micro_batch: list[int]) -> int:
+                    return sum(micro_batch)
+
+                # Step 1: Pack the docs into the new batch.
+                remained_docs = []
+                for doc in all_docs:
+                    workloads = [get_workload(batch) for batch in new_batch]
+                    lengths = [get_length(batch) for batch in new_batch]
+                    min_workload_idx = workloads.index(min(workloads))
+                    min_length_idx = lengths.index(min(lengths))
+                    
+                    if lengths[min_workload_idx] + doc <= Lmax:
+                        new_batch[min_workload_idx].append(doc)
+                    else:
+                        if lengths[min_length_idx] + doc <= Lmax:
+                            new_batch[min_length_idx].append(doc)
+                        else:
+                            remained_docs.append(doc)
+                    pass
+
+                # Step 2: Pack the remained docs, by workload.
+                for doc in remained_docs:
+                    workloads = [get_workload(batch) for batch in new_batch]
+                    lengths = [get_length(batch) for batch in new_batch]
+                    min_workload_idx = workloads.index(min(workloads))
+                    new_batch[min_workload_idx].append(doc)
+
+                
+                print(f"🟡 [Rank {rank}] Before - assigning seq_lens={_seq_lens}")
+                print(f"🟡 new_batch={new_batch}")
+                seq_lens = [new_batch[dp_rank]]
+                print(f"🟡 [Rank {rank}] Taking seq_lens={seq_lens}")
+
+            else:
+                seq_lens = _seq_lens[
+                    dp_rank * cp_size * 2: 
+                    (dp_rank + 1) * cp_size * 2
+                ]
+
+
             doc_lens = flatten(seq_lens)
+            if sum(doc_lens) % (cp_size * 2 * 8) != 0:
+                # TODO(HACK): This is a hack to ensure the doc_lens is divisible by cp_size*2.
+                sum_of_doc_lens = sum(doc_lens)
+                doc_lens[-1] += (cp_size * 2 * 8) - sum_of_doc_lens % (cp_size * 2 * 8)
+                # assert doc_lens[-1] > 0
+                pass
+            
             rank = torch.distributed.get_rank()
             
             debug_print(f"doc_lens", doc_lens)
             assert cp_size == cp_degree
 
-            local_context_length = total_seq_len * 2
+            # local_context_length = total_seq_len * 2
+            local_context_length = sum(doc_lens) // cp_size
             context_length = local_context_length * cp_size
 
             import d2.runtime.megatron_patch.create_group
             # cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
-            cp_group = mpu.get_context_parallel_group()
             # debug_print(f"cp_size", cp_size)
-            # debug_print(f"context_length", context_length)
+            debug_print(f"local_context_length", local_context_length)
+            debug_print(f"context_length", context_length)
             doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
                 doc_lens, context_length, cp_size
             )
@@ -818,6 +907,8 @@ def test(args):
     
 
         elif mode == "d2":
+            # TODO: FIXME - but well, for d2 it is dp/cp anyways.
+            dp_size = as_world_size
             # D2 mode: Use balanced flops planning and ping-pang parameters
             seq_lens_0 = _seq_lens[:as_world_size]
             seq_lens_1 = _seq_lens[as_world_size:]
@@ -885,37 +976,9 @@ def test(args):
                 print("=" * 20 + "warmup done")
         
         # Real Experiment
-        N = 5
+        N = 3
         torch.cuda.synchronize()
-        # torch.distributed.barrier()
-
-        # # Calculate per-rank duration for forward_backward_batch
-        # my_rank_durations = []
-        # for _ in range(N):
-        #     torch.cuda.nvtx.range_push(f"PerRank-sample_{sample_id}(repeat={N})")
-        #     start_time = time.time()
-        #     ref = worker.forward_backward_batch(
-        #         microbatches=microbatches,
-        #         normal_forward_fn=normal_forward_fn,
-        #         forward_only=False,
-        #     )
-        #     torch.cuda.synchronize()
-        #     end_time = time.time()
-        #     duration = end_time - start_time
-        #     torch.cuda.nvtx.range_pop()
-        #     duration_ms = duration * 1000
-        #     my_rank_durations.append(duration_ms)
-        #     torch.distributed.barrier()
-            
-        # my_rank_avg_duration_ms = sum(my_rank_durations) / len(my_rank_durations)
-        # # all gather across all ranks and print out the times
-        # all_rank_durations = [0] * world_size
-        # torch.distributed.all_gather_object(all_rank_durations, my_rank_avg_duration_ms)
-        # if rank == 0:
-        #     rich.print(f"[Sample ID=({sample_id})] Sequence Lengths: {_seq_lens}")
-        #     for this_rank, duration in enumerate(all_rank_durations):
-        #         rich.print(f"[Sample ID=({sample_id})] Rank {this_rank} duration: {duration:.2f} ms")
-
+        
         # Calculate the average duration of the forward_backward_batch
         start_time = time.time()
         torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
@@ -970,8 +1033,8 @@ def test(args):
     if rank == 0:
         
         rich.print(f"🟢 Test {__file__} passed")
-        dp_size = as_world_size
-        config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, replan_iter=replan_iter, elongate_factor=elongate_factor)
+        
+        config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, cp_size=cp_degree, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, replan_iter=replan_iter, elongate_factor=elongate_factor)
         rich.print(f"🟢 Test Config: ", config)
         rich.print(f"🟢 Test DateTime: ", timestamp)
         
