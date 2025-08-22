@@ -68,7 +68,11 @@ def setup_global_batch(
             [total_seq_len // 8] * 8,
         ]
         GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH 
-
+    # GLOBAL_BATCH = [
+    #         [total_seq_len/2, total_seq_len/2, 4, 4],
+    #         [total_seq_len/2, total_seq_len/4, total_seq_len/8, total_seq_len/8],
+    #     ]
+    # GLOBAL_BATCH = GLOBAL_BATCH * 100
     GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
 
@@ -118,6 +122,7 @@ setup_global_batch(total_seq_len=sequence_length)
 import torch
 
 from test_util import gen_seq_lens
+
 def create_pipeline_seqlens(
     ref_seq_lens: Optional[torch.Tensor],
     add_dummy: bool,
@@ -154,8 +159,8 @@ def create_pipeline_seqlens(
         new_seqlen = gen_seq_lens(dp_size, num_seqs, _num_tokens_shard).long()
 
     # Change to torch tensor for later concat.
-    new_seqlen_list = get_next_batch(dp_size)
-    # Change to even.
+    new_seqlen_list = get_next_batch(dp_size, )
+    # Change to even 
     from copy import deepcopy
     result = deepcopy(new_seqlen_list)
     for l in result:
@@ -166,9 +171,14 @@ def create_pipeline_seqlens(
             l[idx1] += 1
             l[idx2] -= 1
     new_seqlen_list = result
+    for seq in new_seqlen_list:
+        for s in seq:
+            assert(s % 2 == 0)
+    # pad real sequence and dummy sequence.
+    pad_num = 8 #max(1, tp_size)
     print("new_seq_len_list is : ", new_seqlen_list)
     max_cols = max(len(x) for x in new_seqlen_list)
-    new_seqlen_list = [x + [0] * (max_cols - len(x)) for x in new_seqlen_list]
+    new_seqlen_list = [x + [pad_num] * (max_cols - len(x)) for x in new_seqlen_list]
     
     new_seqlen = torch.tensor(new_seqlen_list, dtype=torch.long) # Padded Tensor.
 
@@ -191,14 +201,18 @@ def create_pipeline_seqlens(
     max_num_cols = max(new_cols, prev_cols)
     pad_new = max_num_cols - new_cols
     pad_prev = max_num_cols - prev_cols
+    # Pad previous batch and new batch.
     if pad_new > 0:
-        new_seqlen = F.pad(new_seqlen, (0, pad_new), "constant", 0)
+        padding = (torch.ones(new_seqlen.shape[0], pad_new) * pad_num).int()
+        new_seqlen = torch.cat([new_seqlen, padding], dim=1)
     
     if pad_prev > 0:
-        prev_seqlen = F.pad(prev_seqlen, (0, pad_prev), "constant", 0)
-
+        padding = (torch.ones(prev_seqlen.shape[0], pad_prev) * pad_num).int()
+        prev_seqlen = torch.cat([prev_seqlen, padding], dim=1)
+    
     seq_len = torch.cat([new_seqlen, prev_seqlen], dim=0)
-    assert torch.all(seq_len.sum(-1) % tp_size == 0), "tot_seqlen_on_rank % tp_size should be 0 for sequence parallel"
+
+    assert torch.all(seq_len.sum(-1) % tp_size == 0), f"tot_seqlen_on_rank % tp_size should be 0 for sequence parallel, seq_sum : {seq_len.sum(-1)}, {seq_len.sum(-1) % tp_size}"
     print("Output seq_len:\n", seq_len)
     return seq_len
 
@@ -244,12 +258,12 @@ def create_qkv_dispatch_pipeline_tick_planned(
 
     # Post processing seq_len. Remove padded zero.
     batch = seq_lens.tolist()
-    result = []
+    # result = []
 
-    for row in batch:
-        row = [i for i in row if i!=0]
-        result.append(row)
-    batch = result
+    # for row in batch:
+    #     row = [i for i in row if i!=0]
+    #     result.append(row)
+    # batch = result
 
 
     print("batch =", batch)
@@ -326,9 +340,8 @@ if __name__ == "__main__":
     add_dummy = False
     is_backward = False
 
-    # print("==== 多次调用 create_pipeline_seqlens ====")
     # for i in range(5):
-    #     print(f"\n--- 第 {i+1} 次调用 ---")
+    #     print(f"\n---  {i+1} th call ---")
     #     ref_seq_lens = create_pipeline_seqlens(
     #         ref_seq_lens=ref_seq_lens,
     #         add_dummy=add_dummy,

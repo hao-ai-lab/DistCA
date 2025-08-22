@@ -445,8 +445,8 @@ def create_pipeline_seqlens(
         new_seqlen = gen_seq_lens(dp_size, num_seqs, _num_tokens_shard).long()
 
     # Change to torch tensor for later concat.
-    new_seqlen_list = get_next_batch(dp_size)
-    # Change to even.
+    new_seqlen_list = get_next_batch(dp_size, )
+    # Change to even 
     from copy import deepcopy
     result = deepcopy(new_seqlen_list)
     for l in result:
@@ -454,21 +454,20 @@ def create_pipeline_seqlens(
         for i in range(0, len(odd_indices), 2):
             idx1 = odd_indices[i]
             idx2 = odd_indices[i+1]
-            
-            # 一个加 1，一个减 1，两者都变成了偶数，总和不变
             l[idx1] += 1
             l[idx2] -= 1
     new_seqlen_list = result
+    for seq in new_seqlen_list:
+        for s in seq:
+            assert(s % 2 == 0)
+    # pad real sequence and dummy sequence.
+    pad_num = 8 #max(1, tp_size)
     print("new_seq_len_list is : ", new_seqlen_list)
     max_cols = max(len(x) for x in new_seqlen_list)
-    new_seqlen_list = [x + [0] * (max_cols - len(x)) for x in new_seqlen_list]
+    new_seqlen_list = [x + [pad_num] * (max_cols - len(x)) for x in new_seqlen_list]
     
     new_seqlen = torch.tensor(new_seqlen_list, dtype=torch.long) # Padded Tensor.
 
-
-
-    # gen_seq_lens(dp_size, num_seqs, _num_tokens_shard).long()
-    # new_seqlen *= max_cp_degree
     print("Next tick sequence length is :", new_seqlen)
     #  new_seqlen : shape : [dp, num_seqs]  We should sample seq_len here.
     # And add the sampled seq_len to the batch. 
@@ -488,14 +487,18 @@ def create_pipeline_seqlens(
     max_num_cols = max(new_cols, prev_cols)
     pad_new = max_num_cols - new_cols
     pad_prev = max_num_cols - prev_cols
+    # Pad previous batch and new batch.
     if pad_new > 0:
-        new_seqlen = F.pad(new_seqlen, (0, pad_new), "constant", 0)
+        padding = (torch.ones(new_seqlen.shape[0], pad_new) * pad_num).int()
+        new_seqlen = torch.cat([new_seqlen, padding], dim=1)
     
     if pad_prev > 0:
-        prev_seqlen = F.pad(prev_seqlen, (0, pad_prev), "constant", 0)
-
+        padding = (torch.ones(prev_seqlen.shape[0], pad_prev) * pad_num).int()
+        prev_seqlen = torch.cat([prev_seqlen, padding], dim=1)
+    
     seq_len = torch.cat([new_seqlen, prev_seqlen], dim=0)
-    assert torch.all(seq_len.sum(-1) % tp_size == 0), "tot_seqlen_on_rank % tp_size should be 0 for sequence parallel"
+
+    assert torch.all(seq_len.sum(-1) % tp_size == 0), f"tot_seqlen_on_rank % tp_size should be 0 for sequence parallel, seq_sum : {seq_len.sum(-1)}, {seq_len.sum(-1) % tp_size}"
     print("Output seq_len:\n", seq_len)
     return seq_len
 
