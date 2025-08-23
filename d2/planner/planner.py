@@ -655,9 +655,14 @@ class Planner:
         return metadata
     
     def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False):
-        items = self.plan_items(items_, verbose, plot)
-        for i, item in enumerate(items):
-            rich.print(f"🟡 Planned after: items[{i}]", item)
+        # no plan for cp debug
+        plan = True    
+        if plan == False:
+            rich.print("[bold yellow]Skip planning for CP debug.[/bold yellow]")
+            items = deepcopy(items_)
+        else:
+            rich.print("[bold green]Start planning.[/bold green]")
+            items = self.plan_items(items_, verbose, plot)
         items = self.postprocess_items(items)
         shard_infos = self.items_into_shardinfos(items)
         
@@ -673,7 +678,6 @@ class Planner:
 
         flops_per_gpu = [0.0] * self.num_dispatch_instances
         for item in items:
-            print(f"item.gpuid: {item.gpuid}, item.total_flops: {item.total_flops}")
             flops_per_gpu[item.gpuid] += item.total_flops
         total_flops = sum(flops_per_gpu)
         

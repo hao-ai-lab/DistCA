@@ -41,9 +41,9 @@ from megatron_test_utils import (
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
 )
 
-import wlbllm
-import wlbllm.utils
-import wlbllm.registry
+# import wlbllm
+# import wlbllm.utils
+# import wlbllm.registry
 
 
 def debug_print(*args, **kwargs):
@@ -407,80 +407,11 @@ def setup_global_batch(
         manual_case = [
             [2 * K] * (total_seq_len // (2 * K)),
         ] * 8
-        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH   
-
-    GLOBAL_BATCH = iter(GLOBAL_BATCH)
-
-    # # --------------------
-
-    # GLOBAL_BATCH = [
-    #     [101296, 2560, 2096, 2592, 2160, 4240, 5264, 272, 432, 3840, 3488, 2832], 
-    #     [101296, 2560, 2096, 2592, 2160, 4240, 5264, 272, 432, 3840, 3488, 2832], 
-
-    #     [69712, 6000, 3648, 51712],
-    #     [69712, 6000, 3648, 51712],
-
-    #     [2560, 2096, 2592, 2160, 4240, 5264, 272, 101296, 432, 3840, 3488, 2832], 
-    #     [2560, 2096, 2592, 2160, 4240, 5264, 272, 101296, 432, 3840, 3488, 2832], 
-
-    # ] * 5
-    # GLOBAL_BATCH = iter(GLOBAL_BATCH)
-
-    
-
+        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH
+    # CP debug batch case.  
     GLOBAL_BATCH = [
-        # 🟢 Success: Cross 2 GPUs
-        # [total_seq_len // 4 + 16, total_seq_len // 4 - 16, total_seq_len // 4, total_seq_len // 4],
-        # [total_seq_len // 4 + 16, total_seq_len // 4 - 16, total_seq_len // 4, total_seq_len // 4],
-
-        # 🟢 Success: Cross 2 GPUs
-        # [total_seq_len // 2, total_seq_len // 4, total_seq_len // 4,],
-        # [total_seq_len // 2, total_seq_len // 4, total_seq_len // 4,],
-
-        # 🟢 Success: Cross 3 GPUs with small size
-        # [total_seq_len // 2 + 512, total_seq_len // 4 - 512, total_seq_len // 4,],
-        # [total_seq_len // 2 + 512, total_seq_len // 4 - 512, total_seq_len // 4,],
-
-        
-        # 🟢 Success: Every middle sequences will cross 2 GPUs
-        [total_seq_len // 8, total_seq_len // 4, total_seq_len // 4, total_seq_len // 4, total_seq_len // 8,],
-        [total_seq_len // 8, total_seq_len // 4, total_seq_len // 4, total_seq_len // 4, total_seq_len // 8,],
-
-        # 🟢 Success: cross 2 GPUs
-        [total_seq_len // 8, total_seq_len // 4, total_seq_len // 4, total_seq_len // 8, total_seq_len // 4,],
-        [total_seq_len // 8, total_seq_len // 4, total_seq_len // 4, total_seq_len // 8, total_seq_len // 4,],
-
-        # 🔴 Failed: Cross 3 GPU + non cross for the others
-        [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
-        [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
-
-
-        # 🔴 Failed: Cross 3 GPU + Cross 2 GPU
-        [total_seq_len // 4 * 3 - 512, total_seq_len // 4 + 512],
-        [total_seq_len // 4 * 3 - 512, total_seq_len // 4 + 512],
-        
-        # 🔴 Failed: Cross 3 GPUs
         [total_seq_len // 4 * 3, total_seq_len // 4],
-        [total_seq_len // 4 * 3, total_seq_len // 4],
-
-        # [101296, 2560, 2096, 2592, 2160, 4240, 5264, 272, 432, 3840, 3488, 2832], 
-        # [101296, 2560, 2096, 2592, 2160, 4240, 5264, 272, 432, 3840, 3488, 2832], 
-
-
-
-        # 🟢 Success: 
-        [total_seq_len],
-        [total_seq_len],
-
-        # 🟢 Success: 
-        [total_seq_len // 2, total_seq_len // 2],
-        [total_seq_len // 2, total_seq_len // 4, total_seq_len // 4],
-        
-        # 🟢 Success: 
-        [total_seq_len // 8, total_seq_len // 4, total_seq_len // 4, total_seq_len // 8, total_seq_len // 4,],
-        [total_seq_len // 8, total_seq_len // 4, total_seq_len // 4, total_seq_len // 8, total_seq_len // 4,],
-
-    ] * 5
+    ] * 100
     GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
 
@@ -993,14 +924,14 @@ def test(args):
             wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
 
         elif mode == "d2":
+            scale_factor = 4    # max token per doc : total_seq_len * scale_factor
+            assert as_world_size % scale_factor == 0, f"as_world_size={as_world_size} must be divisible by {scale_factor}"
 
-            rank = torch.distributed.get_rank()
-
-            total_seq_len_including_cp = total_seq_len * as_world_size
+            total_seq_len_including_cp = total_seq_len * scale_factor #as_world_size
             rich.print(f"🟡 total_seq_len_including_cp", total_seq_len_including_cp // 1024, "K")
 
             setup_global_batch(
-                # TODO(HACK): This is a hack to make 32k x 2 -> 64k
+                # TODO(HACK): This is a hack to make total token: per_rank_total * as_worker
                 total_seq_len_including_cp, # per_rank_total * as_worker
                 up_sample_factor=up_sample_factor,
                 elongate_factor=elongate_factor,
@@ -1008,17 +939,21 @@ def test(args):
                 filter_ratio=filter_ratio,
                 should_add_debug_cases=should_add_debug_cases,
             )
-            _seq_lens: list[list[int]] = get_next_batch(2)
-            print(f"🟡 [Rank {rank}] sample_id={sample_id}: {_seq_lens}")
 
+            _seq_lens: list[list[int]] = get_next_batch(as_world_size // scale_factor * 2)
+            
             dp_size = as_world_size
+            num_list_per_batch =dp_size // scale_factor
             # D2 mode: Use balanced flops planning and ping-pang parameters
             # Note: Although this is still list of list of int,
             # it only has one element (one batch) and does not correspond to 
             # the per-rank sequence placement.
             # Later, we will do this CP sharding placement. Sit tight.
-            seq_lens_0: list[list[int]] = [_seq_lens[0]]
-            seq_lens_1: list[list[int]] = [_seq_lens[1]]
+            seq_lens_0: list[list[int]] = _seq_lens[:num_list_per_batch]
+            seq_lens_1: list[list[int]] = _seq_lens[num_list_per_batch:]
+
+            print(f"🟡 ping pong batch1 : {seq_lens_0}")
+            print(f"🟡 ping pong batch2 : {seq_lens_1}")
 
             from d2.planner.planner import (
                 batch_to_items_general,
@@ -1029,19 +964,12 @@ def test(args):
             parallel_config = ParallelConfig(
                 tensor_model_parallel_size=tp_size,
                 pipeline_model_parallel_size=1,
-                # data_parallel_size=dp_size,
             )
-
+            
             num_batched_token = total_seq_len # per-rank total seq len
             model_config = hf_config
             _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token, dp_size, model_config)
             _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token, dp_size, model_config)
-            
-            # debug print items
-            for i, item in enumerate(_items_0):
-                rich.print(f"🟡 [Rank {rank}] Planned Before: _items_0[{i}]", item)
-            for i, item in enumerate(_items_1):
-                rich.print(f"🟡 [Rank {rank}] Planned Before: _items_1[{i}]", item)
 
             # Note: 
             # Planner's world_size is the total number of GPUs. 
@@ -1069,15 +997,6 @@ def test(args):
                     q_to_num_kv_tokens,
                 ) = ret
 
-                rich.print(f"🟡 [Rank {rank}] mlp_num_seqs", mlp_num_seqs)
-                rich.print(f"🟡 [Rank {rank}] mlp_seq_lens", mlp_seq_lens)
-                rich.print(f"🟡 [Rank {rank}] mlp_q_dispatch", mlp_q_dispatch)
-                rich.print(f"🟡 [Rank {rank}] kv_to_q_mapping", kv_to_q_mapping)
-                rich.print(f"🟡 [Rank {rank}] kv_to_q_rank", kv_to_q_rank)
-                rich.print(f"🟡 [Rank {rank}] kv_context_size", kv_context_size)
-                rich.print(f"🟡 [Rank {rank}] q_to_num_kv_seq", q_to_num_kv_seq)
-                rich.print(f"🟡 [Rank {rank}] q_to_num_kv_tokens", q_to_num_kv_tokens)
-
                 # TODO(HACK)(Refactor): 
                 # We probably want to move this function inside the Planner.plan
                 (
@@ -1098,12 +1017,7 @@ def test(args):
                     softmax_lse_size=0,
                 )
 
-                rich.print(f"🟡 [Rank {rank}] fwd_metadata_q", fwd_metadata_q)
-                rich.print(f"🟡 [Rank {rank}] bwd_metadata_q", bwd_metadata_q)
-                rich.print(f"🟡 [Rank {rank}] fwd_metadata_kv", fwd_metadata_kv)
-                rich.print(f"🟡 [Rank {rank}] bwd_metadata_kv", bwd_metadata_kv)
-                rich.print(f"🟡 [Rank {rank}] fa_params", fa_params)
-                rich.print(f"🟡 [Rank {rank}] fa2a_metadata", fa2a_metadata)
+                rich.print(f"🟡 [Rank {rank}] fa2a_metadata=", fa2a_metadata)
 
                 ping_pang_params = get_single_step_packed_seq_params(
                     fa2a_metadata, fa_params, as_rank
@@ -1111,28 +1025,15 @@ def test(args):
 
                 raw_seq_len = mlp_seq_lens
                 mlp_seq_params = mlp_layout_packed_params(raw_seq_len)
-                # rich.print(f"🟡 raw_seq_len", raw_seq_len)
-                # # --------- Reproduce the mlp_layout_packed_params ---------
-                # # 1. cu_seqlens_q = prepend_zero_fn(seq_lens.cumsum(dim=0))
-                # seq_len_cunsum = mlp_seq_lens.cumsum(dim=0)
-                # cu_seqlens_q = prepend_zero_fn(seq_len_cunsum)
-                # # 2. max_seqlen = seq_lens.max()
-                # max_seqlen = mlp_seq_lens.max()
-                # # 3. packed_seq_params = PackedSeqParams(
-                # #     qkv_format="thd",
-                # #     cu_seqlens_q=cu_seqlens_q,
-                # #     cu_seqlens_kv=cu_seqlens_q,
-                # #     max_seqlen_q=max_seqlen,
-                # #     max_seqlen_kv=max_seqlen,
-                # rich.print(f"🟡 mlp_seq_params", mlp_seq_params)
-                # exit(0)
 
                 return (
                     ping_pang_params,
                     mlp_seq_params,
                 )
-
-
+            rank_id = torch.distributed.get_rank()
+            if rank_id == 0:    
+                for i, item in enumerate(_items_0):
+                    rich.print(f"🟡 Planned before: items[{i}]", item)
             ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
             ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
             
@@ -1159,11 +1060,6 @@ def test(args):
                 "position_ids": position_ids_local,
                 "packed_seq_params": packed_seq_params,
             }
-            rich.print(f"🟡 [Rank {rank}] total_seq_len", total_seq_len)
-            rich.print(f"🟡 [Rank {rank}] total_seq_len_including_cp", total_seq_len_including_cp)
-            rich.print(f"🟡 [Rank {rank}] microbatch.input_ids.shape", microbatch["input_ids"].shape)
-            rich.print(f"🟡 [Rank {rank}] microbatch.position_ids.shape", microbatch["position_ids"].shape)
-            rich.print(f"🟡 [Rank {rank}] microbatch.packed_seq_params", microbatch["packed_seq_params"])
             
             pass
         
@@ -1177,7 +1073,7 @@ def test(args):
                 should_add_debug_cases=should_add_debug_cases,
             )
             _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
-            print(f"🟡 [Rank {rank}] sample_id={sample_id}: {_seq_lens}")
+            print(f"🟡 sample_id={sample_id}: {_seq_lens}")
             # TODO: FIXME - but well, for d2 it is dp/cp anyways.
             dp_size = as_world_size
             # D2 mode: Use balanced flops planning and ping-pang parameters
