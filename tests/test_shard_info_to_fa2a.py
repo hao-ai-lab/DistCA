@@ -65,11 +65,13 @@ def simulate_all2all(
     max_send_bytes = int(torch.max(tot_send_bytes).item())
     tot_recv_bytes = metadata.fa2a_metadata[3].sum(dim=1) // element_size
     max_recv_bytes = int(torch.max(tot_recv_bytes).item())
+    dtype = q[0].dtype
+    device = q[0].device
     src_buffer = torch.empty(
-        (world_size, max_send_bytes), dtype=q.dtype, device=q.device
+        (world_size, max_send_bytes), dtype=dtype, device=device
     )
     dst_buffer = torch.empty(
-        (world_size, max_recv_bytes), dtype=q.dtype, device=q.device
+        (world_size, max_recv_bytes), dtype=dtype, device=device
     )
     for rank in range(world_size):
         metadata_local = metadata.get_slice(rank)
@@ -81,10 +83,12 @@ def simulate_all2all(
         else:
             fn = simulate_fa2a_send_qkv_rev
         assert q[rank].shape == metadata_local.tensor_shape[0].send_shape
-        assert k[rank].shape == metadata_local.tensor_shape[1].send_shape
+        # the first dim in metadata_local is the max cp
+        assert k[rank].shape == metadata_local.tensor_shape[1].send_shape[-2:]
         assert v[rank].shape == k[rank].shape
         src_buffer[rank] = fn(
-            q[rank], k[rank], v[rank], src_buffer[rank],
+            q[rank].flatten(), k[rank].flatten(), v[rank].flatten(),
+            src_buffer[rank],
             *metadata_local.send_memcpy_metadata,
             metadata_local.seq_lens[0].send_seqlens,
             metadata_local.seq_lens[1].send_seqlens,
@@ -108,19 +112,27 @@ def simulate_all2all(
         max_cp = metadata_local.kv_replica_mask.shape[1]
         if is_fwd:
             fn = simulate_fa2a_recv_qkv
+            dst_q: torch.Tensor = dst_q.flatten()
+            dst_k: torch.Tensor = dst_k.flatten()
+            dst_v: torch.Tensor = dst_v.flatten()
         else:
             bwd_args = (max_cp, metadata_local.kv_replica_mask)
             fn = simulate_fa2a_recv_qkv_rev
+            dst_q: torch.Tensor = dst_q.flatten()
+            dst_k: torch.Tensor = dst_k.flatten(start_dim=1)
+            dst_v: torch.Tensor = dst_v.flatten(start_dim=1)
         dst_q, dst_k, dst_v = fn(
-            dst_q, dst_k, dst_v, dst_buffer[rank],
+            dst_q, dst_k, dst_v,
+            dst_buffer[rank],
             *metadata_local.recv_memcpy_metadata,
+            metadata_local.seq_lens[0].recv_seqlens,
             metadata_local.seq_lens[1].recv_seqlens,
             hidden_q, hidden_k, element_size,
             *bwd_args,
         )
-        dst_qs.append(dst_q)
-        dst_ks.append(dst_k)
-        dst_vs.append(dst_v)
+        dst_qs.append(dst_q.reshape(q_shape))
+        dst_ks.append(dst_k.reshape(k_shape))
+        dst_vs.append(dst_v.reshape(k_shape))
     return dst_qs, dst_ks, dst_vs
 
 
@@ -143,6 +155,8 @@ def test(args):
     min_shard_len = args.min_shard_len
     simulate = args.simulate_world_size > 0
     world_size = args.simulate_world_size if simulate else os.environ.get("WORLD_SIZE")
+    # TODO: if not simulate, launch workers to run all-to-all
+    assert simulate, "test with real op not supported yet"
 
     hidden_size_q = args.hidden_size_q
     hidden_size_k = args.hidden_size_k
@@ -194,7 +208,7 @@ def test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--simulate-world_size", type=int, default=-1)
+    parser.add_argument("--simulate-world_size", type=int, default=2)
     parser.add_argument("--num-doc", type=int, default=4)
     parser.add_argument("--max-num-shard", type=int, default=2)
     parser.add_argument("--max-shard-len", type=int, default=128)

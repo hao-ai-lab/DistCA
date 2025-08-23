@@ -104,7 +104,7 @@ def _assign_offsets(
     for comm_info in comm_infos:
         linear_rank_id, attn_rank_id, shard_glob_id, replica_id = comm_info
         if is_kv_linear:
-            send_offset[linear_rank][linear_rank_id, replica_id] = cur_offset_send
+            send_offset[linear_rank][replica_id, linear_rank_id] = cur_offset_send
         else:
             send_offset[linear_rank][linear_rank_id] = cur_offset_send
         recv_offset[attn_rank][attn_rank_id] = cur_offset_recv
@@ -146,7 +146,6 @@ def _from_shard_info(
     num_send_k: list[list[int]] = [
         [0 for _ in range(len(scheduler_output[did]))] for did in range(num_doc)
     ]
-    linear_to_attn_k_replica = list[list[int]] = [[] for _ in range(world_size)]
     for doc_id, doc in enumerate(scheduler_output):
         for shard_id, shard in enumerate(doc):
             linear_rank = shard.rid
@@ -168,7 +167,7 @@ def _from_shard_info(
             )
 
             for k_shard_id in range(shard_id + 1):
-                k_attn_rank_id = len(attn_k_shards_on_rank)
+                attn_rank_id_k = len(attn_k_shards_on_rank[attn_rank])
                 k_shard_glob_id: _ShardID = (doc_id, k_shard_id)
                 attn_k_shards_on_rank[attn_rank].append(k_shard_glob_id)
 
@@ -176,9 +175,9 @@ def _from_shard_info(
                 k_linear_rank, k_linear_rank_id = k_shard_pos_linear
                 assert k_linear_rank == doc[k_shard_id].rid
                 replica_id = num_send_k[doc_id][k_shard_id]
-                linear_to_attn_k[k_linear_rank][attn_rank].append([
-                    (k_linear_rank_id, k_attn_rank_id, k_shard_glob_id, replica_id)
-                ])
+                linear_to_attn_k[k_linear_rank][attn_rank].append(
+                    (k_linear_rank_id, attn_rank_id_k, k_shard_glob_id, replica_id)
+                )
                 num_send_k[doc_id][k_shard_id] += 1
 
     # seqlens
@@ -217,8 +216,9 @@ def _from_shard_info(
     q_recv_shape = _get_logical_shape(
         linear_to_attn_num_tokens_q.T, world_size, q_hidden,
     )
+    # we use _q instead of _k here because _k has duplication
     k_send_shape = _get_logical_shape(
-        linear_to_attn_num_tokens_k, world_size, k_hidden,
+        linear_to_attn_num_tokens_q, world_size, k_hidden,
         is_kv_linear=True, kv_max_cp=max_cp_on_ranks
     )
     k_recv_shape = _get_logical_shape(
@@ -226,13 +226,13 @@ def _from_shard_info(
     )
 
     # number of bytes from i to j
-    linear_to_attn_qkv_size = (
+    linear_to_attn_qkv_bytes = (
         linear_to_attn_num_tokens_q * q_bytes +
         linear_to_attn_num_tokens_k * k_bytes * 2
     )
     # fast a2a metadata
     linear_to_attn_qkv_fa2a_metadata = send_bytes_to_fa2a_metadata(
-        linear_to_attn_qkv_size
+        linear_to_attn_qkv_bytes
     )
 
     # qkv linear to attn metadata
@@ -243,11 +243,14 @@ def _from_shard_info(
         for l_rank in range(world_size)
     ]
     k_offset_sends = [
-        torch.ones((n_shards_send[l_rank], max_cp_on_ranks[l_rank]), dtype=torch.int64) * -1
+        torch.ones((max_cp_on_ranks[l_rank], n_shards_send[l_rank]), dtype=torch.int64) * -1
         for l_rank in range(world_size)
     ]
     v_offset_sends = [ko.clone() for ko in k_offset_sends]
-    kv_replica_masks = [torch.zeros_like(ko, dtype=torch.int8) for ko in k_offset_sends]
+    kv_replica_masks = [
+        torch.zeros((n_shards_send[l_rank], max_cp_on_ranks[l_rank]), dtype=torch.int8)
+        for l_rank in range(world_size)
+    ]
     q_offset_recvs = [
         torch.zeros((len(attn_q_shards_on_rank[a_rank]),), dtype=torch.int64)
         for a_rank in range(world_size)
@@ -265,8 +268,8 @@ def _from_shard_info(
         for sid, shard_num_send in enumerate(num_send_k_on_rank[l_rank]):
             kv_replica_masks[l_rank][sid, :shard_num_send] = 1
         for a_rank in range(world_size):
-            cur_offset_send = sender_send_disp[a_rank].item()
-            cur_offset_recv = sender_recv_disp[a_rank].item()
+            cur_offset_send = sender_send_disp[l_rank][a_rank].item()
+            cur_offset_recv = sender_recv_disp[l_rank][a_rank].item()
             cur_offset_send, cur_offset_recv = _assign_offsets(
                 cur_offset_send, cur_offset_recv,
                 q_offset_sends, q_offset_recvs, scheduler_output,
@@ -276,11 +279,13 @@ def _from_shard_info(
                 cur_offset_send, cur_offset_recv,
                 k_offset_sends, k_offset_recvs, scheduler_output,
                 k_bytes, l_rank, a_rank, linear_to_attn_k[l_rank][a_rank],
+                is_kv_linear=True,
             )
             cur_offset_send, cur_offset_recv = _assign_offsets(
                 cur_offset_send, cur_offset_recv,
                 v_offset_sends, v_offset_recvs, scheduler_output,
                 k_bytes, l_rank, a_rank, linear_to_attn_k[l_rank][a_rank],
+                is_kv_linear=True,
             )
     qkv_my_rank_fa2a_metadata = _get_my_rank_from_metadata(linear_to_attn_qkv_fa2a_metadata)
 
@@ -301,8 +306,8 @@ def _from_shard_info(
         **qkv_my_rank_fa2a_metadata,
         seq_lens=(linear_to_attn_seqlens_q, linear_to_attn_seqlens_k),
         tensor_shape=(
-            LogicalShape(q_recv_shape, q_send_shape),
-            LogicalShape(k_recv_shape, k_send_shape),
+            LogicalShape(q_send_shape, q_recv_shape),
+            LogicalShape(k_send_shape, k_recv_shape),
         ),
         kv_replica_mask=tuple(kv_replica_masks)
     )
@@ -311,11 +316,11 @@ def _from_shard_info(
     )
     if compute_attn_out_metadata:
         # fa2a metadata
-        out_grad_linear_to_attn_size = (
-            linear_to_attn_num_tokens_q * out_hidden,
+        out_grad_linear_to_attn_bytes = (
+            linear_to_attn_num_tokens_q * attn_out_bytes
         )
         linear_to_attn_out_grad_fa2a_metadata = send_bytes_to_fa2a_metadata(
-            out_grad_linear_to_attn_size
+            out_grad_linear_to_attn_bytes
         )
         # my rank fa2a metadata
         out_grad_my_rank_fa2a_metadata = _get_my_rank_from_metadata(
@@ -328,8 +333,8 @@ def _from_shard_info(
         sender_recv_disp = linear_to_attn_out_grad_fa2a_metadata[2]
         for l_rank in range(world_size):
             for a_rank in range(world_size):
-                cur_offset_send = sender_send_disp[a_rank].item()
-                cur_offset_recv = sender_recv_disp[a_rank].item()
+                cur_offset_send = sender_send_disp[l_rank][a_rank].item()
+                cur_offset_recv = sender_recv_disp[l_rank][a_rank].item()
                 cur_offset_send, cur_offset_recv = _assign_offsets(
                     cur_offset_send, cur_offset_recv,
                     out_grad_offset_sends, out_grad_offset_recvs, scheduler_output,
