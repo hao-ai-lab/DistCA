@@ -654,10 +654,9 @@ class Planner:
         metadata = self.item_to_metadata(items)
         return metadata
     
-    def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False):
+    def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False, should_plan = True):
         # no plan for cp debug
-        plan = True    
-        if plan == False:
+        if should_plan == False:
             rich.print("[bold yellow]Skip planning for CP debug.[/bold yellow]")
             items = deepcopy(items_)
         else:

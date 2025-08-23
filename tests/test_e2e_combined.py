@@ -41,11 +41,6 @@ from megatron_test_utils import (
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
 )
 
-# import wlbllm
-# import wlbllm.utils
-# import wlbllm.registry
-
-
 def debug_print(*args, **kwargs):
     if os.getenv("D2_DEBUG_PRINT", "0") == "1":
         if torch.distributed.is_initialized():
@@ -399,20 +394,20 @@ def setup_global_batch(
         GLOBAL_BATCH = list(GLOBAL_BATCH)
         # DP2 case
         manual_case = [
-            # [total_seq_len],
-            # [total_seq_len // 8] * 8,
+            [total_seq_len],
+            [total_seq_len // 2] * 2,
             # [total_seq_len],
             # [total_seq_len // 8] * 8,
         ]
-        manual_case = [
-            [2 * K] * (total_seq_len // (2 * K)),
-        ] * 8
-        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH
+        # manual_case = [
+        #     [2 * K] * (total_seq_len // (2 * K)),
+        # ] * 8
+        GLOBAL_BATCH = manual_case + GLOBAL_BATCH
+        GLOBAL_BATCH = iter(GLOBAL_BATCH)
     # CP debug batch case.  
-    GLOBAL_BATCH = [
-        [total_seq_len // 4 * 3, total_seq_len // 4],
-    ] * 100
-    GLOBAL_BATCH = iter(GLOBAL_BATCH)
+    # GLOBAL_BATCH = [
+    #     [total_seq_len // 4 * 3, total_seq_len // 4],
+    # ] * 100
     return
 
 
@@ -613,6 +608,10 @@ def create_one_batch_balanced_flops(
 
 
 # from transformer_engine.pytorch.attention.dot_product_attention.backends import get_attention_duration
+import wlbllm
+import wlbllm.utils
+import wlbllm.registry
+
 
 def test(args):
     seed = args.seed
@@ -745,20 +744,6 @@ def test(args):
             assert isinstance(microbatch["packed_seq_params"], PackedSeqParams)
 
         elif mode == "wlbllm":
-            setup_global_batch(
-                total_seq_len, 
-                up_sample_factor=up_sample_factor,
-                elongate_factor=elongate_factor,
-                filter_threshold=filter_threshold,
-                filter_ratio=filter_ratio,
-                should_add_debug_cases=should_add_debug_cases,
-            )
-            _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
-            print(f"🟡 sample_id={sample_id}: {_seq_lens}")
-            # TODO: Adding proper support for context parallel in megatron.
-            # Baseline mode: Use simple batch generation
-            # seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
-            # seq_lens = _seq_lens[as_rank] + _seq_lens[as_rank + as_world_size]
             cp_rank = mpu.get_context_parallel_rank()
             cp_size = mpu.get_context_parallel_world_size()
             dp_rank = mpu.get_data_parallel_rank()
@@ -767,6 +752,23 @@ def test(args):
 
             rank = torch.distributed.get_rank()
             device = torch.cuda.current_device()
+
+
+            setup_global_batch(
+                total_seq_len * cp_size, 
+                up_sample_factor=up_sample_factor,
+                elongate_factor=elongate_factor,
+                filter_threshold=filter_threshold,
+                filter_ratio=filter_ratio,
+                should_add_debug_cases=should_add_debug_cases,
+            )
+            # _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
+            _seq_lens: list[list[int]] = get_next_batch(dp_size * 2)
+            print(f"🟡 sample_id={sample_id}: {_seq_lens}")
+            # TODO: Adding proper support for context parallel in megatron.
+            # Baseline mode: Use simple batch generation
+            # seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
+            # seq_lens = _seq_lens[as_rank] + _seq_lens[as_rank + as_world_size]
 
             print(f"🟡 [Rank {rank}] cp_rank={cp_rank}, cp_size={cp_size}, dp_rank={dp_rank}, dp_size={dp_size}, as_rank={as_rank}, as_world_size={as_world_size}, device={device}")
             # test an all reduce to ensure things are doing good
@@ -782,7 +784,9 @@ def test(args):
             # ENABLE_BALANCED_FLOS_NO_DEFER = False
             ENABLE_BALANCED_FLOS_NO_DEFER = True
             if ENABLE_BALANCED_FLOS_NO_DEFER and dp_size > 1:
-                Lmax = total_seq_len * 2 # 128 * K * 2 -- the batch of this dp rank.
+                # how many tokens per dp replicate (with cp) can hold?
+                # max_seq_len_without_cp * cp_size * 2 (ping pong)
+                Lmax = total_seq_len * 2 * cp_size # 128 * K * 2
 
                 all_docs = flatten(_seq_lens)
                 all_docs.sort(reverse=True)
@@ -791,6 +795,7 @@ def test(args):
                     new_batch.append([])
                 
                 def get_workload(micro_batch: list[int]) -> int:
+                    # TODO: Fix this get_workload function to calculate the `breakpoint` of a model.
                     a = [ i / (64 * K) for i in micro_batch]
                     return sum(i ** 2 + i for i in a)
 
@@ -835,12 +840,14 @@ def test(args):
 
 
             doc_lens = flatten(seq_lens)
-            if sum(doc_lens) % (cp_size * 2 * 8) != 0:
-                # TODO(HACK): This is a hack to ensure the doc_lens is divisible by cp_size*2.
-                sum_of_doc_lens = sum(doc_lens)
-                doc_lens[-1] += (cp_size * 2 * 8) - sum_of_doc_lens % (cp_size * 2 * 8)
-                # assert doc_lens[-1] > 0
-                pass
+            # if sum(doc_lens) % (cp_size * 2 * 8) != 0:
+            #     # TODO(HACK): This is a hack to ensure the doc_lens is divisible by cp_size*2.
+            #     sum_of_doc_lens = sum(doc_lens)
+            #     doc_lens[-1] += (cp_size * 2 * 8) - sum_of_doc_lens % (cp_size * 2 * 8)
+            #     # assert doc_lens[-1] > 0
+            #     pass
+            # assert sum(doc_lens) % (cp_size * 2 * 8) == 0, f"sum(doc_lens)={sum(doc_lens)} must be divisible by {cp_size * 2 * 8}"
+            assert sum(doc_lens) % (cp_size * 2) == 0, f"sum(doc_lens)={sum(doc_lens)} must be divisible by {cp_size * 2}"
             
             rank = torch.distributed.get_rank()
             
@@ -924,6 +931,10 @@ def test(args):
             wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
 
         elif mode == "d2":
+            # TODO(FIX): How we sample is a little bit different.
+            # it really should be:
+            # 1. first we fix a context length
+            # 2. then we, in order to fix the 
             scale_factor = 4    # max token per doc : total_seq_len * scale_factor
             assert as_world_size % scale_factor == 0, f"as_world_size={as_world_size} must be divisible by {scale_factor}"
 
@@ -985,7 +996,9 @@ def test(args):
             from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
 
             def items_to_metadata(items: list[Item]):
-                ret = planner.plan_to_raw_qkv_dispatch(items)
+                # TODO(FIX) should_plan=True will actually do replanning, 
+                # but get stuck for some cases.
+                ret = planner.plan_to_raw_qkv_dispatch(items, should_plan=False)
                 (
                     mlp_num_seqs,
                     mlp_q_dispatch,
@@ -1221,7 +1234,7 @@ def test(args):
         rich.print(f"🟢 Test {__file__} passed")
         
         config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, cp_size=cp_degree, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, replan_iter=replan_iter, elongate_factor=elongate_factor)
-        rich.print(f"🟢 Test Config: ", config)
+        rich.print(f"🟢 Test Config: {config}")
         rich.print(f"🟢 Test DateTime: ", timestamp)
         
         # Prepare benchmark data
