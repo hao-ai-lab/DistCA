@@ -396,19 +396,12 @@ def from_shard_info(
             hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
             is_resend_qkv_in_bwd=True, is_send_lse_in_fwd=False,
         )
-        qkv_resend_and_out_grad_linear_to_attn, _ = _from_shard_info(
-            world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
-            compute_attn_out_metadata=False, attn_out_bytes=None
-        )
-        # backward 2: q_grad, k_grad, v_grad
-        q_bytes, k_bytes, _ = get_per_token_bytes(
-            hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
-            is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=False,
-        )
-        _, qkv_grad_attn_to_linear = _from_shard_info(
-            world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
-            compute_attn_out_metadata=False, attn_out_bytes=None
-        )
+        (qkv_resend_and_out_grad_linear_to_attn,
+         qkv_grad_attn_to_linear) = backward_from_shard_info(
+             world_size, scheduler_output_bwd,
+             hidden_size_q, hidden_size_kv,
+             lse_size_in_hidden_dtype, element_size
+            )
         out_grad_linear_to_attn = qkv_resend_and_out_grad_linear_to_attn
     else:
         assert scheduler_output_bwd is None
@@ -427,3 +420,32 @@ def from_shard_info(
         qkv_linear_to_attn, qkv_grad_attn_to_linear,
         out_attn_to_linear, out_grad_linear_to_attn,
     )
+
+
+def backward_from_shard_info(
+    world_size: int,
+    scheduler_output_bwd: Optional[Sequence[Sequence[ShardInfo]]],
+    hidden_size_q: int,
+    hidden_size_kv: int,
+    lse_size_in_hidden_dtype: int,
+    element_size: int,
+):
+    # backward 1: out_grad & out & q & k & v
+    q_bytes, k_bytes, _ = get_per_token_bytes(
+        hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
+        is_resend_qkv_in_bwd=True, is_send_lse_in_fwd=False,
+    )
+    qkv_resend_and_out_grad_linear_to_attn, _ = _from_shard_info(
+        world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
+        compute_attn_out_metadata=False, attn_out_bytes=None
+    )
+    # backward 2: q_grad, k_grad, v_grad
+    q_bytes, k_bytes, _ = get_per_token_bytes(
+        hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
+        is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=False,
+    )
+    _, qkv_grad_attn_to_linear = _from_shard_info(
+        world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
+        compute_attn_out_metadata=False, attn_out_bytes=None
+    )
+    return qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear
