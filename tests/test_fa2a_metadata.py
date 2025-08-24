@@ -79,14 +79,18 @@ def simulate_fa2a_send_qkv(
     dst_tensor = simulate_fa2a_copy_non_cp(
         q, dst_tensor, q_offset, q_seqlen, hidden_size_q, element_size, is_send=True
     )
-    dst_tensor = simulate_fa2a_copy_cp(
-        k, dst_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
-        max_cp, send_mask, is_send=True,
-    )
-    dst_tensor = simulate_fa2a_copy_cp(
-        v, dst_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
-        max_cp, send_mask, is_send=True,
-    )
+    if k is not None:
+        assert v is not None
+        dst_tensor = simulate_fa2a_copy_cp(
+            k, dst_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
+            max_cp, send_mask, is_send=True,
+        )
+        dst_tensor = simulate_fa2a_copy_cp(
+            v, dst_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
+            max_cp, send_mask, is_send=True,
+        )
+    else:
+        assert v is None
     return dst_tensor
 
 
@@ -100,12 +104,16 @@ def simulate_fa2a_send_qkv_rev(
     dst_tensor = simulate_fa2a_copy_non_cp(
         q, dst_tensor, q_offset, q_seqlen, hidden_size_q, element_size, is_send=True
     )
-    dst_tensor = simulate_fa2a_copy_non_cp(
-        k, dst_tensor, k_offset, k_seqlen, hidden_size_k, element_size, is_send=True
-    )
-    dst_tensor = simulate_fa2a_copy_non_cp(
-        v, dst_tensor, v_offset, k_seqlen, hidden_size_k, element_size, is_send=True
-    )
+    if k is not None:
+        assert v is not None
+        dst_tensor = simulate_fa2a_copy_non_cp(
+            k, dst_tensor, k_offset, k_seqlen, hidden_size_k, element_size, is_send=True
+        )
+        dst_tensor = simulate_fa2a_copy_non_cp(
+            v, dst_tensor, v_offset, k_seqlen, hidden_size_k, element_size, is_send=True
+        )
+    else:
+        assert v is None
     return dst_tensor
 
 
@@ -119,12 +127,16 @@ def simulate_fa2a_recv_qkv(
     q = simulate_fa2a_copy_non_cp(
         q, src_tensor, q_offset, q_seqlen, hidden_size_q, element_size, is_send=False
     )
-    k = simulate_fa2a_copy_non_cp(
-        k, src_tensor, k_offset, k_seqlen, hidden_size_k, element_size, is_send=False
-    )
-    v = simulate_fa2a_copy_non_cp(
-        v, src_tensor, v_offset, k_seqlen, hidden_size_k, element_size, is_send=False
-    )
+    if k is not None:
+        assert v is not None
+        k = simulate_fa2a_copy_non_cp(
+            k, src_tensor, k_offset, k_seqlen, hidden_size_k, element_size, is_send=False
+        )
+        v = simulate_fa2a_copy_non_cp(
+            v, src_tensor, v_offset, k_seqlen, hidden_size_k, element_size, is_send=False
+        )
+    else:
+        assert v is None
     return q, k, v
 
 
@@ -139,14 +151,18 @@ def simulate_fa2a_recv_qkv_rev(
     q = simulate_fa2a_copy_non_cp(
         q, src_tensor, q_offset, q_seqlen, hidden_size_q, element_size, is_send=False
     )
-    k = simulate_fa2a_copy_cp(
-        k, src_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
-        max_cp, send_mask, is_send=False,
-    )
-    v = simulate_fa2a_copy_cp(
-        v, src_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
-        max_cp, send_mask, is_send=False,
-    )
+    if k is not None:
+        assert v is not None
+        k = simulate_fa2a_copy_cp(
+            k, src_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
+            max_cp, send_mask, is_send=False,
+        )
+        v = simulate_fa2a_copy_cp(
+            v, src_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
+            max_cp, send_mask, is_send=False,
+        )
+    else:
+        assert v is None
     return q, k, v
 
 

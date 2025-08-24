@@ -356,7 +356,7 @@ def _from_shard_info(
             recv_memcpy_metadata=(tuple(out_grad_offset_recvs),),
             **out_grad_my_rank_fa2a_metadata,
             seq_lens=out_grad_seqlen,
-            tensor_shape=[LogicalShape(out_grad_recv_shape, out_grad_send_shape)],
+            tensor_shape=[LogicalShape(out_grad_send_shape, out_grad_recv_shape)],
             kv_replica_mask=None,
         )
         out_attn_to_linear = compute_reverse_a2a_layout_metadata(
@@ -377,41 +377,22 @@ def from_shard_info(
     hidden_size_kv: int,
     lse_size_in_hidden_dtype: int,
     element_size: int,
-    is_pp: bool,
-    scheduler_output_bwd: Optional[Sequence[Sequence[ShardInfo]]] = None,
+    is_pipeline_tick: bool,
 ):
-    if is_pp:
-        assert scheduler_output_bwd is not None
-        # forward
-        q_bytes, k_bytes, out_bytes = get_per_token_bytes(
-            hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
-            is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=True,
-        )
-        qkv_linear_to_attn, _, out_attn_to_linear, _ = _from_shard_info(
-            world_size, scheduler_output, q_bytes, k_bytes, element_size,
-            compute_attn_out_metadata=True, attn_out_bytes=out_bytes,
-        )
-        # backward
-        (qkv_resend_and_out_grad_linear_to_attn,
-         qkv_grad_attn_to_linear) = backward_from_shard_info(
-             world_size, scheduler_output_bwd,
-             hidden_size_q, hidden_size_kv,
-             lse_size_in_hidden_dtype, element_size
-            )
-        out_grad_linear_to_attn = qkv_resend_and_out_grad_linear_to_attn
-    else:
-        assert scheduler_output_bwd is None
-        q_bytes, k_bytes, out_bytes = get_per_token_bytes(
-            hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
-            is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=False
-        )
-        (
-            qkv_linear_to_attn, qkv_grad_attn_to_linear,
-            out_attn_to_linear, out_grad_linear_to_attn,
-        ) = _from_shard_info(
-            world_size, scheduler_output, q_bytes, k_bytes, element_size,
-            compute_attn_out_metadata=True, attn_out_bytes=out_bytes,
-        )
+    """NOTE: for PP, this only computes the Forward"""
+    q_bytes, k_bytes, out_bytes = get_per_token_bytes(
+        hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
+        is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=is_pipeline_tick,
+    )
+    (qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
+     out_grad_linear_to_attn,) = _from_shard_info(
+        world_size, scheduler_output, q_bytes, k_bytes, element_size,
+        compute_attn_out_metadata=True, attn_out_bytes=out_bytes,
+    )
+    if is_pipeline_tick:
+        # Force them to None to avoid being misused.
+        qkv_grad_attn_to_linear = None
+        out_grad_linear_to_attn = None
     return (
         qkv_linear_to_attn, qkv_grad_attn_to_linear,
         out_attn_to_linear, out_grad_linear_to_attn,
@@ -426,6 +407,9 @@ def backward_from_shard_info(
     lse_size_in_hidden_dtype: int,
     element_size: int,
 ):
+    """
+    Compute the backward communication metadatga for pipeline parallel. (resend qkv)
+    """
     # backward 1: out_grad & out & q & k & v
     q_bytes, k_bytes, _ = get_per_token_bytes(
         hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
