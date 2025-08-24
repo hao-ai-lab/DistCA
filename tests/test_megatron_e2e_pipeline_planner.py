@@ -5,7 +5,7 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_m
 """
 import argparse
 import time
-from typing import Optional
+from typing import Iterable, List, Optional
 
 import megatron.core.parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -17,7 +17,7 @@ from d2.runtime.inplace_metadata import mlp_layout_packed_params
 from d2.planner.planner import Planner, batch_to_items_class
 from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata, compute_backward_resend_e2e_metadata
 
-from test_util import ParallelConfig, create_raw_qkv_dispatch, set_random_seed
+from test_util import ParallelConfig, create_raw_qkv_dispatch, set_random_seed,gen_seq_lens
 from test_megatron_e2e_pipeline import MegatronE2eWorker as MegatronPpBaseWorker, init_megatron_e2e_test
 
 
@@ -168,8 +168,6 @@ def create_qkv_dispatch_pipeline_tick_planned(
             seq_lens,)
 
 
-from test_util import gen_seq_lens
-from typing import Iterable, List, Optional
 
 ITERATION_ID = 0
 iterated_samples = []

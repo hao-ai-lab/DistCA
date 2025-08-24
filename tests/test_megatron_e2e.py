@@ -31,9 +31,6 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self.enable_gradient_checkpointing = False
         self.gradient_checkpointing_kwargs = {}
 
-    def init_comm(self, *args, **kwargs):
-        super().init_comm(*args, **kwargs)
-
     def set_config(self, dtype=torch.bfloat16, enable_gradient_checkpointing=False, gradient_checkpointing_kwargs={}):
         self.dtype = dtype
         self.enable_gradient_checkpointing = enable_gradient_checkpointing
