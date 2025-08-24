@@ -8,7 +8,6 @@ import torch
 
 from d2.runtime.compute_metadata import from_shard_info, backward_from_shard_info
 from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata
-from d2.runtime.shard_info import ShardInfo
 
 from test_util import create_random_shard_info
 from test_fa2a_metadata import (

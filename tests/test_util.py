@@ -255,11 +255,15 @@ def create_list(n: int, s: int, min_val: int, t: int) -> list[int] | None:
 
 def create_random_shard_info(
     seed: int, world_size: int, num_doc: int,
-    max_num_shard: int, max_shard_len: int, min_shard_len: int=8,
+    max_num_shard: int, max_shard_len: int=-1, min_shard_len: int=8,
     tot_num_token: int=-1, multiple_of: int=1
 ):
-    set_random_seed(seed)
+    set_random_seed(seed, set_megatron=False)
     scheduler_output: list[list[ShardInfo]] = []
+    if max_shard_len <= 0:
+        assert tot_num_token > 0
+        max_shard_len = tot_num_token
+
     num_shards = torch.randint(1, max_num_shard + 1, (num_doc,)).tolist()
     has_shard_src = [False] * world_size
     has_shard_dst = [False] * world_size
