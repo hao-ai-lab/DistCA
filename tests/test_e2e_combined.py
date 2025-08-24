@@ -303,7 +303,10 @@ def init_megatron_e2e_test(
     buffer_size = (
         token_bytes_q * max_tokens_query +
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
-    ) * 8
+    )
+
+    buffer_size_gb = buffer_size // 1024 / 1024 / 1024
+    print(f"🟡 buffer_size = {buffer_size_gb} GB")
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=tp_size
     )
@@ -606,12 +609,16 @@ def create_one_batch_balanced_flops(
         rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
         qkv_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
         qkv_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
+        qkv_fwd_fa2a_metadata.my_rank_send_sz = 0
         qkv_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
         qkv_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
+        qkv_rev_fa2a_metadata.my_rank_send_sz = 0
         attn_out_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
         attn_out_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
+        attn_out_fwd_fa2a_metadata.my_rank_send_sz = 0
         attn_out_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
         attn_out_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
+        attn_out_rev_fa2a_metadata.my_rank_send_sz = 0
 
 
     attn_metadata = (
@@ -629,6 +636,7 @@ import wlbllm.registry
 
 def test(args):
     seed = args.seed
+    batch_size = args.batch_size
     num_tokens = args.num_tokens
     cp_degree = max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
@@ -653,6 +661,7 @@ def test(args):
     normal_forward_fn = (mode in ["baseline", "wlbllm"])
     # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
     os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
+
 
     if mode == "wlbllm":
         import wlbllm.megatron_patch.dot_product_attention
@@ -712,21 +721,20 @@ def test(args):
     hidden_size_k_tp = hidden_size_kv // tp_size
 
     # TODO(Refactor): Properly refactor this into a function and we call it multiple times
+
+    setup_global_batch(
+        total_seq_len,
+        up_sample_factor=up_sample_factor,
+        elongate_factor=elongate_factor,
+        filter_threshold=filter_threshold,
+        filter_ratio=filter_ratio,
+        should_add_debug_cases=should_add_debug_cases,
+    )
+
     max_sample_id = max_sample_id
     sample_times = []
     for sample_id in range(max_sample_id):
-        
-        
-
         if mode == "baseline":
-            setup_global_batch(
-                total_seq_len, 
-                up_sample_factor=up_sample_factor,
-                elongate_factor=elongate_factor,
-                filter_threshold=filter_threshold,
-                filter_ratio=filter_ratio,
-                should_add_debug_cases=should_add_debug_cases,
-            )
             _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
             print(f"🟡 sample_id={sample_id}: {_seq_lens}")
             # TODO: Adding proper support for context parallel in megatron.
@@ -762,17 +770,7 @@ def test(args):
             rank = torch.distributed.get_rank()
             device = torch.cuda.current_device()
 
-
-            setup_global_batch(
-                total_seq_len * cp_size, 
-                up_sample_factor=up_sample_factor,
-                elongate_factor=elongate_factor,
-                filter_threshold=filter_threshold,
-                filter_ratio=filter_ratio,
-                should_add_debug_cases=should_add_debug_cases,
-            )
-            # _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
-            _seq_lens: list[list[int]] = get_next_batch(dp_size * 2)
+            _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
             print(f"🟡 sample_id={sample_id}: {_seq_lens}")
             # TODO: Adding proper support for context parallel in megatron.
             # Baseline mode: Use simple batch generation
@@ -795,7 +793,7 @@ def test(args):
             if ENABLE_BALANCED_FLOS_NO_DEFER and dp_size > 1:
                 # how many tokens per dp replicate (with cp) can hold?
                 # max_seq_len_without_cp * cp_size * 2 (ping pong)
-                Lmax = total_seq_len * 2 * cp_size # 128 * K * 2
+                Lmax = total_seq_len * 2 * batch_size // cp_size
 
                 all_docs = flatten(_seq_lens)
                 all_docs.sort(reverse=True)
@@ -867,7 +865,6 @@ def test(args):
             local_context_length = sum(doc_lens) // cp_size
             context_length = local_context_length * cp_size
 
-            import d2.runtime.megatron_patch.create_group
             # cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
             # debug_print(f"cp_size", cp_size)
             debug_print(f"local_context_length", local_context_length)
@@ -954,7 +951,6 @@ def test(args):
             # 2. Each GPU should get total_seq_len // as_world_size number of tokens. 
 
             dp_size = as_world_size
-            batch_size = args.batch_size
 
             model_config = hf_config
             parallel_config = ParallelConfig(
@@ -962,21 +958,13 @@ def test(args):
                 pipeline_model_parallel_size=1,
             )
 
-            setup_global_batch(
-                total_seq_len,
-                up_sample_factor=up_sample_factor,
-                elongate_factor=elongate_factor,
-                filter_threshold=filter_threshold,
-                filter_ratio=filter_ratio,
-                should_add_debug_cases=should_add_debug_cases,
-            )
-
             _seq_lens: list[list[int]] = get_next_batch(2 * batch_size)
             seq_lens_0: list[list[int]] = _seq_lens[:batch_size]
             seq_lens_1: list[list[int]] = _seq_lens[batch_size:]
 
-            print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch1 : {seq_lens_0}")
-            print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch2 : {seq_lens_1}")
+            if rank % 8 == 0: # TODO(HACK) Fix it to say tp_rank == 0 will print
+                print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch1 : {seq_lens_0}")
+                print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch2 : {seq_lens_1}")
 
             num_batched_token_per_as_rank = total_seq_len // as_world_size * batch_size
 
@@ -1019,7 +1007,16 @@ def test(args):
                     # TODO: What is this? How do specify this values?
                     softmax_lse_size=0,
                 )
+                if os.environ.get("D2_FA2A_DISABLE_SEND_RECV", "0") == "1":
+                    rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
+                    for i in range(4):
+                        fa2a_metadata[i].fa2a_metadata[0][:] = 0
+                        fa2a_metadata[i].fa2a_metadata[1][:] = 0
+                        fa2a_metadata[i].fa2a_metadata[2][:] = 0
+                        fa2a_metadata[i].fa2a_metadata[3][:] = 0
+                        fa2a_metadata[i].my_rank_send_sz = 0
 
+                
                 # rich.print(f"🟡 [Rank {rank}] fa2a_metadata=", fa2a_metadata)
 
                 ping_pang_params = get_single_step_packed_seq_params(
@@ -1034,8 +1031,23 @@ def test(args):
                     mlp_seq_params,
                 )
 
+            print(f"🟡 [Rank {rank}] hidden_size_q_tp = {hidden_size_q_tp}, hidden_size_k_tp = {hidden_size_k_tp}, element_size = {element_size}")
+            import pickle
+            if rank == 0:
+                rich.print(model_config)
+                with open("model_config.pkl", "wb") as f:
+                    pickle.dump(model_config, f)
+            exit(0)
             ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
             ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
+
+            if rank % 8 == 0:
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_fwd_metadata =", ping_pang_params_0.qkv_fwd_metadata)
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_bwd_metadata =", ping_pang_params_0.qkv_bwd_metadata)
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_fwd_metadata =", ping_pang_params_1.qkv_fwd_metadata)
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_bwd_metadata =", ping_pang_params_1.qkv_bwd_metadata)
+                rich.print(f"🟡 [Rank {rank}] mlp_seq_params_0 =", mlp_seq_params_0)
+                rich.print(f"🟡 [Rank {rank}] mlp_seq_params_1 =", mlp_seq_params_1)
 
             packed_seq_params = PingPangPackedSeqParams(
                 seq_params=[ping_pang_params_0, ping_pang_params_1],
@@ -1051,6 +1063,10 @@ def test(args):
 
             input_ids_local = torch.randint(0, 100, (1, num_batched_token_per_as_rank * 2))[0]
             position_ids_local = torch.arange(num_batched_token_per_as_rank, dtype=torch.int64).repeat(1, 2)[0]
+
+            if rank % 8 == 0:
+                rich.print(f"🟡 [Rank {rank}] input_ids_local.shape =", input_ids_local.shape)
+                rich.print(f"🟡 [Rank {rank}] position_ids_local.shape =", position_ids_local.shape)
 
             microbatch = {
                 "input_ids": input_ids_local,
@@ -1144,6 +1160,7 @@ def test(args):
         # Prepare benchmark data
         benchmark_data = {
             "test_file": __file__,
+            "args": str(args),
             "timestamp": timestamp,
             "config": config,
             "samples": []
