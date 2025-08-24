@@ -15,8 +15,6 @@ from test_util import (
 )
 
 
-
-
 def test_create_qkv_dispatch_balanced_flops_1(
     world_size_, total_seq_len_, num_seqs_, max_cp_degree_, 
     verbose=False,
@@ -26,7 +24,7 @@ def test_create_qkv_dispatch_balanced_flops_1(
 
     world_size = 4
     assert world_size == world_size_, f"This test forces world_size = 4"
-    
+
     total_seq_len = 16 * K
     assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = 16K"
 
@@ -35,7 +33,7 @@ def test_create_qkv_dispatch_balanced_flops_1(
 
     max_cp_degree = 8
     assert max_cp_degree == max_cp_degree_, f"This test forces max_cp_degree = 8"
-    
+
 
     seq_lens_list = [
         [16*K],
@@ -77,7 +75,7 @@ def test_create_qkv_dispatch_balanced_flops_1(
         for j in range(len(seq_lens_list[i])):
             seq_lens[i, j] = seq_lens_list[i][j]
     rich.print("seq_lens =", seq_lens)
-    
+
     cp_num = torch.zeros((world_size, num_seqs), dtype=torch.int64)
     for i in range(len(cp_num_list)):
         for j in range(len(cp_num_list[i])):
@@ -97,9 +95,9 @@ def test_create_qkv_dispatch_balanced_flops_1(
             for k in range(len(seq_shard_lens_list[i][j])):
                 seq_shard_lens[i, j, k] = seq_shard_lens_list[i][j][k]
     rich.print("seq_shard_lens =", seq_shard_lens)
-    
+
     # breakpoint()
-    
+
     ret = create_qkv_dispatch_with_custom_mapping(
         world_size, 
         seq_lens,
@@ -119,10 +117,10 @@ def test_create_qkv_dispatch_balanced_flops_2(
 ):
 
     K = 1024
-    
+
     world_size = 4
     assert world_size == world_size_, f"This test forces world_size = 4"
-    
+
     total_seq_len = 16 * K
     assert total_seq_len == total_seq_len_, f"This test forces total_seq_len = 16K"
 
@@ -131,7 +129,7 @@ def test_create_qkv_dispatch_balanced_flops_2(
 
     max_cp_degree = 8
     assert max_cp_degree == max_cp_degree_, f"This test forces max_cp_degree = 8"
-    
+
 
     from d2.planner.equal_flops import (
         batch_to_items, 
@@ -258,7 +256,7 @@ def test_create_qkv_dispatch_balanced_flops_2(
          [2048,    0,    0,    0,    0,    0]]
     ])
 
-    
+
     ret = create_qkv_dispatch_with_custom_mapping(
         world_size, 
         seq_lens,
