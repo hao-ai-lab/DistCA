@@ -25,13 +25,15 @@ from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.packed_seq_params import PackedSeqParams
-
+from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
 from omegaconf import OmegaConf
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 
 from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
 from d2.runtime.inplace_metadata import mlp_layout_packed_params
+from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
+from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed
 from test_pingpang_layer import create_one_batch, get_single_step_packed_seq_params
@@ -39,6 +41,12 @@ from megatron_test_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
+)
+
+from d2.planner.planner import (
+    batch_to_items_general,
+    Planner,
+    Item,
 )
 
 def debug_print(*args, **kwargs):
@@ -936,12 +944,125 @@ def test(args):
             wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
             wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
 
+        
         elif mode == "d2":
+            # D2 will get 2 batch each time, one for ping, the other for pong.
+            # Suppose we have 
+            #   as_world_size = 4
+            # Then that means we implicitly have dpcp = 4
+            # 1. We get 2 batch, each batch has `total_seq_len`` number of tokens
+            # 2. Each GPU should get total_seq_len // as_world_size number of tokens. 
+            # 
+
+            model_config = hf_config
+            parallel_config = ParallelConfig(
+                tensor_model_parallel_size=tp_size,
+                pipeline_model_parallel_size=1,
+            )
+
+            setup_global_batch(
+                total_seq_len,
+                up_sample_factor=up_sample_factor,
+                elongate_factor=elongate_factor,
+                filter_threshold=filter_threshold,
+                filter_ratio=filter_ratio,
+                should_add_debug_cases=should_add_debug_cases,
+            )
+
+            _seq_lens: list[list[int]] = get_next_batch(2)
+            seq_lens_0: list[list[int]] = _seq_lens[:1]
+            seq_lens_1: list[list[int]] = _seq_lens[1:]
+
+            print(f"🟡 ping pong batch1 : {seq_lens_0}")
+            print(f"🟡 ping pong batch2 : {seq_lens_1}")
+
+            num_batched_token_per_as_rank = total_seq_len // as_world_size  
+
+            _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
+            _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
+
+            planner = Planner(world_size, parallel_config, model_config=model_config)
+            
+            d2_should_replan = os.environ.get("D2_SHOULD_REPLAN", "0") == "1"
+            
+            def items_to_metadata(items: list[Item]) -> tuple['PingPangSingleStepPackedSeqParams', 'PackedSeqParams']:
+                ret = planner.plan_to_raw_qkv_dispatch(items, should_plan=d2_should_replan)
+                (
+                    mlp_num_seqs,
+                    mlp_q_dispatch,
+                    mlp_seq_lens,
+                    kv_to_q_mapping,
+                    kv_to_q_rank,
+                    kv_context_size,
+                    q_to_num_kv_seq,
+                    q_to_num_kv_tokens,
+                ) = ret
+
+                # TODO(HACK)(Refactor): 
+                # We probably want to move this function inside the Planner.plan
+                (
+                    fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv, fa_params, fa2a_metadata
+                ) = compute_e2e_fa2a_metadata(
+                    mlp_seq_lens,
+                    mlp_num_seqs,
+                    mlp_q_dispatch,
+                    kv_to_q_mapping,
+                    kv_to_q_rank,
+                    kv_context_size,
+                    q_to_num_kv_seq,
+                    q_to_num_kv_tokens,
+                    hidden_size_q_tp,
+                    hidden_size_k_tp,
+                    element_size,
+                    # TODO: What is this? How do specify this values?
+                    softmax_lse_size=0,
+                )
+
+                # rich.print(f"🟡 [Rank {rank}] fa2a_metadata=", fa2a_metadata)
+
+                ping_pang_params = get_single_step_packed_seq_params(
+                    fa2a_metadata, fa_params, as_rank
+                )
+
+                raw_seq_len = mlp_seq_lens
+                mlp_seq_params = mlp_layout_packed_params(raw_seq_len)
+
+                return (
+                    ping_pang_params,
+                    mlp_seq_params,
+                )
+
+            ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
+            ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
+
+            packed_seq_params = PingPangPackedSeqParams(
+                seq_params=[ping_pang_params_0, ping_pang_params_1],
+                mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
+                # max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+                # max_seqlen_kv=torch.tensor([total_seq_len_including_cp * 2], dtype=torch.int32)[0],
+                
+                # TODO:(Question) Why do we need to x2 here?
+                max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+                max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+                qkv_format="thd",
+            )
+
+            input_ids_local = torch.randint(0, 100, (1, num_batched_token_per_as_rank * 2))[0]
+            position_ids_local = torch.arange(num_batched_token_per_as_rank, dtype=torch.int64).repeat(1, 2)[0]
+
+            microbatch = {
+                "input_ids": input_ids_local,
+                "position_ids": position_ids_local,
+                "packed_seq_params": packed_seq_params,
+            }
+            pass
+
+        elif mode == "d2-old-v2":
             # TODO(FIX): How we sample is a little bit different.
             # it really should be:
             # 1. first we fix a context length
             # 2. then we, in order to fix the 
-            scale_factor = 4    # max token per doc : total_seq_len * scale_factor
+            scale_factor = max_cp_degree    # max token per doc : total_seq_len * scale_factor
             assert as_world_size % scale_factor == 0, f"as_world_size={as_world_size} must be divisible by {scale_factor}"
 
             total_seq_len_including_cp = total_seq_len * scale_factor #as_world_size
@@ -957,10 +1078,10 @@ def test(args):
                 should_add_debug_cases=should_add_debug_cases,
             )
 
-            _seq_lens: list[list[int]] = get_next_batch(as_world_size // scale_factor * 2)
+            _seq_lens: list[list[int]] = get_next_batch(2)
             
             dp_size = as_world_size
-            num_list_per_batch =dp_size // scale_factor
+            num_list_per_batch = dp_size // scale_factor
             # D2 mode: Use balanced flops planning and ping-pang parameters
             # Note: Although this is still list of list of int,
             # it only has one element (one batch) and does not correspond to 
@@ -972,11 +1093,6 @@ def test(args):
             print(f"🟡 ping pong batch1 : {seq_lens_0}")
             print(f"🟡 ping pong batch2 : {seq_lens_1}")
 
-            from d2.planner.planner import (
-                batch_to_items_general,
-                Planner,
-                Item,
-            )
 
             parallel_config = ParallelConfig(
                 tensor_model_parallel_size=tp_size,
@@ -999,7 +1115,7 @@ def test(args):
             # items_0 and items_1 is the result similar to `create_qkv_dispatch_with_custom_mapping`...
             # items_1 = planner.plan_to_raw_qkv_dispatch(_items_1)
 
-            from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
+            
 
             d2_should_replan = os.environ.get("D2_SHOULD_REPLAN", "0") == "1"
 
@@ -1038,7 +1154,7 @@ def test(args):
                     softmax_lse_size=0,
                 )
 
-                rich.print(f"🟡 [Rank {rank}] fa2a_metadata=", fa2a_metadata)
+                # rich.print(f"🟡 [Rank {rank}] fa2a_metadata=", fa2a_metadata)
 
                 ping_pang_params = get_single_step_packed_seq_params(
                     fa2a_metadata, fa_params, as_rank
@@ -1057,9 +1173,7 @@ def test(args):
                     rich.print(f"🟡 Planned before: items[{i}]", item)
             ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
             ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
-            
-            from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
-            
+                        
             packed_seq_params = PingPangPackedSeqParams(
                 seq_params=[ping_pang_params_0, ping_pang_params_1],
                 mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
@@ -1149,7 +1263,6 @@ def test(args):
             mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
             mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
             
-            from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
             packed_seq_params = PingPangPackedSeqParams(
                 seq_params=[ping_pang_params_0, ping_pang_params_1],
                 mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
