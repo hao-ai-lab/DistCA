@@ -125,7 +125,8 @@ def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_
     rank_budgets = [num_batched_token] * DP_degree
     current_rank_idx = 0
 
-    all_docs = []
+    # Flatten the batches into a list of dicts, each dict contains the length of the document.
+    all_docs: list[dict] = []
     for _, batch in enumerate(batches):
         for doc_len in batch:
             all_docs.append({'len': doc_len})
@@ -657,10 +658,12 @@ class Planner:
     def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False, should_plan = True):
         # no plan for cp debug
         if should_plan == False:
-            rich.print("[bold yellow]Skip planning for CP debug.[/bold yellow]")
+            if verbose:
+                rich.print("[bold yellow]Skip planning for CP debug.[/bold yellow]")
             items = deepcopy(items_)
         else:
-            rich.print("[bold green]Start planning.[/bold green]")
+            if verbose:
+                rich.print("[bold green]Start planning.[/bold green]")
             items = self.plan_items(items_, verbose, plot)
         items = self.postprocess_items(items)
         shard_infos = self.items_into_shardinfos(items)

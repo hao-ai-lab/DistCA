@@ -303,7 +303,7 @@ def init_megatron_e2e_test(
     buffer_size = (
         token_bytes_q * max_tokens_query +
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
-    )
+    ) * 8
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=tp_size
     )
@@ -952,9 +952,9 @@ def test(args):
             # Then that means we implicitly have dpcp = 4
             # 1. We get 2 batch, each batch has `total_seq_len`` number of tokens
             # 2. Each GPU should get total_seq_len // as_world_size number of tokens. 
-            # 
 
             dp_size = as_world_size
+            batch_size = args.batch_size
 
             model_config = hf_config
             parallel_config = ParallelConfig(
@@ -971,15 +971,14 @@ def test(args):
                 should_add_debug_cases=should_add_debug_cases,
             )
 
-            _seq_lens: list[list[int]] = get_next_batch(2)
-            seq_lens_0: list[list[int]] = _seq_lens[:1]
-            seq_lens_1: list[list[int]] = _seq_lens[1:]
+            _seq_lens: list[list[int]] = get_next_batch(2 * batch_size)
+            seq_lens_0: list[list[int]] = _seq_lens[:batch_size]
+            seq_lens_1: list[list[int]] = _seq_lens[batch_size:]
 
-            if as_rank == 0:
-                print(f"🟡 ping pong batch1 : {seq_lens_0}")
-                print(f"🟡 ping pong batch2 : {seq_lens_1}")
+            print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch1 : {seq_lens_0}")
+            print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch2 : {seq_lens_1}")
 
-            num_batched_token_per_as_rank = total_seq_len // as_world_size  
+            num_batched_token_per_as_rank = total_seq_len // as_world_size * batch_size
 
             _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
             _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
@@ -1044,7 +1043,7 @@ def test(args):
                 # max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
                 # max_seqlen_kv=torch.tensor([total_seq_len_including_cp * 2], dtype=torch.int32)[0],
                 
-                # TODO:(Question) Why do we need to x2 here?
+                # TODO:(Question) Not sure if the values are correct here??
                 max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
                 max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
                 qkv_format="thd",
@@ -1060,225 +1059,6 @@ def test(args):
             }
             pass
 
-        elif mode == "d2-old-v2":
-            # TODO(FIX): How we sample is a little bit different.
-            # it really should be:
-            # 1. first we fix a context length
-            # 2. then we, in order to fix the 
-            scale_factor = max_cp_degree    # max token per doc : total_seq_len * scale_factor
-            assert as_world_size % scale_factor == 0, f"as_world_size={as_world_size} must be divisible by {scale_factor}"
-
-            total_seq_len_including_cp = total_seq_len * scale_factor #as_world_size
-            rich.print(f"🟡 total_seq_len_including_cp", total_seq_len_including_cp // 1024, "K")
-
-            setup_global_batch(
-                # TODO(HACK): This is a hack to make total token: per_rank_total * as_worker
-                total_seq_len_including_cp, # per_rank_total * as_worker
-                up_sample_factor=up_sample_factor,
-                elongate_factor=elongate_factor,
-                filter_threshold=filter_threshold,
-                filter_ratio=filter_ratio,
-                should_add_debug_cases=should_add_debug_cases,
-            )
-
-            _seq_lens: list[list[int]] = get_next_batch(2)
-            
-            dp_size = as_world_size
-            num_list_per_batch = dp_size // scale_factor
-            # D2 mode: Use balanced flops planning and ping-pang parameters
-            # Note: Although this is still list of list of int,
-            # it only has one element (one batch) and does not correspond to 
-            # the per-rank sequence placement.
-            # Later, we will do this CP sharding placement. Sit tight.
-            seq_lens_0: list[list[int]] = _seq_lens[:num_list_per_batch]
-            seq_lens_1: list[list[int]] = _seq_lens[num_list_per_batch:]
-
-            print(f"🟡 ping pong batch1 : {seq_lens_0}")
-            print(f"🟡 ping pong batch2 : {seq_lens_1}")
-
-
-            parallel_config = ParallelConfig(
-                tensor_model_parallel_size=tp_size,
-                pipeline_model_parallel_size=1,
-            )
-            
-            num_batched_token = total_seq_len # per-rank total seq len
-            model_config = hf_config
-            _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token, dp_size, model_config)
-            _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token, dp_size, model_config)
-
-            # Note: 
-            # Planner's world_size is the total number of GPUs. 
-            # Inside the Planner, we have some logics that uses world_size 
-            # to deduce DP size etc using ParallelConfig.
-            # dp_size = world_size // parallel_config.tensor_model_parallel_size // parallel_config.pipeline_model_parallel_size
-            planner = Planner(world_size, parallel_config, model_config=model_config)
-            
-            # TODO: May fail here?
-            # items_0 and items_1 is the result similar to `create_qkv_dispatch_with_custom_mapping`...
-            # items_1 = planner.plan_to_raw_qkv_dispatch(_items_1)
-
-            
-
-            d2_should_replan = os.environ.get("D2_SHOULD_REPLAN", "0") == "1"
-
-            def items_to_metadata(items: list[Item]):
-                # TODO(FIX) should_plan=True will actually do replanning, 
-                # but get stuck for some cases.
-                ret = planner.plan_to_raw_qkv_dispatch(items, should_plan=d2_should_replan)
-                (
-                    mlp_num_seqs,
-                    mlp_q_dispatch,
-                    mlp_seq_lens,
-                    kv_to_q_mapping,
-                    kv_to_q_rank,
-                    kv_context_size,
-                    q_to_num_kv_seq,
-                    q_to_num_kv_tokens,
-                ) = ret
-
-                # TODO(HACK)(Refactor): 
-                # We probably want to move this function inside the Planner.plan
-                (
-                    fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv, fa_params, fa2a_metadata
-                ) = compute_e2e_fa2a_metadata(
-                    mlp_seq_lens,
-                    mlp_num_seqs,
-                    mlp_q_dispatch,
-                    kv_to_q_mapping,
-                    kv_to_q_rank,
-                    kv_context_size,
-                    q_to_num_kv_seq,
-                    q_to_num_kv_tokens,
-                    hidden_size_q_tp,
-                    hidden_size_k_tp,
-                    element_size,
-                    # TODO: What is this? How do specify this values?
-                    softmax_lse_size=0,
-                )
-
-                # rich.print(f"🟡 [Rank {rank}] fa2a_metadata=", fa2a_metadata)
-
-                ping_pang_params = get_single_step_packed_seq_params(
-                    fa2a_metadata, fa_params, as_rank
-                )
-
-                raw_seq_len = mlp_seq_lens
-                mlp_seq_params = mlp_layout_packed_params(raw_seq_len)
-
-                return (
-                    ping_pang_params,
-                    mlp_seq_params,
-                )
-            rank_id = torch.distributed.get_rank()
-            if rank_id == 0:    
-                for i, item in enumerate(_items_0):
-                    rich.print(f"🟡 Planned before: items[{i}]", item)
-            ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
-            ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
-                        
-            packed_seq_params = PingPangPackedSeqParams(
-                seq_params=[ping_pang_params_0, ping_pang_params_1],
-                mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
-                # max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-                # max_seqlen_kv=torch.tensor([total_seq_len_including_cp * 2], dtype=torch.int32)[0],
-                
-                # TODO:(Question) Why do we need to x2 here?
-                max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-                max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-                qkv_format="thd",
-            )
-
-            
-            input_ids_local = torch.randint(0, 100, (1, total_seq_len * 2))[0]
-            position_ids_local = torch.arange(total_seq_len, dtype=torch.int64).repeat(1, 2)[0]
-
-            microbatch = {
-                "input_ids": input_ids_local,
-                "position_ids": position_ids_local,
-                "packed_seq_params": packed_seq_params,
-            }
-            
-            pass
-        
-        elif mode == "d2-old":
-            setup_global_batch(
-                total_seq_len, 
-                up_sample_factor=up_sample_factor,
-                elongate_factor=elongate_factor,
-                filter_threshold=filter_threshold,
-                filter_ratio=filter_ratio,
-                should_add_debug_cases=should_add_debug_cases,
-            )
-            _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
-            print(f"🟡 sample_id={sample_id}: {_seq_lens}")
-            # TODO: FIXME - but well, for d2 it is dp/cp anyways.
-            dp_size = as_world_size
-            # D2 mode: Use balanced flops planning and ping-pang parameters
-            seq_lens_0 = _seq_lens[:as_world_size]
-            seq_lens_1 = _seq_lens[as_world_size:]
-            
-            def get_flops(xss):
-                K = 1024
-                flops = 0
-                for xs in xss:
-                    for x in xs:
-                        y = x / (64 * K)
-                        flops = x ** 2 + x
-                return flops
-
-            seq_lens = seq_lens_0 + seq_lens_1 # Not used for logging in D2 mode
-
-            flops_0 = get_flops(seq_lens_0)
-            flops_1 = get_flops(seq_lens_1)
-            if flops_0 < flops_1:
-                # always put the larger microbatch first.
-                seq_lens_0, seq_lens_1 = seq_lens_1, seq_lens_0
-                flops_0, flops_1 = flops_1, flops_0
-                
-
-            _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_one_batch_balanced_flops(
-                as_world_size, total_seq_len, seq_lens_0, max_cp_degree,
-                hidden_size_q_tp, hidden_size_k_tp, element_size,
-                replan_iter=replan_iter,
-            )
-            _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_one_batch_balanced_flops(
-                as_world_size, total_seq_len, seq_lens_1, max_cp_degree,
-                hidden_size_q_tp, hidden_size_k_tp, element_size,
-                replan_iter=replan_iter,
-            )
-
-            set_random_seed(seed, set_megatron=False)
-            input_ids = torch.randint(0, 100, (as_world_size, total_seq_len * 2))
-            position_ids = torch.arange(total_seq_len).repeat(as_world_size, 2)
-            input_ids_local = input_ids[as_rank]
-            position_ids_local = position_ids[as_rank]
-            
-            ping_pang_params_0 = get_single_step_packed_seq_params(
-                fa2a_metadata_0, attn_metadata_0, as_rank
-            )
-            ping_pang_params_1 = get_single_step_packed_seq_params(
-                fa2a_metadata_1, attn_metadata_1, as_rank
-            )
-
-            # NOTE: we don't consider that seq_lens var has padding because our data generation
-            # guarantees so. However, in practice, this is not true.
-            mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
-            mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
-            
-            packed_seq_params = PingPangPackedSeqParams(
-                seq_params=[ping_pang_params_0, ping_pang_params_1],
-                mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
-                max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-                max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-                qkv_format="thd",
-            )
-            
-            microbatch = {
-                "input_ids": input_ids_local,
-                "position_ids": position_ids_local,
-                "packed_seq_params": packed_seq_params,
-            }
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -1437,6 +1217,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm"], default="baseline", 
                         help="Test mode: 'baseline' for simple batch generation, 'd2' for balanced flops planning, 'wlbllm' for wlbllm")
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--cp-degree", type=int, default=2)
     parser.add_argument("--num-seqs", type=int, default=3)

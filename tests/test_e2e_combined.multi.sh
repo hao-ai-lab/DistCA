@@ -52,9 +52,7 @@ CP_DEGREE=${CP_DEGREE:-1}
 
 # Tweek the mode between baseline vs d2.
 REPLAN_ITER=${REPLAN_ITER:-10}
-# NUM_TOKENS=2048
-# NUM_TOKENS=32768
-# NUM_TOKENS=65536
+BATCH_SIZE=${BATCH_SIZE:-1}
 NUM_TOKENS=${NUM_TOKENS:-131072}
 # NUM_TOKENS=174080
 NUM_LAYERS=${NUM_LAYERS:-4}
@@ -111,6 +109,7 @@ TORCHRUN_CMD=(
     --model-path ${MODEL_PATH} \
     --mode ${MODE} \
     --replan-iter ${REPLAN_ITER} \
+    --batch-size ${BATCH_SIZE} \
     --num-nodes ${NNODES} \
     --num-gpus-per-node ${NPROC_PER_NODE} \
     --num-layers ${NUM_LAYERS} \
@@ -121,7 +120,7 @@ TORCHRUN_CMD=(
     --num-tokens ${NUM_TOKENS} \
     --elongate-factor ${ELONGATE_FACTOR} \
     --filter-threshold ${FILTER_THRESHOLD} \
-    --filter-ratio ${FILTER_RATIO}    
+    --filter-ratio ${FILTER_RATIO}  
 )
 
 
