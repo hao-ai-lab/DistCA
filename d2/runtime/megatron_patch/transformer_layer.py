@@ -25,9 +25,11 @@ from d2.runtime.fast_dispatch_fn import (
 
 
 #### Tool functions for splitting and gathering args ####
-def _split_tensor(x: Optional[torch.Tensor], num_splits: int):
+def _split_tensor(x: Optional[torch.Tensor], num_splits: int, replicate: bool = True):
     if x is None:
         return (None,) * num_splits
+    if replicate:
+        return (x,) * num_splits
     return x.split(x.shape[0] // num_splits, dim=0)
 
 def _repack_args(args: List[List[torch.Tensor]], num_splits: int):
@@ -44,12 +46,12 @@ def _repack_dicts(args: Dict[str, List[torch.Tensor]], num_splits: int):
         for i in range(num_splits)
     ]
 
-def _splits_all(tensors: List[torch.Tensor], num_splits: int):
-    splits = [_split_tensor(t, num_splits) for t in tensors]
+def _splits_all(tensors: List[torch.Tensor], num_splits: int, replicate_index: Iterable[int] = ()):
+    splits = [_split_tensor(t, num_splits, replicate=i in replicate_index) for i, t in enumerate(tensors)]
     return _repack_args(splits, num_splits)
 
 def _split_all_dict(tensors: Dict[str, torch.Tensor], num_splits: int):
-    splits = {k: _split_tensor(v, num_splits) for k, v in tensors.items()}
+    splits = {k: _split_tensor(v, num_splits, replicate="rotary_pos" in k) for k, v in tensors.items()}
     return _repack_dicts(splits, num_splits)
 
 def _gather_tensor(tensors: List[torch.Tensor], num_splits: int):
@@ -251,7 +253,7 @@ class TransformerLayer(BaseTransformerLayer):
         args = [hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
                 rotary_pos_cos, rotary_pos_sin, attention_bias, sequence_len_offset]
         if needs_split:
-            args_0, args_1 = _splits_all(args, 2)
+            args_0, args_1 = _splits_all(args, 2, replicate_index=range(4, 7))  # do not split rotary_pos_*
         else:
             args_0, args_1 = _repack_args(args, 2)
         (hidden_states_0, attention_mask_0, context_0, context_mask_0, rotary_pos_emb_0,
