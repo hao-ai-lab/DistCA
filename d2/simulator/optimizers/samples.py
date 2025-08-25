@@ -205,7 +205,8 @@ def sample_wlbllm_docs_upsample(
 def batch_documents(
     docs: Sequence[int],
     *,
-    max_ctx_length: int
+    max_ctx_length: int,
+    multiple_of: int = 16
 ) -> Iterable[List[int]]:
     """
     Yield batches whose token-sums never exceed `max_ctx_length`.
@@ -232,6 +233,10 @@ def batch_documents(
 
     while docs:
         doc = docs.popleft()
+        # ensure the document is a multiple of multiple_of
+        doc = (doc + multiple_of - 1) // multiple_of * multiple_of
+        assert doc > 0, f"doc={doc} is not positive"
+        assert doc % multiple_of == 0, f"doc={doc} is not a multiple of {multiple_of}"
 
         while doc:                                  # may need multiple splits
             space_left = max_ctx_length - sum(batch)

@@ -129,6 +129,80 @@ class FastAlltoAllMetadata:
     # Debug setting
     single_stream: bool = False
 
+    def __better_print__(self):
+        """Convert the tensor size to MB. This is just for debugging.
+        
+        Usage:
+        ```
+        fa2a_metadata: FastAlltoAllMetadata = ...
+        d = fa2a_metadata.__better_print__()
+        print(d)
+        # or even fancier
+        import rich
+        rich.print(d)
+        ```
+        
+        """
+        # Print in the order of MB for tensor
+        (
+            __sender_send_offset,
+            __sender_transfer_sz,
+            __sender_recv_offset,
+            __recver_transfer_sz,
+        ) = self.fa2a_metadata
+
+        def convert_to_mb(x):
+            y = x / (1024 ** 2)
+            return y.to('cpu')
+        
+        sender_send_offset = convert_to_mb(__sender_send_offset)
+        sender_transfer_sz = convert_to_mb(__sender_transfer_sz)
+        sender_recv_offset = convert_to_mb(__sender_recv_offset)
+        recver_transfer_sz = convert_to_mb(__recver_transfer_sz)
+
+        __send_memcpy_metadata = self.send_memcpy_metadata
+        _send_memcpy_metadata = []
+        for i, t in enumerate(__send_memcpy_metadata):
+            if isinstance(t, torch.Tensor):
+                _send_memcpy_metadata.append(convert_to_mb(t))
+            else:
+                _send_memcpy_metadata.append(t)
+        send_memcpy_metadata = tuple(_send_memcpy_metadata)
+
+        __recv_memcpy_metadata = self.recv_memcpy_metadata
+        _recv_memcpy_metadata = []
+        for i, t in enumerate(__recv_memcpy_metadata):
+            if isinstance(t, torch.Tensor):
+                _recv_memcpy_metadata.append(convert_to_mb(t))
+            else:
+                _recv_memcpy_metadata.append(t)
+        recv_memcpy_metadata = tuple(_recv_memcpy_metadata)
+
+        my_rank_send_offset = self.my_rank_send_offset  
+        my_rank_recv_offset = self.my_rank_recv_offset
+        my_rank_send_sz = self.my_rank_send_sz
+        seq_lens = self.seq_lens
+        tensor_shape = self.tensor_shape
+        kv_replica_mask = self.kv_replica_mask
+        single_stream = self.single_stream
+
+        return dict(
+            sender_send_offset=sender_send_offset,
+            sender_transfer_sz=sender_transfer_sz,
+            sender_recv_offset=sender_recv_offset,
+            recver_transfer_sz=recver_transfer_sz,
+            send_memcpy_metadata=send_memcpy_metadata,
+            recv_memcpy_metadata=recv_memcpy_metadata,
+            my_rank_send_offset=my_rank_send_offset,
+            my_rank_recv_offset=my_rank_recv_offset,   
+            my_rank_send_sz=my_rank_send_sz,
+            seq_lens=seq_lens,
+            tensor_shape=tensor_shape,
+            kv_replica_mask=kv_replica_mask,
+            single_stream=single_stream,
+        )
+        
+
     def get_slice(self, rank):
         """
         Returns the metadata for the given rank.

@@ -99,16 +99,34 @@ Example 2 : CP split required
     Item3  q=8K kv=8K  gpu=2 seq=2 src=2 is_orig=True
     ...
 """
-def batch_to_items_general(batches, num_batched_token, DP_degree, model_config):
+from typing import List, Dict, Any
+
+def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_degree: int, model_config: dict):
     """
     Put a batch of documents onto GPU ranks and return a list of Item objects.
+    Args:
+        batches: List[List[int]]
+            Outer list = per-sequence groups, inner list = document lengths in tokens.
+        num_batched_token: int
+            Maximum tokens that one rank can accept in this micro-batch.
+        DP_degree: int
+            Number of data-parallel ranks.
+        model_config: dict
+            Model configuration.
+
+    Returns:
+        List[Item]
+        One Item per **placed chunk**.  
+        • DP-fitting documents yield 1 Item.  
+        • CP-split documents yield 2 Items (head + tail).
     """
     items = []
     seqid = 0
     rank_budgets = [num_batched_token] * DP_degree
     current_rank_idx = 0
 
-    all_docs = []
+    # Flatten the batches into a list of dicts, each dict contains the length of the document.
+    all_docs: list[dict] = []
     for _, batch in enumerate(batches):
         for doc_len in batch:
             all_docs.append({'len': doc_len})
@@ -637,12 +655,22 @@ class Planner:
         metadata = self.item_to_metadata(items)
         return metadata
     
-    def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False):
-        items = self.plan_items(items_, verbose, plot)
+    def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False, should_plan = True, return_items = False):
+        # no plan for cp debug
+        if should_plan == False:
+            if verbose:
+                rich.print("[bold yellow]Skip planning for CP debug.[/bold yellow]")
+            items = deepcopy(items_)
+        else:
+            if verbose:
+                rich.print("[bold green]Start planning.[/bold green]")
+            items = self.plan_items(items_, verbose, plot)
         items = self.postprocess_items(items)
         shard_infos = self.items_into_shardinfos(items)
         
         ret = handle_planner_metadata(self.num_dispatch_instances, shard_infos)
+        if return_items:
+            return ret, items
         return ret
     
     def plan_items(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
@@ -654,7 +682,6 @@ class Planner:
 
         flops_per_gpu = [0.0] * self.num_dispatch_instances
         for item in items:
-            print(f"item.gpuid: {item.gpuid}, item.total_flops: {item.total_flops}")
             flops_per_gpu[item.gpuid] += item.total_flops
         total_flops = sum(flops_per_gpu)
         

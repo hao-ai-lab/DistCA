@@ -78,9 +78,10 @@ class PerDocumentCPAttention(torch.autograd.Function):
         attn_events: 'Optional[List[torch.cuda.Event]]',
     ):
         # TODO(HACK): obviously cursor don't know how to use warning to do log the first time...
-        print("👻 Inside PerDocumentCPAttention.forward()")
+        # print("👻 Inside PerDocumentCPAttention.forward()")
         should_sync_time_flash_attn = os.getenv("WLBLLM_SYNC_TIME_FLASH_ATTN", "0") == "1"
         should_sync_time_perdocattn = os.getenv("WLBLLM_SYNC_TIME_PERDOC_ATTN", "0") == "1"
+        should_sync_time_ag = os.getenv("WLBLLM_SYNC_TIME_AG", "0") == "1"
         ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "1") == "1"
 
         if should_sync_time_perdocattn:
@@ -116,8 +117,26 @@ class PerDocumentCPAttention(torch.autograd.Function):
             with torch.cuda.stream(cp_stream):
                 local_k = local_k.contiguous()
                 local_v = local_v.contiguous()
+                if should_sync_time_ag:
+                    torch.cuda.synchronize()
+                    start_time__ag = time.time()
                 dist.all_gather(gather_k_list, local_k, group=cp_group)
+                if should_sync_time_ag:
+                    torch.cuda.synchronize()
+                    end_time__ag = time.time()
+                    duration_ms__ag = (end_time__ag - start_time__ag) * 1000
+                    print(f"🟡 PerDocumentCPAttention allgather-k time: {duration_ms__ag} ms")
+
+                if should_sync_time_ag:
+                    torch.cuda.synchronize()
+                    start_time__ag = time.time()
                 dist.all_gather(gather_v_list, local_v, group=cp_group)
+                if should_sync_time_ag:
+                    torch.cuda.synchronize()
+                    end_time__ag = time.time()
+                    duration_ms__ag = (end_time__ag - start_time__ag) * 1000
+                    print(f"🟡 PerDocumentCPAttention allgather-v time: {duration_ms__ag} ms")
+
                 print("🟡 All gather local_k.shape =", local_k.shape)
 
             start_time__shuffle = time.time()

@@ -25,13 +25,15 @@ from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.packed_seq_params import PackedSeqParams
-
+from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
 from omegaconf import OmegaConf
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 
 from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
 from d2.runtime.inplace_metadata import mlp_layout_packed_params
+from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
+from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
 from test_pingpong_layer import create_one_batch, get_single_step_packed_seq_params
@@ -41,10 +43,11 @@ from megatron_test_utils import (
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
 )
 
-import wlbllm
-import wlbllm.utils
-import wlbllm.registry
-
+from d2.planner.planner import (
+    batch_to_items_general,
+    Planner,
+    Item,
+)
 
 def debug_print(*args, **kwargs):
     if os.getenv("D2_DEBUG_PRINT", "0") == "1":
@@ -52,6 +55,21 @@ def debug_print(*args, **kwargs):
             rank = torch.distributed.get_rank()
             rich.print(f"[Rank {rank}]", *args, **kwargs)
     return
+
+def set_random_seed(seed, set_megatron: bool=True):
+    """Set worker side random seed."""
+    import random
+
+    import numpy as np
+    import torch
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if get_torch_device().device_count() > 0 and set_megatron:
+        from megatron.core import tensor_parallel
+
+        tensor_parallel.model_parallel_cuda_manual_seed(seed)
 
 
 class MegatronE2eWorker(MegatronBaseWorker):
@@ -285,7 +303,22 @@ def init_megatron_e2e_test(
     buffer_size = (
         token_bytes_q * max_tokens_query +
         token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
-    )
+    ) * 1.5
+    buffer_size = int(buffer_size)
+
+    EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB = os.environ.get("EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB", "-1")
+    try:
+        EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB = float(EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB)
+        if EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB > 0:
+            EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB *= (1024 ** 3)
+            EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB = int(EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB)
+            buffer_size = EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB
+            pass
+    except:
+        pass
+
+    buffer_size_gb = buffer_size // 1024 / 1024 / 1024
+    print(f"🟡 buffer_size = {buffer_size_gb} GB")
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=tp_size
     )
@@ -353,8 +386,8 @@ GLOBAL_BATCH: Optional[Iterable[List[int]]] = None
 K = 1024
 # TODO(Refactor): Remove this global variable.
 iterated_samples = []
-
-
+modified_batches = []
+fa2a_metadata_list = []
 
 
 def setup_global_batch(
@@ -383,22 +416,31 @@ def setup_global_batch(
     if should_add_debug_cases:
         GLOBAL_BATCH = list(GLOBAL_BATCH)
         # DP2 case
+        # manual_case = [
+        #     [total_seq_len],
+        #     [total_seq_len // 2] * 2,
+        #     # [total_seq_len],
+        #     # [total_seq_len // 8] * 8,
+        # ]
+        # 🔴 Failed: Cross 3 GPU + non cross for the others
         manual_case = [
-            # [total_seq_len],
-            # [total_seq_len // 8] * 8,
-            # [total_seq_len],
-            # [total_seq_len // 8] * 8,
+            [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
+            [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
         ]
-        manual_case = [
-            [2 * K] * (total_seq_len // (2 * K)),
-        ] * 8
-        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH   
 
-    GLOBAL_BATCH = iter(GLOBAL_BATCH)
+        # manual_case = [
+        #     [2 * K] * (total_seq_len // (2 * K)),
+        # ] * 8
+        GLOBAL_BATCH = manual_case + GLOBAL_BATCH
+        GLOBAL_BATCH = iter(GLOBAL_BATCH)
+    # CP debug batch case.  
+    # GLOBAL_BATCH = [
+    #     [total_seq_len // 4 * 3, total_seq_len // 4],
+    # ] * 100
     return
 
 
-def get_next_batch(dp_size):
+def get_next_batch(dp_size) -> Iterable[List[List[int]]]:
     global GLOBAL_BATCH
     global ITERATION_ID
     global iterated_samples
@@ -565,10 +607,11 @@ def create_one_batch_balanced_flops(
         attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
     )
 
-    rich.print(f"qkv_fwd_fa2a_metadata.fa2a_metadata=", qkv_fwd_fa2a_metadata.fa2a_metadata)
-    rich.print(f"qkv_rev_fa2a_metadata.fa2a_metadata=", qkv_rev_fa2a_metadata.fa2a_metadata)
-    rich.print(f"attn_out_fwd_fa2a_metadata.fa2a_metadata=", attn_out_fwd_fa2a_metadata.fa2a_metadata)
-    rich.print(f"attn_out_rev_fa2a_metadata.fa2a_metadata=", attn_out_rev_fa2a_metadata.fa2a_metadata)
+    if os.environ.get("D2_DEBUG_PRINT_METADATA", "0") == "1":
+        rich.print(f"qkv_fwd_fa2a_metadata.fa2a_metadata=", qkv_fwd_fa2a_metadata.fa2a_metadata)
+        rich.print(f"qkv_rev_fa2a_metadata.fa2a_metadata=", qkv_rev_fa2a_metadata.fa2a_metadata)
+        rich.print(f"attn_out_fwd_fa2a_metadata.fa2a_metadata=", attn_out_fwd_fa2a_metadata.fa2a_metadata)
+        rich.print(f"attn_out_rev_fa2a_metadata.fa2a_metadata=", attn_out_rev_fa2a_metadata.fa2a_metadata)
     
     # Only for debug!
     # Intentionally set the sender_transfer_sz and receiver_transfer_sz to 0 
@@ -578,12 +621,16 @@ def create_one_batch_balanced_flops(
         rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
         qkv_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
         qkv_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
+        qkv_fwd_fa2a_metadata.my_rank_send_sz = 0
         qkv_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
         qkv_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
+        qkv_rev_fa2a_metadata.my_rank_send_sz = 0
         attn_out_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
         attn_out_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
+        attn_out_fwd_fa2a_metadata.my_rank_send_sz = 0
         attn_out_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
         attn_out_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
+        attn_out_rev_fa2a_metadata.my_rank_send_sz = 0
 
 
     attn_metadata = (
@@ -594,9 +641,14 @@ def create_one_batch_balanced_flops(
 
 
 # from transformer_engine.pytorch.attention.dot_product_attention.backends import get_attention_duration
+import wlbllm
+import wlbllm.utils
+import wlbllm.registry
+
 
 def test(args):
     seed = args.seed
+    batch_size = args.batch_size
     num_tokens = args.num_tokens
     cp_degree = max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
@@ -622,6 +674,7 @@ def test(args):
     # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
     os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
 
+
     if mode == "wlbllm":
         import wlbllm.megatron_patch.dot_product_attention
         wlbllm.megatron_patch.dot_product_attention.monkey_patch()
@@ -629,22 +682,10 @@ def test(args):
         wlbllm.megatron_patch.backends.monkey_patch()
         pass
 
-
-    # Create for wlbllm
-    # cp_stream = torch.cuda.Stream()
-    cp_stream = torch.cuda.current_stream()
-
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
-    setup_global_batch(
-        total_seq_len, 
-        up_sample_factor=up_sample_factor,
-        elongate_factor=elongate_factor,
-        filter_threshold=filter_threshold,
-        filter_ratio=filter_ratio,
-        should_add_debug_cases=should_add_debug_cases,
-    )
+    
     print(f"🟡 setup_global_batch (mode={mode}): ")
     print(f"  - total_seq_len = {total_seq_len}")
 
@@ -676,6 +717,8 @@ def test(args):
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
+    # parallel_config = worker.parallel_config
+
     if mode == "wlbllm":
         rank = torch.distributed.get_rank()
         as_rank = mpu.get_context_parallel_rank()
@@ -690,14 +733,22 @@ def test(args):
     hidden_size_k_tp = hidden_size_kv // tp_size
 
     # TODO(Refactor): Properly refactor this into a function and we call it multiple times
+
+    setup_global_batch(
+        total_seq_len,
+        up_sample_factor=up_sample_factor,
+        elongate_factor=elongate_factor,
+        filter_threshold=filter_threshold,
+        filter_ratio=filter_ratio,
+        should_add_debug_cases=should_add_debug_cases,
+    )
+
     max_sample_id = max_sample_id
     sample_times = []
     for sample_id in range(max_sample_id):
-        
-        _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
-        print(f"🟡 sample_id={sample_id}: {_seq_lens}")
-
         if mode == "baseline":
+            _seq_lens: list[list[int]] = get_next_batch(as_world_size * 2)
+            print(f"🟡 sample_id={sample_id}: {_seq_lens}")
             # TODO: Adding proper support for context parallel in megatron.
             # Baseline mode: Use simple batch generation
             # seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
@@ -722,10 +773,6 @@ def test(args):
             assert isinstance(microbatch["packed_seq_params"], PackedSeqParams)
 
         elif mode == "wlbllm":
-            # TODO: Adding proper support for context parallel in megatron.
-            # Baseline mode: Use simple batch generation
-            # seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
-            # seq_lens = _seq_lens[as_rank] + _seq_lens[as_rank + as_world_size]
             cp_rank = mpu.get_context_parallel_rank()
             cp_size = mpu.get_context_parallel_world_size()
             dp_rank = mpu.get_data_parallel_rank()
@@ -734,6 +781,13 @@ def test(args):
 
             rank = torch.distributed.get_rank()
             device = torch.cuda.current_device()
+
+            _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
+            print(f"🟡 sample_id={sample_id}: {_seq_lens}")
+            # TODO: Adding proper support for context parallel in megatron.
+            # Baseline mode: Use simple batch generation
+            # seq_lens = _seq_lens[2 * as_rank] + _seq_lens[2 * as_rank + 1]
+            # seq_lens = _seq_lens[as_rank] + _seq_lens[as_rank + as_world_size]
 
             print(f"🟡 [Rank {rank}] cp_rank={cp_rank}, cp_size={cp_size}, dp_rank={dp_rank}, dp_size={dp_size}, as_rank={as_rank}, as_world_size={as_world_size}, device={device}")
             # test an all reduce to ensure things are doing good
@@ -749,7 +803,11 @@ def test(args):
             # ENABLE_BALANCED_FLOS_NO_DEFER = False
             ENABLE_BALANCED_FLOS_NO_DEFER = True
             if ENABLE_BALANCED_FLOS_NO_DEFER and dp_size > 1:
-                Lmax = total_seq_len * 2 # 128 * K * 2 -- the batch of this dp rank.
+                # how many tokens per dp replicate (with cp) can hold?
+                # max_seq_len_without_cp * cp_size * 2 (ping pong)
+                Lmax = total_seq_len * 2 * batch_size // dp_size
+                # Lmax = total_seq_len * 2 * batch_size // cp_size
+                rich.print(f"🟡 [Rank {rank}] Lmax = {Lmax}")
 
                 all_docs = flatten(_seq_lens)
                 all_docs.sort(reverse=True)
@@ -758,6 +816,7 @@ def test(args):
                     new_batch.append([])
                 
                 def get_workload(micro_batch: list[int]) -> int:
+                    # TODO: Fix this get_workload function to calculate the `breakpoint` of a model.
                     a = [ i / (64 * K) for i in micro_batch]
                     return sum(i ** 2 + i for i in a)
 
@@ -788,11 +847,16 @@ def test(args):
                     min_workload_idx = workloads.index(min(workloads))
                     new_batch[min_workload_idx].append(doc)
 
+                if rank == 0:
+                    rich.print(f"🟡 [Rank {rank}] WLBLLM Reordered Batch: new_batch = {new_batch}")
+
+                modified_batches.append(new_batch)
+
                 
-                print(f"🟡 [Rank {rank}] Before - assigning seq_lens={_seq_lens}")
-                print(f"🟡 new_batch={new_batch}")
+                # print(f"🟡 [Rank {rank}] Before - assigning seq_lens={_seq_lens}")
+                # print(f"🟡 new_batch={new_batch}")
                 seq_lens = [new_batch[dp_rank]]
-                print(f"🟡 [Rank {rank}] Taking seq_lens={seq_lens}")
+                # print(f"🟡 [Rank {rank}] Taking seq_lens={seq_lens}")
 
             else:
                 seq_lens = _seq_lens[
@@ -808,6 +872,8 @@ def test(args):
                 doc_lens[-1] += (cp_size * 2 * 8) - sum_of_doc_lens % (cp_size * 2 * 8)
                 # assert doc_lens[-1] > 0
                 pass
+            assert sum(doc_lens) % (cp_size * 2 * 8) == 0, f"sum(doc_lens)={sum(doc_lens)} must be divisible by {cp_size * 2 * 8}"
+            assert sum(doc_lens) % (cp_size * 2) == 0, f"sum(doc_lens)={sum(doc_lens)} must be divisible by {cp_size * 2}"
             
             rank = torch.distributed.get_rank()
             
@@ -818,7 +884,6 @@ def test(args):
             local_context_length = sum(doc_lens) // cp_size
             context_length = local_context_length * cp_size
 
-            import d2.runtime.megatron_patch.create_group
             # cp_group = d2.runtime.megatron_patch.create_group.get_attn_server_group()
             # debug_print(f"cp_size", cp_size)
             debug_print(f"local_context_length", local_context_length)
@@ -878,6 +943,11 @@ def test(args):
             
             # Now save some context for the use of WLBLLM function
 
+
+            # Create for wlbllm
+            # cp_stream = torch.cuda.Stream()
+            cp_stream = torch.cuda.current_stream()
+
             wlbllm.registry.clear()
             wlbllm.registry.set("doc_lens", doc_lens)
             wlbllm.registry.set("doc_shards", doc_shards)
@@ -889,58 +959,173 @@ def test(args):
             wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
             wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
             wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
-    
 
+        
         elif mode == "d2":
-            # TODO: FIXME - but well, for d2 it is dp/cp anyways.
+            # D2 will get 2 batch each time, one for ping, the other for pong.
+            # Suppose we have 
+            #   as_world_size = 4
+            # Then that means we implicitly have dpcp = 4
+            # 1. We get 2 batch, each batch has `total_seq_len`` number of tokens
+            # 2. Each GPU should get total_seq_len // as_world_size number of tokens. 
+
             dp_size = as_world_size
-            # D2 mode: Use balanced flops planning and ping-pang parameters
-            seq_lens_0 = _seq_lens[:as_world_size]
-            seq_lens_1 = _seq_lens[as_world_size:]
-            seq_lens = seq_lens_0 + seq_lens_1 # Not used for logging in D2 mode
-            _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_one_batch_balanced_flops(
-                as_world_size, total_seq_len, seq_lens_0, max_cp_degree,
-                hidden_size_q_tp, hidden_size_k_tp, element_size,
-                replan_iter=replan_iter,
-            )
-            _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_one_batch_balanced_flops(
-                as_world_size, total_seq_len, seq_lens_1, max_cp_degree,
-                hidden_size_q_tp, hidden_size_k_tp, element_size,
-                replan_iter=replan_iter,
+
+            model_config = hf_config
+            parallel_config = ParallelConfig(
+                tensor_model_parallel_size=tp_size,
+                pipeline_model_parallel_size=1,
             )
 
-            set_random_seed(seed, set_megatron=False)
-            input_ids = torch.randint(0, 100, (as_world_size, total_seq_len * 2))
-            position_ids = torch.arange(total_seq_len).repeat(as_world_size, 2)
-            input_ids_local = input_ids[as_rank]
-            position_ids_local = position_ids[as_rank]
-            
-            ping_pang_params_0 = get_single_step_packed_seq_params(
-                fa2a_metadata_0, attn_metadata_0, as_rank
-            )
-            ping_pang_params_1 = get_single_step_packed_seq_params(
-                fa2a_metadata_1, attn_metadata_1, as_rank
-            )
+            _seq_lens: list[list[int]] = get_next_batch(2 * batch_size)
+            seq_lens_0: list[list[int]] = _seq_lens[:batch_size]
+            seq_lens_1: list[list[int]] = _seq_lens[batch_size:]
 
-            # NOTE: we don't consider that seq_lens var has padding because our data generation
-            # guarantees so. However, in practice, this is not true.
-            mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
-            mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
+            if rank % 8 == 0: # TODO(HACK) Fix it to say tp_rank == 0 will print
+                print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch1 : {seq_lens_0}")
+                print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch2 : {seq_lens_1}")
+
+            num_batched_token_per_as_rank = total_seq_len // as_world_size * batch_size
+
+            _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
+            _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
+
             
-            from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
+
+            planner = Planner(world_size, parallel_config, model_config=model_config)
+            
+            d2_should_replan = os.environ.get("D2_SHOULD_REPLAN", "0") == "1"
+
+            # modified_items = []
+            # commented_fa2a_metadatas = []
+
+            def items_to_metadata(items: list[Item]) -> tuple['PingPangSingleStepPackedSeqParams', 'PackedSeqParams']:
+                ret, __items = planner.plan_to_raw_qkv_dispatch(items, should_plan=d2_should_replan, return_items=True)
+                (
+                    mlp_num_seqs,
+                    mlp_q_dispatch,
+                    mlp_seq_lens,
+                    kv_to_q_mapping,
+                    kv_to_q_rank,
+                    kv_context_size,
+                    q_to_num_kv_seq,
+                    q_to_num_kv_tokens,
+                ) = ret
+
+                # modified_items.append(__items)
+
+                # TODO(HACK)(Refactor): 
+                # We probably want to move this function inside the Planner.plan
+                (
+                    fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
+                    fa_params, fa2a_metadata
+                ) = compute_e2e_fa2a_metadata(
+                    mlp_seq_lens,
+                    mlp_num_seqs,
+                    mlp_q_dispatch,
+                    kv_to_q_mapping,
+                    kv_to_q_rank,
+                    kv_context_size,
+                    q_to_num_kv_seq,
+                    q_to_num_kv_tokens,
+                    hidden_size_q_tp,
+                    hidden_size_k_tp,
+                    element_size,
+                    # TODO: What is this? How do specify this values?
+                    softmax_lse_size=0,
+                )
+                if os.environ.get("D2_FA2A_DISABLE_SEND_RECV", "0") == "1":
+                    rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
+                    for i in range(4):
+                        fa2a_metadata[i].fa2a_metadata[0][:] = 0
+                        fa2a_metadata[i].fa2a_metadata[1][:] = 0
+                        fa2a_metadata[i].fa2a_metadata[2][:] = 0
+                        fa2a_metadata[i].fa2a_metadata[3][:] = 0
+                        fa2a_metadata[i].my_rank_send_sz = 0
+
+                
+                # if rank == 0:
+                #     (
+                #         qkv_fwd_fa2a_metadata,
+                #         qkv_bwd_fa2a_metadata,
+                #         attn_out_fwd_fa2a_metadata,
+                #         attn_out_bwd_fa2a_metadata,
+                #     ) = fa2a_metadata
+                    
+                #     # qkv_fwd_fa2a_metadata
+                #     qkv_fwd_fa2a_metadata__send_transfer_sz_mb = qkv_fwd_fa2a_metadata.fa2a_metadata[1] // 1024 // 1024
+                #     qkv_fwd_fa2a_metadata__recv_transfer_sz_mb = qkv_fwd_fa2a_metadata.fa2a_metadata[3] // 1024 // 1024
+
+                #     attn_out_fwd_fa2a_metadata__send_transfer_sz_mb = attn_out_fwd_fa2a_metadata.fa2a_metadata[1] // 1024 // 1024
+                #     attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb = attn_out_fwd_fa2a_metadata.fa2a_metadata[3] // 1024 // 1024
+                    
+                #     rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.send_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
+                #     rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.recv_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
+                    
+                #     # attn_out_fwd_fa2a_metadata
+                #     rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.send_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__send_transfer_sz_mb)
+                #     rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.recv_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb)
+
+                #     commented_fa2a_metadatas.append(dict(
+                #         qkv_fwd_fa2a_metadata__send_transfer_sz_mb=qkv_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
+                #         qkv_fwd_fa2a_metadata__recv_transfer_sz_mb=qkv_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
+                #         attn_out_fwd_fa2a_metadata__send_transfer_sz_mb=attn_out_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
+                #         attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb=attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
+                #     ))
+                    
+
+                ping_pang_params = get_single_step_packed_seq_params(
+                    fa2a_metadata, fa_params, as_rank
+                )
+
+                raw_seq_len = mlp_seq_lens
+                mlp_seq_params = mlp_layout_packed_params(raw_seq_len)
+
+                return (
+                    ping_pang_params,
+                    mlp_seq_params,
+                )
+
+            print(f"🟡 [Rank {rank}] hidden_size_q_tp = {hidden_size_q_tp}, hidden_size_k_tp = {hidden_size_k_tp}, element_size = {element_size}")
+
+            ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
+            ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
+
+            # modified_batches.append(modified_items)
+            # fa2a_metadata_list.append(commented_fa2a_metadatas)
+
+            if rank % 8 == 0:
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_fwd_metadata =", ping_pang_params_0.qkv_fwd_metadata.__better_print__())
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_fwd_metadata =", ping_pang_params_1.qkv_fwd_metadata.__better_print__())
+                rich.print(f"🟡 [Rank {rank}] mlp_seq_params_0 =", mlp_seq_params_0)
+                rich.print(f"🟡 [Rank {rank}] mlp_seq_params_1 =", mlp_seq_params_1)
+
             packed_seq_params = PingPangPackedSeqParams(
                 seq_params=[ping_pang_params_0, ping_pang_params_1],
                 mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
+                # max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+                # max_seqlen_kv=torch.tensor([total_seq_len_including_cp * 2], dtype=torch.int32)[0],
+                
+                # TODO:(Question) Not sure if the values are correct here??
                 max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
                 max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
                 qkv_format="thd",
             )
-            
+
+            input_ids_local = torch.randint(0, 100, (1, num_batched_token_per_as_rank * 2))[0]
+            position_ids_local = torch.arange(num_batched_token_per_as_rank, dtype=torch.int64).repeat(1, 2)[0]
+
+            if rank % 8 == 0:
+                rich.print(f"🟡 [Rank {rank}] input_ids_local.shape =", input_ids_local.shape)
+                rich.print(f"🟡 [Rank {rank}] position_ids_local.shape =", position_ids_local.shape)
+
             microbatch = {
                 "input_ids": input_ids_local,
                 "position_ids": position_ids_local,
                 "packed_seq_params": packed_seq_params,
             }
+            pass
+
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -948,7 +1133,13 @@ def test(args):
 
         if sample_id == 0:
             # Warmup
-            for _ in range(5):
+            warmup_times = 5
+            try:
+                warmup_times = int(os.environ.get("EXPERIMENT_WARMUP_TIMES", 5))
+            except:
+                pass
+
+            for _ in range(warmup_times):
                 ref = worker.forward_backward_batch(
                     microbatches=microbatches,
                     normal_forward_fn=normal_forward_fn,
@@ -962,6 +1153,12 @@ def test(args):
         
         # Real Experiment
         N = 3
+        
+        try:
+            N = int(os.environ.get("EXPERIMENT_REPEAT_TIMES", 3))
+        except:
+            N = 3
+
         torch.cuda.synchronize()
         
         # Calculate the average duration of the forward_backward_batch
@@ -986,6 +1183,7 @@ def test(args):
             if mode == "baseline":
                 rich.print(f"[Sample ID=({sample_id})] seq_lens = {seq_lens}")
             rich.print(f"[Sample ID=({sample_id})] Mode={mode} forward_backward_batch: avg_time_per_iteration = {avg_duration_ms:.2f} ms")
+            
 
         time.sleep(2) # to ensure the profile sees a better profiling result
         torch.cuda.synchronize()
@@ -1005,8 +1203,6 @@ def test(args):
     benchmark_dir = os.path.join(file_dir, "..", "benchmarks", "_250809_e2e_benchmark", "data")
     os.makedirs(benchmark_dir, exist_ok=True)
     benchmark_file = os.path.join(benchmark_dir, f"benchmark.{now_ts}.{mode}.json")
-
-    attn_output_file = os.path.join(benchmark_dir, f"attention_durations.{now_ts}.{mode}.json")
     
     # rank = torch.distributed.get_rank()
     # with open(attn_output_file, "w") as f:
@@ -1020,22 +1216,25 @@ def test(args):
         rich.print(f"🟢 Test {__file__} passed")
         
         config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, cp_size=cp_degree, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, replan_iter=replan_iter, elongate_factor=elongate_factor)
-        rich.print(f"🟢 Test Config: ", config)
+        rich.print(f"🟢 Test Config: {config}")
         rich.print(f"🟢 Test DateTime: ", timestamp)
         
         # Prepare benchmark data
         benchmark_data = {
             "test_file": __file__,
+            "args": str(args),
             "timestamp": timestamp,
             "config": config,
-            "samples": []
+            "samples": [],
+            # "modified_batches": modified_batches,
+            # "fa2a_metadata_list": fa2a_metadata_list,
         }
         
         for idx in range(len(sample_times)):
             samples = iterated_samples[idx]
             duration = sample_times[idx]
             # total_flops_factor = 
-            rich.print(f"🟢 Sample {idx}: {samples}, duration: {duration} ms")
+            rich.print(f"🟢 Sample {idx}: duration: {duration:.2f} ms, samples = {samples}")
             benchmark_data["samples"].append({
                 "sample_id": idx,
                 "samples": samples,
@@ -1099,6 +1298,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm"], default="baseline", 
                         help="Test mode: 'baseline' for simple batch generation, 'd2' for balanced flops planning, 'wlbllm' for wlbllm")
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--cp-degree", type=int, default=2)
     parser.add_argument("--num-seqs", type=int, default=3)

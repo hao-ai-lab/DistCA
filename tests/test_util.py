@@ -94,6 +94,7 @@ class BaseWorker:
             torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size)
             local_rank = int(os.environ.get("LOCAL_RANK"))
             self.device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(self.device)
 
     def init_nvshmem(self, buffer_size: int, local_rank: int = None):
         if self.rank == 0:
