@@ -2,11 +2,10 @@ import argparse
 import math
 import os
 import time
-import random
 
 import torch
 
-from d2.runtime.compute_metadata import from_shard_info, backward_from_shard_info
+from d2.runtime.compute_metadata import from_planner_output, backward_from_planner_output
 from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata
 
 from test_util import create_random_shard_info
@@ -171,7 +170,7 @@ def test(args):
     )
 
     tik = time.time()
-    fwd_qkv_metadata, bwd_qkv_metadata, fwd_attn_out_metadata, bwd_attn_out_metadata = from_shard_info(
+    fwd_qkv_metadata, bwd_qkv_metadata, fwd_attn_out_metadata, bwd_attn_out_metadata = from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
         is_pipeline_tick=False
     )
@@ -249,12 +248,12 @@ def test(args):
     )
     # update metadata to the fused version
     hidden_attn_out_merged = hidden_size_q + lse_size
-    fwd_qkv_metadata, _, fwd_attn_out_metadata, _ = from_shard_info(
+    fwd_qkv_metadata, _, fwd_attn_out_metadata, _ = from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
         is_pipeline_tick=True
     )
     # We use the same scheduler output for backward to verify correctness. It should be different
-    qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear = backward_from_shard_info(
+    qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear = backward_from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size
     )
     merged_attn_outs_lse_attn_layout = [

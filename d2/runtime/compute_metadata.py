@@ -116,7 +116,7 @@ def _assign_offsets(
     return cur_offset_send, cur_offset_recv
 
 
-def _from_shard_info(
+def _from_planner_output(
     world_size: int,
     scheduler_output: Sequence[Sequence[ShardInfo]],
     q_bytes: int,
@@ -370,7 +370,7 @@ def _from_shard_info(
         return qkv_linear_to_attn, qkv_grad_attn_to_linear
 
 
-def from_shard_info(
+def from_planner_output(
     world_size: int,
     scheduler_output: Sequence[Sequence[ShardInfo]],
     hidden_size_q: int,
@@ -385,7 +385,7 @@ def from_shard_info(
         is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=is_pipeline_tick,
     )
     (qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
-     out_grad_linear_to_attn,) = _from_shard_info(
+     out_grad_linear_to_attn,) = _from_planner_output(
         world_size, scheduler_output, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=True, attn_out_bytes=out_bytes,
     )
@@ -399,7 +399,7 @@ def from_shard_info(
     )
 
 
-def backward_from_shard_info(
+def backward_from_planner_output(
     world_size: int,
     scheduler_output_bwd: Optional[Sequence[Sequence[ShardInfo]]],
     hidden_size_q: int,
@@ -415,7 +415,7 @@ def backward_from_shard_info(
         hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
         is_resend_qkv_in_bwd=True, is_send_lse_in_fwd=False,
     )
-    qkv_resend_and_out_grad_linear_to_attn, _ = _from_shard_info(
+    qkv_resend_and_out_grad_linear_to_attn, _ = _from_planner_output(
         world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=False, attn_out_bytes=None
     )
@@ -424,7 +424,7 @@ def backward_from_shard_info(
         hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
         is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=False,
     )
-    _, qkv_grad_attn_to_linear = _from_shard_info(
+    _, qkv_grad_attn_to_linear = _from_planner_output(
         world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=False, attn_out_bytes=None
     )

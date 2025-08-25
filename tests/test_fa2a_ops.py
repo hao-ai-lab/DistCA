@@ -5,7 +5,7 @@ from d2.runtime.inplace_metadata import Metadata
 from d2.runtime.attn_kernels.ops import (
     fast_a2a_memcpy_non_cp, fast_a2a_memcpy_cp
 )
-from d2.runtime.compute_metadata import from_shard_info
+from d2.runtime.compute_metadata import from_planner_output
 
 from test_util import create_random_shard_info
 from test_fa2a_metadata import (
@@ -29,7 +29,7 @@ def test(args):
     lse_size = 0    # we do not test pp here so it can be 0
     scheduler_output, _ = create_random_shard_info(args.seed, world_size, num_doc, max_cp_degree,
                                                    min_shard_len=8, tot_num_token=total_seq_len)
-    qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata, _, _ = from_shard_info(
+    qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata, _, _ = from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
         is_pipeline_tick=False,
     )

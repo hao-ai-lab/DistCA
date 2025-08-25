@@ -213,7 +213,7 @@ def create_list(n: int, s: int, min_val: int, t: int) -> list[int] | None:
     Generates a list of n integers that sum to s.
 
     Each integer in the list must be:
-    - in range of [a, b].
+    - in range of [min_val, s).
     - Divisible by t.
 
     Returns:
