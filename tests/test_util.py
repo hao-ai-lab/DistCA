@@ -313,10 +313,14 @@ def create_random_shard_info(
 def random_shard_info_linear_layout_dp(
     world_size: int, max_num_doc_per_rank: int, tot_num_token: int,
     min_shard_len: int=8, multiple_of: int=1, max_num_shard: int=4, seed: int = None,
+    create_backward_redispatch: bool=False,
 ):
     """
     Create random shard info but guarantee that documents are stored
     in a DP manner on the linear layout.
+    For backward redispatch, ideally we should consider that a forward
+    shard may be further split into multiple shards during backward,
+    but for simplicity we skip this now.
     """
     if seed is not None:
         set_random_seed(seed, set_megatron=False)
@@ -364,7 +368,25 @@ def random_shard_info_linear_layout_dp(
             ])
             glob_doc_lens[rank].append(min_shard_len)
         scheduler_output.extend(scheduler_output_per_rank[rank])
-    return scheduler_output, glob_doc_lens
+    if create_backward_redispatch:
+        bwd_has_shard_dst = [False] * world_size
+        def rand_or_fixed(src_r):
+            # Force the first shard on that rank stays there.
+            if bwd_has_shard_dst[src_r]:
+                return random.randint(0, world_size - 1)
+            bwd_has_shard_dst[src_r] = True
+            return src_r
+        scheduler_output_bwd = [[
+            ShardInfo(
+                shard.rid, rand_or_fixed(shard.dispatch_rid),
+                shard.logical_sid, shard.shard_len
+            )
+            for shard in doc_shards
+        ] for doc_shards in scheduler_output
+        ]
+        return scheduler_output, glob_doc_lens, scheduler_output_bwd
+    else:
+        return scheduler_output, glob_doc_lens
 
 
 ######## TODO: deprecate all below
