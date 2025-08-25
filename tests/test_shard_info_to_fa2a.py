@@ -53,7 +53,7 @@ def simulate_all2all(
             fwd_args = (max_cp, metadata_local.kv_replica_mask)
         else:
             fn = simulate_fa2a_send_qkv_rev
-        assert q[rank].shape == metadata_local.tensor_shape[0].send_shape, f"{q[rank].shape} vs {metadata_local.tensor_shape[0].send_shape}"
+        assert q[rank].shape == metadata_local.tensor_shape[0].send_shape
         # the first dim in metadata_local is the max cp
 
         if has_kv:
