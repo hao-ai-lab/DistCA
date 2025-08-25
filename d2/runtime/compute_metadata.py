@@ -7,6 +7,7 @@ from d2.runtime.fast_alltoall_metadata import (
     compute_reverse_a2a_layout_metadata,
     exclusive_cumsum, size_pad_by_int4, _get_my_rank_from_metadata,
 )
+from d2.runtime.inplace_metadata import prepend_zero_fn
 from d2.runtime.shard_info import ShardInfo
 
 
@@ -116,6 +117,32 @@ def _assign_offsets(
     return cur_offset_send, cur_offset_recv
 
 
+def get_attn_metadata(
+    seqlens_q: Sequence[torch.Tensor], seqlens_kv: Sequence[torch.Tensor]
+):
+    """Get attn metadata from seqlens of each rank"""
+    world_size = len(seqlens_q)
+    assert len(seqlens_kv) == world_size
+    world_metadata = []
+    for r in range(world_size):
+        seqlen_q = seqlens_q[r]
+        assert seqlen_q.ndim == 1
+        cu_seqlens_q = prepend_zero_fn(seqlen_q.cumsum(dim=0))
+        max_seqlen_q = seqlen_q.max().item()
+        seqlen_kv = seqlens_kv[r]
+        assert seqlen_kv.shape == seqlen_q.shape
+        cu_seqlens_kv = prepend_zero_fn(seqlen_kv.cumsum(dim=0))
+        max_seqlen_kv = seqlen_kv.max().item()
+        out = dict(
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv
+        )
+        world_metadata.append(out)
+    return world_metadata
+
+
 def _from_planner_output(
     world_size: int,
     scheduler_output: Sequence[Sequence[ShardInfo]],
@@ -136,6 +163,8 @@ def _from_planner_output(
     attn_q_shards_on_rank: list[list[_ShardID]] = [[] for _ in range(world_size)]
     attn_k_shards_on_rank: list[list[_ShardID]] = [[] for _ in range(world_size)]
     shard_pos_linear_layout: list[list[_ShardPos]] = [[] for _ in range(num_doc)]
+    attn_q_seqlens_on_rank: list[list[int]] = [[] for _ in range(world_size)]
+    attn_k_seqlens_on_rank: list[list[int]] = [[] for _ in range(world_size)]
 
     linear_to_attn_q: list[list[list[_ShardCommInfo]]] = [
         [[] for _ in range(world_size)] for _ in range(world_size)
@@ -147,6 +176,7 @@ def _from_planner_output(
         [0 for _ in range(len(scheduler_output[did]))] for did in range(num_doc)
     ]
     for doc_id, doc in enumerate(scheduler_output):
+        context_len = 0
         for shard_id, shard in enumerate(doc):
             linear_rank = shard.rid
             attn_rank = shard.dispatch_rid
@@ -161,6 +191,10 @@ def _from_planner_output(
             shard_glob_id: _ShardID = (doc_id, shard_id)
             linear_shards_on_rank[linear_rank].append(shard_glob_id)
             attn_q_shards_on_rank[attn_rank].append(shard_glob_id)
+            # handle seqlens
+            context_len += shard.shard_len
+            attn_q_seqlens_on_rank[attn_rank].append(shard.shard_len)
+            attn_k_seqlens_on_rank[attn_rank].append(context_len)
             # linear_rank_id -> buffer_id -> attn_rank_id_q
             linear_to_attn_q[linear_rank][attn_rank].append(
                 (linear_rank_id, attn_rank_id_q, shard_glob_id, None)
@@ -314,6 +348,16 @@ def _from_planner_output(
     qkv_grad_attn_to_linear = compute_reverse_a2a_layout_metadata(
         qkv_linear_to_attn
     )
+
+    attn_q_seqlens_on_rank = [
+        torch.tensor(v, dtype=torch.int32) for v in attn_q_seqlens_on_rank
+    ]
+    attn_k_seqlens_on_rank = [
+        torch.tensor(v, dtype=torch.int32) for v in attn_k_seqlens_on_rank
+    ]
+    attn_metadata = get_attn_metadata(
+        attn_q_seqlens_on_rank, attn_k_seqlens_on_rank
+    )
     if compute_attn_out_metadata:
         # fa2a metadata
         out_grad_linear_to_attn_bytes = (
@@ -365,9 +409,10 @@ def _from_planner_output(
         return (
             qkv_linear_to_attn, qkv_grad_attn_to_linear,
             out_attn_to_linear, out_grad_linear_to_attn,
+            attn_metadata,
         )
     else:
-        return qkv_linear_to_attn, qkv_grad_attn_to_linear
+        return qkv_linear_to_attn, qkv_grad_attn_to_linear, attn_metadata
 
 
 def from_planner_output(
@@ -385,7 +430,7 @@ def from_planner_output(
         is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=is_pipeline_tick,
     )
     (qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
-     out_grad_linear_to_attn,) = _from_planner_output(
+     out_grad_linear_to_attn, attn_metadata) = _from_planner_output(
         world_size, scheduler_output, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=True, attn_out_bytes=out_bytes,
     )
@@ -396,6 +441,7 @@ def from_planner_output(
     return (
         qkv_linear_to_attn, qkv_grad_attn_to_linear,
         out_attn_to_linear, out_grad_linear_to_attn,
+        attn_metadata,
     )
 
 
@@ -415,7 +461,7 @@ def backward_from_planner_output(
         hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
         is_resend_qkv_in_bwd=True, is_send_lse_in_fwd=False,
     )
-    qkv_resend_and_out_grad_linear_to_attn, _ = _from_planner_output(
+    qkv_resend_and_out_grad_linear_to_attn, _, bwd_attn_metadata = _from_planner_output(
         world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=False, attn_out_bytes=None
     )
@@ -424,8 +470,8 @@ def backward_from_planner_output(
         hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
         is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=False,
     )
-    _, qkv_grad_attn_to_linear = _from_planner_output(
+    _, qkv_grad_attn_to_linear, bwd_attn_metadata = _from_planner_output(
         world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=False, attn_out_bytes=None
     )
-    return qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear
+    return qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear, bwd_attn_metadata

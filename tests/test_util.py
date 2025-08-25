@@ -309,6 +309,63 @@ def create_random_shard_info(
     return scheduler_output, src_num_token
 
 
+def random_shard_info_linear_layout_dp(
+    seed: int, world_size: int, max_num_doc_per_rank: int, tot_num_token: int,
+    min_shard_len: int=8, multiple_of: int=1, max_num_shard: int=4,
+):
+    """
+    Create random shard info but guarantee that documents are stored
+    in a DP manner on the linear layout.
+    """
+    set_random_seed(seed, set_megatron=False)
+    scheduler_output_per_rank: list[list[list[ShardInfo]]] = [[] for _ in range(world_size)]
+    has_shard_dst = [False] * world_size
+    glob_doc_lens = [[] for _ in range(world_size)]
+    for r in range(world_size):
+        num_doc = random.randint(1, max_num_doc_per_rank)
+        doc_lens = create_list(num_doc, tot_num_token, min_shard_len, multiple_of)
+        glob_doc_lens[r] = doc_lens
+        for doc_len in doc_lens:
+            max_shard = min(max_num_shard, doc_len // min_shard_len)
+            num_shard = random.randint(1, max_shard)
+            shard_lens = create_list(num_shard, doc_len, min_shard_len, multiple_of)
+            shards = [
+                ShardInfo(
+                    r, dispatch_rid=random.randint(0, world_size - 1),
+                    logical_sid=shard_id, shard_len=shard_len
+                ) for shard_id, shard_len in enumerate(shard_lens)
+            ]
+            for s in shards:
+                has_shard_dst[s.dispatch_rid] = True
+            scheduler_output_per_rank[r].append(shards)
+    # final step: guarantee that each rank is at least dst of one shard.
+    scheduler_output: list[list[ShardInfo]] = []
+    for rank in range(world_size):
+        if not has_shard_dst[rank]:
+            # 1. find a doc to modify.
+            token_updated = False
+            for did in range(glob_doc_lens[rank]):
+                for shard in scheduler_output_per_rank[rank][did]:
+                    if shard.shard_len < 2 * min_shard_len:
+                        continue
+                    # found the document, modify
+                    glob_doc_lens[rank][did] -= min_shard_len
+                    shard.shard_len -= min_shard_len
+                    token_updated = True
+                    break
+                if token_updated:
+                    break
+            # add a new smallest document.
+            scheduler_output_per_rank[rank].append([
+                ShardInfo(rid=rank, dispatch_rid=rank, logical_sid=0,
+                          shard_len=min_shard_len)
+            ])
+            glob_doc_lens[rank].append(min_shard_len)
+        scheduler_output.extend(scheduler_output_per_rank[rank])
+    return scheduler_output, glob_doc_lens
+
+
+######## TODO: deprecate all below
 def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor:
     ratio = torch.rand((world_size, num_seqs)) + 0.25 / num_seqs   # Use a min value to guarantee that the sequence is not too short (0 after rounding)
     ratio = ratio / ratio.sum(dim=1, keepdim=True)
