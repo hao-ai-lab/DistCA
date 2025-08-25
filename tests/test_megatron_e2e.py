@@ -15,7 +15,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
 from d2.runtime.inplace_metadata import mlp_layout_packed_params
 
-from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed
+from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
 from test_pingpang_layer import create_one_batch, get_single_step_packed_seq_params
 from megatron_test_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
@@ -24,31 +24,12 @@ from megatron_test_utils import (
 )
 
 
-def set_random_seed(seed, set_megatron: bool=True):
-    """Set worker side random seed."""
-    import random
-
-    import numpy as np
-    import torch
-
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    if get_torch_device().device_count() > 0 and set_megatron:
-        from megatron.core import tensor_parallel
-
-        tensor_parallel.model_parallel_cuda_manual_seed(seed)
-
-
 class MegatronE2eWorker(MegatronBaseWorker):
     def __init__(self, rank: int, world_size: int):
         super().__init__(rank, world_size)
         self.dtype = torch.bfloat16
         self.enable_gradient_checkpointing = False
         self.gradient_checkpointing_kwargs = {}
-
-    def init_comm(self, *args, **kwargs):
-        super().init_comm(*args, **kwargs)
 
     def set_config(self, dtype=torch.bfloat16, enable_gradient_checkpointing=False, gradient_checkpointing_kwargs={}):
         self.dtype = dtype
