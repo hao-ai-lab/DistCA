@@ -26,14 +26,6 @@ def test_create_raw_qkv_dispatch():
     rich.print(f"seq_lens = {seq_lens}")
     return
 
-(
-            fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-            attention_metadata_attn_layout, intermediates, seq_lens
-        ) = create_qkv_dispatch(
-            as_world_size, total_seq_len, num_seqs, max_cp_degree,
-            return_intermediate=True, return_mlp_no_shard_seq_lens=True
-        )
-
 
 if __name__ == "__main__":
     test_create_raw_qkv_dispatch()
