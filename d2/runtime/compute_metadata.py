@@ -1,5 +1,6 @@
 from typing import Optional, Sequence, Tuple
 
+from megatron.core.packed_seq_params import PackedSeqParams
 import torch
 
 from d2.runtime.fast_alltoall_metadata import (
@@ -118,9 +119,20 @@ def _assign_offsets(
 
 
 def get_attn_metadata(
-    seqlens_q: Sequence[torch.Tensor], seqlens_kv: Sequence[torch.Tensor]
+    seqlens_q: Sequence[torch.Tensor],
+    seqlens_kv: Sequence[torch.Tensor] = None,
+    get_packed_seq_params: bool=False
 ):
     """Get attn metadata from seqlens of each rank"""
+    return_list = True
+    if seqlens_kv is None:
+        seqlens_kv = seqlens_q
+    if isinstance(seqlens_q, torch.Tensor):
+        assert isinstance(seqlens_kv, torch.Tensor)
+        seqlens_q = [seqlens_q]
+        seqlens_kv = [seqlens_kv]
+        return_list = False
+
     world_size = len(seqlens_q)
     assert len(seqlens_kv) == world_size
     world_metadata = []
@@ -139,8 +151,13 @@ def get_attn_metadata(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_kv
         )
+        if get_packed_seq_params:
+            out = PackedSeqParams(qkv_format="thd", **out)
         world_metadata.append(out)
-    return world_metadata
+    if return_list:
+        return world_metadata
+    else:
+        return world_metadata[0]
 
 
 def _from_planner_output(

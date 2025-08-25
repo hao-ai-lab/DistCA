@@ -142,10 +142,8 @@ def test_forward(
     )
     tensor_shard = tensors[as_rank]
     # 1. normal forward. Need to provide the PackedSeqParams
-    orig_impl_attn_metadata = get_attn_metadata(doc_lens_per_rank, doc_lens_per_rank)
-    packed_seq_params = PackedSeqParams(
-        qkv_format="thd",
-        **orig_impl_attn_metadata[as_rank]
+    packed_seq_params = get_attn_metadata(
+        doc_lens_per_rank[as_rank], get_packed_seq_params=True
     )
     normal_forward_out, debug_ref = worker.forward_normal(
         tensor_shard, packed_seq_params

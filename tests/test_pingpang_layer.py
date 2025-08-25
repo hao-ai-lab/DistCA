@@ -11,7 +11,7 @@ torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer.py \
 Correctness:
 
 DP:
-NVSHMEM_IB_ENABLE_IBGDA=true NVSHMEM_DEBUG=DEBUG NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 2 test_pingpang_layer.py \
     --world-size 2 \
     --num-query-heads 8 --num-heads 32 --hidden-size 4096 --num-tokens 8192
@@ -24,13 +24,14 @@ torchrun --nnodes 1 --nproc_per_node 4 test_pingpang_layer.py \
 
 import argparse
 
+from megatron.core.packed_seq_params import PackedSeqParams
 import torch
 
 from d2.runtime.inplace_metadata import mlp_layout_packed_params
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
-from d2.runtime.fast_alltoall_metadata import compute_fa2a_metadata_from_logical_metadata
+from d2.runtime.compute_metadata import from_planner_output, get_attn_metadata
 
-from test_util import create_qkv_dispatch
+from test_util import random_shard_info_linear_layout_dp
 from test_megatron_layer import MegatronLayerWorker, init_megatron_test
 
 
@@ -78,39 +79,32 @@ class PingPangLayerWorker(MegatronLayerWorker):
 
 
 def create_one_batch(
-    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
+    seed: int, world_size: int, total_seq_len: int, num_docs: int,
     hidden_size_q: int, hidden_size_k: int, element_size: int
 ):
-    (
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        attention_metadata_attn_layout, intermediates, seq_lens
-    ) = create_qkv_dispatch(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
-        return_intermediate=True, return_mlp_no_shard_seq_lens=True
+    planner_output, doc_lens_per_rank = random_shard_info_linear_layout_dp(
+        seed, world_size, num_docs, tot_num_token=total_seq_len
     )
-    # NOTE: this already adds prepended zeros and is sharded to tuples (remove padding seqs)
-    (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-     num_local_seqs_recv) = attention_metadata_attn_layout
+    doc_lens_per_rank = [
+        torch.tensor(val, dtype=torch.int32, device='cuda') for val in doc_lens_per_rank
+    ]
 
+    lse_size = 0
     (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
      attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
-    ) = compute_fa2a_metadata_from_logical_metadata(
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        intermediates, total_seq_len, hidden_size_q, hidden_size_k,
-        element_size,
-    )
-    logical_metadata = (
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
+     as_attn_metadata,
+    ) = from_planner_output(
+        world_size, planner_output, hidden_size_q, hidden_size_k,
+        lse_size, element_size, is_pipeline_tick=False
     )
     fa2a_metadata = (
         qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
         attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
     )
-    attn_metadata = (
-        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-    )
-    raw_seq_lens = seq_lens
-    return logical_metadata, fa2a_metadata, attn_metadata, raw_seq_lens
+    doc_lens_per_rank = [
+        torch.tensor(l, dtype=torch.int32) for l in doc_lens_per_rank
+    ]
+    return planner_output, fa2a_metadata, as_attn_metadata, doc_lens_per_rank
 
 
 def get_single_step_packed_seq_params(
@@ -120,15 +114,9 @@ def get_single_step_packed_seq_params(
         qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
         attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
     ) = fa2a_metadata
-    (
-        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-    ) = attn_metadata
     ping_pang_params = PingPangSingleStepPackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_q[rank],
-        cu_seqlens_kv=cu_seqlens_kv[rank],
-        max_seqlen_q=max_seqlen_q[rank],
-        max_seqlen_kv=max_seqlen_kv[rank],
+        **attn_metadata[rank],
         qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(rank),
         qkv_bwd_metadata=qkv_rev_fa2a_metadata.get_slice(rank),
         attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
@@ -139,7 +127,7 @@ def get_single_step_packed_seq_params(
 
 @torch.no_grad()
 def test_forward(
-    seed, total_seq_len, num_seqs, max_cp_degree,
+    seed, total_seq_len, num_docs,
     worker: PingPangLayerWorker, hidden_size_q: int, hidden_size_k: int,
     debug=False, profile=False, tp_size: int = 1
 ):
@@ -154,11 +142,11 @@ def test_forward(
 
     # Create two splits for ping-pong
     _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_one_batch(
-        as_world_size, total_seq_len, num_seqs, max_cp_degree,
+        seed, as_world_size, total_seq_len, num_docs,
         hidden_size_q_tp, hidden_size_k_tp, element_size
     )
     _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_one_batch(
-        as_world_size, total_seq_len, num_seqs, max_cp_degree,
+        seed + 1, as_world_size, total_seq_len, num_docs,
         hidden_size_q_tp, hidden_size_k_tp, element_size
     )
 
@@ -170,10 +158,15 @@ def test_forward(
     )
     as_rank = worker.as_rank
     tensor_shard = tensors[as_rank]
+
+    # packed seq params for orig impl
     seq_lens_local = torch.concat(
-        (raw_seq_lens_0[as_rank][:num_seqs], raw_seq_lens_1[as_rank][:num_seqs])
+        (raw_seq_lens_0[as_rank], raw_seq_lens_1[as_rank])
     )
-    packed_seq_params = mlp_layout_packed_params(seq_lens_local)
+    packed_seq_params = get_attn_metadata(
+        seq_lens_local, get_packed_seq_params=True,
+    )
+    # orig forward
     normal_forward_out, debug_ref = worker.forward_normal(
         tensor_shard, packed_seq_params
     )
@@ -185,15 +178,16 @@ def test_forward(
         fa2a_metadata_1, attn_metadata_1, as_rank
     )
     print(f"{worker.rank=}, Attention Server Rank {as_rank}, pingpong 0 send bytes:{ping_pang_params_0.qkv_fwd_metadata.fa2a_metadata[1]}, pingpong 1 send bytes:{ping_pang_params_1.qkv_fwd_metadata.fa2a_metadata[1]}")
-    mlp_layout_seq_params = tuple(
-        mlp_layout_packed_params(seq_lens) for seq_lens in
-        (raw_seq_lens_0[as_rank][:num_seqs], raw_seq_lens_1[as_rank][:num_seqs])
+    mlp_layout_seq_params = get_attn_metadata(
+        (raw_seq_lens_0[as_rank], raw_seq_lens_1[as_rank]),
+        get_packed_seq_params=True
     )
+    max_seqlens = max(psp.max_seqlen_q for psp in mlp_layout_seq_params)
     ping_pang_params = PingPangPackedSeqParams(
         seq_params=[ping_pang_params_0, ping_pang_params_1],
         mlp_layout_seq_params=list(mlp_layout_seq_params),
-        max_seqlen_q=mlp_layout_seq_params[0].max_seqlen_q,
-        max_seqlen_kv=mlp_layout_seq_params[0].max_seqlen_kv,
+        max_seqlen_q=max_seqlens,
+        max_seqlen_kv=max_seqlens,
         qkv_format="thd",
         do_gather=True,
         debug=debug,
@@ -244,8 +238,8 @@ def test(args):
         PingPangLayerWorker
     )
     test_forward(
-        args.seed, args.num_tokens, args.num_seqs,
-        max_cp_degree, worker, hidden_size, hidden_size_kv,
+        args.seed, args.num_tokens, args.num_docs,
+        worker, hidden_size, hidden_size_kv,
         profile=args.profile, tp_size=tp_size,
     )
 
@@ -255,7 +249,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--num-tokens", type=int, default=1024)
-    parser.add_argument("--num-seqs", type=int, default=3)
+    parser.add_argument("--num-docs", type=int, default=3)
     parser.add_argument("--max-cp-degree", type=int, default=2)
     # NOTE: when increasing this value, remember to increase num-heads as well
     # because FA2 only supports head_dim_qk <= 256.
