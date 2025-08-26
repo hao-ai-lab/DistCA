@@ -1,9 +1,3 @@
-# %%[markdown]
-# # WLBLLM PP Simulator
-# ## Few problems to solve
-# - [ ] Calculating the linear time properly (divide cp or not?)
-# - [ ] Add defer logic.
-
 # %%
 K = 1024
 
@@ -77,7 +71,7 @@ def plot_timeline(execution_log, title_suffix="", granularity=100):
     # cosmetics
     ax.set_xlabel("Time (ms)")
     ax.set_yticks(yticks, ylabels)
-    ax.set_title(f"WLBLLM PP: 1F1B Timeline {title_suffix}\n"
+    ax.set_title(f"D2 PP: 1F1B Timeline {title_suffix}\n"
                  f"Total={total_ms:.1f} ms; Util {util_str}")
     ax.grid(True, axis="x", linestyle="--", alpha=0.35)
 
@@ -125,8 +119,6 @@ linear_base_time = (mlp_base_time + qkvo_base_time)  # mlp + qkvo
 # linear_base_time = 0
 # linear_base_time = 0
 
-wlb_dp = 4
-wlb_cp = 2
 total_ranks = 8
 
 
@@ -323,79 +315,3 @@ rich.print(flops)
 execution_log = run_iteration(batches, num_stages, nlayers=1)
 _ = plot_timeline(execution_log, title_suffix=f" | NumBatches = {num_batches}, Stages = {num_stages}", granularity=1000)
 plt.show()  # Display the figure
-
-# %%
-# ---- Adding workload balancing across the batches ----
-from d2.simulator.optimizers.samples import (
-    sample_wlbllm_docs_upsample, 
-    batch_documents,
-)
-
-GLOBAL_BATCH = batch_documents(
-    sample_wlbllm_docs_upsample(
-        size=10000,
-        filter_threshold=64 * K,
-        filter_ratio=0.90,
-        upsample_long_factor=2,
-        elongate_factor=4,
-    ), max_ctx_length=K * 512
-)
-num_batches = 10
-batches = [next(GLOBAL_BATCH) for _ in range(num_batches)]
-
-def get_workload_balancing_batches_no_defer(batches: list[list[int]]) -> list[list[int]]:
-    
-    
-    
-    def get_workload(micro_batch: list[int]) -> int:
-        # TODO: Fix this get_workload function to calculate the `breakpoint` of a model.
-        a = [ i / (64 * K) for i in micro_batch]
-        return sum(i ** 2 + i for i in a)
-    
-    def get_length(micro_batch: list[int]) -> int:
-        return sum(micro_batch)
-    
-    
-    Lmax = max(
-        get_length(batch) for batch in batches
-    )
-
-    new_batch = []
-    for r in range(len(batches)):
-        new_batch.append([])
-
-    # Step 1: Pack the docs into the new batch.
-    all_docs = [doc for batch in batches for doc in batch]
-    all_docs.sort(reverse=True)
-
-    remained_docs = []
-    for doc in all_docs:
-        workloads = [get_workload(batch) for batch in new_batch]
-        lengths = [get_length(batch) for batch in new_batch]
-        min_workload_idx = workloads.index(min(workloads))
-        min_length_idx = lengths.index(min(lengths))
-        
-        if lengths[min_workload_idx] + doc <= Lmax:
-            new_batch[min_workload_idx].append(doc)
-        else:
-            if lengths[min_length_idx] + doc <= Lmax:
-                new_batch[min_length_idx].append(doc)
-            else:
-                remained_docs.append(doc)
-        pass
-    
-    # Step 2: Pack the remained docs, directly by workload, no defer to next stage.
-    for doc in remained_docs:
-        workloads = [get_workload(batch) for batch in new_batch]
-        lengths = [get_length(batch) for batch in new_batch]
-        min_workload_idx = workloads.index(min(workloads))
-        new_batch[min_workload_idx].append(doc)
-    
-    return new_batch
-
-new_batches = get_workload_balancing_batches_no_defer(batches)
-execution_log = run_iteration(new_batches, num_stages, nlayers=1)
-_ = plot_timeline(execution_log, title_suffix=f" | NumBatches = {num_batches}, Stages = {num_stages}", granularity=1000)
-plt.show()  # Display the figure
-
-# %%
