@@ -676,7 +676,7 @@ class Planner:
             attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
             as_attn_metadata,
             ) = from_planner_output(
-                self.world_size, planner_output, hidden_size_q_tp, hidden_size_k_tp,
+                self.attention_server_world_size, planner_output, hidden_size_q_tp, hidden_size_k_tp,
                 lse_size, element_size, is_pipeline_tick=False
             )
             fa2a_metadata = (
