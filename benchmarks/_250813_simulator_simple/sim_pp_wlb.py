@@ -3,6 +3,7 @@
 # ## Few problems to solve
 # - [ ] Calculating the linear time properly (divide cp or not?)
 # - [ ] Add defer logic.
+# - [ ] Make sure the stage's threshold is correct.
 
 # %%
 K = 1024
@@ -189,7 +190,7 @@ from collections import defaultdict
 
 K = 1024
 
-def run_iteration(batches, num_stages=4, nlayers=1):
+def run_iteration(batches, num_stages=4, nlayers=1, threshold=None):
     """
     Run a pipeline parallel simulation with the given batches and number of stages.
     
@@ -207,7 +208,7 @@ def run_iteration(batches, num_stages=4, nlayers=1):
     
     # Number of microbatches is the length of batches list
     num_microbatches = len(batches)
-    threshold = num_microbatches // 2
+    # threshold = threshold or num_microbatches // 2
 
     # Create completion events for each stage
     completion_events = [env.event() for _ in range(num_stages)]
@@ -220,7 +221,8 @@ def run_iteration(batches, num_stages=4, nlayers=1):
     # Modify the stage function to signal completion
     def stage_with_signal(env, idx, inbox, next_inbox, prev_inbox, num_microbatches, done_counter, log_data, nlayers=1, ):
         """Main stage function to perform pipeline parallelism."""
-
+        
+        threshold = num_stages - idx
         active_batch_count = 0
         while done_counter[idx] < num_microbatches:
             # Get all batch from the inbox, 
@@ -343,6 +345,8 @@ batches = [
 ]
 num_batches = len(batches)
 num_stages = 4
+# threshold = num_batches // 2
+# threshold = num_stages
 execution_log = run_iteration(batches, num_stages)
 _ = plot_timeline(execution_log, title_suffix=f" | M={num_batches}, S={num_stages}", granularity=1000)
 plt.show()  # Display the figure
@@ -390,7 +394,9 @@ GLOBAL_BATCH = batch_documents(
         elongate_factor=4,
     ), max_ctx_length=K * 512
 )
-num_batches = 8
+num_batches = 16
+num_stages = 4  
+# threshold = num_stages
 batches = [next(GLOBAL_BATCH) for _ in range(num_batches)]
 
 def get_workload_balancing_batches_no_defer(batches: list[list[int]]) -> list[list[int]]:
