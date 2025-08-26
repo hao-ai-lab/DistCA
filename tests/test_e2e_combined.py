@@ -596,9 +596,17 @@ def create_one_batch_balanced_flops(
 
 
 # from transformer_engine.pytorch.attention.dot_product_attention.backends import get_attention_duration
-import wlbllm
-import wlbllm.utils
-import wlbllm.registry
+try:
+    import wlbllm
+    import wlbllm.utils
+    import wlbllm.registry
+except ImportError:
+    print("""⚠️ WLBLLM is not installed. This only affects if you're testing WLBLLM tests. To install:
+
+    cd d2/baseline/wlbllm_original
+    pip install -e .
+    """)
+    pass
 
 
 def test(args):
@@ -945,8 +953,6 @@ def test(args):
             _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
             _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
 
-            
-
             planner = Planner(world_size, parallel_config, model_config=model_config)
             
             d2_should_replan = os.environ.get("D2_SHOULD_REPLAN", "0") == "1"
@@ -1166,11 +1172,16 @@ def test(args):
     #     formatted_durations = [f"{duration:.2f}" for duration in attention_durations]
     #     rich.print(f"🟢 Attention durations: {formatted_durations}")
 
-    if rank == 0:
+    if rank % 8 == 0:
         
         rich.print(f"🟢 Test {__file__} passed")
         
-        config = dict(mode=mode, tp_size=tp_size, dp_size=dp_size, cp_size=cp_degree, num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, replan_iter=replan_iter, elongate_factor=elongate_factor)
+        config = dict(
+            mode=mode, tp_size=tp_size, dp_size=dp_size, cp_size=cp_degree, 
+            num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, 
+            max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, 
+            replan_iter=replan_iter, elongate_factor=elongate_factor,
+        )
         rich.print(f"🟢 Test Config: {config}")
         rich.print(f"🟢 Test DateTime: ", timestamp)
         
@@ -1199,7 +1210,7 @@ def test(args):
         # Write benchmark results to file
         # TODO: Make the output directory configurable.
         
-        
+    if rank == 0:
         with open(benchmark_file, 'w') as f:
             json.dump(benchmark_data, f, indent=2)
         
@@ -1212,41 +1223,11 @@ def test(args):
     # Cleanup and exit
     rich.print(f"❄️ [Rank {rank}] Finished test and exit.")
     
-    print(f"[Rank {rank}] Starting aggressive cleanup process...")
-    
-    # NO BARRIER - this is what was causing the hang!
-    # Instead, each process cleans up independently and exits
     
     # if False: # Only use it when force exit
     if args.force_exit: 
+        print(f"[Rank {rank}] Starting aggressive cleanup process...")
         os._exit(0)
-        # Clear CUDA cache first
-        try:
-            if torch.cuda.is_available():
-                print(f"[Rank {rank}] Clearing CUDA cache...")
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                torch.cuda.ipc_collect()
-                print(f"[Rank {rank}] CUDA cleanup completed")
-        except Exception as e:
-            print(f"[Rank {rank}] Error in CUDA cleanup: {e}")
-        
-        # Force garbage collection
-        try:
-            
-            gc.collect()
-            print(f"[Rank {rank}] Garbage collection completed")
-        except Exception as e:
-            print(f"[Rank {rank}] Error in garbage collection: {e}")
-        
-        # Just force exit immediately - don't try to clean up distributed stuff
-        # as it often hangs in complex setups like Megatron + NVSHMEM
-        print(f"[Rank {rank}] Force exiting now... nsys may not dump the cuda hw")
-        
-        # Immediate force exit with os._exit (bypasses Python cleanup)
-        os._exit(0)
-        # import sys
-        # sys.exit(0)  # or raise SystemExit
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 
 
+from torch.cuda.nvtx import range_push, range_pop
+
 def send_forward_recv_forward(output_tensors, recv_prev, tensor_shapes, config):
     """Wrapper for p2p_communication.send_backward_recv_forward used
     with non-interleaving schedule."""
@@ -451,6 +453,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     Returns gradient of loss with respect to input tensor (None if first
     stage)."""
+    range_push("backward_step")
 
     # NOTE: This code currently can handle at most one skip connection. It
     # needs to be modified slightly to support arbitrary numbers of skip
@@ -513,5 +516,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
+
+    range_pop()
 
     return input_tensor_grad

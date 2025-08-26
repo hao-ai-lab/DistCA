@@ -1,3 +1,6 @@
+# %%[markdown]
+# # Simulate the speedups of D2 vs WLBLLM. Only DP+CP.
+
 # %%
 K = 1024
 megatron_batch_size = 2 # because we do pingpong.
