@@ -84,8 +84,8 @@ class PingPangPackedSeqParams:
             ],
             debug=self.debug,
             do_gather=self.do_gather,
-            max_seqlen_q=max_seqlen_q.cpu().item(),
-            max_seqlen_kv=max_seqlen_kv.cpu().item(),
+            max_seqlen_q=_to_int(max_seqlen_q),
+            max_seqlen_kv=_to_int(max_seqlen_kv),
         )
 
 

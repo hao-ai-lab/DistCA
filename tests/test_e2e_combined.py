@@ -11,21 +11,18 @@ bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
 
 """
+import argparse
 import os
 import gc
 import pytz
 import json
-import os
-import os
 import time
 import rich
-import argparse
-import sys
+
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.packed_seq_params import PackedSeqParams
-from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
 from omegaconf import OmegaConf
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
@@ -35,8 +32,8 @@ from d2.runtime.inplace_metadata import mlp_layout_packed_params
 from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
 
-from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed
-from test_pingpang_layer import create_one_batch, get_single_step_packed_seq_params
+from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
+from test_pingpong_layer import get_single_step_packed_seq_params
 from megatron_test_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
@@ -454,53 +451,11 @@ def get_next_batch(dp_size) -> Iterable[List[List[int]]]:
 
 
 from test_util import (
-    create_raw_qkv_dispatch,
     create_qkv_dispatch_with_custom_mapping,
-)
-
-from d2.runtime.inplace_metadata import (
-    compute_metadata,
-    compute_metadata_kv,
-    compute_attn_layout_seqlens,
 )
 
 # D2 specific imports
 from d2.runtime.fast_alltoall_metadata import compute_fa2a_metadata_from_logical_metadata
-
-
-def create_qkv_dispatch(
-    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
-    return_intermediate: bool=False, return_mlp_no_shard_seq_lens: bool=False
-):
-    (cp_seq_lens, num_cp_shards, cp_query_dst,
-     kv_to_q_mapping, kv_to_q_rank, kv_context_size,
-     q_to_num_kv_seq, q_to_num_kv_tokens,
-     seq_lens) = create_raw_qkv_dispatch(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
-        return_mlp_no_shard_seq_lens
-    )
-    fwd_q_metadata, rev_q_metadata, q_intermediates = compute_metadata(
-        cp_seq_lens, cp_query_dst, return_intermediate=True
-    )
-    _, q_seq_to_dst, _ = q_intermediates
-    pad_len = torch.max(num_cp_shards)
-    fwd_k_metadata, rev_k_metadata, kv_intermediates = compute_metadata_kv(
-        kv_to_q_mapping, kv_to_q_rank, kv_context_size, q_to_num_kv_seq,
-        q_to_num_kv_tokens, cp_seq_lens, num_cp_shards, cp_query_dst,
-        q_seq_to_dst.squeeze(2), pad_len,
-        return_intermediate=True
-    )
-    attention_metadata = compute_attn_layout_seqlens(
-        cp_seq_lens, q_to_num_kv_tokens, cp_query_dst, shard_to_tuple=True
-    )
-    ret = (
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
-    )
-    if return_intermediate:
-        intermediates = q_intermediates + kv_intermediates
-        ret += (intermediates,)
-    ret += seq_lens
-    return ret
 
 
 # ========== D2 Specific Functions ==========

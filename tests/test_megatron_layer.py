@@ -26,17 +26,17 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 import torch
 
-from d2.runtime.inplace_metadata import mlp_layout_packed_params
+from d2.runtime.compute_metadata import from_planner_output, get_attn_metadata
 from d2.runtime.megatron_patch.create_group import get_attn_server_group
 from d2.runtime.megatron_patch.model_patch import get_gpt_layer_with_transformer_engine_spec, get_gpt_config
 from d2.runtime.megatron_patch.packed_seq_params import PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron_patch.transformer_layer import TransformerLayer as PingPangTransformerLayer
-from d2.runtime.fast_alltoall_metadata import compute_fa2a_metadata_from_logical_metadata
 
 from test_util import (
-    MegatronBaseWorker, ParallelConfig, simulate_communication,
-    create_qkv_dispatch, init_worker_torch_distributed,
+    MegatronBaseWorker, ParallelConfig,
+    init_worker_torch_distributed, random_shard_info_linear_layout_dp
 )
+from test_shard_info_to_fa2a import simulate_all2all
 
 
 class MegatronLayerWorker(MegatronBaseWorker):
@@ -55,8 +55,8 @@ class MegatronLayerWorker(MegatronBaseWorker):
             qkv_format=packed_seq_params.qkv_format,
             cu_seqlens_q=packed_seq_params.cu_seqlens_q.cuda().to(torch.int32),
             cu_seqlens_kv=packed_seq_params.cu_seqlens_kv.cuda().to(torch.int32),
-            max_seqlen_q=packed_seq_params.max_seqlen_q.cuda().to(torch.int32),
-            max_seqlen_kv=packed_seq_params.max_seqlen_kv.cuda().to(torch.int32),
+            max_seqlen_q=packed_seq_params.max_seqlen_q,
+            max_seqlen_kv=packed_seq_params.max_seqlen_kv,
         )
         tensor_input = tensor_input.cuda().detach()
         tensor_input.requires_grad = True
@@ -86,8 +86,6 @@ class MegatronLayerWorker(MegatronBaseWorker):
         tensor_input = tensor_input.cuda().detach()
         tensor_input.requires_grad = True
 
-        backward_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
-
         self.layer.train()
 
         if return_grad:
@@ -97,7 +95,6 @@ class MegatronLayerWorker(MegatronBaseWorker):
         with ctx:
             mlp_output, context, debug_tensors = self.layer.forward_ping_pong_single_sided(
                 tensor_input, packed_seq_params=packed_seq_params,
-                backward_resend_qkv=backward_resend_qkv,
                 return_debug=True,
             )
             if return_grad:
@@ -109,7 +106,7 @@ class MegatronLayerWorker(MegatronBaseWorker):
 
 
 def test_forward(
-    seed, total_seq_len, num_seqs, max_cp_degree,
+    seed: int, total_seq_len: int, num_docs: int, max_cp_degree: int,
     worker: MegatronLayerWorker, hidden_size_q: int, hidden_size_k: int,
     tp_size: int = 1, profile: bool = False,
 ):
@@ -119,26 +116,24 @@ def test_forward(
     as_world_size = worker.as_world_size
     as_rank = worker.as_rank
 
-    (
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        attention_metadata_attn_layout, intermediates, seq_lens
-    ) = create_qkv_dispatch(
-        as_world_size, total_seq_len, num_seqs, max_cp_degree,
-        return_intermediate=True, return_mlp_no_shard_seq_lens=True
+    planner_output, doc_lens_per_rank = random_shard_info_linear_layout_dp(
+        as_world_size, num_docs, tot_num_token=total_seq_len,
+        max_num_shard=max_cp_degree, seed=seed,
     )
-    # NOTE: this already adds prepended zeros and is sharded to tuples (remove padding seqs)
-    (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-     num_local_seqs_recv) = attention_metadata_attn_layout
+    doc_lens_per_rank = [
+        torch.tensor(val, dtype=torch.int32, device='cuda') for val in doc_lens_per_rank
+    ]
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_k // tp_size
 
+    lse_size = 0
     (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
      attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
-    ) = compute_fa2a_metadata_from_logical_metadata(
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata,
-        intermediates, total_seq_len, hidden_size_q_tp, hidden_size_k_tp,
-        element_size,
+     as_attn_metadata,
+    ) = from_planner_output(
+        as_world_size, planner_output, hidden_size_q_tp, hidden_size_k_tp,
+        lse_size, element_size, is_pipeline_tick=False
     )
 
     # thd layout's hidden size input is "t,1,h"
@@ -148,34 +143,34 @@ def test_forward(
     )
     tensor_shard = tensors[as_rank]
     # 1. normal forward. Need to provide the PackedSeqParams
-    seq_lens_local = seq_lens[as_rank][:num_seqs]
-    packed_seq_params = mlp_layout_packed_params(seq_lens_local)
+    packed_seq_params = get_attn_metadata(
+        doc_lens_per_rank[as_rank], get_packed_seq_params=True
+    )
     normal_forward_out, debug_ref = worker.forward_normal(
         tensor_shard, packed_seq_params
     )
 
-    ping_pang_params = PingPangSingleStepPackedSeqParams(
+    ping_pong_params = PingPangSingleStepPackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_q[as_rank],
-        cu_seqlens_kv=cu_seqlens_kv[as_rank],
-        max_seqlen_q=max_seqlen_q[as_rank],
-        max_seqlen_kv=max_seqlen_kv[as_rank],
         qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(as_rank),
         qkv_bwd_metadata=qkv_rev_fa2a_metadata.get_slice(as_rank),
         attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(as_rank),
         attn_out_bwd_metadata=attn_out_rev_fa2a_metadata.get_slice(as_rank),
+        **as_attn_metadata[as_rank],
     )
     ping_pang_out, debug_out = worker.forward_ping_pang_one_stage(
-        tensor_shard, ping_pang_params
+        tensor_shard, ping_pong_params
     )
 
     ref_debug = [None] * as_world_size
     ans_debug = [None] * as_world_size
     pingpong_seq_params = [None] * as_world_size
     as_group = get_attn_server_group()
+    torch.testing.assert_close(normal_forward_out, ping_pang_out)
+
     torch.distributed.all_gather_object(ref_debug, debug_ref, group=as_group)
     torch.distributed.all_gather_object(ans_debug, debug_out, group=as_group)
-    torch.distributed.all_gather_object(pingpong_seq_params, ping_pang_params, group=as_group)
+    torch.distributed.all_gather_object(pingpong_seq_params, ping_pong_params, group=as_group)
     print("debug tensors gathered.")
     if as_rank == 0:
         device = torch.device("cuda", worker.rank)
@@ -199,12 +194,23 @@ def test_forward(
         ref_attn_outs = [debug_tensor[1] for debug_tensor in ref_debug]
         torch.testing.assert_close(ref_qkvs, ans_debug_qkvs_pre_transfer)
         print("debug pre-layout-transfer qkv allclose")
-        ref_qs = [debug_tensor[0] for debug_tensor in ref_qkvs]
-        ref_ks = [debug_tensor[1] for debug_tensor in ref_qkvs]
-        ref_vs = [debug_tensor[2] for debug_tensor in ref_qkvs]
-        ref_qs_post_comm = simulate_communication(ref_qs, fwd_q_metadata)
-        ref_ks_post_comm = simulate_communication(ref_ks, fwd_k_metadata)
-        ref_vs_post_comm = simulate_communication(ref_vs, fwd_k_metadata)
+        ref_qs = [debug_tensor[0].flatten(start_dim=1) for debug_tensor in ref_qkvs]
+        ref_ks = [debug_tensor[1].flatten(start_dim=1) for debug_tensor in ref_qkvs]
+        ref_vs = [debug_tensor[2].flatten(start_dim=1) for debug_tensor in ref_qkvs]
+        ref_qs_post_comm, ref_ks_post_comm, ref_vs_post_comm = simulate_all2all(
+            ref_qs, ref_ks, ref_vs, qkv_fwd_fa2a_metadata,
+            element_size, hidden_size_q_tp, hidden_size_k_tp,
+            is_from_linear_layout=True,
+        )
+        ref_qs_post_comm = [
+            t.unsqueeze(1) for t in ref_qs_post_comm
+        ]
+        ref_ks_post_comm = [
+            t.unsqueeze(1) for t in ref_ks_post_comm
+        ]
+        ref_vs_post_comm = [
+            t.unsqueeze(1) for t in ref_vs_post_comm
+        ]
         ref_qkvs_post_comm = [
             (ref_qs_post_comm[rank], ref_ks_post_comm[rank], ref_vs_post_comm[rank]) for rank in range(as_world_size)
         ]
@@ -217,6 +223,7 @@ def test_forward(
         ref_attn_outs_a_layout = []
         for rank in range(as_world_size):
             metadata = pingpong_seq_params[rank].to_device()
+            print(ref_qs_post_comm[rank].shape)
             ref_attn_out = flash_attn_varlen_func(
                 ref_qs_post_comm[rank], ref_ks_post_comm[rank], ref_vs_post_comm[rank],
                 cu_seqlens_q = metadata.cu_seqlens_q,
@@ -228,9 +235,12 @@ def test_forward(
             )
             ref_attn_out = ref_attn_out.reshape(ref_attn_out.shape[0], 1, -1)
             ref_attn_outs_a_layout.append(ref_attn_out)
-        ref_attn_outs_post_comm = simulate_communication(
-            ref_attn_outs_a_layout, rev_q_metadata
+        ref_attn_outs_post_comm, _, _ = simulate_all2all(
+            [t.flatten(start_dim=1) for t in ref_attn_outs_a_layout],
+            None, None, attn_out_fwd_fa2a_metadata,
+            element_size, hidden_size_q_tp, None, is_from_linear_layout=False
         )
+        ref_attn_outs_post_comm = [t.unsqueeze(1) for t in ref_attn_outs_post_comm]
         torch.testing.assert_close(ref_attn_outs, ref_attn_outs_post_comm)
         print("simulated attn out allclose with expected value")
         torch.testing.assert_close(ans_debug_core_attn_out, ref_attn_outs_a_layout)
@@ -257,13 +267,13 @@ def test_forward(
         print("normal forward profiling done")
         for _ in range(3):
             ping_pang_out, debug_out = worker.forward_ping_pang_one_stage(
-                tensor_shard, ping_pang_params, return_grad=True
+                tensor_shard, ping_pong_params, return_grad=True
             )
         torch.cuda.synchronize()
         torch.distributed.barrier()
         for _ in range(20):
             ping_pang_out, debug_out = worker.forward_ping_pang_one_stage(
-                tensor_shard, ping_pang_params, return_grad=True
+                tensor_shard, ping_pong_params, return_grad=True
             )
             torch.cuda.synchronize()
             torch.distributed.barrier()
@@ -326,8 +336,8 @@ def test(args):
     )
 
     test_forward(
-        args.seed, args.num_tokens, args.num_seqs,
-        max_cp_degree, worker, hidden_size, hidden_size_kv,
+        args.seed, args.num_tokens, args.num_docs, max_cp_degree,
+        worker, hidden_size, hidden_size_kv,
         tp_size, profile=args.profile,
     )
 
@@ -338,7 +348,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--num-tokens", type=int, default=1024)
-    parser.add_argument("--num-seqs", type=int, default=3)
+    parser.add_argument("--num-docs", type=int, default=3)
     parser.add_argument("--max-cp-degree", type=int, default=2)
     # NOTE: when increasing this value, remember to increase num-heads as well
     # because FA2 only supports head_dim_qk <= 256.
