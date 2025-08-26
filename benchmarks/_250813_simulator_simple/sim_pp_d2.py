@@ -111,16 +111,11 @@ def plot_timeline(execution_log, title_suffix="", granularity=100):
 
 base_seq_len = K * 64
 attn_base_time = 12.5020
-# linear_base_time = (13.5 + 8.5) # mlp + qkvo
-# linear_base_time = (13.5 + 8.5)  # mlp + qkvo
 mlp_base_time = 13.5  # assume expert parallel
 qkvo_base_time = 8.5
 linear_base_time = (mlp_base_time + qkvo_base_time)  # mlp + qkvo
-# linear_base_time = 0
-# linear_base_time = 0
 
 total_ranks = 8
-
 
 def get_attn_time(batch) -> float:
     total_time = 0
@@ -129,7 +124,6 @@ def get_attn_time(batch) -> float:
         total_time += attn_base_time * (ratio ** 2)
     return total_time
 
-
 def get_mlp_time(batch) -> float:
     total_time = 0
     for l in batch:
@@ -137,6 +131,12 @@ def get_mlp_time(batch) -> float:
         total_time += linear_base_time * (ratio)
     return total_time
 
+def get_qkv_time(batch) -> float:
+    total_time = 0
+    for l in batch:
+        ratio = l / base_seq_len
+        total_time += qkvo_base_time * (ratio)
+    return total_time
 
 def get_network_time(token_per_batch, cp_degree) -> float:
     base_token_per_batch = 512 * 1024
@@ -154,7 +154,6 @@ def get_network_time(token_per_batch, cp_degree) -> float:
     total_time = base_time * (token_per_batch / base_token_per_batch)
     return total_time
 
-
 def get_batch_time(batch: list[int], is_backward: bool = False, wlb_cp: int = 2, nlayers: int = 1) -> float:
     token_per_batch = sum(batch)
     network_time = get_network_time(token_per_batch, wlb_cp)
@@ -168,109 +167,255 @@ def get_batch_time(batch: list[int], is_backward: bool = False, wlb_cp: int = 2,
     total_time *= nlayers
     return total_time
 
-
 # %%
 # 4-stage pipeline parallel (1F1B) SimPy model with a Matplotlib timeline.
 # Forward = 130 ms, Backward = 2.5x (325 ms)
 # One PriorityStore per stage: grad (prio=0) > act (prio=1)
 # ---- Sim model (tiny + readable) ----
 
-
 import simpy
 from collections import defaultdict
 
-K = 1024
-
-def run_iteration(batches, num_stages=4, nlayers=1):
+def make_dynamic_alltoall(env, comm_time_fn=None):
     """
-    Run a pipeline parallel simulation with the given batches and number of stages.
-    
-    Args:
-        batches: List of batches, each batch is a list of sequence lengths
-        num_stages: Number of pipeline stages/devices
-    
-    Returns:
-        execution_log: Execution log for timeline visualization
+    Dynamic reusable all-to-all with value passing.
+
+    API:
+      register(worker_id)                 # call once when a stage starts
+      deregister(worker_id)               # call once when a stage is done
+      ev = launch_comm(worker_id, payload)  # non-blocking; 'data = yield ev'
+
+    Round semantics:
+      - The *first arrival* of a round snapshots the set of currently-active workers.
+      - Only that set is required to arrive for this round.
+      - If a required worker deregisters before arriving, it is dropped.
+      - Event succeeds with a dict of payloads from the required subset.
+    """
+    active = set()            # currently active workers
+    gen = 0
+
+    # per-generation state
+    arrivals = {}             # wid -> payload
+    required = None           # set of wids required this gen (snapshot at first arrival)
+    release_event = env.event()
+    releasing = False
+
+    def _reset_generation():
+        nonlocal arrivals, required, release_event, releasing, gen
+        gen += 1
+        arrivals = {}
+        required = None
+        release_event = env.event()
+        releasing = False
+
+    def register(worker_id: int):
+        active.add(worker_id)
+
+    def deregister(worker_id: int):
+        nonlocal required, releasing
+        active.discard(worker_id)
+        # If this worker was required but hasn't arrived yet, drop it.
+        if required is not None and worker_id in required and not release_event.triggered:
+            required.discard(worker_id)
+            if not releasing and required.issubset(arrivals.keys()):
+                _schedule_release()
+
+    def _schedule_release():
+        nonlocal releasing
+        if releasing or release_event.triggered:
+            return
+        releasing = True
+        snap = {wid: arrivals[wid] for wid in required if wid in arrivals}
+
+        def _release_proc():
+            delay = float(comm_time_fn(snap)) if comm_time_fn else 0.0
+            if delay > 0:
+                yield env.timeout(delay)
+            release_event.succeed(snap)
+        env.process(_release_proc())
+
+    def launch_comm(worker_id: int, payload):
+        nonlocal required
+        # First arrival sets required set to currently active snapshot
+        if required is None:
+            required = set(active) if active else {worker_id}  # at least self
+
+        # Record arrival
+        if worker_id not in arrivals:
+            arrivals[worker_id] = payload
+
+        # If everyone required has arrived, release
+        if required.issubset(arrivals.keys()):
+            _schedule_release()
+
+        return release_event
+
+    return register, deregister, launch_comm
+
+def run_iteration(batches, num_stages=4, nlayers=2):
+    """
+    Same structure as your version, but:
+      - dynamic barrier (register/deregister)
+      - each stage increments its own done counter when it finishes a grad send
+        for a microbatch (so later stages can exit and deregister cleanly)
     """
     env = simpy.Environment()
     inboxes = [simpy.PriorityStore(env) for _ in range(num_stages)]
     done_counter = [0] * num_stages
-    execution_log = []
-    
-    # Number of microbatches is the length of batches list
+    completion_events = [env.event() for _ in range(num_stages)]
     num_microbatches = len(batches)
 
-    # Create completion events for each stage
-    completion_events = [env.event() for _ in range(num_stages)]
+    # Build per-env dynamic barrier
+    # (Put your delay model in comm_time_fn if you want)
+    register, deregister, launch_comm = make_dynamic_alltoall(env, comm_time_fn=None)
 
-    # Function to check if a stage is complete and trigger its event
     def check_stage_completion(stage_idx):
         if done_counter[stage_idx] >= num_microbatches and not completion_events[stage_idx].triggered:
             completion_events[stage_idx].succeed()
 
-    # Modify the stage function to signal completion
-    def stage_with_signal(env, idx, inbox, next_inbox, prev_inbox, num_microbatches, done_counter, log_data, nlayers=1):
-        """Main stage function to perform pipeline parallelism."""
-        while done_counter[idx] < num_microbatches:
-            _, kind, m, batch = yield inbox.get()
+    def flatten_payloads(payloads_dict):
+        out = []
+        for v in payloads_dict.values():
+            out.extend(v)
+        return out
 
-            is_backward = (kind == "grad")
+    def stage(env, idx, inbox, next_inbox, prev_inbox, num_microbatches, nlayers):
+        # Enter pipeline (become eligible for comm rounds)
+        register(idx)
+        try:
+            while done_counter[idx] < num_microbatches:
+                prio, kind, m, batch = yield inbox.get()
+                ping, pong = batch
 
-            if is_backward:
-                t0 = env.now
-                time_spent = get_batch_time(batch, is_backward=is_backward, nlayers=nlayers)
-                yield env.timeout(time_spent)
-                t1 = env.now
-                log_data.append(("B", idx, m, t0, t1))
-                done_counter[idx] += 1
-                # Check if stage is complete
-                check_stage_completion(idx)
-                if prev_inbox is not None:
-                    yield prev_inbox.put((0, "grad", m, batch))
+                is_backward = (kind == "grad")
+                is_forward  = not is_backward
+                is_last     = (idx == num_stages - 1)
 
-            else:  # "act" -> forward
+                # ---------------- FORWARD (two microbatches) ----------------
+                if is_forward:
+                    # L1: qkv[0] -> comm -> qkv[1] -> comm -> attn[0] -> comm -> attn[1] -> comm
+                    # qkv[0]
+                    yield env.timeout(get_qkv_time(ping))
+                    ev_m2a0 = launch_comm(idx, ping)
 
-                t0 = env.now
-                time_spent = get_batch_time(batch, is_backward=is_backward, nlayers=nlayers)
-                yield env.timeout(time_spent)
-                t1 = env.now
-                log_data.append(("F", idx, m, t0, t1))
-                if next_inbox is not None:
+                    # qkv[1]
+                    yield env.timeout(get_qkv_time(pong))
+                    ev_m2a1 = launch_comm(idx, pong)
+
+                    # attn[0] -> a2m[0]
+                    payloads = yield ev_m2a0
+                    attn_0_batch = flatten_payloads(payloads)
+                    yield env.timeout(get_attn_time(attn_0_batch) / total_ranks)
+                    ev_a2m0 = launch_comm(idx, ping)
+
+                    # attn[1] -> a2m[1]
+                    payloads = yield ev_m2a1
+                    attn_1_batch = flatten_payloads(payloads)
+                    yield env.timeout(get_attn_time(attn_1_batch) / total_ranks)
+                    ev_a2m1 = launch_comm(idx, pong)
+
+                    # Middle layers 1..L-2
+                    for l in range(1, nlayers - 1):
+                        # mlp+qkv[0] -> comm
+                        yield env.timeout(get_mlp_time(ping))
+                        ev_m2a0 = launch_comm(idx, ping)
+
+                        # mlp+qkv[1] -> comm
+                        yield env.timeout(get_mlp_time(pong))
+                        ev_m2a1 = launch_comm(idx, pong)
+
+                        # attn[0] -> comm
+                        payloads = yield ev_m2a0
+                        yield env.timeout(get_attn_time(flatten_payloads(payloads)) / total_ranks)
+                        ev_a2m0 = launch_comm(idx, ping)
+
+                        # attn[1] -> comm
+                        payloads = yield ev_m2a1
+                        yield env.timeout(get_attn_time(flatten_payloads(payloads)) / total_ranks)
+                        ev_a2m1 = launch_comm(idx, pong)
+
+                    # Last layer mlp only
+                    yield env.timeout(get_mlp_time(ping))
+                    yield env.timeout(get_mlp_time(pong))
+
+                # Forward → next stage
+                if is_forward and next_inbox is not None:
                     yield next_inbox.put((1, "act", m, batch))
-                else:
-                    # last stage: immediately do backward for this microbatch
-                    t0b = env.now
-                    time_spent = get_batch_time(batch, is_backward=True, nlayers=nlayers)
-                    yield env.timeout(time_spent)
-                    t1b = env.now
-                    log_data.append(("B", idx, m, t0b, t1b))
-                    done_counter[idx] += 1
-                    # Check if stage is complete
-                    check_stage_completion(idx)
-                    if prev_inbox is not None:
-                        yield prev_inbox.put((0, "grad", m, batch))
 
-    # Start stage processes
+                # ---------------- BACKWARD trigger ----------------
+                if is_backward or (is_forward and next_inbox is None):
+                    # Simple mirrored backward (kept from your version)
+                    # mlp_o[1] -> comm; mlp_o[0] -> comm
+                    yield env.timeout(get_mlp_time(pong) * 2)
+                    ev_m2a1 = launch_comm(idx, ping)
+
+                    yield env.timeout(get_mlp_time(ping) * 2)
+                    ev_m2a0 = launch_comm(idx, pong)
+
+                    # attn_b[1] -> comm; attn_b[0] -> comm
+                    payloads = yield ev_m2a1
+                    yield env.timeout(get_attn_time(flatten_payloads(payloads)) * 2.5 / total_ranks)
+                    ev_a2m1 = launch_comm(idx, pong)
+
+                    payloads = yield ev_m2a0
+                    yield env.timeout(get_attn_time(flatten_payloads(payloads)) * 2.5 / total_ranks)
+                    ev_a2m0 = launch_comm(idx, ping)
+
+                    # middle layers
+                    for l in range(1, nlayers - 1):
+                        yield env.timeout(get_mlp_time(pong) * 2)
+                        ev_m2a1 = launch_comm(idx, ping)
+
+                        yield env.timeout(get_mlp_time(ping) * 2)
+                        ev_m2a0 = launch_comm(idx, pong)
+
+                        payloads = yield ev_m2a1
+                        yield env.timeout(get_attn_time(flatten_payloads(payloads)) * 2.5 / total_ranks)
+                        ev_a2m1 = launch_comm(idx, pong)
+
+                        payloads = yield ev_m2a0
+                        yield env.timeout(get_attn_time(flatten_payloads(payloads)) * 2.5 / total_ranks)
+                        ev_a2m0 = launch_comm(idx, ping)
+
+                    # first layer qkv_b
+                    yield env.timeout(get_qkv_time(pong) * 1.7)
+                    yield env.timeout(get_qkv_time(ping) * 1.7)
+
+                # Backward → previous stage (or mark done if first stage)
+                if (is_backward or (is_forward and next_inbox is None)) and (inboxes and idx > 0):
+                    yield inboxes[idx - 1].put((0, "grad", m, batch))
+
+                    # mark microbatch done for this stage once we sent its grad upstream
+                    done_counter[idx] += 1
+                    if done_counter[idx] >= num_microbatches:
+                        check_stage_completion(idx)
+
+                elif (is_backward or (is_forward and next_inbox is None)) and idx == 0:
+                    # Stage 0 finishes the mb completely
+                    done_counter[idx] += 1
+                    if done_counter[idx] >= num_microbatches:
+                        check_stage_completion(idx)
+
+        finally:
+            # Leave pipeline: future comm rounds no longer wait for this stage
+            deregister(idx)
+
+    # Spin up stages
     for i in range(num_stages):
         next_inbox = inboxes[i + 1] if i < num_stages - 1 else None
         prev_inbox = inboxes[i - 1] if i > 0 else None
-        env.process(stage_with_signal(env, i, inboxes[i], next_inbox, prev_inbox, num_microbatches, done_counter, execution_log, nlayers=nlayers))
+        env.process(stage(env, i, inboxes[i], next_inbox, prev_inbox, num_microbatches, nlayers))
 
-    # Feed microbatches to stage 0 as activations
+    # Feed microbatches (two per item, as in your code)
     def feeder():
         for m, batch in enumerate(batches):
-            # (prio, kind, m=batch_id, batch)
             yield inboxes[0].put((1, "act", m, batch))
-
     env.process(feeder())
 
-    # Wait for all completion events
-    all_complete = simpy.AllOf(env, completion_events)
+    all_complete = simpy.events.AllOf(env, completion_events)
     env.run(until=all_complete)
 
     return execution_log
-
-
 
 # %%
 # ---- Quick demo ----
