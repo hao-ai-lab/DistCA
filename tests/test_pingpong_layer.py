@@ -26,7 +26,6 @@ import argparse
 
 import torch
 
-from d2.runtime.inplace_metadata import mlp_layout_packed_params
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from d2.runtime.compute_metadata import from_planner_output, get_attn_metadata
 
@@ -104,6 +103,7 @@ def create_one_batch(
     return planner_output, fa2a_metadata, as_attn_metadata, doc_lens_per_rank
 
 
+# TODO(yonghao): move this to planner / d2/utils.py because it's not only used for test.
 def get_single_step_packed_seq_params(
     fa2a_metadata, attn_metadata, rank: int
 ):
