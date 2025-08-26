@@ -134,7 +134,7 @@ from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangPac
 from d2.runtime.inplace_metadata import mlp_layout_packed_params
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed
-from test_pingpang_layer import create_one_batch, get_single_step_packed_seq_params
+from test_pingpong_layer import create_one_batch, get_single_step_packed_seq_params
 from megatron_test_utils import (
     get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,

@@ -5,6 +5,8 @@ torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
 """
 import argparse
 import os
+import time
+
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
@@ -12,13 +14,13 @@ from omegaconf import OmegaConf
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 
+from d2.runtime.compute_metadata import get_attn_metadata
 from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
-from d2.runtime.inplace_metadata import mlp_layout_packed_params
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
-from test_pingpang_layer import create_one_batch, get_single_step_packed_seq_params
+from test_pingpong_layer import create_one_batch, get_single_step_packed_seq_params
 from megatron_test_utils import (
-    get_megatron_optimizer_param_scheduler, get_model, get_torch_device, gptmodel_forward,
+    get_megatron_optimizer_param_scheduler, get_model, gptmodel_forward,
     hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
     make_batch_generator, print_model_size, update_model_config, unwrap_model,
 )
@@ -266,10 +268,10 @@ def test(args):
     seed = args.seed
     num_tokens = args.num_tokens
     max_cp_degree = args.cp_degree
-    num_seqs = args.num_seqs
+    num_docs = args.num_docs
     tp_size = args.tp_size
     world_size = args.num_nodes * args.num_gpus_per_node
-    total_seq_len = args.num_tokens
+    num_token_on_rank = args.num_tokens
 
     dtype = torch.bfloat16
     element_size = dtype.itemsize
@@ -299,18 +301,18 @@ def test(args):
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
 
-    _, fa2a_metadata_0, attn_metadata_0, raw_seq_lens_0 = create_one_batch(
-        as_world_size, total_seq_len, num_seqs, max_cp_degree,
+    _, fa2a_metadata_0, attn_metadata_0, doc_lens_0 = create_one_batch(
+        seed, as_world_size, num_token_on_rank, num_docs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size
     )
-    _, fa2a_metadata_1, attn_metadata_1, raw_seq_lens_1 = create_one_batch(
-        as_world_size, total_seq_len, num_seqs, max_cp_degree,
+    _, fa2a_metadata_1, attn_metadata_1, doc_lens_1 = create_one_batch(
+        seed + 1, as_world_size, num_token_on_rank, num_docs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size
     )
 
     set_random_seed(seed, set_megatron=False)
-    input_ids = torch.randint(0, 100, (as_world_size, total_seq_len * 2))
-    position_ids = torch.arange(total_seq_len).repeat(as_world_size, 2)
+    input_ids = torch.randint(0, 100, (as_world_size, num_token_on_rank * 2))
+    position_ids = torch.arange(num_token_on_rank).repeat(as_world_size, 2)
     input_ids_local = input_ids[as_rank]
     position_ids_local = position_ids[as_rank]
     ping_pang_params_0 = get_single_step_packed_seq_params(
@@ -322,14 +324,14 @@ def test(args):
 
     # NOTE: we don't consider that seq_lens var has padding because our data generation
     # guarantees so. However, in practice, this is not true.
-    mlp_seq_params_0 = mlp_layout_packed_params(raw_seq_lens_0[as_rank])
-    mlp_seq_params_1 = mlp_layout_packed_params(raw_seq_lens_1[as_rank])
+    mlp_seq_params_0 = get_attn_metadata(doc_lens_0[as_rank], get_packed_seq_params=True)
+    mlp_seq_params_1 = get_attn_metadata(doc_lens_1[as_rank], get_packed_seq_params=True)
     ping_pang_params = PingPangPackedSeqParams(
         seq_params=[ping_pang_params_0, ping_pang_params_1],
         mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
-        max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-        max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
         qkv_format="thd",
+        max_seqlen_q=torch.tensor([num_token_on_rank * 2], dtype=torch.int32)[0],
+        max_seqlen_kv=torch.tensor([num_token_on_rank * 2], dtype=torch.int32)[0],
     )
     microbatch = {
         "input_ids": input_ids_local,
@@ -338,7 +340,7 @@ def test(args):
     }
     # print(rank, microbatch["packed_seq_params"])
     microbatches = [microbatch]
-    import time
+
     for _ in range(3):
         ref = worker.forward_backward_batch(
             microbatches=microbatches,
@@ -364,7 +366,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--cp-degree", type=int, default=2)
-    parser.add_argument("--num-seqs", type=int, default=3)
+    parser.add_argument("--num-docs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--num-gpus-per-node", type=int, default=2)

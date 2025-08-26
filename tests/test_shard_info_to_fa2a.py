@@ -53,7 +53,7 @@ def simulate_all2all(
             fwd_args = (max_cp, metadata_local.kv_replica_mask)
         else:
             fn = simulate_fa2a_send_qkv_rev
-        assert q[rank].shape == metadata_local.tensor_shape[0].send_shape, f"{q[rank].shape} vs {metadata_local.tensor_shape[0].send_shape}"
+        assert q[rank].shape == metadata_local.tensor_shape[0].send_shape
         # the first dim in metadata_local is the max cp
 
         if has_kv:
@@ -248,12 +248,12 @@ def test(args):
     )
     # update metadata to the fused version
     hidden_attn_out_merged = hidden_size_q + lse_size
-    fwd_qkv_metadata, _, fwd_attn_out_metadata, _ = from_planner_output(
+    fwd_qkv_metadata, _, fwd_attn_out_metadata, _, _ = from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
         is_pipeline_tick=True
     )
     # We use the same scheduler output for backward to verify correctness. It should be different
-    qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear = backward_from_planner_output(
+    qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear, _ = backward_from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size
     )
     merged_attn_outs_lse_attn_layout = [

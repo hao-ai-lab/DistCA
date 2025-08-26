@@ -13,8 +13,8 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 import torch
 from transformers import AutoConfig
 
+from d2.runtime.compute_metadata import get_attn_metadata
 from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
-from d2.runtime.inplace_metadata import mlp_layout_packed_params
 from d2.runtime.megatron_patch.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
 
 from test_util import ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch_pipeline_tick
@@ -175,7 +175,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
                            max_cp_degree: int, hidden_size_q_tp: int,
                            hidden_size_k_tp: int, element_size: int,
                            num_head_in_dtype: int, tp_size: int, dp_size: int,):
-    tick_seq_lens = None
+    tick_per_rank_doc_lens = None
     bwd_metadata = []
     microbatches = []
     for i in range(num_microbatch + pp_degree - 1):
@@ -187,34 +187,27 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
             fa_fwd_params, fa_bwd_params,
             qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
             attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
-            tick_seq_lens,
+            tick_per_rank_doc_lens,
         ) = create_qkv_dispatch_pipeline_tick(
             as_world_size, total_seq_len, num_seqs, max_cp_degree,
             hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-            ref_seq_lens=tick_seq_lens,
+            ref_doc_lens=tick_per_rank_doc_lens,
             add_dummy=add_dummy_forward,
             tp_size=tp_size,
             dp_size=dp_size,
         )
-        this_rank_num_tokens = tick_seq_lens[as_rank].sum().item()
+        this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
 
-        (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_bwd_params
         bwd_packed_seq_params = PackedSeqParams(
-            cu_seqlens_q=cu_seqlens_q[as_rank],
-            cu_seqlens_kv=cu_seqlens_kv[as_rank],
-            max_seqlen_q=max_seqlen_q[as_rank].item(),
-            max_seqlen_kv=max_seqlen_kv[as_rank].item(),
+            qkv_format="thd", **fa_bwd_params[as_rank]
         )
-        mlp_packed_seq_params = mlp_layout_packed_params(tick_seq_lens[as_rank][:num_seqs])
-        (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, *_) = fa_fwd_params
+        tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens[as_rank], dtype=torch.int32)
+        mlp_packed_seq_params = get_attn_metadata(tensor_doc_lens, get_packed_seq_params=True)
 
         # Create packed_params. Note that we do not add backward params here.
         ping_pang_params = PingPangSingleStepPackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_q[as_rank],
-            cu_seqlens_kv=cu_seqlens_kv[as_rank],
-            max_seqlen_q=max_seqlen_q[as_rank].item(),
-            max_seqlen_kv=max_seqlen_kv[as_rank].item(),
+            **fa_fwd_params[as_rank],
             qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(as_rank),
             attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(as_rank),
             mlp_packed_seq_params=mlp_packed_seq_params,
