@@ -314,7 +314,7 @@ def run_iteration(batches, num_stages=4, nlayers=1, threshold=None, wlb_cp=2):
     for i in range(num_stages):
         next_inbox = inboxes[i + 1] if i < num_stages - 1 else None
         prev_inbox = inboxes[i - 1] if i > 0 else None
-        env.process(stage_with_signal(env, i, inboxes[i], next_inbox, prev_inbox, num_microbatches, done_counter, execution_log, nlayers=nlayers, wlb_cp=wlb_cp))
+        env.process(stage_with_signal(env, i, inboxes[i], next_inbox, prev_inbox, num_microbatches, done_counter, execution_log, nlayers=nlayers))
 
     # Feed microbatches to stage 0 as activations
     def feeder():
@@ -336,72 +336,57 @@ def run_iteration(batches, num_stages=4, nlayers=1, threshold=None, wlb_cp=2):
 # ---- Quick demo ----
 # Create 4 batches with the same sequence length
 # batches = [[64 * K] for _ in range(num_batches)]
-batches = [
-    [128 * K] * 4,
-    [256 * K] * 2,
-    [512 * K] * 1,
-    [256 * K] * 2,
-    [128 * K] * 4,
-    [256 * K] * 2,
-    [512 * K] * 1,
-    [256 * K] * 2,
+def quick_demo():
+    batches = [
+        [128 * K] * 4,
+        [256 * K] * 2,
+        [512 * K] * 1,
+        [256 * K] * 2,
+        [128 * K] * 4,
+        [256 * K] * 2,
+        [512 * K] * 1,
+        [256 * K] * 2,
 
-]
-num_batches = len(batches)
-num_stages = 4
-# threshold = num_batches // 2
-# threshold = num_stages
-execution_log = run_iteration(batches, num_stages)
-_ = plot_timeline(execution_log, title_suffix=f" | M={num_batches}, S={num_stages}", granularity=1000)
-plt.show()  # Display the figure
-# %%
-# ---- Actually using a distribution to try out ----
-from d2.simulator.optimizers.samples import (
-    sample_wlbllm_docs_upsample, 
-    batch_documents,
-)
-
-GLOBAL_BATCH = batch_documents(
-    sample_wlbllm_docs_upsample(
-        size=10000,
-        filter_threshold=64 * K,
-        filter_ratio=0.90,
-        upsample_long_factor=2,
-        elongate_factor=4,
-    ), max_ctx_length=K * 512
-)
-num_batches = 10
-batches = [next(GLOBAL_BATCH) for _ in range(num_batches)]
-flops = []
-for batch in batches:
-    flops.append(get_batch_time(batch, is_backward=False, nlayers=1))
-import rich
-rich.print(flops)
-
-execution_log = run_iteration(batches, num_stages, nlayers=1)
-_ = plot_timeline(execution_log, title_suffix=f" | NumBatches = {num_batches}, Stages = {num_stages}", granularity=1000)
-plt.show()  # Display the figure
+    ]
+    num_batches = len(batches)
+    num_stages = 4
+    # threshold = num_batches // 2
+    # threshold = num_stages
+    execution_log = run_iteration(batches, num_stages)
+    _ = plot_timeline(execution_log, title_suffix=f" | M={num_batches}, S={num_stages}", granularity=1000)
+    plt.show()  # Display the figure
+    return
 
 # %%
-# ---- Adding workload balancing across the batches ----
-from d2.simulator.optimizers.samples import (
-    sample_wlbllm_docs_upsample, 
-    batch_documents,
-)
+def actual_demo_with_distribution():
+    # ---- Actually using a distribution to try out ----
+    from d2.simulator.optimizers.samples import (
+        sample_wlbllm_docs_upsample, 
+        batch_documents,
+    )
 
-GLOBAL_BATCH = batch_documents(
-    sample_wlbllm_docs_upsample(
-        size=10000,
-        filter_threshold=64 * K,
-        filter_ratio=0.90,
-        upsample_long_factor=2,
-        elongate_factor=4,
-    ), max_ctx_length=K * 512
-)
-num_batches = 16
-num_stages = 4  
-# threshold = num_stages
-batches = [next(GLOBAL_BATCH) for _ in range(num_batches)]
+    GLOBAL_BATCH = batch_documents(
+        sample_wlbllm_docs_upsample(
+            size=10000,
+            filter_threshold=64 * K,
+            filter_ratio=0.90,
+            upsample_long_factor=2,
+            elongate_factor=4,
+        ), max_ctx_length=K * 512
+    )
+    num_batches = 10
+    batches = [next(GLOBAL_BATCH) for _ in range(num_batches)]
+    flops = []
+    for batch in batches:
+        flops.append(get_batch_time(batch, is_backward=False, nlayers=1))
+    import rich
+    rich.print(flops)
+
+    execution_log = run_iteration(batches, num_stages, nlayers=1)
+    _ = plot_timeline(execution_log, title_suffix=f" | NumBatches = {num_batches}, Stages = {num_stages}", granularity=1000)
+    plt.show()  # Display the figure
+
+# %%
 
 def get_workload_balancing_batches_no_defer(batches: list[list[int]]) -> list[list[int]]:
     
@@ -451,9 +436,28 @@ def get_workload_balancing_batches_no_defer(batches: list[list[int]]) -> list[li
     
     return new_batch
 
-new_batches = get_workload_balancing_batches_no_defer(batches)
-execution_log = run_iteration(new_batches, num_stages, nlayers=1)
-_ = plot_timeline(execution_log, title_suffix=f" | NumBatches = {num_batches}, Stages = {num_stages}", granularity=1000)
-plt.show()  # Display the figure
+# ---- Adding workload balancing across the batches ----
+def actual_demo_with_workload_balancing():
+    from d2.simulator.optimizers.samples import (
+        sample_wlbllm_docs_upsample, 
+        batch_documents,
+    )
 
-# %%
+    GLOBAL_BATCH = batch_documents(
+        sample_wlbllm_docs_upsample(
+            size=10000,
+            filter_threshold=64 * K,
+            filter_ratio=0.90,
+            upsample_long_factor=2,
+            elongate_factor=4,
+        ), max_ctx_length=K * 512
+    )
+    num_batches = 16
+    num_stages = 4  
+    # threshold = num_stages
+    batches = [next(GLOBAL_BATCH) for _ in range(num_batches)]
+
+    new_batches = get_workload_balancing_batches_no_defer(batches)
+    execution_log = run_iteration(new_batches, num_stages, nlayers=1)
+    _ = plot_timeline(execution_log, title_suffix=f" | NumBatches = {num_batches}, Stages = {num_stages}", granularity=1000)
+    plt.show()  # Display the figure

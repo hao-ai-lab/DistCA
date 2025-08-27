@@ -41,7 +41,12 @@ def window_slice(idx, size, max_idx):
     return slice(lo, hi)
 # %%
 
-def simulate_d2_pipeline(batches: list[list[list[int]]], pp_size: int = 4, verbose: bool = False):
+def simulate_d2_pipeline(
+    batches: list[list[list[int]]], 
+    pp_size: int = 4, 
+    dpcp_size: int = 1,
+    verbose: bool = False,
+):
     """
     Simulate the D2 with pipeline parallelism.
     """
@@ -69,12 +74,12 @@ def simulate_d2_pipeline(batches: list[list[list[int]]], pp_size: int = 4, verbo
         mlp_batch = ping + pong
         log(f"mlp_batch: {mlp_batch}")
         if mlp_time is None:
-            mlp_time = get_mlp_time(mlp_batch)
+            mlp_time = get_mlp_time(mlp_batch) / dpcp_size
         log(f"mlp_time: {mlp_time}")
 
         attn_batch = batches[fwd_window]
         attn_batch = flatten(flatten(attn_batch))
-        attn_time = get_attn_time(attn_batch) / pp_size
+        attn_time = get_attn_time(attn_batch) / pp_size / dpcp_size
 
         this_time = mlp_time + attn_time
         future_time = current_time + this_time
@@ -85,7 +90,7 @@ def simulate_d2_pipeline(batches: list[list[list[int]]], pp_size: int = 4, verbo
         pass
 
     # Phase 2: forward and backward alternate
-    while forward_idx < len(batches) + pp_size - 1: # TODO: Inspect this condition
+    while forward_idx < len(batches) + pp_size - 1:
         
         # first backward
         bwd_window = window(backward_idx)
@@ -93,7 +98,7 @@ def simulate_d2_pipeline(batches: list[list[list[int]]], pp_size: int = 4, verbo
         
         backward_batch = batches[bwd_window]
         attn_batch = flatten(flatten(backward_batch))
-        attn_time = get_attn_time(attn_batch) / pp_size
+        attn_time = get_attn_time(attn_batch) / pp_size / dpcp_size
         log(f"attn_time: {attn_time}")
 
         # TODO: Fix the time.
@@ -109,7 +114,7 @@ def simulate_d2_pipeline(batches: list[list[list[int]]], pp_size: int = 4, verbo
         log(f"Phase 2: forward and backward alternate, forward_idx: {forward_idx} ({fwd_window})")
         forward_batch = batches[fwd_window]
         attn_batch = flatten(flatten(forward_batch))
-        attn_time = get_attn_time(attn_batch) / pp_size
+        attn_time = get_attn_time(attn_batch) / pp_size / dpcp_size
         log(f"attn_time: {attn_time}")
         this_time = attn_time * 2.5 + mlp_time * 2
         future_time = current_time + this_time
@@ -126,7 +131,7 @@ def simulate_d2_pipeline(batches: list[list[list[int]]], pp_size: int = 4, verbo
         log(f"Phase 3: backward only, backward_idx: {backward_idx} ({bwd_window})")
         backward_batch = batches[bwd_window]
         attn_batch = flatten(flatten(backward_batch))
-        attn_time = get_attn_time(attn_batch) / pp_size
+        attn_time = get_attn_time(attn_batch) / pp_size / dpcp_size
         this_time = attn_time * 2.5 + mlp_time * 2
         future_time = current_time + this_time
         events.append((f"backward", backward_idx, bwd_window, current_time, future_time))
@@ -190,57 +195,61 @@ def plot_d2_timeline(events):
 # ---- Quick demo ----
 # Create 4 batches with the same sequence length
 # batches = [[64 * K] for _ in range(num_batches)]
+def quick_demo():
+    batches = [
+        [[128 * K] * 4, [256 * K] * 2],
+        [[512 * K] * 1, [128 * K] * 4],
+        [[64 * K] * 8, [128 * K] * 4],
+        [[64 * K] * 8, [128 * K] * 4],
+        [[64 * K] * 8, [128 * K] * 4],
+        [[64 * K] * 8, [128 * K] * 4],
+        [[64 * K] * 8, [128 * K] * 4],
+        [[64 * K] * 8, [128 * K] * 4],
+        
+    ]
+    pp_size = 4
+    events = simulate_d2_pipeline(batches, pp_size=pp_size, verbose=True)
+    plot_d2_timeline(events)
 
-batches = [
-    [[128 * K] * 4, [256 * K] * 2],
-    [[512 * K] * 1, [128 * K] * 4],
-    [[64 * K] * 8, [128 * K] * 4],
-    [[64 * K] * 8, [128 * K] * 4],
-    [[64 * K] * 8, [128 * K] * 4],
-    [[64 * K] * 8, [128 * K] * 4],
-    [[64 * K] * 8, [128 * K] * 4],
-    [[64 * K] * 8, [128 * K] * 4],
-       
-]
-pp_size = 4
-events = simulate_d2_pipeline(batches, pp_size=pp_size, verbose=True)
-plot_d2_timeline(events)
-
-forward_pass_times = [e[3] for e in events if "forward" in e[0]]
-backward_pass_times = [e[3] for e in events if "backward" in e[0]]
-assert len(forward_pass_times) == len(batches) + pp_size - 1, f"Forward pass times: {forward_pass_times}"
-assert len(backward_pass_times) == len(batches) + pp_size - 1, f"Backward pass times: {backward_pass_times}"
+    forward_pass_times = [e[3] for e in events if "forward" in e[0]]
+    backward_pass_times = [e[3] for e in events if "backward" in e[0]]
+    assert len(forward_pass_times) == len(batches) + pp_size - 1, f"Forward pass times: {forward_pass_times}"
+    assert len(backward_pass_times) == len(batches) + pp_size - 1, f"Backward pass times: {backward_pass_times}"
 
 # %%
 # ---- Actually using a distribution to try out ----
-from d2.simulator.optimizers.samples import (
-    sample_wlbllm_docs_upsample, 
-    batch_documents,
-)
+def actual_demo_with_distribution():
+    from d2.simulator.optimizers.samples import (
+        sample_wlbllm_docs_upsample, 
+        batch_documents,
+    )
 
-GLOBAL_BATCH = batch_documents(
-    sample_wlbllm_docs_upsample(
-        size=10000,
-        filter_threshold=64 * K,
-        filter_ratio=0.90,
-        upsample_long_factor=2,
-        elongate_factor=4,
-    ), max_ctx_length=K * 512
-)
-num_batches = 10
-batches = [
-    [next(GLOBAL_BATCH) , next(GLOBAL_BATCH)]
-    for _ in range(num_batches)
-]
-sim_events = simulate_d2_pipeline(batches, pp_size=pp_size, verbose=True)
-plot_d2_timeline(sim_events)
+    GLOBAL_BATCH = batch_documents(
+        sample_wlbllm_docs_upsample(
+            size=10000,
+            filter_threshold=64 * K,
+            filter_ratio=0.90,
+            upsample_long_factor=2,
+            elongate_factor=4,
+        ), max_ctx_length=K * 512
+    )
+    num_batches = 10
+    batches = [
+        [next(GLOBAL_BATCH) , next(GLOBAL_BATCH)]
+        for _ in range(num_batches)
+    ]
+    sim_events = simulate_d2_pipeline(batches, pp_size=pp_size, verbose=True)
+    plot_d2_timeline(sim_events)
 
-end_time = max([
-    e[-1]
-    for e in sim_events
-])
-print("End Time: ", end_time)
+    end_time = max([
+        e[-1]
+        for e in sim_events
+    ])
+    print("End Time: ", end_time)
 
 
 
-# %%
+if __name__ == "__main__":
+    quick_demo()
+    actual_demo_with_distribution()
+
