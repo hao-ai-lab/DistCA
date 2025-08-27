@@ -1,18 +1,18 @@
 # pyright: reportCallIssue=false
 
 from collections.abc import Sequence
+import enum
 import os
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
-
-from d2.runtime.inplace_metadata import Metadata
 
 _lib_path = os.path.join(os.path.dirname(__file__), "libas_comm.so")
 torch.ops.load_library(_lib_path)
 _ops = torch.ops.dispatch_kernels
 
 ###### NVSHMEM utils ######
+
 
 def nvshmem_get_unique_id() -> torch.Tensor:
     return _ops.nvshmem_get_unique_id()
@@ -64,6 +64,7 @@ class FastDispatcherWrapper:
     ] = None
     is_acquired: list[bool] = [False, False]
     cur_instance: int = 0
+    comm_stream: torch.cuda.Stream = None
 
     def __init__(self, rank, local_rank, world_size, buffer_size):
         self.rank = rank
@@ -133,8 +134,12 @@ class FastDispatcherWrapper:
     def release(instance_id: int):
         assert FastDispatcherWrapper.is_acquired[instance_id]
         FastDispatcherWrapper.is_acquired[instance_id] = False
-        _ops.release_buffer(FastDispatcherWrapper.get_instance(instance_id).handle)
-        FastDispatcherWrapper.get_instance(instance_id).release_event.record(torch.cuda.current_stream())
+        stream = FastDispatcherWrapper.comm_stream
+        compute_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            stream.wait_stream(compute_stream)
+            _ops.release_buffer(FastDispatcherWrapper.get_instance(instance_id).handle)
+        FastDispatcherWrapper.get_instance(instance_id).release_event.record(stream)
 
 
 def fast_a2a_memcpy_non_cp(
