@@ -22,10 +22,8 @@ GLOBAL_BATCH = batch_documents(
         filter_ratio=0.90,
         upsample_long_factor=2,
         elongate_factor=4,
-    ), max_ctx_length=K * 512
+    ), max_ctx_length=K * 256
 )
-
-
 
 def flatten(lst):
     """Recursively flatten nested lists into a single list."""
@@ -46,7 +44,9 @@ def pair(lst):
 
 # %%
 # ---- WLBLLM & D2 Config ----
+total_layers = 32
 pp_size = num_stages = 4
+nlayers = 32 // pp_size
 d2_dpcp_size = 1
 wlb_dp_size = 1
 wlb_cp_size = 1
@@ -64,7 +64,7 @@ print("batches", batches)
 # Run WLBLLM
 
 new_batches = sim_pp_wlb.get_workload_balancing_batches_no_defer(batches)
-wlbllm_events = sim_pp_wlb.run_iteration(new_batches, num_stages, nlayers=1, wlb_cp=wlb_cp_size)
+wlbllm_events = sim_pp_wlb.run_iteration(new_batches, num_stages, nlayers=nlayers, wlb_cp=wlb_cp_size)
 _ = sim_pp_wlb.plot_timeline(wlbllm_events, title_suffix=f" | NumBatches = {num_batches}, Stages = {num_stages}", granularity=1000)
 plt.show()  # Display the figure
 
@@ -78,6 +78,7 @@ d2_batches = pair(batches)
 d2_events = sim_pp_d2.simulate_d2_pipeline(
     d2_batches, pp_size=pp_size, 
     dpcp_size=d2_dpcp_size,
+    nlayers=nlayers,
     verbose=False
 )
 sim_pp_d2.plot_d2_timeline(d2_events)
