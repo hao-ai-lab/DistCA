@@ -1241,6 +1241,8 @@ def test(args):
         os._exit(0)
 
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm"], default="baseline", 
@@ -1263,6 +1265,50 @@ if __name__ == "__main__":
     parser.add_argument("--filter-ratio", type=float, default=0.90)
     parser.add_argument("--force-exit", action="store_true")
     parser.add_argument("--should-add-debug-cases", action="store_true")
+    parser.add_argument("--should-profile-memory", type=str, default=None)
     
     args = parser.parse_args()
-    test(args)
+
+    should_profile_memory = args.should_profile_memory
+    if should_profile_memory:
+        torch.cuda.memory._record_memory_history()
+        pass
+
+    if should_profile_memory:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            try:
+                test(args)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                pass
+    else:
+        test(args)
+    
+    if should_profile_memory:
+        mode = args.mode
+        batch_size = args.batch_size
+        num_tokens = args.num_tokens
+        cp_degree = args.cp_degree
+        tp_size = args.tp_size
+        num_layers = args.num_layers
+
+        rank = torch.distributed.get_rank()
+        if rank % 8 == 0:
+            print("Dumping memory snapshot")
+
+            os.makedirs(f"mem_snapshots", exist_ok=True)
+
+            now_ts = get_current_timestamp()
+            torch.cuda.memory._dump_snapshot(f"mem_snapshots/{now_ts}.mem_snapshot.{mode}.rank{rank}.batch{batch_size}.tokens{num_tokens}.cp{cp_degree}.tp{tp_size}.layers{num_layers}.pickle")
+            prof.export_memory_timeline(f"mem_snapshots/{now_ts}.mem_timeline.{mode}.rank{rank}.batch{batch_size}.tokens{num_tokens}.cp{cp_degree}.tp{tp_size}.layers{num_layers}.html", device=torch.cuda.current_device())
+            print("Memory snapshot dumped")
+
