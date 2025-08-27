@@ -15,6 +15,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
+from d2.runtime.attn_kernels.ops import FastDispatcherWrapper
 from d2.runtime.megatron_patch.fused_comm_attn import FlashAttnArgs, FusedCommAttn, dummy_backward, post_a2a_attn_out_with_lse
 from d2.runtime.megatron_patch.base_transformer_layer import TransformerLayer as BaseTransformerLayer
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
@@ -514,6 +515,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         self.comm_stream = torch.cuda.Stream(device=device, priority=-1)
         self._ping_pang_debug = True
         self.ping_pong_comm_initialized = True
+        FastDispatcherWrapper.comm_stream = self.comm_stream
 
     def ping_pang_forward(
         self: MegatronTransformerBlock,
