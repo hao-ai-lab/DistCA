@@ -945,11 +945,8 @@ def test(args):
             seq_lens_0: list[list[int]] = _seq_lens[:batch_size]
             seq_lens_1: list[list[int]] = _seq_lens[batch_size:]
 
-            if rank % 8 == 0: # TODO(HACK) Fix it to say tp_rank == 0 will print
-                print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch1 : {seq_lens_0}")
-                print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch2 : {seq_lens_1}")
-
-            num_batched_token_per_as_rank = total_seq_len // as_world_size * batch_size
+            # num_batched_token_per_as_rank = tokens per as rank = tokens per batch * num batch / (as_world_size = dp_size)
+            num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
 
             _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
             _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)

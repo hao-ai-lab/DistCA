@@ -256,6 +256,16 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.save_for_backward")
 
+        if os.getenv("D2_DEBUG_PRINT", "0") == "1":
+            if torch.distributed.get_rank() % 8 == 0:
+                debug_print(f"🟡 PerDocumentCPAttention shapes:")
+                debug_print(f"  - local_q.shape = {local_q.shape}")
+                debug_print(f"  - local_ks = {[k.shape for k in local_ks]}")
+                debug_print(f"  - local_vs = {[v.shape for v in local_vs]}")
+                debug_print(f"  - k_global.shape = {k_global.shape}")
+                debug_print(f"  - v_global.shape = {v_global.shape}")
+                debug_print(f"  - final_out.shape = {final_out.shape}")
+
         ctx.save_for_backward(
             local_q,
             k_global, v_global,
