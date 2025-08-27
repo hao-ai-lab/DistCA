@@ -31,6 +31,7 @@ from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangPac
 from d2.runtime.inplace_metadata import mlp_layout_packed_params
 from d2.runtime.fast_alltoall_metadata import compute_e2e_fa2a_metadata
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams
+from d2.runtime.compute_metadata import get_attn_metadata
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
 from test_pingpong_layer import get_single_step_packed_seq_params
@@ -944,113 +945,123 @@ def test(args):
             seq_lens_0: list[list[int]] = _seq_lens[:batch_size]
             seq_lens_1: list[list[int]] = _seq_lens[batch_size:]
 
-            if rank % 8 == 0: # TODO(HACK) Fix it to say tp_rank == 0 will print
-                print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch1 : {seq_lens_0}")
-                print(f"🟡 [Rank {rank}][as_rank {as_rank}] ping pong batch2 : {seq_lens_1}")
-
-            num_batched_token_per_as_rank = total_seq_len // as_world_size * batch_size
+            # num_batched_token_per_as_rank = tokens per as rank = tokens per batch * num batch / (as_world_size = dp_size)
+            num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
 
             _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
             _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
 
             planner = Planner(world_size, parallel_config, model_config=model_config)
             
-            d2_should_replan = os.environ.get("D2_SHOULD_REPLAN", "0") == "1"
-
+            # TODO: These commented code can be deleted after large scale DP/CP test.
+            # d2_should_replan = os.environ.get("D2_SHOULD_REPLAN", "0") == "1"
             # modified_items = []
             # commented_fa2a_metadatas = []
+            # def items_to_metadata(items: list[Item]) -> tuple['PingPangSingleStepPackedSeqParams', 'PackedSeqParams']:
+            #     ret, __items = planner.plan_to_raw_qkv_dispatch(items, should_plan=d2_should_replan, return_items=True)
+            #     (
+            #         mlp_num_seqs,
+            #         mlp_q_dispatch,
+            #         mlp_seq_lens,
+            #         kv_to_q_mapping,
+            #         kv_to_q_rank,
+            #         kv_context_size,
+            #         q_to_num_kv_seq,
+            #         q_to_num_kv_tokens,
+            #     ) = ret
 
-            def items_to_metadata(items: list[Item]) -> tuple['PingPangSingleStepPackedSeqParams', 'PackedSeqParams']:
-                ret, __items = planner.plan_to_raw_qkv_dispatch(items, should_plan=d2_should_replan, return_items=True)
-                (
-                    mlp_num_seqs,
-                    mlp_q_dispatch,
-                    mlp_seq_lens,
-                    kv_to_q_mapping,
-                    kv_to_q_rank,
-                    kv_context_size,
-                    q_to_num_kv_seq,
-                    q_to_num_kv_tokens,
-                ) = ret
+            #     # modified_items.append(__items)
 
-                # modified_items.append(__items)
-
-                # TODO(HACK)(Refactor): 
-                # We probably want to move this function inside the Planner.plan
-                (
-                    fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
-                    fa_params, fa2a_metadata
-                ) = compute_e2e_fa2a_metadata(
-                    mlp_seq_lens,
-                    mlp_num_seqs,
-                    mlp_q_dispatch,
-                    kv_to_q_mapping,
-                    kv_to_q_rank,
-                    kv_context_size,
-                    q_to_num_kv_seq,
-                    q_to_num_kv_tokens,
-                    hidden_size_q_tp,
-                    hidden_size_k_tp,
-                    element_size,
-                    # TODO: What is this? How do specify this values?
-                    softmax_lse_size=0,
-                )
-                if os.environ.get("D2_FA2A_DISABLE_SEND_RECV", "0") == "1":
-                    rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
-                    for i in range(4):
-                        fa2a_metadata[i].fa2a_metadata[0][:] = 0
-                        fa2a_metadata[i].fa2a_metadata[1][:] = 0
-                        fa2a_metadata[i].fa2a_metadata[2][:] = 0
-                        fa2a_metadata[i].fa2a_metadata[3][:] = 0
-                        fa2a_metadata[i].my_rank_send_sz = 0
+            #     # TODO(HACK)(Refactor): 
+            #     # We probably want to move this function inside the Planner.plan
+            #     (
+            #         fwd_metadata_q, bwd_metadata_q, fwd_metadata_kv, bwd_metadata_kv,
+            #         fa_params, fa2a_metadata
+            #     ) = compute_e2e_fa2a_metadata(
+            #         mlp_seq_lens,
+            #         mlp_num_seqs,
+            #         mlp_q_dispatch,
+            #         kv_to_q_mapping,
+            #         kv_to_q_rank,
+            #         kv_context_size,
+            #         q_to_num_kv_seq,
+            #         q_to_num_kv_tokens,
+            #         hidden_size_q_tp,
+            #         hidden_size_k_tp,
+            #         element_size,
+            #         # TODO: What is this? How do specify this values?
+            #         softmax_lse_size=0,
+            #     )
+            #     if os.environ.get("D2_FA2A_DISABLE_SEND_RECV", "0") == "1":
+            #         rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
+            #         for i in range(4):
+            #             fa2a_metadata[i].fa2a_metadata[0][:] = 0
+            #             fa2a_metadata[i].fa2a_metadata[1][:] = 0
+            #             fa2a_metadata[i].fa2a_metadata[2][:] = 0
+            #             fa2a_metadata[i].fa2a_metadata[3][:] = 0
+            #             fa2a_metadata[i].my_rank_send_sz = 0
 
                 
-                # if rank == 0:
-                #     (
-                #         qkv_fwd_fa2a_metadata,
-                #         qkv_bwd_fa2a_metadata,
-                #         attn_out_fwd_fa2a_metadata,
-                #         attn_out_bwd_fa2a_metadata,
-                #     ) = fa2a_metadata
+            #     if rank == 0:
+            #         (
+            #             qkv_fwd_fa2a_metadata,
+            #             qkv_bwd_fa2a_metadata,
+            #             attn_out_fwd_fa2a_metadata,
+            #             attn_out_bwd_fa2a_metadata,
+            #         ) = fa2a_metadata
                     
-                #     # qkv_fwd_fa2a_metadata
-                #     qkv_fwd_fa2a_metadata__send_transfer_sz_mb = qkv_fwd_fa2a_metadata.fa2a_metadata[1] // 1024 // 1024
-                #     qkv_fwd_fa2a_metadata__recv_transfer_sz_mb = qkv_fwd_fa2a_metadata.fa2a_metadata[3] // 1024 // 1024
+            #         # qkv_fwd_fa2a_metadata
+            #         qkv_fwd_fa2a_metadata__send_transfer_sz_mb = qkv_fwd_fa2a_metadata.fa2a_metadata[1] // 1024 // 1024
+            #         qkv_fwd_fa2a_metadata__recv_transfer_sz_mb = qkv_fwd_fa2a_metadata.fa2a_metadata[3] // 1024 // 1024
 
-                #     attn_out_fwd_fa2a_metadata__send_transfer_sz_mb = attn_out_fwd_fa2a_metadata.fa2a_metadata[1] // 1024 // 1024
-                #     attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb = attn_out_fwd_fa2a_metadata.fa2a_metadata[3] // 1024 // 1024
+            #         attn_out_fwd_fa2a_metadata__send_transfer_sz_mb = attn_out_fwd_fa2a_metadata.fa2a_metadata[1] // 1024 // 1024
+            #         attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb = attn_out_fwd_fa2a_metadata.fa2a_metadata[3] // 1024 // 1024
                     
-                #     rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.send_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
-                #     rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.recv_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
+            #         rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.send_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
+            #         rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.recv_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
                     
-                #     # attn_out_fwd_fa2a_metadata
-                #     rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.send_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__send_transfer_sz_mb)
-                #     rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.recv_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb)
+            #         # attn_out_fwd_fa2a_metadata
+            #         rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.send_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__send_transfer_sz_mb)
+            #         rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.recv_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb)
 
-                #     commented_fa2a_metadatas.append(dict(
-                #         qkv_fwd_fa2a_metadata__send_transfer_sz_mb=qkv_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
-                #         qkv_fwd_fa2a_metadata__recv_transfer_sz_mb=qkv_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
-                #         attn_out_fwd_fa2a_metadata__send_transfer_sz_mb=attn_out_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
-                #         attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb=attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
-                #     ))
+            #         commented_fa2a_metadatas.append(dict(
+            #             qkv_fwd_fa2a_metadata__send_transfer_sz_mb=qkv_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
+            #             qkv_fwd_fa2a_metadata__recv_transfer_sz_mb=qkv_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
+            #             attn_out_fwd_fa2a_metadata__send_transfer_sz_mb=attn_out_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
+            #             attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb=attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
+            #         ))
                     
 
-                ping_pang_params = get_single_step_packed_seq_params(
-                    fa2a_metadata, fa_params, as_rank
-                )
+            #     ping_pang_params = get_single_step_packed_seq_params(
+            #         fa2a_metadata, fa_params, as_rank
+            #     )
 
-                raw_seq_len = mlp_seq_lens
-                mlp_seq_params = mlp_layout_packed_params(raw_seq_len)
+            #     raw_seq_len = mlp_seq_lens
+            #     mlp_seq_params = mlp_layout_packed_params(raw_seq_len)
 
-                return (
-                    ping_pang_params,
-                    mlp_seq_params,
-                )
+            #     return (
+            #         ping_pang_params,
+            #         mlp_seq_params,
+            #     )
 
             print(f"🟡 [Rank {rank}] hidden_size_q_tp = {hidden_size_q_tp}, hidden_size_k_tp = {hidden_size_k_tp}, element_size = {element_size}")
 
-            ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
-            ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
+            # params for ping-pong batch0
+            fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0)
+            ping_pang_params_0 = get_single_step_packed_seq_params(
+                fa2a_metadata_0, as_attn_metadata_0, as_rank
+            )
+            mlp_seq_params_0 = get_attn_metadata(mlp_shard_len_0[as_rank], get_packed_seq_params=True)
+            # params for ping-pong batch1
+            fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_0)
+            ping_pang_params_1 = get_single_step_packed_seq_params(
+                fa2a_metadata_1, as_attn_metadata_1, as_rank
+            )
+            mlp_seq_params_1 = get_attn_metadata(mlp_shard_len_1[as_rank], get_packed_seq_params=True)
+            
+            # old approach to generate metadata.
+            # ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
+            # ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
 
             # modified_batches.append(modified_items)
             # fa2a_metadata_list.append(commented_fa2a_metadatas)
@@ -1230,6 +1241,8 @@ def test(args):
         os._exit(0)
 
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm"], default="baseline", 
@@ -1252,6 +1265,50 @@ if __name__ == "__main__":
     parser.add_argument("--filter-ratio", type=float, default=0.90)
     parser.add_argument("--force-exit", action="store_true")
     parser.add_argument("--should-add-debug-cases", action="store_true")
+    parser.add_argument("--should-profile-memory", type=str, default=None)
     
     args = parser.parse_args()
-    test(args)
+
+    should_profile_memory = args.should_profile_memory
+    if should_profile_memory:
+        torch.cuda.memory._record_memory_history()
+        pass
+
+    if should_profile_memory:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            try:
+                test(args)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                pass
+    else:
+        test(args)
+    
+    if should_profile_memory:
+        mode = args.mode
+        batch_size = args.batch_size
+        num_tokens = args.num_tokens
+        cp_degree = args.cp_degree
+        tp_size = args.tp_size
+        num_layers = args.num_layers
+
+        rank = torch.distributed.get_rank()
+        if rank % 8 == 0:
+            print("Dumping memory snapshot")
+
+            os.makedirs(f"mem_snapshots", exist_ok=True)
+
+            now_ts = get_current_timestamp()
+            torch.cuda.memory._dump_snapshot(f"mem_snapshots/{now_ts}.mem_snapshot.{mode}.rank{rank}.batch{batch_size}.tokens{num_tokens}.cp{cp_degree}.tp{tp_size}.layers{num_layers}.pickle")
+            prof.export_memory_timeline(f"mem_snapshots/{now_ts}.mem_timeline.{mode}.rank{rank}.batch{batch_size}.tokens{num_tokens}.cp{cp_degree}.tp{tp_size}.layers{num_layers}.html", device=torch.cuda.current_device())
+            print("Memory snapshot dumped")
+

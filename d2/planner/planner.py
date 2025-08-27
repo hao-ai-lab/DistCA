@@ -1,9 +1,11 @@
 from collections import defaultdict
 from copy import deepcopy
-from typing import List
+from typing import Any, Dict, List, Optional
 
 import rich
-from d2.runtime.shard_info import (handle_planner_metadata,
+import torch
+from d2.runtime.compute_metadata import from_planner_output
+from d2.runtime.shard_info import (ShardInfo, handle_planner_metadata,
                                    items_into_shardinfos, plan_to_metadata)
 from rich.console import Console
 from rich.panel import Panel
@@ -99,8 +101,6 @@ Example 2 : CP split required
     Item3  q=8K kv=8K  gpu=2 seq=2 src=2 is_orig=True
     ...
 """
-from typing import List, Dict, Any
-
 def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_degree: int, model_config: dict):
     """
     Put a batch of documents onto GPU ranks and return a list of Item objects.
@@ -178,7 +178,9 @@ def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_
 
 
 # Represent a part of sequence.
-# item_dicts: {'q': ... , 'kv': ..}
+# This class can handle DP/CP MLP layout. 
+# For DP layout, whole document will be put on one GPU.
+# For CP layout, the document will be split into two chunks, head and tail on multiple GPUs.
 class Item:
     def __init__(self, 
                 model_config,
@@ -186,6 +188,7 @@ class Item:
                 *item_dicts, 
                 is_original = True):
         self.model_config = model_config
+        assert len(item_dicts) == 1 or len(item_dicts) == 2, "item_dicts must contain exactly 1 or 2 items"
         for item in item_dicts:
             assert 'q' in item and 'kv' in item, "Each item must have 'q' and 'kv' keys"
 
@@ -209,8 +212,8 @@ class Item:
     def get_flops(self):
         flops = 0
         for item in self.items:
-            q = item['q']
-            kv = item['kv']
+            q = int(item['q'])
+            kv = int(item['kv'])
             flops += sum(kv - i for i in range(q))
         return flops
 
@@ -391,7 +394,7 @@ class Planner_DP:
         self.world_size = world_size
         self.parallel_config = parallel_config
         self.data_parallel = world_size // (parallel_config.pipeline_model_parallel_size * parallel_config.tensor_model_parallel_size)
-        self.num_dispatch_instances = self.data_parallel * parallel_config.pipeline_model_parallel_size
+        self.attention_server_world_size = self.data_parallel * parallel_config.pipeline_model_parallel_size
 
         self.tolerance_factor = tolerance_factor
 
@@ -422,13 +425,13 @@ class Planner_DP:
                 rich.print(message)
 
         # Get total flops, and avg flops per GPU
-        flops_per_gpu = [0.0] * self.num_dispatch_instances
+        flops_per_gpu = [0.0] * self.attention_server_world_size
         for item in items:
             flops_per_gpu[item['gpuid']] += get_flops(**item)
         total_flops = sum(flops_per_gpu)
         
-        assert self.num_dispatch_instances > 0, "No worker to dispatch to."
-        avg_flops_per_gpu = total_flops / self.num_dispatch_instances
+        assert self.attention_server_world_size > 0, "No worker to dispatch to."
+        avg_flops_per_gpu = total_flops / self.attention_server_world_size
         rlog(f"Total FLOPs: {total_flops:.2f}, Average FLOPs per GPU: {avg_flops_per_gpu:.2f}")
         
         surplus_deficit = [f - avg_flops_per_gpu for f in flops_per_gpu]
@@ -569,7 +572,7 @@ class Planner_DP:
         final_items = post_processed_items
         rlog("\n[bold green]Relocation planning finished.[/bold green]")
         
-        final_flops_per_gpu = [0.0] * self.num_dispatch_instances
+        final_flops_per_gpu = [0.0] * self.attention_server_world_size
         for item in final_items:
             final_flops_per_gpu[item['gpuid']] += get_flops(**item)
         
@@ -638,23 +641,53 @@ class Planner:
                 world_size: int,
                 parallel_config,
                 tolerance_factor: float = 0.1,
-                model_config = None) -> None:
+                model_config = None,
+                dtype: torch.dtype = torch.bfloat16) -> None:
         self.model_config = model_config
         self.world_size = world_size
         self.parallel_config = parallel_config
         self.data_parallel = world_size // (parallel_config.pipeline_model_parallel_size * parallel_config.tensor_model_parallel_size)
-        self.num_dispatch_instances = self.data_parallel * parallel_config.pipeline_model_parallel_size
-        rich.print(f"[bold green] world_size: {self.world_size}, DP: {self.data_parallel}[/bold green], PP: {parallel_config.pipeline_model_parallel_size}, TP: {parallel_config.tensor_model_parallel_size}, num_dispatch_instances: {self.num_dispatch_instances}")
+        self.attention_server_world_size = self.data_parallel * parallel_config.pipeline_model_parallel_size
+        self.dtype = dtype
+        rich.print(f"[bold green] world_size: {self.world_size}, DP: {self.data_parallel}[/bold green], PP: {parallel_config.pipeline_model_parallel_size}, TP: {parallel_config.tensor_model_parallel_size}, attention_server_world_size: {self.attention_server_world_size}")
         
         self.tolerance_factor = tolerance_factor
 
+    # from item to metadata.
     def plan(self, items_: list[Item], verbose=False, plot=False):
-        items = self.plan_items(items_, verbose, plot)
-        items = self.postprocess_items(items)
+        mlp_shard_len = self.items_to_mlp_doc_len(items_)
+        planned_items: list[Item] = self.plan_items(items_, verbose, plot)
+        planned_items: list[Item] = self.postprocess_items(planned_items)
+        planner_output: list[list[ShardInfo]] = self.items_into_shardinfos(planned_items)
+        if self.parallel_config.pipeline_model_parallel_size == 1:
+            hidden_size_q = self.model_config.hidden_size
+            hidden_size_kv = hidden_size_q
+            if hasattr(self.model_config, "num_key_value_heads"):
+                hidden_size_kv = (hidden_size_kv * self.model_config.num_key_value_heads //
+                                self.model_config.num_attention_heads)
 
-        metadata = self.item_to_metadata(items)
-        return metadata
+            hidden_size_q_tp = hidden_size_q // self.parallel_config.tensor_model_parallel_size
+            hidden_size_k_tp = hidden_size_kv // self.parallel_config.tensor_model_parallel_size
+
+            lse_size = 0    # we don't send lse when pp = 1.
+            element_size = self.dtype.itemsize
+
+            (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
+            attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
+            as_attn_metadata,
+            ) = from_planner_output(
+                self.attention_server_world_size, planner_output, hidden_size_q_tp, hidden_size_k_tp,
+                lse_size, element_size, is_pipeline_tick=False
+            )
+            fa2a_metadata = (
+                qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
+                attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
+            )
+            return fa2a_metadata, as_attn_metadata, mlp_shard_len
+        else:   
+            raise NotImplementedError("PP > 1 will be supported very soon.")
     
+    # This function will be deprecated. As we don't need logical metadata anymore.
     def plan_to_raw_qkv_dispatch(self, items_: list[Item], verbose=False, plot=False, should_plan = True, return_items = False):
         # no plan for cp debug
         if should_plan == False:
@@ -668,7 +701,7 @@ class Planner:
         items = self.postprocess_items(items)
         shard_infos = self.items_into_shardinfos(items)
         
-        ret = handle_planner_metadata(self.num_dispatch_instances, shard_infos)
+        ret = handle_planner_metadata(self.attention_server_world_size, shard_infos)
         if return_items:
             return ret, items
         return ret
@@ -680,14 +713,14 @@ class Planner:
             if verbose:
                 rich.print(message)
 
-        flops_per_gpu = [0.0] * self.num_dispatch_instances
+        flops_per_gpu = [0.0] * self.attention_server_world_size
         for item in items:
             flops_per_gpu[item.gpuid] += item.total_flops
         total_flops = sum(flops_per_gpu)
         
-        if self.num_dispatch_instances == 0:
+        if self.attention_server_world_size == 0:
             return []
-        avg_flops_per_gpu = total_flops / self.num_dispatch_instances
+        avg_flops_per_gpu = total_flops / self.attention_server_world_size
         rlog(f"Total FLOPs: {total_flops:.2f}, Average FLOPs per GPU: {avg_flops_per_gpu:.2f}")
         
         surplus_deficit = [f - avg_flops_per_gpu for f in flops_per_gpu]
@@ -752,7 +785,7 @@ class Planner:
         final_items = [item for item in items if item.total_flops > 0]
 
         if verbose:
-            final_flops_per_gpu = [0.0] * self.num_dispatch_instances
+            final_flops_per_gpu = [0.0] * self.attention_server_world_size
             for item in final_items:
                 final_flops_per_gpu[item.gpuid] += item.get_flops()
             
@@ -778,10 +811,43 @@ class Planner:
                 
         return dict_items
     
+    # Get mlp_shard_len from items. May need to change later. 
+    # Currently, shards are put on MLP based on seq_id from small to big.
+    def items_to_mlp_doc_len(self, items: list[Item], device: str = 'cuda') -> torch.Tensor:
+        items_by_src_gpu = defaultdict(list)
+        for item in items:
+            items_by_src_gpu[item.src_gpuid].append(item)
+
+        for src_gpuid in items_by_src_gpu:
+            items_by_src_gpu[src_gpuid].sort(key=lambda x: x.seqid)
+
+        final_shards_by_rank = [[] for _ in range(self.attention_server_world_size)]
+
+        sorted_src_gpuids = sorted(items_by_src_gpu.keys())
+
+        for src_gpuid in sorted_src_gpuids:
+            sorted_items = items_by_src_gpu[src_gpuid]
+            for item in sorted_items:
+                if item.complete:
+                    shard_len = item.complete_item['q'] # item.complete_item['q'] = item.seq_len
+                    final_shards_by_rank[src_gpuid].append(shard_len)
+                else:
+                    head_shard_len = item.head['q']
+                    final_shards_by_rank[src_gpuid].append(head_shard_len)
+
+                    tail_shard_len = item.tail['q']
+                    final_shards_by_rank[src_gpuid].append(tail_shard_len)
+
+        doc_lens_per_rank = [
+            torch.tensor(shard_len_list, dtype=torch.int32, device=device) for shard_len_list in final_shards_by_rank
+            ]
+        return doc_lens_per_rank
+
+
     def item_to_metadata(self, items: list[dict]):
         shard_infos = self.items_into_shardinfos(items)
         metadatas = plan_to_metadata(
-            self.num_dispatch_instances, shard_infos, return_intermediate=True
+            self.attention_server_world_size, shard_infos, return_intermediate=True
         )
         return metadatas
 

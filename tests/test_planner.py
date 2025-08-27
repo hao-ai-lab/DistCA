@@ -4,12 +4,13 @@ import time
 from typing import Any, Dict, List
 
 import rich
-from rich.console import Console
-from rich.table import Table
-from test_util import ParallelConfig
-
+import torch
 from d2.planner.planner import (Planner, Planner_DP, batch_to_items,
                                 batch_to_items_general, get_flops)
+from rich.console import Console
+from rich.table import Table
+
+from test_util import ParallelConfig
 
 console = Console()
 
@@ -442,7 +443,67 @@ def test_cp_planner():
     verification_layout(initial_dict, replan_dict)
     run_flops_balance_test(initial_dict, replan_dict, tolerance_factor)
 
+def test_mlp_seq_len():
+    model_config = MockConfig()
+    parallel_config = ParallelConfig(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    world_size = 4
+    tolerance_factor = 0.1
+    planner = Planner(
+        world_size=world_size,
+        parallel_config=parallel_config,
+        model_config=model_config,
+        tolerance_factor=tolerance_factor
+    )
+    # Test DP
+    batches: List[List[int]] = [[256, 256],[128, 384],[512], [10, 502] ]
+    num_batched_token = 512
+    dp_degree = world_size // parallel_config.tensor_model_parallel_size // parallel_config.pipeline_model_parallel_size
+
+    dp_cp_test_items = batch_to_items_general(batches, num_batched_token=num_batched_token, DP_degree=dp_degree, model_config = model_config)
+    actual_output = planner.items_to_mlp_doc_len(dp_cp_test_items, device='cpu')
+
+    expected_output = [
+        torch.tensor([256, 256], dtype=torch.int32),
+        torch.tensor([128, 384], dtype=torch.int32),
+        torch.tensor([512], dtype=torch.int32),
+        torch.tensor([10, 502], dtype=torch.int32),
+    ]
+
+    for i in range(world_size):
+        actual_tensor = actual_output[i]
+        expected_tensor = expected_output[i]
+        assert torch.equal(actual_tensor, expected_tensor), \
+            f"Rank {i} tensor is wrong\n Expected: {expected_tensor}\n actual: {actual_tensor}"
+    rich.print(f"[bold green][PASS][/bold green] test_mlp_seq_len Passed MLP DP test")
+
+    # Test CP
+    batches: List[List[int]] = [[256, 1024],[256], [128, 384] ]
+    num_batched_token = 512
+    dp_degree = world_size // parallel_config.tensor_model_parallel_size // parallel_config.pipeline_model_parallel_size
+
+    dp_cp_test_items = batch_to_items_general(batches, num_batched_token=num_batched_token, DP_degree=dp_degree, model_config = model_config)
+    actual_output = planner.items_to_mlp_doc_len(dp_cp_test_items, device='cpu')
+
+    expected_output = [
+        torch.tensor([256, 128, 128], dtype=torch.int32),
+        torch.tensor([256, 256], dtype=torch.int32),
+        torch.tensor([128, 128, 256], dtype=torch.int32),
+        torch.tensor([128, 384], dtype=torch.int32),
+    ]
+
+    for i in range(world_size):
+        actual_tensor = actual_output[i]
+        expected_tensor = expected_output[i]
+        assert torch.equal(actual_tensor, expected_tensor), \
+            f"Rank {i} tensor is wrong\n Expected: {expected_tensor}\n actual: {actual_tensor}"
+    rich.print(f"[bold green][PASS][/bold green] test_mlp_seq_len Passed MLP CP test")
+    return
+
 if __name__ == "__main__":
+    test_mlp_seq_len()
     iter = 1
     for _ in range(iter):
         test_dp_planner()
