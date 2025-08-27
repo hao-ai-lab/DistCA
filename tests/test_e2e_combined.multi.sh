@@ -5,7 +5,7 @@
 #
 
 # export CUDA_LAUNCH_BLOCKING=1 
-# export D2_DEBUG_PRINT=1
+D2_DEBUG_PRINT=${D2_DEBUG_PRINT:-0}
 # export WLBLLM_DISABLE_LSE=1
 # export WLBLLM_SYNC_TIME_FLASH_ATTN=1
 
@@ -71,12 +71,14 @@ DEFAULT_OUTPUT_DIR=${DEFAULT_OUTPUT_DIR:-${CURDIR}/../test-logs}
 OUTPUT_DIR=${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}
 OUTPUT_DIR=$(realpath ${OUTPUT_DIR})
 
+SHOULD_PROFILE_MEMORY=${SHOULD_PROFILE_MEMORY:-0}
 
 now="$(TZ='America/Los_Angeles' date +%Y%m%d_%H%M%S)_PST"
 mkdir -p ${OUTPUT_DIR}
 output_file_stem=${OUTPUT_DIR}/${now}.${MODE}.${THIS_HOST}.nnodes${NNODES}.bs${BATCH_SIZE}.maxid${MAX_SAMPLE_ID}.tp${TP_SIZE}.cp${CP_DEGREE}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}
 NSYS_PROFILE_PATH=${output_file_stem}.nsys-rep
 LOG_PATH=${output_file_stem}.log
+PROFILE_MEMORY_PATH=${output_file_stem}.mem.json
 
 
 function echo_and_tee() {
@@ -133,7 +135,7 @@ TORCHRUN_CMD=(
     --num-tokens ${NUM_TOKENS} \
     --elongate-factor ${ELONGATE_FACTOR} \
     --filter-threshold ${FILTER_THRESHOLD} \
-    --filter-ratio ${FILTER_RATIO} 
+    --filter-ratio ${FILTER_RATIO}
 )
 
 
@@ -145,6 +147,9 @@ if [ ${EXPERIMENT_SHOULD_FORCE_EXIT} -eq 1 ]; then
     TORCHRUN_CMD+=(--force-exit)
 fi
 
+if [ ${SHOULD_PROFILE_MEMORY} -eq 1 ]; then
+    TORCHRUN_CMD+=(--should-profile-memory ${PROFILE_MEMORY_PATH} )
+fi
 
 if [ ${ENABLE_NSYS} -eq 1 ]; then
     echo_and_tee nsys profile \
@@ -161,10 +166,10 @@ if [ ${ENABLE_NSYS} -eq 1 ]; then
       -o ${NSYS_PROFILE_PATH} \
       --sample=none \
       -t cuda,nvtx \
-    torchrun "${TORCHRUN_CMD[@]}" | tee ${LOG_PATH} 2>&1
+    torchrun "${TORCHRUN_CMD[@]}" | tee -a ${LOG_PATH} 2>&1
 else
     echo_and_tee torchrun "${TORCHRUN_CMD[@]}"
 
 
-    torchrun "${TORCHRUN_CMD[@]}" | tee ${LOG_PATH} 2>&1
+    torchrun "${TORCHRUN_CMD[@]}" | tee -a ${LOG_PATH} 2>&1
 fi
