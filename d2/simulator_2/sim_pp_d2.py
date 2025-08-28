@@ -1,35 +1,14 @@
 # %%
 
 from rich import print
+from d2.simulator.optimizers.samples import (
+    sample_wlbllm_docs_upsample, 
+    batch_documents,
+)
 
 K = 1024
-
-base_seq_len = K * 64
-attn_base_time = 12.5020
-# linear_base_time = (13.5 + 8.5) # mlp + qkvo
-# linear_base_time = (13.5 + 8.5)  # mlp + qkvo
-mlp_base_time = 13.5  # assume expert parallel
-qkvo_base_time = 8.5
-linear_base_time = (mlp_base_time + qkvo_base_time)  # mlp + qkvo
-# linear_base_time = 0
-# linear_base_time = 0
-total_ranks = 8
-
-
-def get_attn_time(batch) -> float:
-    total_time = 0
-    for l in batch:
-        ratio = l / base_seq_len
-        total_time += attn_base_time * (ratio ** 2)
-    return total_time
-
-
-def get_mlp_time(batch) -> float:
-    total_time = 0
-    for l in batch:
-        ratio = l / base_seq_len
-        total_time += linear_base_time * (ratio)
-    return total_time
+# from timemodule import get_attn_time, get_mlp_time
+import timemodule as tm
 
 def flatten(batch: list[list[int]]) -> list[int]:
     return [item for sublist in batch for item in sublist]
@@ -45,6 +24,7 @@ def simulate_d2_pipeline(
     batches: list[list[list[int]]], 
     pp_size: int = 4, 
     dpcp_size: int = 1,
+    nlayers: int = 1,
     verbose: bool = False,
 ):
     """
@@ -65,6 +45,12 @@ def simulate_d2_pipeline(
     mlp_time = None
     current_time = 0
 
+    def get_attn_time(batch, is_backward: bool = False) -> float:
+        result = tm.get_attn_time(batch) / pp_size / dpcp_size * nlayers
+        if is_backward:
+            result *= 2.5
+        return result
+
     # Phase 1: forward only
     while forward_idx < pp_size:
         fwd_window = window(forward_idx)
@@ -72,14 +58,11 @@ def simulate_d2_pipeline(
 
         ping, pong = batches[0]
         mlp_batch = ping + pong
-        log(f"mlp_batch: {mlp_batch}")
-        if mlp_time is None:
-            mlp_time = get_mlp_time(mlp_batch) / dpcp_size
-        log(f"mlp_time: {mlp_time}")
+        mlp_time = tm.get_mlp_time(mlp_batch) * nlayers / dpcp_size
 
         attn_batch = batches[fwd_window]
         attn_batch = flatten(flatten(attn_batch))
-        attn_time = get_attn_time(attn_batch) / pp_size / dpcp_size
+        attn_time = get_attn_time(attn_batch)
 
         this_time = mlp_time + attn_time
         future_time = current_time + this_time
@@ -92,35 +75,31 @@ def simulate_d2_pipeline(
     # Phase 2: forward and backward alternate
     while forward_idx < len(batches) + pp_size - 1:
         
-        # first backward
+        # Backward
         bwd_window = window(backward_idx)
         log(f"Phase 2: forward and backward alternate, backward_idx: {backward_idx} ({bwd_window})")
         
         backward_batch = batches[bwd_window]
         attn_batch = flatten(flatten(backward_batch))
-        attn_time = get_attn_time(attn_batch) / pp_size / dpcp_size
-        log(f"attn_time: {attn_time}")
-
-        # TODO: Fix the time.
-        this_time = attn_time * 2.5 + mlp_time * 2
+        attn_time = get_attn_time(attn_batch, is_backward=True)
+        this_time = attn_time + mlp_time * 2
         future_time = current_time + this_time
         events.append((f"backward", backward_idx, bwd_window, current_time, future_time))
         current_time = future_time
         backward_idx += 1
-        log(f"backward_batch: {...} (len={len(backward_batch)})")
+        # log(f"backward_batch: {backward_batch} (len={len(backward_batch)})")
         
-        # then forward
+        # Forward
         fwd_window = window(forward_idx)
         log(f"Phase 2: forward and backward alternate, forward_idx: {forward_idx} ({fwd_window})")
         forward_batch = batches[fwd_window]
         attn_batch = flatten(flatten(forward_batch))
-        attn_time = get_attn_time(attn_batch) / pp_size / dpcp_size
-        log(f"attn_time: {attn_time}")
-        this_time = attn_time * 2.5 + mlp_time * 2
+        attn_time = get_attn_time(attn_batch)
+        this_time = attn_time + mlp_time
         future_time = current_time + this_time
         events.append((f"forward", forward_idx, fwd_window, current_time, future_time))
         current_time = future_time
-        log(f"forward_batch: {...} (len={len(forward_batch)})")
+        # log(f"forward_batch: {...} (len={len(forward_batch)})")
         forward_idx += 1
         pass
 
@@ -131,8 +110,8 @@ def simulate_d2_pipeline(
         log(f"Phase 3: backward only, backward_idx: {backward_idx} ({bwd_window})")
         backward_batch = batches[bwd_window]
         attn_batch = flatten(flatten(backward_batch))
-        attn_time = get_attn_time(attn_batch) / pp_size / dpcp_size
-        this_time = attn_time * 2.5 + mlp_time * 2
+        attn_time = get_attn_time(attn_batch, is_backward=True)
+        this_time = attn_time + mlp_time * 2
         future_time = current_time + this_time
         events.append((f"backward", backward_idx, bwd_window, current_time, future_time))
         current_time = future_time
@@ -143,7 +122,7 @@ def simulate_d2_pipeline(
 # %%
 import matplotlib.pyplot as plt
 
-def plot_d2_timeline(events):
+def plot_d2_timeline(events, save_path: str = None):
     # Create figure and axis
     fig, ax = plt.subplots(figsize=(12, 6))
 
@@ -163,10 +142,10 @@ def plot_d2_timeline(events):
         ax.barh(y=event_name, width=duration, left=start_time, color='none', edgecolor='black')
         
         # Add text labels in the middle of the bar
-        pos = 0.5 - (1 if "forward" in event_name else -1) * 0.05
+        pos = 0.5 - (1 if "forward" in event_name else -1) * 0.03
         
         ax.text(start_time + duration/2, pos, f'{idx}', 
-                horizontalalignment='center', verticalalignment='top', rotation=90)
+                horizontalalignment='center', verticalalignment='top', rotation=0)
         ax.text(start_time + duration/2, event_name, f'{duration:.1f}', 
                 horizontalalignment='center', verticalalignment='center', rotation=90)
 
@@ -179,7 +158,7 @@ def plot_d2_timeline(events):
     # Customize the plot
     ax.set_xlabel('Time')
     ax.set_ylabel('Events')
-    ax.set_title('D2 PP Timeline (backward assume 2.5x attn, 2x mlp)')
+    ax.set_title(f'D2 PP Timeline (backward assume 2.5x attn, 2x mlp) \n end_time: {max_time:.1f}')
     ax.grid(True, axis='x', linestyle='--', alpha=0.7)
 
     # Add legend
@@ -189,13 +168,19 @@ def plot_d2_timeline(events):
     plt.tight_layout()
 
     # Show the plot
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300)
+
     plt.show()
+    return fig
 
 # %%
 # ---- Quick demo ----
 # Create 4 batches with the same sequence length
 # batches = [[64 * K] for _ in range(num_batches)]
-def quick_demo():
+def quick_demo(
+    pp_size: int = 4,
+):
     batches = [
         [[128 * K] * 4, [256 * K] * 2],
         [[512 * K] * 1, [128 * K] * 4],
@@ -207,7 +192,7 @@ def quick_demo():
         [[64 * K] * 8, [128 * K] * 4],
         
     ]
-    pp_size = 4
+    
     events = simulate_d2_pipeline(batches, pp_size=pp_size, verbose=True)
     plot_d2_timeline(events)
 
@@ -218,12 +203,9 @@ def quick_demo():
 
 # %%
 # ---- Actually using a distribution to try out ----
-def actual_demo_with_distribution():
-    from d2.simulator.optimizers.samples import (
-        sample_wlbllm_docs_upsample, 
-        batch_documents,
-    )
-
+def actual_demo_with_distribution(
+    pp_size: int = 4,
+):
     GLOBAL_BATCH = batch_documents(
         sample_wlbllm_docs_upsample(
             size=10000,
@@ -248,8 +230,8 @@ def actual_demo_with_distribution():
     print("End Time: ", end_time)
 
 
-
-if __name__ == "__main__":
-    quick_demo()
-    actual_demo_with_distribution()
-
+# %%
+# if __name__ == "__main__":
+# #     quick_demo()
+#     actual_demo_with_distribution()
+# # %%
