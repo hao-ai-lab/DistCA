@@ -95,17 +95,19 @@ def overflow_info(fa2a_metadata, as_rank):
     max_send_last_offset = max(torch.max(o).item() for o in send_last_offset) // 1024**2
     return max_send_sz_mb, max_recv_sz_mb, max_send_last_offset
 
-
+# %%
+batch_size = 4
+world_size = 8
 per_batch_seq_len = 256 * K
+
+as_world_size = world_size 
+num_batched_token_per_as_rank = per_batch_seq_len * batch_size // as_world_size
+
 GLOBAL_BATCH = setup_global_batch(
     per_batch_seq_len=per_batch_seq_len,
     should_add_debug_cases=True,
     elongate_factor=4,
 )
-batch_size = 2
-world_size = 8
-as_world_size = world_size 
-num_batched_token_per_as_rank = per_batch_seq_len * batch_size // as_world_size
 
 
 max_send_sz_mb_overall: int = 0
@@ -113,7 +115,10 @@ max_recv_sz_mb_overall: int = 0
 max_send_last_offset_overall: int = 0
 for i in range(100):
     rich.print(f"---------------\nIteration {i}\n---------------")
-    _seq_lens: list[list[int]] = get_next_batch(2 * batch_size)
+    try:
+        _seq_lens: list[list[int]] = get_next_batch(2 * batch_size)
+    except StopIteration:
+        break
     seq_lens_0: list[list[int]] = _seq_lens[:batch_size]
     seq_lens_1: list[list[int]] = _seq_lens[batch_size:]
 
