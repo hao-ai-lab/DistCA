@@ -24,11 +24,14 @@ def initialize_attention_server_comm(
     data_parallel_size = mpu.get_data_parallel_world_size() # TODO: double check
 
     # CP
-    assert (
-        mpu.get_context_parallel_group(check_initialized=False) is None or
-        mpu.get_context_parallel_world_size() == 1
-    )
-    context_parallel_size = 1
+    # TODO: We probably should allow initializing with CP degree
+    # assert (
+    #     mpu.get_context_parallel_group(check_initialized=False) is None or
+    #     mpu.get_context_parallel_world_size() == 1
+    # )
+    # context_parallel_size = 1
+    # TODO: This behavior is different when doing megatron baseline vs d2.
+    context_parallel_size = mpu.get_context_parallel_world_size()
     # TP
     if mpu.get_tensor_model_parallel_group(check_initialized=False) is None:
         tensor_model_parallel_size = 1

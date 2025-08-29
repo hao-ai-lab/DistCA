@@ -59,6 +59,8 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
+            rich.print(f"🟡 [rank {self.rank}] batch", batch)
+            # TODO: Given this particular batch, we calculate the necessary metadata needed.
             torch.cuda.nvtx.range_push("forward_step")
             input_ids = batch['input_ids']
             position_ids = batch['position_ids']
@@ -161,6 +163,7 @@ def init_megatron_e2e_test(
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
+        context_parallel_size=max_cp_degree,
     )
 
     worker = init_worker_torch_distributed(
@@ -220,6 +223,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
         microbatch = {
             "position_ids": position_ids_local,
             "packed_seq_params": ping_pang_params,
+            "doc_lens": tick_per_rank_doc_lens[as_rank],
         }
         microbatches.append(microbatch)
 
@@ -260,9 +264,10 @@ def test(args):
     # parallelization
     tp_size = args.tp_size
     pp_size = args.pp_size
+    cp_size = args.cp_degree
     world_size = args.num_nodes * args.num_gpus_per_node
-    assert world_size % (tp_size * pp_size) == 0
-    dp_size = world_size // (tp_size * pp_size)
+    assert world_size % (tp_size * pp_size * cp_size) == 0
+    dp_size = world_size // (tp_size * pp_size * cp_size)
 
     dtype = torch.bfloat16
     element_size = dtype.itemsize
@@ -278,13 +283,31 @@ def test(args):
 
     worker: MegatronE2eWorker = init_megatron_e2e_test(
         hidden_size_q, hidden_size_kv, hf_config.num_attention_heads, num_tokens,
-        world_size, max_cp_degree, tp_size, pp_size,
+        world_size, cp_size, tp_size, pp_size,
         dtype, MegatronE2eWorker
     )
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
+
+
+    # assume this is wlbllm.
+    def wlbllm_patch():
+        import rich
+        def debug_print(*args, **kwargs):
+            rich.print(*args, **kwargs)
+        os.environ["WLBLLM_MODE"] = "1"
+        # os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
+        import wlbllm.megatron_patch.dot_product_attention
+        wlbllm.megatron_patch.dot_product_attention.monkey_patch()
+        debug_print(f"🟡 wlbllm.megatron_patch.dot_product_attention.monkey_patch()")
+        import wlbllm.megatron_patch.backends
+        wlbllm.megatron_patch.backends.monkey_patch()
+        debug_print(f"🟡wlbllm.megatron_patch.backends.monkey_patch()")
+        return
+
+    wlbllm_patch()
 
     as_world_size = worker.as_world_size
     as_rank = worker.as_rank
@@ -350,22 +373,87 @@ def test(args):
             "input_ids": mb["input_ids"],
             "position_ids": mb["position_ids"],
             "packed_seq_params": packed_seq_params,
+            "doc_lens": mb_0["doc_lens"] + mb_1["doc_lens"],
         }
         orig_impl_microbatches.append(orig_mb)
 
+
+    # TODO(Ginda): assume wlbllm 
+    import rich
+    import wlbllm
+    import wlbllm.registry
+    import wlbllm.utils
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_group = mpu.get_context_parallel_group()
+    cp_stream = torch.cuda.current_stream()
+    wlbllm.registry.set("cp_group", cp_group)
+    wlbllm.registry.set("cp_stream", cp_stream)
+
+    wlb_mb_metadata = []
+    for mb in orig_impl_microbatches:
+        """
+        For every iteration when we get the new batch, we will want to clear the registry 
+        and set the new metadata.
+
+        wlbllm.registry.clear()
+        wlbllm.registry.set("doc_lens", doc_lens)
+        wlbllm.registry.set("doc_shards", doc_shards)
+        wlbllm.registry.set("kv_idx_list", kv_idx_list)
+        wlbllm.registry.set("cp_group", cp_group)
+        wlbllm.registry.set("cp_stream", cp_stream)
+        wlbllm.registry.set("cu_seqlens_q_list", cu_seqlens_q_list)
+        wlbllm.registry.set("cu_seqlens_kv_list", cu_seqlens_k_list)
+        wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
+        wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
+        wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
+        """
+        doc_lens = mb["doc_lens"]
+        context_length = sum(doc_lens)
+        doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
+            doc_lens, context_length, cp_size
+        )
+        (
+            cu_seqlens_q_list, cu_seqlens_k_list, 
+            max_seqlen_q_list, max_seqlen_k_list, 
+            kv_idx_list,
+        ) = wlbllm.utils.compute_per_doc_metadate_combined__metadata_only(    
+            context_length, 
+            doc_lens, 
+            doc_shards,
+            cp_size, 
+            cp_rank, 
+            device=torch.cuda.current_device()
+        )
+        
+        item = {
+            "doc_lens": doc_lens,
+            "doc_shards": doc_shards,
+            "kv_idx_list": kv_idx_list,
+            "cu_seqlens_q_list": cu_seqlens_q_list,
+            "cu_seqlens_kv_list": cu_seqlens_k_list,
+            "max_seqlen_q_list": max_seqlen_q_list,
+            "max_seqlen_kv_list": max_seqlen_k_list,
+            "global_tensor_length": (total_seq_len * cp_size * 2),
+        }
+        mb.update(item)
+        wlb_mb_metadata.append(item)
+        pass
+
     time.sleep(2)
-    loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
-        microbatches=orig_impl_microbatches,
-        forward_only=False,
-        mode="orig_reimpl",
-        with_dummy=True,
-    )
+    # loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
+    #     microbatches=orig_impl_microbatches,
+    #     forward_only=False,
+    #     mode="orig_reimpl",
+    #     with_dummy=True,
+    # )
     loss_orig, grad_orig = worker.forward_backward_batch(
         microbatches=orig_impl_microbatches,
         forward_only=False,
         mode="orig_reimpl",
         with_dummy=False,
     )
+    exit(0)
     print("finish baseline")
     for _ in range(3):
         time.sleep(2)
