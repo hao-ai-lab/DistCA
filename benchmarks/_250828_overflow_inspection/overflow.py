@@ -148,6 +148,9 @@ for i in range(100):
     max_send_last_offset_overall = max(max_send_last_offset_overall, max_send_last_offset)
 
 rich.print(f"Max size overall: ({max_send_sz_mb_overall}, {max_recv_sz_mb_overall}, {max_send_last_offset_overall})")
+recommended_buffer_size = max(max_send_sz_mb_overall, max_recv_sz_mb_overall, max_send_last_offset_overall)
+recommended_buffer_size = (recommended_buffer_size  + 1024) // 1024 # MB -> GB
+rich.print(f"buffer_size = {recommended_buffer_size} * GB")
 
 
 
