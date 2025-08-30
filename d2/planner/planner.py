@@ -1,19 +1,21 @@
 from collections import defaultdict
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import rich
 import torch
-from d2.runtime.compute_metadata import from_planner_output
-from d2.runtime.shard_info import (ShardInfo, handle_planner_metadata,
-                                   items_into_shardinfos, plan_to_metadata)
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from d2.runtime.compute_metadata import from_planner_output
+from d2.runtime.shard_info import (ShardInfo, handle_planner_metadata,
+                                   items_into_shardinfos, plan_to_metadata)
+
 K = 1024
 
-
+# This funciton is deprecated. As we use Item class not dict.
 def batch_to_items(batches):
     items = []
     seqid = 0
@@ -27,8 +29,8 @@ def batch_to_items(batches):
             seqid += 1
     return items
 
-
-def batch_to_items_class(batches, model_config=None):
+# Transfer batch to Item. Only for MLP-DP.
+def batch_to_items_class(batches: list[list[int]], model_config=None):
     items = []
     seqid = 0
     for gpuid, batch in enumerate(batches):
@@ -310,7 +312,7 @@ class Item:
             rlog(f"Origin flops {self.total_flops}, moved flops: {moved_flops_actual}, current flops: {self.get_flops()}")
 
             rlog(f"    - [debug] total_flops(before)={self.total_flops}, get_flops()={self.get_flops()}, moved_flops_actual={moved_flops_actual}, sum={self.get_flops() + moved_flops_actual}")
-            assert self.total_flops == self.get_flops() + moved_flops_actual, f"Total flops should be equal, got {self.total_flops} != {self.get_flops()} + {moved_flops_actual}"
+            assert self.total_flops == self.get_flops() + moved_flops_actual, f"Total flops should be equal. This error is mostly because of odd doc length. Currently, we only support even doc length. Please pad to even."
             self.total_flops = self.get_flops()
             rlog(f"    - [bold]Splitting item[/bold]: Actual Moving q={q_to_move} ({moved_flops_actual:.2f} FLOPs) to satisfy need.")
 
@@ -685,6 +687,8 @@ class Planner:
             )
             return fa2a_metadata, as_attn_metadata, mlp_shard_len
         else:   
+            # new metadata computation for pipeline parallel is in test_util. hard to import.
+            # Now PP 3D parallel is directly support in: test_megatron_e2e_pipeline.py
             raise NotImplementedError("PP > 1 will be supported very soon.")
     
     # This function will be deprecated. As we don't need logical metadata anymore.
@@ -795,6 +799,14 @@ class Planner:
         rlog("\n[bold green]Relocation planning finished.[/bold green]")
         return final_items
     
+
+    def items_to_shardinfo(self, items_: list[Item], verbose=False) -> list[list[ShardInfo]]:
+        planned_items = self.plan_items(items_, verbose)
+        planned_items = self.postprocess_items(planned_items)
+        shard_infos = self.items_into_shardinfos(planned_items)
+        return shard_infos
+    
+
     def postprocess_items(self, items: list[Item]) -> list[Item]:
         dict_items = []
         for item in items:
@@ -853,6 +865,32 @@ class Planner:
 
     def items_into_shardinfos(self, item_dicts):
         return items_into_shardinfos(item_dicts)
+    
+    @classmethod
+    def from_individual_params(cls,
+                               tp_size: int,
+                               pp_size: int,
+                               dp_size: int,
+                               world_size: int,
+                               hidden_size_q: int,
+                               hidden_size_k: int,
+                              ):
+        parallel_config = SimpleNamespace(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size
+        )
+        model_config = SimpleNamespace(
+            hidden_size=hidden_size_q * tp_size,
+            num_attention_heads = 1,
+            num_key_value_heads = hidden_size_q // hidden_size_k,
+            num_hidden_layers = 1
+        )
+        return cls(
+            world_size=world_size,
+            parallel_config=parallel_config,
+            model_config=model_config)
+
+
 
     
 def get_flops(q=None, kv=None, **kwargs):

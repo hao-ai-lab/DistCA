@@ -174,10 +174,15 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
                            as_world_size: int, total_seq_len: int, num_seqs: int,
                            max_cp_degree: int, hidden_size_q_tp: int,
                            hidden_size_k_tp: int, element_size: int,
-                           num_head_in_dtype: int, tp_size: int, dp_size: int,):
+                           num_head_in_dtype: int, tp_size: int, dp_size: int,
+                           use_planner: bool=False):
     tick_per_rank_doc_lens = None
     bwd_metadata = []
     microbatches = []
+    if use_planner:
+        print("Enable planner. Get real batch.")
+    else:
+        print("No planner. Use random batch.")
     for i in range(num_microbatch + pp_degree - 1):
         # For the last few ticks (drain-out ticks)
         # add a dummy forward microbatch at PP rank 0.
@@ -195,6 +200,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
             add_dummy=add_dummy_forward,
             tp_size=tp_size,
             dp_size=dp_size,
+            use_planner=use_planner
         )
         this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
 
@@ -298,18 +304,21 @@ def test(args):
     hidden_size_k_tp = hidden_size_kv // tp_size
     num_head_in_dtype = (hf_config.num_attention_heads *
                          torch.float32.itemsize // element_size // tp_size)
-
+    if args.use_planner:
+        from global_batch_provider import setup_global_batch
+        setup_global_batch(total_seq_len=total_seq_len)
+        
     microbatches_0 = create_pp_microbatches(
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-        tp_size, dp_size,
+        tp_size, dp_size, args.use_planner,
     )
     microbatches_1 = create_pp_microbatches(
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-        tp_size, dp_size,
+        tp_size, dp_size, args.use_planner,
     )
     set_random_seed(seed, set_megatron=True)
     microbatches = []
@@ -396,5 +405,6 @@ if __name__ == "__main__":
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--pp-size", type=int, default=4)
     parser.add_argument("--num-microbatch", type=int, default=2)
+    parser.add_argument("--use-planner", action="store_true")
     args = parser.parse_args()
     test(args)
