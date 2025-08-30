@@ -1,6 +1,9 @@
 # %%
 import os
 import pandas as pd
+# glo
+import glob
+
 # %%
 a = ! ls logs/
 len(a)
@@ -29,9 +32,23 @@ os.path.exists(b)
 import json
 
 DF_INCLUDE_BENCHMARK = True
+# DF_INCLUDE_BENCHMARK = False
 # DF_ONLY_SHOW_SUCCESS = True
 DF_ONLY_SHOW_SUCCESS = False
 DF_ONLY_SHOW_FAILED = False
+# DF_ONLY_SHOW_D2 = True
+DF_ONLY_SHOW_D2 = False
+
+
+import subprocess
+active_jobs = subprocess.check_output(['squeue', '--me', '--noheader', '-o', '%A']).decode().splitlines()
+print(active_jobs)
+print(f"There are {len(active_jobs)} active jobs")
+
+# %%
+print("scancel "+ " ".join(active_jobs))
+
+# %%
 
 results = []
 for exp_name in a:
@@ -41,6 +58,9 @@ for exp_name in a:
     config = parse_key_value_file(file_path)
 
     slurm_env_file = f"logs/{exp_name}/slurm.env"
+    if not os.path.exists(slurm_env_file):
+        print(f"Skipping {exp_name} because slurm.env file does not exist")
+        continue
     with open(slurm_env_file, "r") as f:
         slurm_env = f.read()
         slurm_env = slurm_env.split("\n")
@@ -55,6 +75,8 @@ for exp_name in a:
         nnodes = int(slurm_env_dict["SLURM_NNODES"])
         batch_size = int(slurm_env_dict["BATCH_SIZE"])
         num_layers = int(slurm_env_dict["NUM_LAYERS"])
+        EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB = int(slurm_env_dict.get("EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB", -1))
+        MODEL_PATH = slurm_env_dict.get("MODEL_PATH", "")
         # rdzv_id = int(slurm_env_dict["RANDOM"])
 
     benchmark_file = f"logs/{exp_name}/benchmark.json"
@@ -72,21 +94,66 @@ for exp_name in a:
     DP_SIZE = nnodes // (
         int(config.get("CP_SIZE")) * int(config.get("PP_SIZE"))
     )
+
+    log_files = glob.glob(f"logs/{exp_name}/logs/*")
+    is_started = False
+    is_comm_init = False # "Communication groups initialized"
+    is_reached_flash_attn_3 = False # "flash_attn_3"
+    is_past_warmup = False # "warmup done"
+    is_past_one_test = False # "avg_time_per_iteration"
+    is_exited = False # "Finished test and exit"
+
+    for i, log_file in enumerate(log_files):
+        # print(f"\n\n=== {log_file} ===")
+        with open(log_file, "r") as f:
+            log_text = f.read()
+            if "🟡" in log_text:
+                is_started = True
+            if "Communication groups initialized" in log_text:
+                is_comm_init = True
+            if "flash_attn_3" in log_text:
+                is_reached_flash_attn_3 = True
+            if "warmup done" in log_text:   
+                is_past_warmup = True
+            if "avg_time_per_iteration" in log_text:
+                is_past_one_test = True
+            if "Finished test and exit" in log_text:
+                is_exited = True
+
+    # Check if the job id is still active
+    # squeue --me --noheader -o "%A"
+    jobid = slurm_env_dict["SLURM_JOB_ID"]
+    jobid = str(jobid)
+    is_running = jobid in active_jobs
+    
     
     results.append(dict(
-        success=run_successfully,
-        nnodes=nnodes,
+        model=MODEL_PATH,
+        is_running=is_running,
         batch_size=batch_size,
-        DP_SIZE=DP_SIZE,
-        **config,
         num_layers=num_layers,
+        success=run_successfully,
+        is_started=is_started,
+        is_comm_init=is_comm_init,
+        is_reached_flash_attn_3=is_reached_flash_attn_3,
+        is_past_warmup=is_past_warmup,
+        is_past_one_test=is_past_one_test,
+        is_exited=is_exited,
         exp_name=exp_name,
+        buffer_size=EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB,
+        nnodes=nnodes,
+        DP_SIZE=DP_SIZE,
+        jobid=jobid,
+        **config,
         # rdzv_id=rdzv_id,
         **benchmark_datas,
     ))
 
 
 df = pd.DataFrame(results)
+if DF_ONLY_SHOW_D2:
+    df = df[df['MODE'] == 'd2']
+
 sample_columns = [col for col in df.columns if col.startswith("sample[")]
 df['total_time'] = df[sample_columns].sum(axis=1)
 
@@ -101,6 +168,7 @@ df_display['MODE_EMOJI'] = df_display['MODE'].map({
 })
 # Sort by gid
 df_display['gid'] = df_display['nnodes'].astype(str) + "_" + df_display['NUM_TOKENS'].astype(str) + "_" + df_display['BATCH_SIZE'].astype(str)
+df_display['eid'] = df_display['nnodes'].astype(str) + "_" + df_display['NUM_TOKENS'].astype(str) + "_" + df_display['BATCH_SIZE'].astype(str) + "_" + df_display['MODE'].astype(str) + "_" + df_display['CP_SIZE'].astype(str)
 
 
 # Then, aggregate by gid, and then compare the (only one) d2 row's total_time with all the wlbllm row's total_time in that aggregated group. Add a speedup = wlbllm min total time in that window / d2 total time
@@ -130,7 +198,7 @@ df_display['speedup'] = df_display['speedup'].apply(lambda x: f'{x:.2f}' if pd.n
 
 # Reorder columns to put key columns first
 key_columns = ['gid', 'nnodes', 'NUM_TOKENS', 'BATCH_SIZE', 'MODE_EMOJI',]
-front_columns = ['gid', 'nnodes', 'NUM_TOKENS', 'BATCH_SIZE', 'MODE_EMOJI', 'total_time', 'speedup']
+front_columns = ['gid', "eid", 'MODE_EMOJI', 'speedup', 'total_time',  'nnodes', 'NUM_TOKENS', 'BATCH_SIZE', ]
 other_columns = [col for col in df_display.columns if col not in front_columns]
 df_display = df_display[front_columns + other_columns]
 df_display.sort_values(by=key_columns, ascending=True, inplace=True)
@@ -138,13 +206,37 @@ df_display.sort_values(by=key_columns, ascending=True, inplace=True)
 
 # When display the total_time column, make it %2f
 df_display['total_time'] = df_display['total_time'].astype(float).round(2)
+# df_display['total_time'] = df_display['total_time'].apply(lambda x: '' if pd.isna(x) or x == 0 else round(float(x), 2))
 pd.set_option('display.max_rows', None)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)
-df_display
+
+
+# Filter some columns
+# print("Dropped some columns: total_time, speedup")
+# df_display.drop(columns=['total_time', 'speedup', 'nnodes', 'NUM_TOKENS', 'BATCH_SIZE', 'num_layers', 'MODE_EMOJI', 'DP_SIZE'], inplace=True)
+
+# Render True False values to emoji True: ✅, False: ❌
+# - is_comm_init
+# - is_reached_flash_attn_3
+# - is_past_warmup
+# - is_past_one_test
+# - is_exited
+df_display['is_started'] = df_display['is_started'].map({True: '🟢', False: '🔴'})
+df_display['is_comm_init'] = df_display['is_comm_init'].map({True: '🟢', False: '🔴'})
+df_display['is_reached_flash_attn_3'] = df_display['is_reached_flash_attn_3'].map({True: '🟢', False: '🔴'})
+df_display['is_past_warmup'] = df_display['is_past_warmup'].map({True: '🟢', False: '🔴'})
+df_display['is_past_one_test'] = df_display['is_past_one_test'].map({True: '🟢', False: '🔴'})
+df_display['is_exited'] = df_display['is_exited'].map({True: '🟢', False: '🔴'})
+df_display['is_running'] = df_display['is_running'].map({True: '💨', False: '🛑'})
+
+
+df_display.sort_values(by=['gid', ], ascending=True)
+# df_display.sort_values(by=['exp_name', ], ascending=True)
+
 # %%
 # Save this to a file
-df_display.to_csv("analyze_status.csv", index=False)
+df_display.to_csv("analyze_status.tsv", index=False, sep="\t")
 
 # %%
 
@@ -161,16 +253,27 @@ success_rate
 # %%
 # Log inspection
 
+"""
+----
+
+----
+Definitely failed:
+test_e2e_combined.py FAILED
+"""
+
 import glob
 import time
-exp_name = "20250829_064849.jobe2e-656191"
-exp_name = "20250829_083600.jobe2e-656141"
+exp_name = "20250829_234933.jobd2-e2e-661922"
 
+nlines = 100
 log_files = glob.glob(f"logs/{exp_name}/logs/*")
 for i, log_file in enumerate(log_files):
     print(f"\n\n=== {log_file} ===")
     with open(log_file, "r") as f:
-        log = f.read()
+        lines = f.readlines()
+        # Get last 50 lines
+        last_lines = lines[-nlines:] if len(lines) > nlines else lines
+        log = "".join(last_lines)
     print(log)
     # time.sleep(5)
 
