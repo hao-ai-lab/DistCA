@@ -98,15 +98,21 @@ class BaseWorker:
             torch.cuda.set_device(self.device)
 
     def init_nvshmem(self, buffer_size: int, local_rank: int = None):
+        print("====== init_nvshmem ======")
         if self.rank == 0:
             uid = nvshmem_get_unique_id()
+            print(f"Init uid = {uid}")
         else:
             uid = nvshmem_alloc_empty_unique_id()
+        print(f"Broadcast uid: {uid}")
         torch.distributed.broadcast(uid, src=0)
-
+        print(f"Rank {self.rank} uid = {uid}")
+        
+        print("FastDispatcherWrapper.init")
         FastDispatcherWrapper.init(
             self.rank, local_rank, self.world_size, buffer_size, uid
         )
+        print("====== init_nvshmem done ======")
 
     def init_comm(self, buffer_size: int, local_rank: int = None):
         if local_rank is None:
@@ -169,7 +175,9 @@ class MegatronBaseWorker(BaseWorker):
             uid = nvshmem_get_unique_id()
         else:
             uid = nvshmem_alloc_empty_unique_id()
+        print(f"[Rank {as_rank}] init nvshmem with uid = {uid}")
         torch.distributed.broadcast(uid, src=as_src_rank, group=group)
+        print(f"[Rank {as_rank}] after broadcast uid = {uid}")
         FastDispatcherWrapper.init(
             as_rank, local_rank, as_world_size, buffer_size, uid
         )
