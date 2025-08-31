@@ -44,6 +44,7 @@ def set_dp_size_and_rank(rank: int, size: int):
     global _dp_rank
     _dp_size = size
     _dp_rank = rank
+    print(f"Set dp size and rank: {_dp_size = }, {_dp_rank = }")
     return
 
 
@@ -51,6 +52,8 @@ def get_next_batch(num_batches: int) -> List[int]:
     global GLOBAL_BATCH
     global ITERATION_ID
     global iterated_samples
+    global _dp_rank
+    global _dp_size
 
     if GLOBAL_BATCH is None:
         raise RuntimeError("GLOBAL_BATCH has not been initialized. Call setup_global_batch() first.")
@@ -61,6 +64,8 @@ def get_next_batch(num_batches: int) -> List[int]:
         for _ in range(num_batches):
             batches.append(next(GLOBAL_BATCH))
         all_batches.append(batches)
+    print(f"{all_batches = }")
+    print(f"{len(all_batches) = }")
 
     batches = all_batches[_dp_rank]
 
