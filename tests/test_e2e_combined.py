@@ -845,6 +845,10 @@ def test(args):
 
 
             doc_lens = flatten(seq_lens)
+            if len(doc_lens) < dp_size:
+                # Pad the doc_lens to dp_size
+                doc_lens += [512] * (dp_size - len(doc_lens))
+                pass
             if sum(doc_lens) % (cp_size * 2 * 8) != 0:
                 # TODO(HACK): This is a hack to ensure the doc_lens is divisible by cp_size*2.
                 sum_of_doc_lens = sum(doc_lens)
@@ -1148,6 +1152,19 @@ def test(args):
         time.sleep(2) # to ensure the profile sees a better profiling result
         torch.cuda.synchronize()
         torch.distributed.barrier()
+
+        # Write to the benchmark jsonl log
+        
+        # benchmark_data
+        items = {
+            "sample_id": sample_id,
+            "duration_ms": avg_duration_ms,
+            "samples": iterated_samples[-1],
+        }
+        output_file = os.path.join(output_dir, "benchmark.raw.jsonl")
+        with open(output_file, 'w') as f:
+            f.write(json.dumps(items))
+            f.write('\n')
 
     torch.cuda.synchronize()
     torch.distributed.barrier()
