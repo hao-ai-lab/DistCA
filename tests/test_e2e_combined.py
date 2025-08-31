@@ -18,6 +18,12 @@ import pytz
 import json
 import time
 import rich
+import signal
+import traceback
+import sys
+def timeout_handler(signum, frame):
+    raise TimeoutError("forward_backward_batch operation timed out after 5 minutes")
+
 
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
@@ -679,6 +685,7 @@ def test(args):
 
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
+    rich.print(f"🟡 [Rank {worker.rank}] init done")
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
@@ -957,6 +964,7 @@ def test(args):
                 break
             seq_lens_0: list[list[int]] = _seq_lens[:batch_size]
             seq_lens_1: list[list[int]] = _seq_lens[batch_size:]
+            rich.print(f"🟡 [Rank {rank}] _seq_lens = {_seq_lens}")
 
             # num_batched_token_per_as_rank = tokens per as rank = tokens per batch * num batch / (as_world_size = dp_size)
             num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
@@ -996,8 +1004,14 @@ def test(args):
                     [s / 1024**3 for s in send_sz]} GB send sizes, {
                     [sz / 1024**3 for sz in recv_sz]} GB recv sizes"
                 assert max(torch.max(o).item() for o in send_last_offset) <= buffer_size, f"{buffer_size / 1024**3} GB buffer, {[o / 1024**3 for o in send_last_offset]} GB send last offsets"
+                
+                
+                rich.print(f"🟡 [Rank {rank}] Overflow check passed: {max_send_sz} GB, {max_recv_sz} GB recv size, {max(torch.max(o).item() for o in send_last_offset)} GB send last offset, {buffer_size / 1024**3} GB buffer size")
+            
             _check_overflow(fa2a_metadata_0)
+            rich.print("🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0")
             _check_overflow(fa2a_metadata_1)
+            rich.print("🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_1")
 
 
             # params for ping-pong batch0
@@ -1053,6 +1067,8 @@ def test(args):
 
         microbatches = [microbatch]
 
+
+
         if sample_id == 0:
             # Warmup
             warmup_times = 5
@@ -1061,12 +1077,34 @@ def test(args):
             except:
                 pass
 
-            for _ in range(warmup_times):
+            warmup_timeout_sec = 60
+            try:
+                warmup_timeout_sec = int(os.environ.get("EXPERIMENT_WARMUP_TIMEOUT_SEC", 60))
+            except:
+                warmup_timeout_sec = 60
+
+            # Test passing the nvshmem init
+            try:
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(warmup_timeout_sec)  # 60 seconds = 1 minute
                 ref = worker.forward_backward_batch(
                     microbatches=microbatches,
                     normal_forward_fn=normal_forward_fn,
                     forward_only=False,
                 )
+                signal.alarm(0)
+            except TimeoutError as e:
+                print("🔴 Timeout at the first warmup forward_backward function. It may suggest our all2all kernel failed.")
+                sys.exit(1)
+
+            
+            for warmup_idx in range(warmup_times):
+                ref = worker.forward_backward_batch(
+                    microbatches=microbatches,
+                    normal_forward_fn=normal_forward_fn,
+                    forward_only=False,
+                )
+                
             time.sleep(1)
             torch.cuda.synchronize()
             torch.distributed.barrier()

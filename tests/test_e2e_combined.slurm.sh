@@ -1,7 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=e2e
-#SBATCH --partition=main
+#SBATCH --job-name=d2-e2e
 #SBATCH --nodes=4
 #SBATCH --output=logs/slurm/stdout.%j.log
 #SBATCH --error=logs/slurm/stderr.%j.log
@@ -11,10 +10,12 @@
 #SBATCH --mem=512G
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
-#SBATCH --qos=iq
-#SBATCH --exclude=fs-mbz-gpu-286,fs-mbz-gpu-302,fs-mbz-gpu-476,fs-mbz-gpu-597,fs-mbz-gpu-684,fs-mbz-gpu-697,fs-mbz-gpu-868,fs-mbz-gpu-877
+#SBATCH --exclude=fs-mbz-gpu-684,fs-mbz-gpu-697,fs-mbz-gpu-286,fs-mbz-gpu-877,fs-mbz-gpu-757,fs-mbz-gpu-806,fs-mbz-gpu-377,fs-mbz-gpu-906,fs-mbz-gpu-168,fs-mbz-gpu-708,fs-mbz-gpu-868
 #SBATCH --mail-user=seiners_uncut_9y@icloud.com
 #SBATCH --mail-type=END,FAIL
+#SBATCH --partition=lowprio 
+#SBATCH --qos=lowprio
+#SBATCH --requeue 
 
 # ===================================
 # D2 E2E Combined Test - Slurm Script
@@ -63,7 +64,9 @@ TS=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)
 cd $HOME/jd/d2/tests
 
 # TOOD: Fix this hardcode output dir.
-OUTPUT_DIR="$HOME/jd/d2/tests/logs/$TS.job$SLURM_JOB_NAME-${SLURM_JOB_ID}"
+OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
+OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${SLURM_JOB_ID}"}
+OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX"
 mkdir -p "$OUTPUT_DIR"
 
 # Redirect the output of this script to the output directory
@@ -111,6 +114,7 @@ NNODES=$SLURM_NNODES
 
 echo "Running experiment with the following parameters:" > $EXP_README
 echo "- MODE: $MODE" >> $EXP_README
+echo "- MODEL_PATH: $MODEL_PATH" >> $EXP_README
 echo "- NNODES: $NNODES" >> $EXP_README
 echo "- NUM_LAYERS: $NUM_LAYERS" >> $EXP_README
 echo "- TP_SIZE: $TP_SIZE" >> $EXP_README
@@ -126,7 +130,7 @@ echo "- FILTER_RATIO: $FILTER_RATIO" >> $EXP_README
 echo "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES" >> $EXP_README
 
 # Generate equivalent command
-cmd="MODE=$MODE BATCH_SIZE=$BATCH_SIZE NUM_TOKENS=$NUM_TOKENS MAX_SAMPLE_ID=$MAX_SAMPLE_ID TP_SIZE=$TP_SIZE CP_SIZE=$CP_SIZE NUM_LAYERS=$NUM_LAYERS sbatch --nodes $NNODES test_e2e_combined.slurm.sh"
+cmd="MODE=$MODE MODEL_PATH=$MODEL_PATH BATCH_SIZE=$BATCH_SIZE NUM_TOKENS=$NUM_TOKENS MAX_SAMPLE_ID=$MAX_SAMPLE_ID TP_SIZE=$TP_SIZE CP_SIZE=$CP_SIZE NUM_LAYERS=$NUM_LAYERS sbatch --nodes $NNODES test_e2e_combined.slurm.sh"
 echo "" >> $EXP_README
 echo "- Command: $cmd" >> $EXP_README
 
@@ -141,18 +145,28 @@ conda activate jd-d2
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 nvidia-smi --query-gpu=index,name --format=csv
 
-env > $OUTPUT_DIR/slurm.env
+
 
 # ---------------------------
 # Environment variables
 # ---------------------------
-export NVSHMEM_IB_ENABLE_IBGDA=true
-# export NVSHMEM_DEBUG=DEBUG
+# export NVSHMEM_BOOTSTRAP=mpi
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 
+export NVSHMEM_IB_ENABLE_IBGDA=true
+# export NVSHMEM_DEBUG=INFO        # or DEBUG/TRACE for deeper
+# export NVSHMEM_LOG_LEVEL=INFO
+# export NVSHMEM_DEBUG=DEBUG
 # export CUDA_DEVICE_MAX_CONNECTIONS=1
 # export NVSHMEM_IBGDA_NUM_DCI=8
 # export NVSHMEM_IBGDA_NUM_DCT=8
 # export NVSHMEM_IBGDA_NUM_RC_PER_PE=4
+
+# TODO: Debug
+# echo "Debugging: unsetting NVSHMEM_IB_ENABLE_IBGDA, NVSHMEM_IBGDA_NUM_DCI, NVSHMEM_IBGDA_NUM_DCT, NVSHMEM_IBGDA_NUM_RC_PER_PE to avoid the nvshmem init failure"
+# unset NVSHMEM_IB_ENABLE_IBGDA 
+# unset NVSHMEM_IBGDA_NUM_DCI 
+# unset NVSHMEM_IBGDA_NUM_DCT 
+# unset NVSHMEM_IBGDA_NUM_RC_PER_PE
 
 # Comment out for a clean log.
 # export CUDA_LAUNCH_BLOCKING=1 
@@ -164,7 +178,8 @@ export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
 # ---------------------------
 # Setup paths
 # ---------------------------
-export CUDA_DIR=/usr/local/cuda
+# export CUDA_DIR=/usr/local/cuda
+export CUDA_DIR=/mnt/sharefs/software/DeepEP/cuda-12-6
 export NCCL_HOME=/usr
 export NCCL_LIB=/usr/lib/x86_64-linux-gnu
 export NVSHMEM_DIR=/mnt/weka/home/yonghao.zhuang/opt/nvshmem
@@ -189,6 +204,9 @@ EXPERIMENT_WARMUP_TIMES=${EXPERIMENT_REPEAT_TIMES:-5}
 EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=${EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB:--1}
 EXPERIMENT_SHOULD_FORCE_EXIT=${EXPERIMENT_SHOULD_FORCE_EXIT:-0}
 EXPERIMENT_EMIT_BACKWARD_NVTX=${EXPERIMENT_EMIT_BACKWARD_NVTX:-0}
+EXPERIMENT_WARMUP_TIMEOUT_SEC=${EXPERIMENT_WARMUP_TIMEOUT_SEC:-90}
+D2_SHOULD_REPLAN=${D2_SHOULD_REPLAN:-1}
+SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-1}
 
 export NVTE_NVTX_ENABLED=1
 export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
@@ -286,6 +304,19 @@ SRUN_BASE=(
 )
 
 
+# ---------------------------
+# Log environment variables (for debugging)
+# ---------------------------
+env > $OUTPUT_DIR/slurm.env
+
+
+# ---------------------------
+# Run the experiment
+# ---------------------------
+
+
+echo "Start running sbatch at $(TZ='America/Los_Angeles' date)"
+
 if [ ${ENABLE_NSYS} -eq 1 ]; then
   "${SRUN_BASE[@]}" \ \
     --output="${LOG_DIR}/${TS}.${MODE}.%N.%j.out" \
@@ -305,12 +336,16 @@ else
         bash -lc '
             set -x
             hostname
-            nvidia-smi
+            nvidia-smi topo -p2p w     # Check nvidia-smi topology
             python -c "import torch; print(torch.cuda.is_available()); torch.cuda.set_device(0); print(torch.cuda.get_device_name()); x = torch.ones(1).cuda(); print(x)"
+            env # to check the nvshmem environment variables
             exec torchrun '"$TORCHRUN_STR"'
         '
 fi
 
 set +x
+
+echo "Finished running sbatch at $(TZ='America/Los_Angeles' date). Does not guarantee that the experiment finished successfully. Please check if the benchmark.json file exists."
+
 
 # set -euox pipefail

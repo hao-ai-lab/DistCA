@@ -23,11 +23,18 @@ def nvshmem_unique_id_size() -> int:
 def nvshmem_alloc_empty_unique_id() -> torch.Tensor:
     return torch.zeros(nvshmem_unique_id_size(), dtype=torch.uint8, device="cpu")
 
+import datetime
 def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int=-1) -> int:
     # NOTE: this is because we set device in python. Should move it to the cpp end.
+    print(f"Calling nvshmem_init with uid = {uid}")
     torch.cuda.synchronize()
     status = _ops.nvshmem_init(uid, rank, world_size, local_rank)
+    print("nvshmem_init returns with status =", status)
     torch.cuda.synchronize()
+    print("nvshmem_init synchronized. Ready to call barrier")
+    import traceback
+    traceback.print_stack()
+    print("nvshmem_init passed barrier.")
     return status
 
 def nvshmem_alltoall(dest: torch.Tensor, source: torch.Tensor) -> None:
