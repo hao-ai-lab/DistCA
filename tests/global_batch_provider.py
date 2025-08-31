@@ -51,3 +51,8 @@ def get_next_batch(dp_size):
     ITERATION_ID += 1
     iterated_samples.append(batches)
     return batches
+
+
+def get_iterated_samples():
+    global iterated_samples
+    return iterated_samples

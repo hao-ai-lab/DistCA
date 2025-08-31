@@ -474,6 +474,8 @@ def create_pipeline_doclens(
             print(f"In util.py, before calling get_next_batch: GLOBAL_BATCH is: {GLOBAL_BATCH}")
             pp_head_new_doc_len = get_next_batch(dp_size)
 
+    print(f"pp_head_new_doc_len: {pp_head_new_doc_len}")
+
     #  pp_head_new_doc_len : shape : [dp, num_seqs]  We should sample seq_len here.
     # And add the sampled seq_len to the batch. 
     # Next step is based on the previous batch, move the batch. 
