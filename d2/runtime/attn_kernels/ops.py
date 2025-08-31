@@ -83,6 +83,8 @@ class FastDispatcherWrapper:
         )
         # the buffer_released is initialized by all zeros. We should
         # manually release them here once.
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         _ops.release_buffer(self.handle)
         self.release_event = torch.cuda.Event()
         self.release_event.record(torch.cuda.current_stream())
