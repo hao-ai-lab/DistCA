@@ -68,6 +68,7 @@ def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int
                             item_dict, is_original=True)
             items.append(new_item)
             current_rank_idx += 1
+            seqid += 1
         else:
             for doc_length in batch:
                 doc_len = doc_length

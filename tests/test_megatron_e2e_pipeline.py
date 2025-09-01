@@ -218,7 +218,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
                 rank_num_tokens_list = [[num_token_per_rank] for _ in range(number_of_rank_to_span)]
                 rank_num_tokens_lists = rank_num_tokens_lists + rank_num_tokens_list
             else:
-                rank_num_tokens_lists = rank_num_tokens_lists + [num_token_per_rank]
+                rank_num_tokens_lists = rank_num_tokens_lists + [[num_token_per_rank]]
         #this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
         this_rank_num_tokens = sum(rank_num_tokens_lists[as_rank])
 
