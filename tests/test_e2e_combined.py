@@ -1155,16 +1155,17 @@ def test(args):
 
         # Write to the benchmark jsonl log
         
-        # benchmark_data
-        items = {
-            "sample_id": sample_id,
-            "duration_ms": avg_duration_ms,
-            "samples": iterated_samples[-1],
-        }
-        output_file = os.path.join(output_dir, "benchmark.raw.jsonl")
-        with open(output_file, 'w') as f:
-            f.write(json.dumps(items))
-            f.write('\n')
+        if rank == 0:
+            # benchmark_data
+            items = {
+                "sample_id": sample_id,
+                "duration_ms": avg_duration_ms,
+                "samples": iterated_samples[-1],
+            }
+            output_file = os.path.join(output_dir, "benchmark.raw.jsonl")
+            with open(output_file, 'a') as f:
+                f.write(json.dumps(items))
+                f.write('\n')
 
     torch.cuda.synchronize()
     torch.distributed.barrier()

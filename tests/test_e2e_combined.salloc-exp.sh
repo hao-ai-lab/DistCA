@@ -10,9 +10,12 @@
 #SBATCH --mem=512G
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
-#SBATCH --exclude=fs-mbz-gpu-684,fs-mbz-gpu-697,fs-mbz-gpu-286,fs-mbz-gpu-877,fs-mbz-gpu-757,fs-mbz-gpu-806,fs-mbz-gpu-377,fs-mbz-gpu-906,fs-mbz-gpu-168,fs-mbz-gpu-708,fs-mbz-gpu-868,fs-mbz-gpu-223,fs-mbz-gpu-954
+#SBATCH --exclude=fs-mbz-gpu-684,fs-mbz-gpu-697,fs-mbz-gpu-286,fs-mbz-gpu-877,fs-mbz-gpu-757,fs-mbz-gpu-806,fs-mbz-gpu-377,fs-mbz-gpu-906,fs-mbz-gpu-168,fs-mbz-gpu-708,fs-mbz-gpu-868
+#SBATCH --mail-user=seiners_uncut_9y@icloud.com
+#SBATCH --mail-type=END,FAIL
 #SBATCH --partition=lowprio 
 #SBATCH --qos=lowprio
+#SBATCH --requeue 
 
 # ===================================
 # D2 E2E Combined Test - Slurm Script
@@ -58,19 +61,18 @@
 TS=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)
 
 # Get the current directory of the script
-# CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# cd "$CURDIR"
-# echo "Current directory: $CURDIR"
+cd $HOME/jd/d2/tests
 
 # TOOD: Fix this hardcode output dir.
-OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$CURDIR/logs"}
+OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
 OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${SLURM_JOB_ID}"}
 OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX"
 mkdir -p "$OUTPUT_DIR"
 
 # Redirect the output of this script to the output directory
 # exec > $OUTPUT_DIR/slurm.stdout 2> $OUTPUT_DIR/slurm.stderr
-exec > $OUTPUT_DIR/slurm.stdout 2>&1
+# exec > $OUTPUT_DIR/slurm.stdout 2>&1
+exec > >(tee "$OUTPUT_DIR/slurm.stdout") 2>&1
 
 EXP_README="$OUTPUT_DIR/README.md"
 
@@ -79,6 +81,12 @@ LOG_DIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
 set -x
+
+# ------------------------------------------------------
+# Handle salloc+srun env variables
+# ------------------------------------------------------
+
+echo $SLURM_JOB_NAME $SLURM_JOB_ID
 
 
 # ------------------------------------------------------
@@ -139,7 +147,7 @@ echo "- Command: $cmd" >> $EXP_README
 # Env and Sanity Check
 # ---------------------------
 
-conda activate jd-d2
+# conda activate jd-d2
 
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 nvidia-smi --query-gpu=index,name --format=csv
@@ -215,15 +223,31 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 # ---------------------------
 # Setup distributed args
 # ---------------------------
-echo $(hostname)
+# echo $(hostname)
+# echo SLURM_JOB_NODELIST $SLURM_JOB_NODELIST
+
+# # nodes=$SLURM_JOB_NODELIST # 
+# nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+# echo nodes $nodes
+# exit 0
+# nodes_array=($nodes)
+# export head_node=${nodes[0]}
+# head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+
+# echo "$SLURM_STEP_NODELIST"        # compact nodelist for THIS step
+# echo "$SLURM_STEP_NUM_NODES"       # number of nodes in this step
+# scontrol show hostnames "$SLURM_STEP_NODELIST"  # expand to one hostname per line
+# exit 0
+
 nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
-nodes_array=($nodes)
-export head_node=${nodes[0]}
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+echo nodes "${nodes[@]}"
+export head_node_ip=${nodes[0]}
 port=29500
+echo head_node_ip=$head_node_ip port=$port
 
 RZV_BACKEND=c10d
 RZV_ENDPOINT=$head_node_ip:$port
+echo RZV_ENDPOINT=$RZV_ENDPOINT
 
 # Get GPU count from Slurm's environment variables
 # SLURM_GPUS_PER_NODE is set by Slurm when using --gpus-per-node or --gres=gpu:N
@@ -244,7 +268,7 @@ touch ${OUTPUT_DIR}/desc.${COMMON_STEM} # just a description of this experiment,
 # Define missing variables with defaults
 NNODES=${NNODES:-$NUM_NODES}
 NPROC_PER_NODE=${NPROC_PER_NODE:-$GPUS_PER_NODE}
-RZV_ID=${RZV_ID:-$head_node}
+RZV_ID=${RZV_ID:-$head_node_ip}
 REPLAN_ITER=${REPLAN_ITER:-0}
 SHOULD_PROFILE_MEMORY=${SHOULD_PROFILE_MEMORY:-0}
 
@@ -300,17 +324,8 @@ SRUN_BASE=(
   --gpus-per-task=${GPUS_PER_NODE}     # <= crucial
   --gpu-bind=per_task:${GPUS_PER_NODE} # <= bind GPUs to the task
   --kill-on-bad-exit=1
+  --jobid=${JOBID:-SLURM_JOB_ID}
 )
-
-DRY_RUN=${DRY_RUN:-0}
-
-if [ ${DRY_RUN} -eq 1 ]; then
-  SRUN_BASE=(
-    echo
-    ${SRUN_BASE[@]}
-  )
-    
-fi
 
 
 # ---------------------------
@@ -323,22 +338,34 @@ env > $OUTPUT_DIR/slurm.env
 # Run the experiment
 # ---------------------------
 
+if [ ${DRY_RUN} -eq 1 ]; then
+  echo "Dry run, skipping the actual experiment"
+  echo "${SRUN_BASE[@]}" \
+        --output="${LOG_DIR}/%N.%j.out" \
+        --error="${LOG_DIR}/%N.%j.out" \
+        bash -lc '
+            set -x
+            hostname
+            nvidia-smi topo -p2p w     # Check nvidia-smi topology
+            python -c "import torch; print(torch.cuda.is_available()); torch.cuda.set_device(0); print(torch.cuda.get_device_name()); x = torch.ones(1).cuda(); print(x)"
+            env # to check the nvshmem environment variables
+            exec torchrun '"$TORCHRUN_STR"'
+        '
+  exit 0
+fi
+
 
 echo "Start running sbatch at $(TZ='America/Los_Angeles' date)"
 
-
 if [ ${ENABLE_NSYS} -eq 1 ]; then
-  "${SRUN_BASE[@]}" \
+  "${SRUN_BASE[@]}" \ \
     --output="${LOG_DIR}/${TS}.${MODE}.%N.%j.out" \
     --error="${LOG_DIR}/${TS}.${MODE}.%N.%j.out" \
       nsys profile --show-output=true --force-overwrite=true \
         -o "${OUTPUT_DIR}/%h.nsys-rep" --sample=none -t cuda,nvtx \
         torchrun $TORCHRUN_STR
 else
-#   srun \
-#     --output="${OUTPUT_DIR}/%N.%j.out" \
-#     --error="${OUTPUT_DIR}/%N.%j.out" \
-#     torchrun $TORCHRUN_STR
+
 
     "${SRUN_BASE[@]}" \
         --output="${LOG_DIR}/%N.%j.out" \
@@ -359,8 +386,3 @@ echo "Finished running sbatch at $(TZ='America/Los_Angeles' date). Does not guar
 
 
 # set -euox pipefail
-
-
-#SBATCH --mail-user=seiners_uncut_9y@icloud.com
-#SBATCH --mail-type=END,FAIL
-#SBATCH --requeue 

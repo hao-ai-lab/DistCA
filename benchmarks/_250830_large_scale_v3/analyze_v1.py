@@ -5,7 +5,7 @@ import pandas as pd
 import glob
 
 # %%
-log_path = "logs.v1"
+log_path = "logs.v3"
 a = os.listdir(log_path)
 len(a)
 # %%
@@ -33,6 +33,7 @@ os.path.exists(b)
 import json
 
 DF_INCLUDE_BENCHMARK = True
+DF_INCLUDE_BENCHMARK_SAMPLE = True
 # DF_INCLUDE_BENCHMARK = False
 # DF_ONLY_SHOW_SUCCESS = True
 DF_ONLY_SHOW_SUCCESS = False
@@ -41,8 +42,8 @@ DF_ONLY_SHOW_FAILED = False
 DF_ONLY_SHOW_D2 = False
 
 
-# import subprocess
-# active_jobs = subprocess.check_output(['squeue', '--me', '--noheader', '-o', '%A']).decode().splitlines()
+import subprocess
+active_jobs = subprocess.check_output(['squeue', '--me', '--noheader', '-o', '%A']).decode().splitlines()
 # print(active_jobs)
 # print(f"There are {len(active_jobs)} active jobs")
 
@@ -84,6 +85,7 @@ for exp_name in a:
     benchmark_file = f"{log_path}/{exp_name}/benchmark.json"
     run_successfully = os.path.exists(benchmark_file)
     benchmark_datas = {}
+    sample_datas = {}
     if run_successfully and DF_INCLUDE_BENCHMARK:
         with open(benchmark_file, "r") as f:
             benchmark = json.load(f)
@@ -92,6 +94,11 @@ for exp_name in a:
             sample_id = sample["sample_id"]
             samples_duration = sample["duration_ms"]
             benchmark_datas[f"sample[{sample_id}]"] = samples_duration
+            if DF_INCLUDE_BENCHMARK_SAMPLE:
+                sample_datas[f"sample_data[{sample_id}]"] = samples_duration
+                pass
+
+
     
     DP_SIZE = nnodes // (
         int(config.get("CP_SIZE")) * int(config.get("PP_SIZE"))
@@ -109,7 +116,11 @@ for exp_name in a:
     for i, log_file in enumerate(log_files):
         # print(f"\n\n=== {log_file} ===")
         with open(log_file, "r") as f:
-            log_text = f.read()
+            try:
+                log_text = f.read()
+            except Exception as e:
+                print(e)
+                continue
             if "🟡" in log_text:
                 is_started = True
             if "Communication groups initialized" in log_text:
@@ -167,6 +178,7 @@ for exp_name in a:
         **config,
         # rdzv_id=rdzv_id,
         **benchmark_datas,
+        **sample_datas,
     ))
 
 # %%
@@ -175,6 +187,7 @@ results[0]
 # %%
 
 df = pd.DataFrame(results)
+df['NUM_TOKENS'] = df['NUM_TOKENS'].astype(int)
 if DF_ONLY_SHOW_D2:
     df = df[df['MODE'] == 'd2']
 
@@ -191,8 +204,8 @@ df_display['modji'] = df_display['MODE'].map({
     'd2': '🟦',
 })
 # Sort by gid
-df_display['gid'] = df_display['nnodes'].astype(str) + "_" + df_display['NUM_TOKENS'].astype(str) + "_" + df_display['BATCH_SIZE'].astype(str)
-df_display['eid'] = df_display['nnodes'].astype(str) + "_" + df_display['NUM_TOKENS'].astype(str) + "_" + df_display['BATCH_SIZE'].astype(str) + "_" + df_display['MODE'].astype(str) + "_" + df_display['CP_SIZE'].astype(str)
+df_display['gid'] = df_display['nnodes'].astype(str) + "_" + df_display['NUM_TOKENS'].astype(str) + "_" + df_display['BATCH_SIZE'].astype(str) + "_" + df_display['num_layers'].astype(str)
+df_display['eid'] = df_display['nnodes'].astype(str) + "_" + df_display['NUM_TOKENS'].astype(str) + "_" + df_display['BATCH_SIZE'].astype(str) + "_" + df_display['MODE'].astype(str) + "_" + df_display['CP_SIZE'].astype(str) + "_" + df_display['num_layers'].astype(str)
 
 
 # Then, aggregate by gid, and then compare the (only one) d2 row's total_time with all the wlbllm row's total_time in that aggregated group. Add a speedup = wlbllm min total time in that window / d2 total time
@@ -205,17 +218,26 @@ for gid, group in df_display.groupby('gid'):
     
     wlbllm_min_time = wlbllm_rows[wlbllm_rows['total_time'] > 0]['total_time'].min()
     # success
-    is_wlbllm_all_success = wlbllm_rows['success'].all()
+    is_wlbllm_all_success = (wlbllm_rows['success'] == '✅').all()
+    nunique_wlbllm_it_reached = wlbllm_rows[wlbllm_rows['success'] == '✅']['it_reached'].nunique()
 
     if pd.isna(wlbllm_min_time):
         continue
 
     for idx, d2_row in d2_rows.iterrows():
         d2_time = d2_row['total_time']
+        d2_it_reached = d2_row['it_reached']
         if d2_time == 0 or pd.isna(d2_time):
-            break
+            continue
         speedup = wlbllm_min_time / d2_time
-        speedup = f"{speedup:.2f} (🟢)" if is_wlbllm_all_success else f"{speedup:.2f} (❌)"
+        speedup = f"{speedup:.2f}"
+        if not is_wlbllm_all_success:
+            speedup += f" (❌)"
+            pass
+        elif nunique_wlbllm_it_reached == 1:
+            speedup += f" (🟢)"
+        else:
+            speedup += f" (🟡)"
         speedups.append((idx, speedup))
 
 # Add speedup column
@@ -228,7 +250,7 @@ for idx, speedup in speedups:
 
 # Reorder columns to put key columns first
 key_columns = ['gid', 'nnodes', 'NUM_TOKENS', 'BATCH_SIZE', 'modji',]
-front_columns = ['gid', "eid", 'modji', 'is_running', 'success', 'speedup', 'total_time']
+front_columns = ['is_running', 'success', 'gid', "eid", 'modji',  'exp_name',  'speedup', 'total_time']
 other_columns = [col for col in df_display.columns if col not in front_columns]
 df_display = df_display[front_columns + other_columns]
 df_display.sort_values(by=key_columns, ascending=True, inplace=True)
@@ -259,72 +281,139 @@ df_display['is_past_warmup'] = df_display['is_past_warmup'].map({True: '🟢', F
 df_display['is_past_one_test'] = df_display['is_past_one_test'].map({True: '🟢', False: '🔴'})
 # df_display['it_reached'] = df_display['it_reached'].map({True: '🟢', False: '🔴', -1: '❌'})
 df_display['is_exited'] = df_display['is_exited'].map({True: '🟢', False: '🔴'})
-df_display['is_running'] = df_display['is_running'].map({True: '💨', False: '🛑'})
+df_display['is_running'] = df_display['is_running'].map({True: '💨', False: '◾'})
 
 
 # df_display['gid'] = df_display['nnodes'].astype(str) + "_" + df_display['NUM_TOKENS'].astype(str) + "_" + df_display['BATCH_SIZE'].astype(str)
-
-df_display.sort_values(by=['nnodes', 'NUM_TOKENS', 'BATCH_SIZE', 'MODE', 'CP_SIZE', ], ascending=True)
 # df_display.sort_values(by=['exp_name', ], ascending=True)
+
+df_display = df_display.sort_values(by=['num_layers', 'nnodes', 'NUM_TOKENS', 'BATCH_SIZE', 'MODE', 'CP_SIZE', ], ascending=True)
+df_display
 
 # %%
 # Save this to a file
 df_display.to_csv("analyze_status.tsv", index=False, sep="\t")
+# %%
+import numpy as np
+speedups = []
+for gid, group in df_display.groupby('gid'):
+    print(gid)
+    d2_rows = group[group['modji'] == '🟦']
+    wlbllm_rows = group[group['modji'] == '🟥']
+    
+    wlbllm_min_time = wlbllm_rows[wlbllm_rows['total_time'] > 0]['total_time'].min()
+    print(wlbllm_min_time)
+    # success
+    is_wlbllm_all_success = wlbllm_rows['success'].all()
+
+    if pd.isna(wlbllm_min_time):
+        continue
+
+    for idx, d2_row in d2_rows.iterrows():
+        d2_time = d2_row['total_time']
+        if d2_time == 0 or pd.isna(d2_time):
+            break
+        speedup = wlbllm_min_time / d2_time
+        speedup = f"{speedup:.2f} (🟢)" if is_wlbllm_all_success else f"{speedup:.2f} (❌)"
+        speedups.append((idx, speedup))
+    break
+
+speedups
+# %%
+# Get all unique gids and create empty dataframe with both modji values for each
+all_gids = df_display['gid'].unique()
+all_modjis = ['🟦', '🟥']  # d2 and wlb
+rows = []
+for gid in all_gids:
+    for modji in all_modjis:
+        rows.append({'gid': gid, 'modji': modji})
+template_df = pd.DataFrame(rows)
+
+# Filter for valid times and calculate stats
+valid_times = df_display[df_display['total_time'] > 0].groupby(['gid', 'modji'])['total_time']
+min_times = valid_times.min().reset_index()
+avg_times = valid_times.mean().reset_index()
+std_times = valid_times.std().reset_index()
+
+# Merge stats with template to ensure all gid/modji combinations exist
+min_times = template_df.merge(min_times, on=['gid', 'modji'], how='left')
+min_times = min_times.merge(avg_times[['gid', 'modji', 'total_time']].rename(columns={'total_time': 'avg_time'}), 
+                           on=['gid', 'modji'], how='left')
+min_times = min_times.merge(std_times[['gid', 'modji', 'total_time']].rename(columns={'total_time': 'std_time'}),
+                           on=['gid', 'modji'], how='left')
+
+# Add tuple column by splitting gid and sort
+min_times['gid_tuple'] = min_times['gid'].apply(lambda x: tuple(map(int, x.split('_'))))
+min_times = min_times.sort_values(['gid_tuple', 'modji'])
+
+# Calculate speedup by comparing d2 and wlb in same group
+speedups = []
+for gid in all_gids:
+    d2_time = min_times[(min_times['gid'] == gid) & (min_times['modji'] == '🟦')]['total_time'].iloc[0]
+    wlb_time = min_times[(min_times['gid'] == gid) & (min_times['modji'] == '🟥')]['total_time'].iloc[0]
+    
+    if pd.isna(d2_time) or pd.isna(wlb_time):
+        speedups.extend([None, None])
+    else:
+        speedup = wlb_time / d2_time
+        speedups.extend([speedup, speedup])
+
+min_times['speedup'] = speedups
+
+# Sort the min_times by gid_tuple and modji
+min_times = min_times.sort_values(['gid_tuple', 'modji'])
+
+# Display results
+print(min_times[['gid', 'modji', 'total_time', 'avg_time', 'std_time', 'speedup']].to_csv(index=False, sep="\t"))
+
+# %%
+min_times.to_csv("speedup.tsv", index=False, sep="\t")
 
 # %%
 
+# Find the experiment setups where d2 failed to run.
+failed_to_run = df_display.copy()
+# Group by gid and check if all rows in each group failed
+failed_groups = failed_to_run.groupby('gid').filter(lambda x: (x['total_time'] <= 0).all())
+failed_groups.drop(columns=[
+    'is_running', 'speedup', 'total_time'
+], inplace=True)
+# bring [exp_name] to front
+failed_groups = failed_groups[['exp_name'] + [col for col in failed_groups.columns if col != 'exp_name']]
+# Make `gid` to index
+# Set gid as index and style the DataFrame to merge cells with same gid
+# failed_groups = failed_groups.set_index('gid')
+failed_groups
+# %%
+for i in failed_groups['gid'].unique().tolist():
+    print(i)
+# %%
+
+
+# Find the experiment setups where d2 failed to run.
+failed_to_run = df_display.copy()
+# Group by gid and check if all rows in each group failed
+failed_groups = failed_to_run.groupby('eid').filter(lambda x: (x['total_time'] <= 0).all())
+failed_groups.drop(columns=[
+    'is_running', 'speedup', 'total_time'
+], inplace=True)
+# bring [exp_name] to front
+failed_groups = failed_groups[['exp_name'] + [col for col in failed_groups.columns if col != 'exp_name']]
+# Make `gid` to index
+# Set gid as index and style the DataFrame to merge cells with same gid
+# failed_groups = failed_groups.set_index('gid')
+failed_groups
+# %%
+for i in sorted(failed_groups['eid'].unique().tolist()):
+    print(i)
+# %%
 
 # %%
-# df_display.sort_values(by='total_time', ascending=True, inplace=True)
+
+# Get all of the eid that has at least one success run
+success_eids = df_display[df_display['success'] == '✅']['eid'].unique()
+a = " ".join(success_eids.tolist())
+with open("success_eids.txt", "w") as f:
+    f.write(a)
 
 # %%
-# Aggregate by gid, and then for each `sample[%d]` column, take the 
-
-# %%
-# success_rate = df['success'].mean()
-# success_rate
-# # %%
-# # Log inspection
-
-# """
-# ----
-
-# ----
-# Definitely failed:
-# test_e2e_combined.py FAILED
-# """
-
-# import glob
-# import time
-# exp_name = "20250829_234933.jobd2-e2e-661922"
-
-# nlines = 100
-# log_files = glob.glob(f"{log_path}/{exp_name}/logs/*")
-# for i, log_file in enumerate(log_files):
-#     print(f"\n\n=== {log_file} ===")
-#     with open(log_file, "r") as f:
-#         lines = f.readlines()
-#         # Get last 50 lines
-#         last_lines = lines[-nlines:] if len(lines) > nlines else lines
-#         log = "".join(last_lines)
-#     print(log)
-#     # time.sleep(5)
-
-# # %%
-# # How to relaunch this experiment?
-# df[df['exp_name'] == exp_name]
-# # Recombined  to the command line expression
-# #                 MODE=wlbllm BATCH_SIZE=$batch_size NUM_TOKENS=$num_tokens MAX_SAMPLE_ID=100 TP_SIZE=8 CP_SIZE=$cp_size NUM_LAYERS=4 sbatch --nodes $nodes 
-# # test_e2e_combined.slurm.sh
-# MODE = df[df['exp_name'] == exp_name]['MODE'].values[0]
-# BATCH_SIZE = df[df['exp_name'] == exp_name]['BATCH_SIZE'].values[0]
-# NUM_TOKENS = df[df['exp_name'] == exp_name]['NUM_TOKENS'].values[0]
-# MAX_SAMPLE_ID = df[df['exp_name'] == exp_name]['MAX_SAMPLE_ID'].values[0]
-# TP_SIZE = df[df['exp_name'] == exp_name]['TP_SIZE'].values[0]
-# CP_SIZE = df[df['exp_name'] == exp_name]['CP_SIZE'].values[0]
-# NUM_LAYERS = df[df['exp_name'] == exp_name]['num_layers'].values[0]
-# NODES = df[df['exp_name'] == exp_name]['nnodes'].values[0]
-
-# command_line = f"MODE={MODE} BATCH_SIZE={BATCH_SIZE} NUM_TOKENS={NUM_TOKENS} MAX_SAMPLE_ID={MAX_SAMPLE_ID} TP_SIZE={TP_SIZE} CP_SIZE={CP_SIZE} NUM_LAYERS={NUM_LAYERS} sbatch --nodes {NODES} test_e2e_combined.slurm.sh"
-# print(command_line)
-# # %%

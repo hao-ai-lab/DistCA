@@ -33,7 +33,7 @@ def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int=
     torch.cuda.synchronize()
     print("nvshmem_init synchronized. Ready to call barrier")
     import traceback
-    traceback.print_stack()
+    # traceback.print_stack()
     print("nvshmem_init passed barrier.")
     return status
 

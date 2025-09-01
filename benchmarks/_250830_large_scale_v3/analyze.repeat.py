@@ -5,8 +5,23 @@ import time
 importlib.reload(analyze_v1)
 # %%
 
+import random
+
+import wandb
+
+# Start a new wandb run to track this script.
+run = wandb.init(
+    # Set the wandb entity where your project will be logged (generally your team name).
+    entity="junda-d2",
+    # Set the wandb project where this run will be logged.
+    project="d2-cpdp-exp",
+    # Track hyperparameters and run metadata.
+    config={},
+)
+
+# %%
 while True:
-    time.sleep(10)
+    time.sleep(30)
     importlib.reload(analyze_v1)
 
     # analyze_v1.df_display
@@ -32,6 +47,13 @@ while True:
 
     from IPython.display import display
     display(analyze_v1.df_display)
+
+    # Convert dataframe to wandb Table and log it
+    table = wandb.Table(dataframe=analyze_v1.df_display)
+    run.log({"df_display": table})
+    # run.log({"df_display_html": wandb.Html(
+    #     f"<head><meta charset=\"utf-8\"></head><body>{analyze_v1.df_display.to_html()}</body>"
+    # ))
 
 
 

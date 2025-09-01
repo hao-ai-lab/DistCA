@@ -1,0 +1,1 @@
+du -h logs.v3 -d 1
