@@ -1334,6 +1334,14 @@ if __name__ == "__main__":
         if rank % 8 == 0:
             print("Dumping memory snapshot")
 
+            def get_current_timestamp():
+                from datetime import datetime
+                pst = pytz.timezone('US/Pacific')
+                timestamp = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S PST")
+                now_ts = datetime.now(pst).strftime("%Y%m%d_%H%M%S")
+                return now_ts
+
+            now_ts = get_current_timestamp()
             mem_snapshots_dir = os.path.join(args.output_dir, "mem_snapshots")
             os.makedirs(mem_snapshots_dir, exist_ok=True)
             
@@ -1342,7 +1350,6 @@ if __name__ == "__main__":
             memory_timeline_output_path = os.path.join(mem_snapshots_dir, f"{stem}.html")
 
 
-            now_ts = get_current_timestamp()
             torch.cuda.memory._dump_snapshot(mem_snapshot_output_path)
             prof.export_memory_timeline(memory_timeline_output_path, device=torch.cuda.current_device())
             print("Memory snapshot dumped")
