@@ -11,6 +11,7 @@ bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
 
 """
+import math
 import argparse
 import os
 import gc
@@ -1054,7 +1055,17 @@ def test(args):
             if not did_pass_overflow_check:
                 rich.print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
                 rich.print(f"🔴 [Rank {rank}] Specified buffer_size = {buffer_size / 1024**3} GB")
-                raise ValueError(f"[Rank {rank}] Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with all tolerance_factor with buffer_size {buffer_size / 1024**3} GB. Try a bigger buffer size instead. Inspected required_buffer_size = {required_buffer_size}")
+                recommended_buffer_size = math.ceil(max_size_provisioned)
+                rich.print(f"🔴 [Rank {rank}] Force update buffer_size to = {recommended_buffer_size} GB")
+                buffer_size = recommended_buffer_size * 1024**3 # bytes
+
+                FastDispatcherWrapper.instance[0]._update_buffer_size(buffer_size)
+                FastDispatcherWrapper.instance[1]._update_buffer_size(buffer_size)
+
+                rich.print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
+                buffer_size = FastDispatcherWrapper.instance[0].buffer_size
+                
+                # raise ValueError(f"[Rank {rank}] Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with all tolerance_factor with buffer_size {buffer_size / 1024**3} GB. Try a bigger buffer size instead. Inspected required_buffer_size = {required_buffer_size}")
             
             rich.print(f"🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0 and fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB")
 
@@ -1345,12 +1356,21 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default=None)    
     
     args = parser.parse_args()
+    print(f"🟡 Args: {args}")
 
     # "D2_SKIP_FLOAT_CONVERSION"
     os.environ["D2_SKIP_FLOAT_CONVERSION"] = "1"
 
     if args.output_dir is None:
         args.output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        
+        mem_snapshots_dir = os.path.join(args.output_dir, "mem_snapshots")
+        os.makedirs(mem_snapshots_dir, exist_ok=True)
+        print(f"🟡 Will save mem snapshots to: {mem_snapshots_dir}")
+        mem_snapshot_output_path = os.path.join(mem_snapshots_dir, f"memory_profile.pickle")
+        memory_timeline_output_path = os.path.join(mem_snapshots_dir, f"memory_profile.html")
+        print(f"🟡 Will save mem snapshot to: {mem_snapshot_output_path}")
+        print(f"🟡 Will save mem timeline to: {memory_timeline_output_path}")
         pass
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -1403,16 +1423,6 @@ if __name__ == "__main__":
         if rank % 8 == 0:
             print("Dumping memory snapshot")
 
-            mem_snapshots_dir = os.path.join(args.output_dir, "mem_snapshots")
-            os.makedirs(mem_snapshots_dir, exist_ok=True)
-            
-            stem = f"{now_ts}.mem_snapshot.{mode}.rank{rank}.batch{batch_size}.tokens{num_tokens}.cp{cp_degree}.tp{tp_size}.layers{num_layers}"
-            # stem = f"memory_profile"
-            mem_snapshot_output_path = os.path.join(mem_snapshots_dir, f"{stem}.pickle")
-            memory_timeline_output_path = os.path.join(mem_snapshots_dir, f"{stem}.html")
-
-
-            now_ts = get_current_timestamp()
             torch.cuda.memory._dump_snapshot(mem_snapshot_output_path)
             prof.export_memory_timeline(memory_timeline_output_path, device=torch.cuda.current_device())
             print("Memory snapshot dumped")

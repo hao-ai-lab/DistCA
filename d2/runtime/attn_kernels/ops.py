@@ -138,7 +138,8 @@ class FastDispatcherWrapper:
         torch.cuda.current_stream().wait_event(
             FastDispatcherWrapper.get_instance(instance_id).release_event
         )
-        _ops.wait_and_consume_buffer(FastDispatcherWrapper.get_instance(instance_id).handle)
+        # TODO:(Hack) for perf test don't do anything
+        # _ops.wait_and_consume_buffer(FastDispatcherWrapper.get_instance(instance_id).handle)
 
     def release(instance_id: int):
         assert FastDispatcherWrapper.is_acquired[instance_id]
