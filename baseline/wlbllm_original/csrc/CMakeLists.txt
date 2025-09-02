@@ -75,6 +75,6 @@ target_link_libraries(wlb_shuffle PUBLIC
     CUDA::cudart
 )
 set_target_properties(wlb_shuffle PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../wlbllm/fastmemcpy
     CUDA_SEPARABLE_COMPILATION ON
 )
