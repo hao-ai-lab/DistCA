@@ -5,13 +5,12 @@ from typing import Any, Dict, List, Optional
 
 import rich
 import torch
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-
 from d2.runtime.compute_metadata import from_planner_output
 from d2.runtime.shard_info import (ShardInfo, handle_planner_metadata,
                                    items_into_shardinfos, plan_to_metadata)
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 K = 1024
 
@@ -243,6 +242,51 @@ def batch_to_items_general(batches: List[List[int]], num_tokens_per_rank: int, D
         
     return items
 
+from collections import deque
+
+
+def cp_list_to_mlp_list(cp_rank_doc_lens: List[List[int]], as_world_size: int, num_token_per_rank: int) -> List[List[int]]:
+
+    final_mlp_lists: List[List[int]] = []
+
+    for doc_list_per_rank in cp_rank_doc_lens:
+        docs_queue = deque(doc_list_per_rank)
+
+        current_rank: List[int] = []
+
+        while docs_queue:
+            space_left = num_token_per_rank - sum(current_rank)
+
+            if space_left == 0:
+                final_mlp_lists.append(current_rank)
+                current_rank = []
+                space_left = num_token_per_rank
+
+            doc_len = docs_queue.popleft()
+
+            if doc_len <= space_left:
+                current_rank.append(doc_len)
+            
+            else:
+                amount_to_place_now = space_left
+                if amount_to_place_now > 0:
+                    head1 = amount_to_place_now // 2
+                    tail1 = amount_to_place_now - head1
+                    current_rank.extend([head1, tail1])
+
+                final_mlp_lists.append(current_rank)
+                
+
+                remaining_len = doc_len - amount_to_place_now
+                
+                head2 = remaining_len // 2
+                tail2 = remaining_len - head2
+                current_rank = [head2, tail2]
+
+        if current_rank:
+            final_mlp_lists.append(current_rank)
+    assert len(final_mlp_lists) == as_world_size, "final_mlp_lists should contain dp_degree number of List."
+    return final_mlp_lists
 
 
 

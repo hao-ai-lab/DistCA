@@ -5,8 +5,10 @@ from typing import Any, Dict, List
 
 import rich
 import torch
-from d2.planner.planner import (Planner, Planner_DP, Item, batch_to_items,
-                                batch_to_items_general, get_flops, batch_to_items_with_dummy)
+from d2.planner.planner import (Item, Planner, Planner_DP, batch_to_items,
+                                batch_to_items_general,
+                                batch_to_items_with_dummy, cp_list_to_mlp_list,
+                                get_flops)
 from rich.console import Console
 from rich.table import Table
 
@@ -575,7 +577,24 @@ def test_batch_to_items_with_dummy():
     return
 
 
+def test_cp_list_to_mlp_list():
+    # Test DP:
+    cp_list_1 = [[512, 512],[512, 512], [1], [1]]
+
+    num_tokens = 1024
+    result_1 = cp_list_to_mlp_list(cp_list_1, dp_degree=4, num_token_per_rank=num_tokens)
+    assert result_1 == [[512, 512],[512, 512], [1], [1]]
+    
+    # Test CP head tail:
+    cp_list_2 = [[1], [1], [1376, 672]]
+
+    num_tokens = 1024
+    result_2 = cp_list_to_mlp_list(cp_list_2, dp_degree=4, num_token_per_rank=num_tokens)
+    assert result_2 == [[1], [1], [512, 512], [176, 176, 672]]
+
+
 if __name__ == "__main__":
+    test_cp_list_to_mlp_list()
     test_batch_to_items_with_dummy()
     test_mlp_seq_len()
     iter = 1
