@@ -357,6 +357,12 @@ set +x
 
 echo "Finished running sbatch at $(TZ='America/Los_Angeles' date). Does not guarantee that the experiment finished successfully. Please check if the benchmark.json file exists."
 
+# Check if the experiment finished successfully
+if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
+    echo "Experiment failed. The benchmark.json file does not exist."
+fi
+
+
 
 # set -euox pipefail
 

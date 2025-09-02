@@ -175,9 +175,9 @@ class MegatronBaseWorker(BaseWorker):
             uid = nvshmem_get_unique_id()
         else:
             uid = nvshmem_alloc_empty_unique_id()
-        print(f"[Rank {as_rank}] init nvshmem with uid = {uid}")
+        # print(f"[Rank {as_rank}] init nvshmem with uid = {uid}")
         torch.distributed.broadcast(uid, src=as_src_rank, group=group)
-        print(f"[Rank {as_rank}] after broadcast uid = {uid}")
+        # print(f"[Rank {as_rank}] after broadcast uid = {uid}")
         FastDispatcherWrapper.init(
             as_rank, local_rank, as_world_size, buffer_size, uid
         )
