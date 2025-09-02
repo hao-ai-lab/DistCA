@@ -440,11 +440,16 @@ def from_planner_output(
     lse_size_in_hidden_dtype: int,
     element_size: int,
     is_pipeline_tick: bool,
+    is_resend_qkv: bool = False,
 ):
     """NOTE: for PP, this only computes the Forward"""
+    if is_resend_qkv:
+        assert not is_pipeline_tick, "is_resend_qkv is for Non-PP but resend QKV to make memory balanced"
+    is_send_lse_in_fwd = is_pipeline_tick or is_resend_qkv
+
     q_bytes, k_bytes, out_bytes = get_per_token_bytes(
         hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
-        is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=is_pipeline_tick,
+        is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=is_send_lse_in_fwd,
     )
     (qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
      out_grad_linear_to_attn, attn_metadata) = _from_planner_output(
@@ -455,6 +460,11 @@ def from_planner_output(
         # Force them to None to avoid being misused.
         qkv_grad_attn_to_linear = None
         out_grad_linear_to_attn = None
+    if is_resend_qkv:
+        qkv_grad_attn_to_linear, out_grad_linear_to_attn, _ = backward_from_planner_output(
+            world_size, scheduler_output, hidden_size_q, hidden_size_kv,
+            lse_size_in_hidden_dtype, element_size
+        )
     return (
         qkv_linear_to_attn, qkv_grad_attn_to_linear,
         out_attn_to_linear, out_grad_linear_to_attn,

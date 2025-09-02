@@ -661,6 +661,7 @@ class Planner:
         planned_items: list[Item] = self.plan_items(items_, verbose, plot)
         planned_items: list[Item] = self.postprocess_items(planned_items)
         planner_output: list[list[ShardInfo]] = self.items_into_shardinfos(planned_items)
+        tp_size = self.parallel_config.tensor_model_parallel_size
         if self.parallel_config.pipeline_model_parallel_size == 1:
             hidden_size_q = self.model_config.hidden_size
             hidden_size_kv = hidden_size_q
@@ -668,11 +669,13 @@ class Planner:
                 hidden_size_kv = (hidden_size_kv * self.model_config.num_key_value_heads //
                                 self.model_config.num_attention_heads)
 
-            hidden_size_q_tp = hidden_size_q // self.parallel_config.tensor_model_parallel_size
-            hidden_size_k_tp = hidden_size_kv // self.parallel_config.tensor_model_parallel_size
+            hidden_size_q_tp = hidden_size_q // tp_size
+            hidden_size_k_tp = hidden_size_kv // tp_size
 
-            lse_size = 0    # we don't send lse when pp = 1.
+            lse_size = self.model_config.num_attention_heads // tp_size
             element_size = self.dtype.itemsize
+            if self.model_config.attention_softmax_in_fp32:
+                lse_size *= torch.float32.element_size // element_size
 
             (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
             attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
@@ -686,7 +689,7 @@ class Planner:
                 attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
             )
             return fa2a_metadata, as_attn_metadata, mlp_shard_len
-        else:   
+        else:
             # new metadata computation for pipeline parallel is in test_util. hard to import.
             # Now PP 3D parallel is directly support in: test_megatron_e2e_pipeline.py
             raise NotImplementedError("PP > 1 will be supported very soon.")

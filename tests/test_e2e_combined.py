@@ -977,7 +977,7 @@ def test(args):
             _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
 
             planner = Planner(world_size, parallel_config, model_config=model_config)
-            
+
             fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0)
             fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1)
 
