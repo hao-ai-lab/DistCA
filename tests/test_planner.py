@@ -541,18 +541,13 @@ def test_batch_to_items_with_dummy():
 
     compare_items(list_items, expected_items)
 
-    # Test CP:
+    # Test dummy DP:
     batches: List[List[int]] = [[tp_size], [tp_size], [tp_size], [tp_size], [256, 256],[128, 384],[512], [10, 502] ]
-    batches_2: List[List[int]] = [[tp_size], [tp_size], [tp_size], [tp_size], [256, 768],[512, 10, 502] ]
     num_tokens_per_rank = 512
     as_world_size = dp_size * pp_size
     model_config = MockConfig()
 
     list_items_1 = batch_to_items_with_dummy(batches=batches,
-                              num_tokens_per_rank=num_tokens_per_rank,
-                              as_world_size=as_world_size,
-                              model_config=model_config)
-    list_items_2 = batch_to_items_with_dummy(batches=batches,
                               num_tokens_per_rank=num_tokens_per_rank,
                               as_world_size=as_world_size,
                               model_config=model_config)
@@ -573,6 +568,27 @@ def test_batch_to_items_with_dummy():
 
 
     compare_items(list_items_1, expected_items)
+    # Test dummy CP:
+    batches_2: List[List[int]] = [[tp_size], [tp_size], [tp_size], [tp_size], [256, 768],[512, 10, 502] ]
+    num_tokens_per_rank = 512
+    list_items_2 = batch_to_items_with_dummy(batches=batches_2,
+                              num_tokens_per_rank=num_tokens_per_rank,
+                              as_world_size=as_world_size,
+                              model_config=model_config)
+    rich.print(list_items_2)
+    expected_items = [
+        Item(model_config, 8, 0, 0, 0, {'q': 8, 'kv': 8}, is_original=True),
+        Item(model_config, 8, 1, 1, 1, {'q': 8, 'kv': 8}, is_original=True),
+        Item(model_config, 8, 2, 2, 2, {'q': 8, 'kv': 8}, is_original=True),
+        Item(model_config, 8, 3, 3, 3, {'q': 8, 'kv': 8}, is_original=True),
+        Item(model_config, 256, 4, 4, 4, {'q': 256, 'kv': 256}, is_original=True),
+        Item(model_config, 768, 5, 4, 4, {'q': 128, 'kv': 128}, {'q': 128, 'kv': 768}, is_original=True),
+        Item(model_config, 768, 5, 5, 5, {'q': 256, 'kv': 384}, {'q': 256, 'kv': 640}, is_original=False),
+        Item(model_config, 512, 6, 6, 6, {'q': 512, 'kv': 512}, is_original=True),
+        Item(model_config, 10, 7, 7, 7, {'q': 10, 'kv': 10}, is_original=True),
+        Item(model_config, 502, 8, 7, 7, {'q': 502, 'kv': 502}, is_original=True),
+    ]
+
     compare_items(list_items_2, expected_items)
     return
 
@@ -582,14 +598,14 @@ def test_cp_list_to_mlp_list():
     cp_list_1 = [[512, 512],[512, 512], [1], [1]]
 
     num_tokens = 1024
-    result_1 = cp_list_to_mlp_list(cp_list_1, dp_degree=4, num_token_per_rank=num_tokens)
+    result_1 = cp_list_to_mlp_list(cp_list_1, as_world_size=4, num_token_per_rank=num_tokens)
     assert result_1 == [[512, 512],[512, 512], [1], [1]]
     
     # Test CP head tail:
     cp_list_2 = [[1], [1], [1376, 672]]
 
     num_tokens = 1024
-    result_2 = cp_list_to_mlp_list(cp_list_2, dp_degree=4, num_token_per_rank=num_tokens)
+    result_2 = cp_list_to_mlp_list(cp_list_2, as_world_size=4, num_token_per_rank=num_tokens)
     assert result_2 == [[1], [1], [512, 512], [176, 176, 672]]
 
 
