@@ -209,7 +209,16 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
             num_batches=num_batches,
             use_planner=use_planner
         )
+        # this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
         
+        # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, so each rank knows its number of tokens.
+        #   Example1 DP case:
+        # tick_per_rank_doc_lens: List[List[int]] = [[8], [8], [8], [8], [256, 256],[128, 384],[512], [10, 502] ]
+        # rank_num_tokens_lists : [[8], [8], [8], [8], [512], [512], [512], [512]]
+        #   Example2 CP case:
+        # tick_per_rank_doc_lens: List[List[int]] = [[8], [8], [8], [8], [256, 768],[512, 10, 502] ]
+        # rank_num_tokens_lists : [[8], [8], [8], [8], [512], [512], [512], [512]]
+
         rank_num_tokens_lists = []
         # NOTE: Current logic only suppot every rank except dummy, has full tokens.
         for doc_list_per_rank in tick_per_rank_doc_lens:
@@ -218,8 +227,9 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
                 rank_num_tokens_list = [[num_token_per_rank] for _ in range(number_of_rank_to_span)]
                 rank_num_tokens_lists = rank_num_tokens_lists + rank_num_tokens_list
             else:
-                rank_num_tokens_lists = rank_num_tokens_lists + [[num_token_per_rank]]
-        #this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
+                rank_num_tokens_lists = rank_num_tokens_lists + [doc_list_per_rank]
+
+        
         this_rank_num_tokens = sum(rank_num_tokens_lists[as_rank])
 
         bwd_packed_seq_params = PackedSeqParams(
