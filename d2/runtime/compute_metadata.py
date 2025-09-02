@@ -5,11 +5,10 @@ import torch
 
 from d2.runtime.fast_alltoall_metadata import (
     FastAlltoAllMetadata, LogicalShape, SeqLens,
-    compute_reverse_a2a_layout_metadata,
-    exclusive_cumsum, size_pad_by_int4, _get_my_rank_from_metadata,
+    compute_reverse_a2a_layout_metadata, _get_my_rank_from_metadata,
 )
-from d2.runtime.inplace_metadata import prepend_zero_fn
 from d2.runtime.shard_info import ShardInfo
+from d2.runtime.utils import size_pad_by_int4, prepend_zero_fn, exclusive_cumsum
 
 
 # (doc_id, logical_id)
