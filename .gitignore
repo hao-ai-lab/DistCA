@@ -178,3 +178,4 @@ wandb/
 
 # nsys profile
 *.nsys-rep
+.idea/

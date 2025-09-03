@@ -344,6 +344,13 @@ def test(args):
         setup_global_batch(total_seq_len=total_seq_len)
         
     # this total_seq_len is token per rank.
+    # Some explanations of the parameters inside `create_pp_microbatches`:
+    # - num_microbatch: 
+    #   Iterate `num_microbatch + pp_degree - 1` to create each tick's metadata
+    # - num_batches: 
+    #   For each tick, getting `num_batches` number of list from the data loader (GLOBAL_BATCH iterator). 
+    #   This is the parameter controlling the number of batches per tick.
+    # 
     microbatches_0 = create_pp_microbatches(
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
