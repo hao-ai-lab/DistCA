@@ -1320,7 +1320,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 import d2.mem
 def save_memory_usage_to_file(memory_usage_dir: str):
-    os.makedirs(memory_usage_output_dir, exist_ok=True)
+    os.makedirs(memory_usage_dir, exist_ok=True)
     
     rank = torch.distributed.get_rank()
     memory_usage: list[dict] = d2.mem.get_memory_usage()
