@@ -11,7 +11,7 @@ def log_memory_usage(message: str):
     
     global memory_usage
 
-    if os.getenv("EXPERIMENT_LOG_MEMORY_USAGE", "1") != "1":
+    if os.getenv("EXPERIMENT_LOG_MEMORY_USAGE", "0") != "1":
         return
     # Check if `CUDA_LAUNCH_BLOCKING` is set
     if os.getenv("CUDA_LAUNCH_BLOCKING", "0") != "1":
