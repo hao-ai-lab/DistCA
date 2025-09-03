@@ -5,7 +5,7 @@ import pandas as pd
 import glob
 
 # %%
-log_path = "logs.v1"
+log_path = "logs.v3"
 a = os.listdir(log_path)
 len(a)
 # %%
@@ -330,12 +330,12 @@ df_display['is_running'] = df_display['is_running'].map({True: '💨', False: '�
 
 
 # df_display['gid'] = df_display['nnodes'].astype(str) + "_" + df_display['NUM_TOKENS'].astype(str) + "_" + df_display['BATCH_SIZE'].astype(str)
-# df_display.sort_values(by=['exp_name', ], ascending=True)
 
 df_display = df_display.sort_values(by=['num_layers', 'nnodes', 'NUM_TOKENS', 'BATCH_SIZE', 'MODE', 'CP_SIZE', ], ascending=True)
 df_display
 
 # %%
+# df_display.sort_values(by=['index', ], ascending=True)
 df_display
 
 # %%
@@ -364,7 +364,7 @@ for gid, group in df_display.groupby('gid'):
         speedup = wlbllm_min_time / d2_time
         speedup = f"{speedup:.2f} (🟢)" if is_wlbllm_all_success else f"{speedup:.2f} (❌)"
         speedups.append((idx, speedup))
-
+    # break
 
 speedups
 # %%
@@ -459,9 +459,10 @@ for i in sorted(failed_groups['eid'].unique().tolist()):
 # %%
 
 # # Get all of the eid that has at least one success run
-# success_eids = df_display[df_display['success'] == '✅']['eid'].unique()
-# a = " ".join(success_eids.tolist())
-# with open("success_eids.txt", "w") as f:
-#     f.write(a)
+success_eids = df_display[df_display['success'] == '✅']['eid'].unique()
+a = " ".join(success_eids.tolist())
+print(a)
+with open("success_eids.txt", "w") as f:
+    f.write(a)
 
 # %%

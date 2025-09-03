@@ -1,3 +1,5 @@
+# TODO(Deprecate): Consolidate the `test_e2e_combined.salloc-exp.sh` and `test_e2e_combined.slurm.sh` into a single script.
+
 #!/bin/bash
 
 #SBATCH --job-name=d2-e2e
@@ -74,7 +76,6 @@ mkdir -p "$OUTPUT_DIR"
 # exec > $OUTPUT_DIR/slurm.stdout 2>&1
 exec > >(tee "$OUTPUT_DIR/slurm.stdout") 2>&1
 
-EXP_README="$OUTPUT_DIR/README.md"
 
 
 LOG_DIR="$OUTPUT_DIR/logs"
@@ -114,32 +115,12 @@ ELONGATE_FACTOR=${ELONGATE_FACTOR:-1}
 FILTER_THRESHOLD=${FILTER_THRESHOLD:-65536}
 FILTER_RATIO=${FILTER_RATIO:-0.50}
 SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-0}
-
-
+PROFILE_MEMORY_PATH=${PROFILE_MEMORY_PATH:"${OUTPUT_DIR}/"}
 
 NNODES=$SLURM_NNODES
 
-echo "Running experiment with the following parameters:" > $EXP_README
-echo "- MODE: $MODE" >> $EXP_README
-echo "- MODEL_PATH: $MODEL_PATH" >> $EXP_README
-echo "- NNODES: $NNODES" >> $EXP_README
-echo "- NUM_LAYERS: $NUM_LAYERS" >> $EXP_README
-echo "- TP_SIZE: $TP_SIZE" >> $EXP_README
-echo "- PP_SIZE: $PP_SIZE" >> $EXP_README
-echo "- CP_SIZE: $CP_SIZE" >> $EXP_README
-echo "- BATCH_SIZE: $BATCH_SIZE" >> $EXP_README
-echo "- NUM_TOKENS: $NUM_TOKENS" >> $EXP_README
-echo "- MAX_SAMPLE_ID: $MAX_SAMPLE_ID" >> $EXP_README
-echo "- UP_SAMPLE_FACTOR: $UP_SAMPLE_FACTOR" >> $EXP_README
-echo "- ELONGATE_FACTOR: $ELONGATE_FACTOR" >> $EXP_README
-echo "- FILTER_THRESHOLD: $FILTER_THRESHOLD" >> $EXP_README
-echo "- FILTER_RATIO: $FILTER_RATIO" >> $EXP_README
-echo "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES" >> $EXP_README
-
-# Generate equivalent command
 cmd="MODE=$MODE MODEL_PATH=$MODEL_PATH BATCH_SIZE=$BATCH_SIZE NUM_TOKENS=$NUM_TOKENS MAX_SAMPLE_ID=$MAX_SAMPLE_ID TP_SIZE=$TP_SIZE CP_SIZE=$CP_SIZE NUM_LAYERS=$NUM_LAYERS sbatch --nodes $NNODES test_e2e_combined.slurm.sh"
-echo "" >> $EXP_README
-echo "- Command: $cmd" >> $EXP_README
+
 
 # ------------------------------------------------------
 
@@ -320,11 +301,13 @@ TORCHRUN_STR=$(printf " %q" "${TORCHRUN_CMD[@]}")
 SRUN_BASE=(
   srun
   -N ${NNODES}
+  -G ${WORLD_SIZE}
   --ntasks-per-node=1
-  --gpus-per-task=${GPUS_PER_NODE}     # <= crucial
-  --gpu-bind=per_task:${GPUS_PER_NODE} # <= bind GPUs to the task
+  # --gpus-per-task=${GPUS_PER_NODE}     # <= crucial
+  # --gpu-bind=per_task:${GPUS_PER_NODE} # <= bind GPUs to the task
   --kill-on-bad-exit=1
   --jobid=${JOBID:-SLURM_JOB_ID}
+  --mem=0 # inherit the memory from the salloc
 )
 
 
@@ -332,6 +315,29 @@ SRUN_BASE=(
 # Log environment variables (for debugging)
 # ---------------------------
 env > $OUTPUT_DIR/slurm.env
+
+EXP_README="$OUTPUT_DIR/README.md"
+echo "Running experiment with the following parameters:" > $EXP_README
+echo "- MODE: $MODE" >> $EXP_README
+echo "- MODEL_PATH: $MODEL_PATH" >> $EXP_README
+echo "- NNODES: $NNODES" >> $EXP_README
+echo "- NUM_LAYERS: $NUM_LAYERS" >> $EXP_README
+echo "- TP_SIZE: $TP_SIZE" >> $EXP_README
+echo "- PP_SIZE: $PP_SIZE" >> $EXP_README
+echo "- CP_SIZE: $CP_SIZE" >> $EXP_README
+echo "- BATCH_SIZE: $BATCH_SIZE" >> $EXP_README
+echo "- NUM_TOKENS: $NUM_TOKENS" >> $EXP_README
+echo "- MAX_SAMPLE_ID: $MAX_SAMPLE_ID" >> $EXP_README
+echo "- UP_SAMPLE_FACTOR: $UP_SAMPLE_FACTOR" >> $EXP_README
+echo "- ELONGATE_FACTOR: $ELONGATE_FACTOR" >> $EXP_README
+echo "- FILTER_THRESHOLD: $FILTER_THRESHOLD" >> $EXP_README
+echo "- FILTER_RATIO: $FILTER_RATIO" >> $EXP_README
+echo "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES" >> $EXP_README
+echo "- EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB: $EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB" >> $EXP_README
+
+# Generate equivalent command
+echo "" >> $EXP_README
+echo "- Command: $cmd" >> $EXP_README
 
 
 # ---------------------------

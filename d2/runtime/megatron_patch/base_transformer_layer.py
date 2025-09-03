@@ -15,6 +15,13 @@ from megatron.core.transformer.transformer_layer import (
 )
 
 from d2.runtime.megatron_patch.packed_seq_params import PingPangSingleStepPackedSeqParams
+import torch
+
+
+def log_memory_usage(message: str):
+    import d2.mem
+    d2.mem.log_memory_usage(message)
+
 
 class TransformerLayer(MegatronTransformerLayer):
     """Base transformer layer that splits the forward 3 steps: core attention, pre- and post- core attention."""
@@ -46,6 +53,8 @@ class TransformerLayer(MegatronTransformerLayer):
         Perform a forward pass through the attention layer and the layernorms before and after
         the attention operations.
         """
+        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(init, before input layernorm)")
+
         residual = hidden_states
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -55,6 +64,8 @@ class TransformerLayer(MegatronTransformerLayer):
             )
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
+
+        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after input layernorm, before qkv)")
         # Below code copied from megatron.core.transformer.attention.Attention.forward
         # rotary pos emb
         assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -68,6 +79,8 @@ class TransformerLayer(MegatronTransformerLayer):
         #### Some code in core_attention. This is because we don't want the pos embedding
         # being handled in the attention layout (the pos id will be hard to handle)
         inference_context = None
+
+        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after  qkv, before adjust_key_value_for_inference)")
 
         query, key, value, rotary_pos_emb, attn_mask_type = self.self_attention._adjust_key_value_for_inference(
             inference_context,
@@ -83,6 +96,8 @@ class TransformerLayer(MegatronTransformerLayer):
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
+
+        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after adjust_key_value_for_inference, before rope)")
 
         # ================================================
         # relative positional embedding (rotary embedding)
@@ -116,6 +131,7 @@ class TransformerLayer(MegatronTransformerLayer):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after rope, before return)")
         return query, key, value, residual, attn_mask_type
 
     def _forward_core_attn(
@@ -135,6 +151,7 @@ class TransformerLayer(MegatronTransformerLayer):
         # ==================================
         # core attention computation
         # ==================================
+        log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(start)")
         if self.self_attention.checkpoint_core_attention and self.training:
             core_attn_out = self.self_attention._checkpointed_attention_forward(
                 query,
@@ -167,6 +184,7 @@ class TransformerLayer(MegatronTransformerLayer):
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(after core attention)")
         return core_attn_out
 
     def _forward_post_core_attn(
@@ -178,12 +196,16 @@ class TransformerLayer(MegatronTransformerLayer):
     ):
         inference_context = None
         attention_output_with_bias = self.self_attention.linear_proj(core_attn_out)
+
+        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(before layernorm)")
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
             # as a gradient hook of attention_output_with_bias[0]
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
+
+        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after layernorm)")
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -199,12 +221,14 @@ class TransformerLayer(MegatronTransformerLayer):
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
         # Cross attention.
+        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(cross attention)")
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
             attention_mask=context_mask,
             key_value_states=context,
             inference_context=inference_context,
         )
+        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after cross attention)")
 
         if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
             context = attention_output_with_bias["context"]
@@ -215,6 +239,7 @@ class TransformerLayer(MegatronTransformerLayer):
             hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
                 attention_output_with_bias, residual, self.hidden_dropout
             )
+        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after cross attn bda)")
 
         # Residual connection.
         residual = hidden_states
@@ -228,7 +253,10 @@ class TransformerLayer(MegatronTransformerLayer):
         else:
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
+        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after pre mlp layernorm)")
+
         mlp_output = self._forward_mlp(pre_mlp_layernorm_output, residual)
+        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after mlp)")
         return mlp_output, context
 
     ######## Debug ########
@@ -259,6 +287,8 @@ class TransformerLayer(MegatronTransformerLayer):
         # FIXME(yonghao): fix rope
         rotary_pos_emb = None
 
+        log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(before pre core attn)")
+
         query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
             hidden_states,
             rotary_pos_emb,
@@ -269,6 +299,8 @@ class TransformerLayer(MegatronTransformerLayer):
         )
         debug_tensors = [(query, key, value),]
 
+        log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after pre core attn)")
+
         core_attn_out = self._forward_core_attn(
             query,
             key,
@@ -278,6 +310,8 @@ class TransformerLayer(MegatronTransformerLayer):
             attn_mask_type,
             packed_seq_params,
         )
+
+        log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after core attention)")
         debug_tensors.append(core_attn_out)
         mlp_output, context = self._forward_post_core_attn(
             core_attn_out,
@@ -285,6 +319,8 @@ class TransformerLayer(MegatronTransformerLayer):
             context,
             context_mask,
         )
+
+        log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after post core attn)")
 
         return (mlp_output, context,) + (
             (debug_tensors,) if return_debug else ()
