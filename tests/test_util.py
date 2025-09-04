@@ -32,7 +32,7 @@ from d2.runtime.megatron_patch.create_group import (
     initialize_attention_server_comm, get_attn_server_group_gloo,
     get_attn_server_rank, get_attn_server_group_src_rank
 )
-from d2.planner.planner import Planner, batch_to_items_class
+from d2.planner.planner import batch_to_items_with_dummy, cp_list_to_mlp_list
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +437,7 @@ def create_pipeline_doclens(
     num_docs: int,
     tp_size: int,
     dp_size: int,
+    num_batches: int = None,
     use_planner: bool = False,
 ):
     """
@@ -472,7 +473,9 @@ def create_pipeline_doclens(
             #from test_megatron_e2e_pipeline_planner import GLOBAL_BATCH, get_next_batch
             from global_batch_provider import get_next_batch, GLOBAL_BATCH
             print(f"In util.py, before calling get_next_batch: GLOBAL_BATCH is: {GLOBAL_BATCH}")
-            pp_head_new_doc_len = get_next_batch(dp_size)
+            if num_batches == None:
+                num_batches = dp_size 
+            pp_head_new_doc_len = get_next_batch(num_batches)
 
     #  pp_head_new_doc_len : shape : [dp, num_seqs]  We should sample seq_len here.
     # And add the sampled seq_len to the batch. 
@@ -516,6 +519,8 @@ def create_qkv_dispatch_pipeline_tick(
     ref_doc_lens: Optional[torch.Tensor],
     add_dummy: bool,
     tp_size: int, dp_size: int,
+    num_token_per_rank: int,
+    num_batches: int = None,
     use_planner: bool = False
 ):
     """
@@ -531,9 +536,22 @@ def create_qkv_dispatch_pipeline_tick(
     )
     # for perf test. Get doc_lens from GLOBAL_BATCH
     cur_tick_per_rank_doc_lens = create_pipeline_doclens(
-        ref_doc_lens, add_dummy, is_backward=False, use_planner=use_planner,
+        ref_doc_lens, add_dummy, is_backward=False, num_batches = num_batches, use_planner=use_planner,
         **create_pp_doclen_kwargs, 
     )
+
+    # This should be a general function for DP and CP. But we only call it when CP: len(cur_tick_per_rank_doc_lens) <= world_size.
+    # After call this function: len(cur_tick_per_rank_doc_lens) == as_world_size
+    # For CP: 
+    #   We need to tranfer CP list to MLP list for each rank, to match forward and backward.
+    #   If we use CP list directly, the PP flip can't have an effect.
+    # Example: 
+    # DEBUG: before: cur_tick_per_rank_doc_lens = [[2048], [1], [1]], as_world_size = 4, num_token_per_rank = 1024
+    # DEBUG: after: cur_tick_per_rank_doc_lens = [[512, 512], [512, 512], [1], [1]]
+    if len(cur_tick_per_rank_doc_lens) < world_size:
+        print(f"DEBUG, before : {cur_tick_per_rank_doc_lens}")
+        cur_tick_per_rank_doc_lens = cp_list_to_mlp_list(cur_tick_per_rank_doc_lens, as_world_size=world_size, num_token_per_rank = num_token_per_rank)
+        print(f"DEBUG: after: {cur_tick_per_rank_doc_lens}")
 
     if use_planner:
         from d2.planner.planner import Planner
@@ -552,10 +570,11 @@ def create_qkv_dispatch_pipeline_tick(
             num_key_value_heads = hidden_size_q // hidden_size_k,
             num_hidden_layers = 1
         )
-        # This function only works for MLP-DP.
-        # TODO: For PP MLP-CP, return items directly can be better.
-        # We can't directly use batch_to_items_general.
-        items = batch_to_items_class(cur_tick_per_rank_doc_lens, temp_model_config)
+        # Use batch_to_items_with_dummy to handle dummy doc to item.
+        items = batch_to_items_with_dummy(batches=cur_tick_per_rank_doc_lens, 
+                                          num_tokens_per_rank = num_token_per_rank,
+                                          as_world_size=world_size,
+                                          model_config=temp_model_config)
         fwd_planner_out = planner.items_to_shardinfo(items)
     else:
         fwd_planner_out = random_tick_shard_from_doclens(
@@ -574,7 +593,10 @@ def create_qkv_dispatch_pipeline_tick(
         **create_pp_doclen_kwargs,
     )
     if use_planner:
-        items = batch_to_items_class(bwd_tick_per_rank_doc_lens, temp_model_config)
+        items = batch_to_items_with_dummy(batches=bwd_tick_per_rank_doc_lens, 
+                                          num_tokens_per_rank=num_token_per_rank,
+                                          as_world_size=world_size,
+                                          model_config=temp_model_config)
         bwd_planner_out = planner.items_to_shardinfo(items)
     else:
         bwd_planner_out = random_tick_shard_from_doclens(
@@ -601,96 +623,6 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
     seq_len_total_error = seq_len_total - total_len
     seq_len[:, -1] -= seq_len_total_error
     return seq_len
-
-
-def create_qkv_dispatch_pipeline_tick_planned(
-    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
-    hidden_size_q: int, hidden_size_k: int,
-    element_size: int, # dtype's size
-    softmax_lse_size: int, # size of the softmax_lse tensor, should be num_heads
-    ref_seq_lens: Optional[torch.Tensor],
-    add_dummy: bool,
-    tp_size: int, dp_size: int, pp_size: int,
-    hf_config: Optional[AutoConfig] = None,
-):
-    create_pp_doclen_kwargs = dict(
-        world_size=world_size,
-        total_seq_len=total_seq_len,
-        num_seqs=num_seqs,
-        max_cp_degree=max_cp_degree,
-    )
-    seq_lens = create_pipeline_seqlens(
-        ref_seq_lens, add_dummy, is_backward=False,
-        **create_pp_doclen_kwargs,
-        tp_size=tp_size,
-        dp_size=dp_size,
-    )
-    
-    # Create parallel config for the planner.
-    parallel_config = ParallelConfig(
-        tensor_model_parallel_size=tp_size,
-        pipeline_model_parallel_size=pp_size,
-    )
-    planner_ws = tp_size * dp_size * pp_size
-    planner = Planner(
-            world_size=planner_ws,  # Should be the number of GPU. Not Attention server world size.
-            parallel_config = parallel_config,
-            tolerance_factor = 0.1,
-            model_config = None)
-    batch = seq_lens.tolist()
-    print("batch =", batch)
-    
-    items = batch_to_items_class(batch,model_config=hf_config)
-
-    (
-        mlp_num_seqs,
-        mlp_q_dispatch_fwd,
-        mlp_seq_len,
-        kv_to_q_mapping,
-        kv_to_q_rank,
-        kv_context_size,
-        q_to_num_kv_seq,
-        q_to_num_kv_tokens
-    ) = planner.plan_to_raw_qkv_dispatch(items, verbose=True)
-
-    (_, _, _, _,
-     fa_fwd_params, fa2a_fwd_metadata) = compute_e2e_fa2a_metadata(
-        mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
-        kv_to_q_mapping, kv_to_q_rank,
-        kv_context_size, q_to_num_kv_seq, q_to_num_kv_tokens,
-        hidden_size_q, hidden_size_k,
-        element_size, softmax_lse_size
-    )
-    (qkv_fwd_fa2a_metadata, _, attn_out_fwd_fa2a_metadata, _,
-    ) = fa2a_fwd_metadata
-
-    reversed_seqlens = create_pipeline_seqlens(
-        seq_lens, add_dummy=False, is_backward=True,
-        **create_pp_doclen_kwargs,
-        tp_size=tp_size,
-        dp_size=dp_size,
-    )
-    # NOTE: those begin with bwd_ is mostly the flip of the original value.
-    (bwd_mlp_seq_len, bwd_mlp_num_seqs, mlp_q_dispatch_bwd,
-     bwd_kv_to_q_mapping, bwd_kv_to_q_rank, bwd_kv_context_size,
-     bwd_q_to_num_kv_seq, bwd_q_to_num_kv_tokens
-    ) = create_raw_qkv_dispatch(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
-        return_mlp_no_shard_seq_lens=False,
-        seq_lens=reversed_seqlens,
-    )
-
-    (fa_bwd_params, attn_out_qkv_bwd_fa2a_metadata, qkv_bwd_fa2a_metadata
-     ) = compute_backward_resend_e2e_metadata(
-        bwd_mlp_seq_len, bwd_mlp_num_seqs, mlp_q_dispatch_bwd,
-        bwd_kv_to_q_mapping, bwd_kv_to_q_rank, bwd_kv_context_size,
-        bwd_q_to_num_kv_seq, bwd_q_to_num_kv_tokens,
-        hidden_size_q, hidden_size_k, element_size, softmax_lse_size,
-    )
-    return (fa_fwd_params, fa_bwd_params,
-            qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
-            attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
-            seq_lens,)
 
 
 def create_qkv_dispatch_with_custom_mapping(
