@@ -22,6 +22,14 @@ for file in os.listdir(folder):
     mem_data[rank] = data
     # break
 # %%
+mem_data
+# %%
+def get_events(data):
+    return [
+        item['message']
+        for item in data
+    ]
+    pass
 def get_metrics(data, key='allocated_cur'):
 
     return [
@@ -29,6 +37,7 @@ def get_metrics(data, key='allocated_cur'):
         for item in data
     ]
 
+events = get_events(mem_data[0])
 
 plot_data = {}
 for rank in mem_data:
@@ -51,7 +60,13 @@ import plotly.graph_objects as go
 
 fig = go.Figure()
 for rank in plot_data:
-    fig.add_trace(go.Scatter(x=list(range(len(plot_data[rank]))), y=plot_data[rank], name=f'Rank {rank}'))
+    fig.add_trace(go.Scatter(
+        x=list(range(len(plot_data[rank]))), 
+        y=plot_data[rank],
+        name=f'Rank {rank}',
+        text=events[:len(plot_data[rank])],  # Add event text as tooltips
+        hovertemplate='Event: %{text}<br>Memory: %{y:.2f} GB<extra></extra>'
+    ))
 fig.show()
 
 # %%
