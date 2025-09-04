@@ -132,3 +132,95 @@ fig.show()
 # Save the plotly figure as HTML
 fig.write_html("memory_diff.html")
 # %%
+
+max_step = 100
+# Find shortest trace length
+min_length = min(len(trace) for trace in diff_data.values())
+
+# Get min and max values at each step across all ranks
+min_vals = []
+max_vals = []
+diff_vals = []
+for step in range(min_length):
+    step_vals = [diff_data[rank][step] for rank in diff_data]
+    min_val = min(step_vals)
+    max_val = max(step_vals)
+    min_vals.append(min_val)
+    max_vals.append(max_val)
+    diff_vals.append(max_val - min_val)
+
+
+min_vals = min_vals[:max_step]
+max_vals = max_vals[:max_step]
+diff_vals = diff_vals[:max_step]
+# Create min/max plot
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(
+    x=list(range(min_length)),
+    y=min_vals,
+    name='Min across ranks',
+    text=events[1:min_length+1],
+    hovertemplate='Event: %{text}<br>Min Memory Diff: %{y:.2f} MB<extra></extra>',
+    mode='lines+markers',
+    marker=dict(size=8)
+))
+
+fig.add_trace(go.Scatter(
+    x=list(range(min_length)), 
+    y=max_vals,
+    name='Max across ranks',
+    text=events[1:min_length+1],
+    hovertemplate='Event: %{text}<br>Max Memory Diff: %{y:.2f} MB<extra></extra>',
+    mode='lines+markers',
+    marker=dict(size=8)
+))
+
+fig.add_trace(go.Scatter(
+    x=list(range(min_length)),
+    y=diff_vals,
+    name='Max-Min Difference',
+    text=events[1:min_length+1], 
+    hovertemplate='Event: %{text}<br>Max-Min Diff: %{y:.2f} MB<extra></extra>',
+    mode='lines+markers',
+    marker=dict(size=8)
+))
+
+fig.update_layout(
+    title='Min/Max Memory Usage Difference Across Ranks',
+    xaxis_title='Step',
+    yaxis_title='Memory Allocated (MB)'
+)
+
+fig.show()
+
+# Save the plotly figure as HTML
+fig.write_html("memory_diff_minmax.html")
+
+# %%
+# Create a table with x, ymin, ymax, ydiff and message
+import pandas as pd
+
+data = {
+    'Step': list(range(max_step)),
+    'Min Memory (MB)': min_vals,
+    'Max Memory (MB)': max_vals, 
+    'Max-Min Diff (MB)': diff_vals,
+    'Event': events[1:max_step+1]
+}
+
+df = pd.DataFrame(data)
+df = df[df['Max-Min Diff (MB)'] > 1]
+# Display as markdown
+print("\nMemory Usage Statistics Table:")
+print(df.to_markdown(index=False))
+
+# Display the table
+# print("\nMemory Usage Statistics Table:")
+# print(df.to_string(index=False))
+
+# # Save to CSV
+# df.to_csv('memory_stats.csv', index=False)
+# print("\nSaved memory statistics to memory_stats.csv")
+
+# %%
