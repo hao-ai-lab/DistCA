@@ -31,7 +31,7 @@ srun --time=00:10:00 -N 1 -G 8 --ntasks-per-node=1 \
     --error=${LOG_DIR}/%N.%j.out \
     bash -lc "
         set -x
-        exec torchrun --nnodes=1 --nproc_per_node=8 --rdzv_backend=c10d --rdzv_endpoint=fs-mbz-gpu-004:29500 --rdzv_id=fs-mbz-gpu-004 --max_restarts=0 test_e2e_combined.py --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --mode d2 --replan-iter 0 --batch-size $BATCH_SIZE --num-nodes 1 --num-gpus-per-node 8 --num-layers $NUM_LAYERS --max-sample-id $MAX_SAMPLE_ID --tp-size 8 --cp-degree 1 --up-sample-factor 4 --num-tokens $NUM_TOKENS --elongate-factor $ELONGATE_FACTOR --filter-threshold 65536 --filter-ratio 0.50 --output-dir ${OUTPUT_DIR} --should-add-debug-cases
+        exec torchrun --nnodes=1 --nproc_per_node=8 --rdzv_backend=c10d --rdzv_endpoint=fs-mbz-gpu-004:29500 --rdzv_id=fs-mbz-gpu-004 --max_restarts=0 test_e2e_combined.py --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --mode d2 --replan-iter 0 --batch-size $BATCH_SIZE --num-nodes 1 --num-gpus-per-node 8 --num-layers $NUM_LAYERS --max-sample-id $MAX_SAMPLE_ID --tp-size 2 --cp-degree 1 --up-sample-factor 4 --num-tokens $NUM_TOKENS --elongate-factor $ELONGATE_FACTOR --filter-threshold 65536 --filter-ratio 0.50 --output-dir ${OUTPUT_DIR} --should-add-debug-cases
     "
 
 end_time=$(date +%s)

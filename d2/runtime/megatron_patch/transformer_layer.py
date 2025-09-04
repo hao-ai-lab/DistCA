@@ -24,6 +24,12 @@ from d2.runtime.fast_dispatch_fn import (
     all_to_all, post_all2all_layout_transfer, pre_all2all_layout_transfer
 )
 
+def log_memory_usage(message: str):
+    import d2.mem
+    d2.mem.log_memory_usage(message)
+    return
+
+
 
 #### Tool functions for splitting and gathering args ####
 def _split_tensor(x: Optional[torch.Tensor], num_splits: int):
@@ -718,6 +724,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         return arg_group_0, arg_group_1, hidden_states, context
 
     def _forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(start)")
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(before pre core attn)")
         hidden_states = args.pop("hidden_states")
         query, key, value, residual, attn_mask_type = layer._forward_pre_core_attn(
             hidden_states,
@@ -727,30 +735,41 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             args["mlp_packed_seq_params"],
             args["sequence_len_offset"],
         )
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(after pre core attn)")
+
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(before pre mlp to attn)")
         signal = layer._pre_mlp_to_attn(query, key, value, args["packed_seq_params"])
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(after pre mlp to attn)")
+
         args["query"] = query
         args["key"] = key
         args["value"] = value
         args["residual"] = residual
         args["attn_mask_type"] = attn_mask_type
         args["signal"] = signal
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(return)")
         return args
 
     def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
+        log_memory_usage(f"(L{layer.layer_number}) _layout_mlp_to_attn:(start)")
         bwd_resend_qkv = args["packed_seq_params"].bwd_packed_seq_params is not None
         if not bwd_resend_qkv:
             # qkv are stored until attn_out to resend at backward.
             args.pop("query"), args.pop("key"), args.pop("value")
         signal = args.pop("signal")
         args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=True)
+        log_memory_usage(f"(L{layer.layer_number}) _layout_mlp_to_attn:(end)")
         return args
 
     def _forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         # pop out to make sure the tensor is freed
+        log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(start)")
         signal = args.pop("signal")
         packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
         bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
+        
         if bwd_resend_qkv:
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before FusedCommAttn)")
             signal = FusedCommAttn.apply(
                 signal,
                 packed_seq_params.qkv_fwd_metadata,
@@ -769,8 +788,13 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                 ),
             )
             args["signal"] = signal
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after FusedCommAttn)")
         else:
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before post mlp to attn)")
             query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after post mlp to attn)")
+
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before forward core attn)")
             core_attn_out = layer._forward_core_attn(
                 query, key, value,
                 args["attention_mask"],
@@ -778,7 +802,12 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                 args["attn_mask_type"],
                 args["packed_seq_params"],
             )
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after forward core attn)")
+            
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before pre attn to mlp)")
             args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after pre attn to mlp)")
+        log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(end)")
         return args
 
     def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
@@ -787,6 +816,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         return args
 
     def _forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
+        log_memory_usage(f"(L{layer.layer_number}) _forward_post_core_attn:(start)")
         signal = args.pop("signal")
         packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
         bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
@@ -810,9 +840,11 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         )
         args["hidden_states"] = mlp_output
         args["context"] = context
+        log_memory_usage(f"(L{layer.layer_number}) _forward_post_core_attn:(end)")
         return args
 
     def _tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, keys_1):
+        log_memory_usage(f"(L?) _tick_sync:(start)")
         if isinstance(keys_0, str):
             keys_0 = [keys_0]
         if isinstance(keys_1, str):
@@ -827,6 +859,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             arg_group_0[key] = out_tensor
         for key, out_tensor in zip(keys_1, out_tensors_1):
             arg_group_1[key] = out_tensor
+        log_memory_usage(f"(L?) _tick_sync:(end)")
 
     class _debug_monkey_patch:
         def __init__(self, layer_forward_impl):

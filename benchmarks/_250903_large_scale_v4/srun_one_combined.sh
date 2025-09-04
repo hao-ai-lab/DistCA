@@ -25,13 +25,18 @@ mkdir -p $LOG_DIR
 
 # OUTPUT_DIR
 
+MEMORY_PROFILE_ARG=""
+if [ ${SHOULD_PROFILE_MEMORY} -eq 1 ]; then
+    MEMORY_PROFILE_ARG="--should-profile-memory true"
+fi
+
 start_time=$(date +%s)
 srun --time=00:10:00 -N 32 -G 256 --ntasks-per-node=1 \
     --output=${LOG_DIR}/%N.%j.out \
     --error=${LOG_DIR}/%N.%j.out \
     bash -lc "
         set -x
-        exec torchrun --nnodes=32 --nproc_per_node=8 --rdzv_backend=c10d --rdzv_endpoint=fs-mbz-gpu-004:29500 --rdzv_id=fs-mbz-gpu-004 --max_restarts=0 test_e2e_combined.py --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --mode d2 --replan-iter 0 --batch-size $BATCH_SIZE --num-nodes 32 --num-gpus-per-node 8 --num-layers $NUM_LAYERS --max-sample-id $MAX_SAMPLE_ID --tp-size 8 --cp-degree 1 --up-sample-factor 4 --num-tokens $NUM_TOKENS --elongate-factor $ELONGATE_FACTOR --filter-threshold 65536 --filter-ratio 0.50 --output-dir ${OUTPUT_DIR} --should-add-debug-cases
+        exec torchrun --nnodes=32 --nproc_per_node=8 --rdzv_backend=c10d --rdzv_endpoint=fs-mbz-gpu-004:29500 --rdzv_id=fs-mbz-gpu-004 --max_restarts=0 test_e2e_combined.py --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --mode d2 --replan-iter 0 --batch-size $BATCH_SIZE --num-nodes 32 --num-gpus-per-node 8 --num-layers $NUM_LAYERS --max-sample-id $MAX_SAMPLE_ID --tp-size 8 --cp-degree 1 --up-sample-factor 4 --num-tokens $NUM_TOKENS --elongate-factor $ELONGATE_FACTOR --filter-threshold 65536 --filter-ratio 0.50 --output-dir ${OUTPUT_DIR} --should-add-debug-cases $MEMORY_PROFILE_ARG
     "
 
 end_time=$(date +%s)
