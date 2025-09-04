@@ -11,6 +11,7 @@ bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
 
 """
+import math
 import argparse
 import os
 import gc
@@ -72,6 +73,11 @@ def set_random_seed(seed, set_megatron: bool=True):
         from megatron.core import tensor_parallel
 
         tensor_parallel.model_parallel_cuda_manual_seed(seed)
+
+
+def log_memory_usage(message: str):
+    import d2.mem
+    d2.mem.log_memory_usage(message)
 
 
 class MegatronE2eWorker(MegatronBaseWorker):
@@ -192,8 +198,11 @@ class MegatronE2eWorker(MegatronBaseWorker):
         # thd layout
         total_seqlen = microbatches[0]['input_ids'].shape[0]
 
+        # from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
         def loss_func(logits):
             loss = logits.sum()  # no gradient, but can trigger backward
+            # Print the memory usage here
+            log_memory_usage("loss_func")
             return loss, {'loss': loss}
 
         def forward_step(batch_iter, model):
@@ -324,6 +333,7 @@ def init_megatron_e2e_test(
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=tp_size
     )
+    log_memory_usage("init_worker_torch_distributed")
     worker = init_worker_torch_distributed(
         world_size, buffer_size, worker_cls, parallel_config
     )
@@ -376,6 +386,8 @@ def init_wlbllm_e2e_test(
         # order="tp-cp-ep-dp-pp",
     )
     print("Communication groups initialized")
+
+    log_memory_usage("init_worker_torch_distributed")
     return worker
 
 
@@ -541,6 +553,7 @@ def test(args):
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
     rich.print(f"🟡 [Rank {worker.rank}] init done")
+    log_memory_usage("init done")
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
@@ -690,13 +703,14 @@ def test(args):
                 # print(f"🟡 [Rank {rank}] Before - assigning seq_lens={_seq_lens}")
                 # print(f"🟡 new_batch={new_batch}")
                 seq_lens = [new_batch[dp_rank]]
-                # print(f"🟡 [Rank {rank}] Taking seq_lens={seq_lens}")
 
             else:
-                seq_lens = _seq_lens[
-                    dp_rank * cp_size * 2: 
-                    (dp_rank + 1) * cp_size * 2
-                ]
+                seq_lens = _seq_lens
+                # seq_lens = _seq_lens[
+                #     dp_rank * cp_size * 2: 
+                #     (dp_rank + 1) * cp_size * 2
+                # ]
+            print(f"🟡 [Rank {rank}] Taking seq_lens={seq_lens}")
 
 
             doc_lens = flatten(seq_lens)
@@ -831,46 +845,86 @@ def test(args):
             _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
             _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
 
-            planner = Planner(world_size, parallel_config, model_config=model_config)
             
-            fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0)
-            fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1)
-
-
-            if rank % 8 == 0:
-                qkv_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[0].fa2a_metadata[1] // 1024 // 1024
-                qkv_fwd_fa2a_metadata__recv_transfer_sz_mb = fa2a_metadata_0[0].fa2a_metadata[3] // 1024 // 1024
-                attn_out_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[1] // 1024 // 1024
-                attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[3] // 1024 // 1024
-                        
-                # Print qkv_fwd_fa2a_metadata
-                rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.send_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
-                rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.recv_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
+            # Try different tolerance factors and see which one fits the buffer size.
+            # This will sacrifice performance for safety.
+            did_pass_overflow_check = False
+            required_buffer_size = []
+            for tolerance_factor in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+                planner = Planner(world_size, parallel_config, model_config=model_config, tolerance_factor=tolerance_factor)
                 
-                # Print attn_out_fwd_fa2a_metadata
-                rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.send_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__send_transfer_sz_mb)
-                rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.recv_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb)
-            # Check size:
-            def _check_overflow(fa2a_metadata):
-                send_sz = [torch.sum(m.fa2a_metadata[1][as_rank]).item() for m in fa2a_metadata]
-                # send_sz + sender_recv_offset = sender_recv_last_token
-                send_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank] for m in fa2a_metadata]
-                recv_sz = [torch.sum(m.fa2a_metadata[3][as_rank]).item() for m in fa2a_metadata]
-                max_send_sz = max(send_sz)
-                max_recv_sz = max(recv_sz)
+                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0)
+                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1)
+
+
+                if rank % 8 == 0:
+                    qkv_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[0].fa2a_metadata[1] // 1024 // 1024
+                    qkv_fwd_fa2a_metadata__recv_transfer_sz_mb = fa2a_metadata_0[0].fa2a_metadata[3] // 1024 // 1024
+                    attn_out_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[1] // 1024 // 1024
+                    attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[3] // 1024 // 1024
+                            
+                    # Print qkv_fwd_fa2a_metadata
+                    rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.send_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
+                    rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.recv_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
+                    
+                    # Print attn_out_fwd_fa2a_metadata
+                    rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.send_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__send_transfer_sz_mb)
+                    rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.recv_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb)
+
+                # Check size:
                 buffer_size = FastDispatcherWrapper.instance[0].buffer_size
-                assert buffer_size >= max_send_sz and buffer_size >= max_recv_sz, f"{buffer_size / 1024**3} GB buffer, {
-                    [s / 1024**3 for s in send_sz]} GB send sizes, {
-                    [sz / 1024**3 for sz in recv_sz]} GB recv sizes"
-                assert max(torch.max(o).item() for o in send_last_offset) <= buffer_size, f"{buffer_size / 1024**3} GB buffer, {[o / 1024**3 for o in send_last_offset]} GB send last offsets"
+                def _check_overflow(fa2a_metadata):
+                    send_sz = [torch.sum(m.fa2a_metadata[1][as_rank]).item() for m in fa2a_metadata]
+                    # send_sz + sender_recv_offset = sender_recv_last_token
+                    send_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank] for m in fa2a_metadata]
+                    recv_sz = [torch.sum(m.fa2a_metadata[3][as_rank]).item() for m in fa2a_metadata]
+                    max_send_sz = max(send_sz)
+                    max_recv_sz = max(recv_sz)
+                    
+                    rich.print(f"🟡 [Rank {rank}] Overflow check: {max_send_sz // 1024**3} GB, {max_recv_sz // 1024**3} GB recv size, {max(torch.max(o).item() for o in send_last_offset) // 1024**3} GB send last offset, {buffer_size / 1024**3} GB buffer size")
+
+                    max_size_provisioned = max(
+                        max_send_sz, max_recv_sz, max(torch.max(o).item() for o in send_last_offset)
+                    )
+                    if not (buffer_size >= max_size_provisioned):
+                        return False, max_size_provisioned
+                    return True, max_size_provisioned
+                    
+                    # assert buffer_size >= max_send_sz and buffer_size >= max_recv_sz, f"{buffer_size / 1024**3} GB buffer, {
+                    #     [s / 1024**3 for s in send_sz]} GB send sizes, {
+                    #     [sz / 1024**3 for sz in recv_sz]} GB recv sizes"
+                    # assert max(torch.max(o).item() for o in send_last_offset) <= buffer_size, f"{buffer_size / 1024**3} GB buffer, {[o / 1024**3 for o in send_last_offset]} GB send last offsets"
+
+                check_0, max_size_provisioned_0 = _check_overflow(fa2a_metadata_0)
+                check_1, max_size_provisioned_1 = _check_overflow(fa2a_metadata_1)
+                max_size_provisioned = max(max_size_provisioned_0, max_size_provisioned_1) / 1024**3
+                required_buffer_size.append(max_size_provisioned)
                 
-                
-                rich.print(f"🟡 [Rank {rank}] Overflow check passed: {max_send_sz} GB, {max_recv_sz} GB recv size, {max(torch.max(o).item() for o in send_last_offset)} GB send last offset, {buffer_size / 1024**3} GB buffer size")
+                if not (check_0 and check_1):
+                    rich.print(f"⚠️ [Rank {rank}] Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB. Retry...")
+                else:
+                    did_pass_overflow_check = True
+                    break
+                # rich.print("🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0")
+                # rich.print("🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_1")
             
-            _check_overflow(fa2a_metadata_0)
-            rich.print("🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0")
-            _check_overflow(fa2a_metadata_1)
-            rich.print("🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_1")
+            if not did_pass_overflow_check:
+                rich.print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
+                rich.print(f"🔴 [Rank {rank}] Specified buffer_size = {buffer_size / 1024**3} GB")
+                recommended_buffer_size = math.ceil(max_size_provisioned)
+                rich.print(f"🔴 [Rank {rank}] Force update buffer_size to = {recommended_buffer_size} GB")
+                buffer_size = recommended_buffer_size * 1024**3 # bytes
+
+                FastDispatcherWrapper.update_buffer_size(buffer_size)
+                # FastDispatcherWrapper.instance[0]._update_buffer_size(buffer_size)
+                # FastDispatcherWrapper.instance[1]._update_buffer_size(buffer_size)
+
+                rich.print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
+                buffer_size = FastDispatcherWrapper.instance[0].buffer_size
+                
+                # raise ValueError(f"[Rank {rank}] Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with all tolerance_factor with buffer_size {buffer_size / 1024**3} GB. Try a bigger buffer size instead. Inspected required_buffer_size = {required_buffer_size}")
+            
+            rich.print(f"🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0 and fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB")
 
 
             # params for ping-pong batch0
@@ -928,6 +982,7 @@ def test(args):
 
 
 
+        log_memory_usage("warmup start")
         if sample_id == 0:
             # Warmup
             warmup_times = 5
@@ -957,7 +1012,7 @@ def test(args):
                 sys.exit(1)
 
             
-            for warmup_idx in range(warmup_times):
+            for warmup_idx in range(max(warmup_times - 1, 0)):
                 ref = worker.forward_backward_batch(
                     microbatches=microbatches,
                     normal_forward_fn=normal_forward_fn,
@@ -969,6 +1024,7 @@ def test(args):
             torch.distributed.barrier()
             if rank == 0:
                 print("=" * 20 + "warmup done")
+        log_memory_usage("warmup done")
         
         # Real Experiment
         N = 3
@@ -983,12 +1039,14 @@ def test(args):
         # Calculate the average duration of the forward_backward_batch
         start_time = time.time()
         torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
-        for _ in range(N):
+        for repeat_idx in range(N):
+            log_memory_usage(f"forward_backward_batch:start(sample_id={sample_id},repeat={repeat_idx})")
             ref = worker.forward_backward_batch(
                 microbatches=microbatches,
                 normal_forward_fn=normal_forward_fn,
                 forward_only=False,
             )
+            log_memory_usage(f"forward_backward_batch:done(sample_id={sample_id},repeat={repeat_idx})")
         torch.cuda.nvtx.range_pop()
         
         torch.cuda.synchronize()
@@ -1103,14 +1161,11 @@ def test(args):
         
         rich.print(f"🟢 Benchmark results saved to: {output_file}")
 
-        # for idx, (sample, duration) in enumerate(zip(iterated_samples, sample_times)):
-        #     rich.print(f"🟢 Sample {idx}: {sample}, duration: {duration} ms")
+    # for idx, (sample, duration) in enumerate(zip(iterated_samples, sample_times)):
+    #     rich.print(f"🟢 Sample {idx}: {sample}, duration: {duration} ms")
 
-    
     # Cleanup and exit
-    rich.print(f"❄️ [Rank {rank}] Finished test and exit.")
-    
-    
+    rich.print(f"❄️ [Rank {rank}] Finished test and exit.")        
     # if False: # Only use it when force exit
     if args.force_exit: 
         print(f"[Rank {rank}] Starting aggressive cleanup process...")
@@ -1118,6 +1173,19 @@ def test(args):
 
 
 from torch.profiler import profile, record_function, ProfilerActivity
+
+import d2.mem
+def save_memory_usage_to_file(memory_usage_dir: str):
+    os.makedirs(memory_usage_dir, exist_ok=True)
+    
+    rank = torch.distributed.get_rank()
+    memory_usage: list[dict] = d2.mem.get_memory_usage()
+    memory_usage_output_file = os.path.join(memory_usage_dir, f"mem.rank{rank}.jsonl")
+    with open(memory_usage_output_file, 'w') as f:
+        for memory_usage_item in memory_usage:
+            f.write(json.dumps(memory_usage_item) + '\n')
+    rich.print(f"🟢 Memory usage saved to: {memory_usage_output_file}")
+    return
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1142,9 +1210,13 @@ if __name__ == "__main__":
     parser.add_argument("--force-exit", action="store_true")
     parser.add_argument("--should-add-debug-cases", action="store_true")
     parser.add_argument("--should-profile-memory", type=str, default=None)
-    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)    
     
     args = parser.parse_args()
+    print(f"🟡 Args: {args}")
+
+    # "D2_SKIP_FLOAT_CONVERSION"
+    os.environ["D2_SKIP_FLOAT_CONVERSION"] = "1"
 
     if args.output_dir is None:
         args.output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -1156,8 +1228,14 @@ if __name__ == "__main__":
     should_profile_memory = args.should_profile_memory
     if should_profile_memory:
         torch.cuda.memory._record_memory_history()
+        mem_snapshots_dir = os.path.join(args.output_dir, "mem_snapshots")
+        os.makedirs(mem_snapshots_dir, exist_ok=True)
+        print(f"🟡 Will save mem snapshots to: {mem_snapshots_dir}")
+        pass
         pass
 
+    memory_usage_output_dir = os.path.join(args.output_dir, "mem")
+    os.makedirs(memory_usage_output_dir, exist_ok=True)
     if should_profile_memory:
         with torch.profiler.profile(
             activities=[
@@ -1173,9 +1251,18 @@ if __name__ == "__main__":
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                pass
+            finally:
+                save_memory_usage_to_file(memory_usage_output_dir)
     else:
-        test(args)
+        try:
+            test(args)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise e
+        finally:
+            save_memory_usage_to_file(memory_usage_output_dir)
+        
     
     if should_profile_memory:
         mode = args.mode
@@ -1186,18 +1273,12 @@ if __name__ == "__main__":
         num_layers = args.num_layers
 
         rank = torch.distributed.get_rank()
+        mem_snapshot_output_path = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.pickle")
+        memory_timeline_output_path = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.html")
+        print(f"🟡 Will save mem snapshot to: {mem_snapshot_output_path}")
+        print(f"🟡 Will save mem timeline to: {memory_timeline_output_path}")
         if rank % 8 == 0:
             print("Dumping memory snapshot")
-
-            mem_snapshots_dir = os.path.join(args.output_dir, "mem_snapshots")
-            os.makedirs(mem_snapshots_dir, exist_ok=True)
-            
-            stem = f"{now_ts}.mem_snapshot.{mode}.rank{rank}.batch{batch_size}.tokens{num_tokens}.cp{cp_degree}.tp{tp_size}.layers{num_layers}"
-            mem_snapshot_output_path = os.path.join(mem_snapshots_dir, f"{stem}.pickle")
-            memory_timeline_output_path = os.path.join(mem_snapshots_dir, f"{stem}.html")
-
-
-            now_ts = get_current_timestamp()
             torch.cuda.memory._dump_snapshot(mem_snapshot_output_path)
             prof.export_memory_timeline(memory_timeline_output_path, device=torch.cuda.current_device())
             print("Memory snapshot dumped")

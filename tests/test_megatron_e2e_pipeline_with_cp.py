@@ -1,6 +1,12 @@
 """
 Debug example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
+
+Planner example:
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner
+
+Planner + CP layout example:
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner --num-batches 1 --num-tokens 2048
 """
 import argparse
 from functools import partial
@@ -16,6 +22,7 @@ from transformers import AutoConfig
 from d2.runtime.compute_metadata import get_attn_metadata
 from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
 from d2.runtime.megatron_patch.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
+from d2.planner.planner import cp_list_to_mlp_list
 
 from test_util import ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch_pipeline_tick
 from test_megatron_e2e import MegatronE2eWorker as BaseMegatronE2eWorker, set_random_seed
@@ -176,6 +183,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
                            hidden_size_k_tp: int, element_size: int,
                            num_head_in_dtype: int, tp_size: int, dp_size: int,
                            num_token_per_rank: int,
+                           num_batches: int = None,
                            use_planner: bool=False):
     tick_per_rank_doc_lens = None
     bwd_metadata = []
@@ -202,10 +210,20 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
             tp_size=tp_size,
             dp_size=dp_size,
             num_token_per_rank=num_token_per_rank,
+            num_batches=num_batches,
             use_planner=use_planner
         )
-        this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
+        
+        # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, so each rank knows its number of tokens.
+        #   Example1 DP case:
+        # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 256],[128, 384],[512], [10, 502] ]
+        # tick_per_rank_doc_lens mlp list : [[8], [8], [8], [8], [256, 256],[128, 384],[512], [10, 502] ]
+        #   Example2 CP case:
+        # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 768],[512, 10, 502] ]
+        # tick_per_rank_doc_lens mlp list: [[8], [8], [8], [8], [256, 128, 128], [256, 256], [512], [10, 502]]
 
+        tick_per_rank_doc_lens = cp_list_to_mlp_list(tick_per_rank_doc_lens, as_world_size, num_token_per_rank)
+        this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
         bwd_packed_seq_params = PackedSeqParams(
             qkv_format="thd", **fa_bwd_params[as_rank]
         )
@@ -261,11 +279,10 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
 def test(args):
     seed = args.seed
     # test scale
-    num_tokens = args.num_tokens   
+    num_tokens = args.num_tokens
     max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
-    total_seq_len = args.num_tokens 
-    num_token_per_rank = num_tokens      # num_token_per_rank = num_tokens in DP case. CP case, num_token_per_rank need to be deduced.
+    
     # parallelization
     tp_size = args.tp_size
     pp_size = args.pp_size
@@ -273,6 +290,24 @@ def test(args):
     assert world_size % (tp_size * pp_size) == 0
     dp_size = world_size // (tp_size * pp_size)
 
+    assert args.num_microbatch >= pp_size, "num_microbatch need bigger than pp_size. Current num_microbatch: {args.num_microbatch}, pp size: {pp_size}"
+
+    # Set num_batches. 
+    # If None, we use MLP-DP. will get DP number of new batches per tick.
+    # If set, num_batches < dp_size && dp_size % num_batches == 0, Will get num_batches number of List per tick.
+    if args.num_batches == None:
+        num_batches = dp_size
+        num_token_per_rank = args.num_tokens
+        total_seq_len = args.num_tokens # when no CP, total_seq_len == args.num_tokens
+        print(f"MLP-DP, num_batches: {num_batches}, num_token_per_rank: {num_token_per_rank}, total_seq_len: {total_seq_len}")
+    else:
+        assert args.num_batches <= dp_size, "num-batches must be <= dp_size"
+        assert dp_size % args.num_batches == 0, "dp_size must be divisible by num-batches"
+        num_batches = args.num_batches
+        num_token_per_rank = args.num_tokens * num_batches // dp_size
+        total_seq_len = args.num_tokens * num_batches  # total_seq_len is max possible seq_len.
+        if args.num_batches <= dp_size:
+            print(f"MLP-CP, num_batches: {num_batches}, num_token_per_rank: {num_token_per_rank}, total_seq_len: {total_seq_len}")
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
@@ -311,19 +346,27 @@ def test(args):
         from global_batch_provider import setup_global_batch
         setup_global_batch(total_seq_len=total_seq_len)
         
+    # this total_seq_len is token per rank.
+    # Some explanations of the parameters inside `create_pp_microbatches`:
+    # - num_microbatch: 
+    #   Iterate `num_microbatch + pp_degree - 1` to create each tick's metadata
+    # - num_batches: 
+    #   For each tick, getting `num_batches` number of list from the data loader (GLOBAL_BATCH iterator). 
+    #   This is the parameter controlling the number of batches per tick.
+    # 
     microbatches_0 = create_pp_microbatches(
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-        tp_size, dp_size, num_token_per_rank,
-        args.use_planner,
+        tp_size, dp_size, 
+        num_token_per_rank, num_batches, args.use_planner,  
     )
     microbatches_1 = create_pp_microbatches(
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-        tp_size, dp_size, num_token_per_rank,
-        args.use_planner,
+        tp_size, dp_size, 
+        num_token_per_rank, num_batches, args.use_planner,
     )
     set_random_seed(seed, set_megatron=True)
     microbatches = []
@@ -402,6 +445,7 @@ def test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1024)
+    parser.add_argument("--num-batches", type=int)  # this is for cp. set num_batches and num_tokens to control cp doc length.
     parser.add_argument("--cp-degree", type=int, default=2)
     parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)

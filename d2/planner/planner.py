@@ -5,13 +5,12 @@ from typing import Any, Dict, List, Optional
 
 import rich
 import torch
+from d2.runtime.compute_metadata import from_planner_output
+from d2.runtime.shard_info import (ShardInfo, handle_planner_metadata,
+                                   items_into_shardinfos, plan_to_metadata)
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-
-from d2.runtime.compute_metadata import from_planner_output
-from d2.runtime.shard_info import (ShardInfo, handle_planner_metadata,
-                                   items_into_shardinfos)
 
 K = 1024
 
@@ -49,6 +48,73 @@ def batch_to_items_class(batches: list[list[int]], model_config=None):
             seqid += 1
     return items
 
+def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int, as_world_size: int, model_config: dict):
+
+    items = []
+    seqid = 0
+    rank_budgets = [num_tokens_per_rank] * as_world_size
+    current_rank_idx = 0
+
+    for batch in batches:
+        if len(batch) == 1 and batch[0] < num_tokens_per_rank:
+            while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
+                current_rank_idx += 1
+            assert rank_budgets[current_rank_idx] == num_tokens_per_rank, "dummy doc should put on a empty rank"
+            # dummy doc, this rank only put this dummy item.
+            doc_len = batch[0]
+            item_dict = {'q': doc_len, 'kv': doc_len}
+            new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                            item_dict, is_original=True)
+            items.append(new_item)
+            current_rank_idx += 1
+            seqid += 1
+        else:
+            for doc_length in batch:
+                doc_len = doc_length
+                remaining_len = doc_len
+                head_prefix_len = 0
+                tail_suffix_start_pos = doc_len
+                is_original_flag = True
+
+                while remaining_len > 0:
+                    while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
+                        current_rank_idx += 1
+                    if current_rank_idx >= as_world_size:
+                        raise ValueError(f"Not enough space for seqid {seqid}, remaining_len {remaining_len}.")
+                    
+                    chunk_size = min(remaining_len, rank_budgets[current_rank_idx])
+                    
+                    if remaining_len == doc_len and chunk_size == doc_len:
+                        item_dict = {'q': doc_len, 'kv': doc_len}
+                        new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                                        item_dict, is_original=True)
+                        items.append(new_item)
+                    else:
+                        q_len_head = chunk_size // 2
+                        q_len_tail = chunk_size - q_len_head
+                        
+                        new_head_kv = head_prefix_len + q_len_head
+                        head_item = {'q': q_len_head, 'kv': new_head_kv}
+                        tail_item = {'q': q_len_tail, 'kv': tail_suffix_start_pos}
+
+                        new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                                        head_item, tail_item, is_original=is_original_flag)
+                        items.append(new_item)
+
+                        head_prefix_len = new_head_kv
+                        tail_suffix_start_pos -= q_len_tail
+                        is_original_flag = False
+
+                    rank_budgets[current_rank_idx] -= chunk_size
+                    remaining_len -= chunk_size
+
+                seqid += 1
+        
+    return items
+
+
+
+
 
 """
 Partition and place a batch of variable-length documents onto GPU ranks under a
@@ -63,7 +129,7 @@ Steps
 Args
   batches : List[List[int]]
       Outer list = per-sequence groups, inner list = document lengths in tokens.
-  num_batched_token : int
+  num_tokens_per_rank : int
       Maximum tokens that one rank can accept in this micro-batch.
   DP_degree : int
       Number of data-parallel ranks.
@@ -78,7 +144,7 @@ Examples
 ----------
 Example 1 : documents fit into DP ranks
     batch           = [[16K], [8K, 8K], [4K]*4, [2K]*8]
-    num_batched_token = 16K
+    num_tokens_per_rank = 16K
     DP_degree         = 4
 
     Item0  q=16K kv=16K  gpu=0 seq=0 src=0 is_orig=True
@@ -86,7 +152,7 @@ Example 1 : documents fit into DP ranks
     ...
 Example 2 : CP split required
     batch           = [[32K], [8K, 8K], [4K]*4]
-    num_batched_token = 16K
+    num_tokens_per_rank = 16K
     DP_degree         = 4
 
     # 32K doc split across 2 ranks (16K each)
@@ -103,13 +169,13 @@ Example 2 : CP split required
     Item3  q=8K kv=8K  gpu=2 seq=2 src=2 is_orig=True
     ...
 """
-def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_degree: int, model_config: dict):
+def batch_to_items_general(batches: List[List[int]], num_tokens_per_rank: int, DP_degree: int, model_config: dict):
     """
     Put a batch of documents onto GPU ranks and return a list of Item objects.
     Args:
         batches: List[List[int]]
             Outer list = per-sequence groups, inner list = document lengths in tokens.
-        num_batched_token: int
+        num_tokens_per_rank: int
             Maximum tokens that one rank can accept in this micro-batch.
         DP_degree: int
             Number of data-parallel ranks.
@@ -124,7 +190,7 @@ def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_
     """
     items = []
     seqid = 0
-    rank_budgets = [num_batched_token] * DP_degree
+    rank_budgets = [num_tokens_per_rank] * DP_degree
     current_rank_idx = 0
 
     # Flatten the batches into a list of dicts, each dict contains the length of the document.
@@ -175,6 +241,64 @@ def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_
         seqid += 1
         
     return items
+
+from collections import deque
+
+
+def cp_list_to_mlp_list(cp_rank_doc_lens: List[List[int]], as_world_size: int, num_token_per_rank: int) -> List[List[int]]:
+    final_mlp_lists: List[List[int]] = []
+    current_rank: List[int] = []
+
+    for doc_list_per_rank in cp_rank_doc_lens:
+        docs_queue = deque(doc_list_per_rank)
+
+        while docs_queue:
+            doc_len = docs_queue.popleft()
+            is_split_doc = False
+
+            while True:
+                space_left = num_token_per_rank - sum(current_rank)
+
+                if space_left == 0:
+                    if current_rank:
+                        final_mlp_lists.append(current_rank)
+                    current_rank = []
+                    space_left = num_token_per_rank
+
+                if doc_len <= space_left:
+                    if is_split_doc:
+                        head = doc_len // 2
+                        tail = doc_len - head
+                        current_rank.extend([head, tail])
+                    else:
+                        current_rank.append(doc_len)
+                    break
+
+                if space_left > 0:
+                    head1 = space_left // 2
+                    tail1 = space_left - head1
+                    current_rank.extend([head1, tail1])
+                
+                final_mlp_lists.append(current_rank)
+                current_rank = []
+                
+                doc_len -= space_left
+                is_split_doc = True
+
+        if current_rank:
+            final_mlp_lists.append(current_rank)
+            current_rank = []
+
+    while len(final_mlp_lists) < as_world_size:
+        final_mlp_lists.append([])
+    
+    if len(final_mlp_lists) > as_world_size:
+        final_mlp_lists = final_mlp_lists[:as_world_size]
+    
+    # for l in final_mlp_lists, sum(l) should be either num_token_per_rank or dummy(tp_size).
+    assert len(final_mlp_lists) == as_world_size, f"final_mlp_lists should contain {as_world_size} number of List. But get {len(final_mlp_lists)}. final_mlp_list: {final_mlp_lists}"
+    return final_mlp_lists
+
 
 
 
