@@ -593,18 +593,18 @@ def create_one_batch_balanced_flops(
     # os.environ["D2_FA2A_DISABLE_SEND_RECV"]
     if os.environ.get("D2_FA2A_DISABLE_SEND_RECV", "0") == "1":
         rich.print("⚠️ D2_FA2A_DISABLE_SEND_RECV is set, setting sender_transfer_sz and receiver_transfer_sz to 0")
-        qkv_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
-        qkv_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
-        qkv_fwd_fa2a_metadata.my_rank_send_sz = 0
-        qkv_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
-        qkv_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
-        qkv_rev_fa2a_metadata.my_rank_send_sz = 0
-        attn_out_fwd_fa2a_metadata.fa2a_metadata[1][:] = 0
-        attn_out_fwd_fa2a_metadata.fa2a_metadata[3][:] = 0
-        attn_out_fwd_fa2a_metadata.my_rank_send_sz = 0
-        attn_out_rev_fa2a_metadata.fa2a_metadata[1][:] = 0
-        attn_out_rev_fa2a_metadata.fa2a_metadata[3][:] = 0
-        attn_out_rev_fa2a_metadata.my_rank_send_sz = 0
+        qkv_fwd_fa2a_metadata.fa2a_metadata[1][:] = 1
+        qkv_fwd_fa2a_metadata.fa2a_metadata[3][:] = 1
+        qkv_fwd_fa2a_metadata.my_rank_send_sz = 1
+        qkv_rev_fa2a_metadata.fa2a_metadata[1][:] = 1
+        qkv_rev_fa2a_metadata.fa2a_metadata[3][:] = 1
+        qkv_rev_fa2a_metadata.my_rank_send_sz = 1
+        attn_out_fwd_fa2a_metadata.fa2a_metadata[1][:] = 1
+        attn_out_fwd_fa2a_metadata.fa2a_metadata[3][:] = 1
+        attn_out_fwd_fa2a_metadata.my_rank_send_sz = 1
+        attn_out_rev_fa2a_metadata.fa2a_metadata[1][:] = 1
+        attn_out_rev_fa2a_metadata.fa2a_metadata[3][:] = 1
+        attn_out_rev_fa2a_metadata.my_rank_send_sz = 1
 
 
     attn_metadata = (
@@ -1097,10 +1097,22 @@ def test(args):
 
             mlp_seq_params_0 = get_attn_metadata(mlp_shard_len_0[as_rank], get_packed_seq_params=True)
             mlp_seq_params_1 = get_attn_metadata(mlp_shard_len_1[as_rank], get_packed_seq_params=True)
+
+            def debug_set_metadata_transfer_size_to_0(ping_pang_params: 'PingPangSingleStepPackedSeqParams'):
+                for param in [
+                    ping_pang_params.qkv_fwd_metadata,
+                    ping_pang_params.qkv_bwd_metadata,
+                    ping_pang_params.attn_out_fwd_metadata,
+                    ping_pang_params.attn_out_bwd_metadata,
+                ]:
+                    param.fa2a_metadata[1][:] = 1
+                    param.fa2a_metadata[3][:] = 1
+                    param.my_rank_send_sz = 1
+                return
             
-            # old approach to generate metadata.
-            # ping_pang_params_0, mlp_seq_params_0 = items_to_metadata(_items_0)
-            # ping_pang_params_1, mlp_seq_params_1 = items_to_metadata(_items_1)
+            if os.environ.get("EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0", "0") == "1":
+                debug_set_metadata_transfer_size_to_0(ping_pang_params_0)
+                debug_set_metadata_transfer_size_to_0(ping_pang_params_1)
 
             if rank % 8 == 0:
                 rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_fwd_metadata =", ping_pang_params_0.qkv_fwd_metadata.__better_print__())
