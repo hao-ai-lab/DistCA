@@ -13,8 +13,6 @@
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
 #SBATCH --exclude=fs-mbz-gpu-684,fs-mbz-gpu-697,fs-mbz-gpu-286,fs-mbz-gpu-877,fs-mbz-gpu-757,fs-mbz-gpu-806,fs-mbz-gpu-377,fs-mbz-gpu-906,fs-mbz-gpu-168,fs-mbz-gpu-708,fs-mbz-gpu-868
-#SBATCH --mail-user=seiners_uncut_9y@icloud.com
-#SBATCH --mail-type=END,FAIL
 #SBATCH --partition=lowprio 
 #SBATCH --qos=lowprio
 #SBATCH --requeue 
@@ -306,7 +304,7 @@ SRUN_BASE=(
   # --gpus-per-task=${GPUS_PER_NODE}     # <= crucial
   # --gpu-bind=per_task:${GPUS_PER_NODE} # <= bind GPUs to the task
   --kill-on-bad-exit=1
-  --jobid=${JOBID:-SLURM_JOB_ID}
+  --jobid=${JOBID:-$SLURM_JOB_ID}
   --mem=0 # inherit the memory from the salloc
 )
 

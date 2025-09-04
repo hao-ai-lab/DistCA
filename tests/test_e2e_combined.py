@@ -78,10 +78,18 @@ def set_random_seed(seed, set_megatron: bool=True):
         tensor_parallel.model_parallel_cuda_manual_seed(seed)
 
 
-def log_memory_usage(message: str):
+def log_memory_usage(message: str, force_print=True):
     import d2.mem
     d2.mem.log_memory_usage(message)
 
+    if force_print:
+        (
+            allocated_cur,
+            allocated_peak,
+            total_alloc,
+        ) = d2.mem.get_torch_cuda_memory_usage()
+        print(f"Ⓜ️ [{message}] Allocated: {(allocated_cur/ 1024):.2f} GB | Peak: {(allocated_peak/ 1024):.2f} GB | Total alloc (approx): {(total_alloc/ 1024):.2f} GB")
+    return
 
 class MegatronE2eWorker(MegatronBaseWorker):
     def __init__(self, rank: int, world_size: int):

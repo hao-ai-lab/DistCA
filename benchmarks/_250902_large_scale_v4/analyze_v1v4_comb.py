@@ -5,7 +5,7 @@ import pandas as pd
 import glob
 
 # %%
-log_path = "logs.v4"
+log_path = "logs.v1.v4.comb"
 a = os.listdir(log_path)
 len(a)
 # %%
@@ -367,12 +367,6 @@ df_display
 # %%
 # Save this to a file
 df_display.to_csv("analyze_status.tsv", index=False, sep="\t")
-
-# %%
-df_display
-
-# %%
-
 # %%
 import numpy as np
 speedups = []
@@ -497,69 +491,4 @@ print(a)
 with open("success_eids.txt", "w") as f:
     f.write(a)
 
-# %%
-
-# %%
-
-# Filter only d2 rows (modji == 🟦) for each eid
-df_display_d2_only = df_display[
-    (df_display['modji'] == '🟦') & (df_display['success'].str.contains('✅') )
-]
-df_display_d2_only['speedup'] = df_display_d2_only['speedup'].str.replace(' (🟢)', '').str.replace(' (❌)', '')
-# drop the rows where speedup is empty string
-df_display_d2_only = df_display_d2_only[df_display_d2_only['speedup'].str.strip() != '']
-# for each group (by gid), take the value where the speedup is max
-df_display_d2_only = df_display_d2_only.groupby('gid').apply(lambda x: x.loc[x['speedup'].idxmax()])
-# only retain the columns: 
-# ['gid', 'modji', 'batch_size', 'num_layers', 'speedup']
-df_display_d2_only = df_display_d2_only[['gid', 'modji', 'batch_size', 'num_layers', 'speedup']]
-df_display_d2_only.to_csv("d2_only_max_speedup.tsv", index=False, sep="\t")
-df_display_d2_only
-# %%
-
-# Filter only d2 rows (modji == 🟦) for each eid
-df_display_d2_only = df_display[
-    (df_display['modji'] == '🟥') & (df_display['success'].str.contains('oom') )
-]
-
-df_display_d2_only_2 = df_display_d2_only[[
-    'num_layers', 
-    'batch_size', 
-    'NNODES', 'NUM_TOKENS', 'CP_SIZE', 'MODE',
-    'success', 
-    'gid', 
-    'eid', 
-    'exp_name', 
-]]
-df_display_d2_only_2 = df_display_d2_only_2[
-    df_display_d2_only_2['NNODES'] == df_display_d2_only_2['CP_SIZE'] 
-]
-
-df_display_d2_only_2 = df_display_d2_only_2.drop_duplicates()
-df_display_d2_only_2 = df_display_d2_only_2.sort_values(by=['num_layers', 'NNODES', 'NUM_TOKENS', 'batch_size'], ascending=True)
-df_display_d2_only_2
-# %%
-
-
-# Filter only d2 rows (modji == 🟦) for each eid
-df_display_d2_only = df_display[
-    (df_display['modji'] == '🟥')
-]
-
-df_display_d2_only_2 = df_display_d2_only[[
-    'num_layers', 
-    'batch_size', 
-    'NNODES', 'NUM_TOKENS', 'CP_SIZE', 'MODE',
-    'success', 
-    'gid', 
-    'eid', 
-    'exp_name', 
-]]
-df_display_d2_only_2 = df_display_d2_only_2[
-    df_display_d2_only_2['NNODES'] == df_display_d2_only_2['CP_SIZE'] 
-]
-
-df_display_d2_only_2 = df_display_d2_only_2.drop_duplicates()
-df_display_d2_only_2 = df_display_d2_only_2.sort_values(by=['num_layers', 'NNODES', 'NUM_TOKENS', 'batch_size'], ascending=True)
-df_display_d2_only_2
 # %%

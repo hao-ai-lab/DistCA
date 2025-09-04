@@ -7,6 +7,17 @@ import os
 memory_usage = []
 
 
+def get_torch_cuda_memory_usage():
+    device = torch.cuda.current_device()
+    allocated_cur = torch.cuda.memory_allocated(device) / (1024 ** 2) # MB
+    allocated_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+    total_alloc = (allocated_cur + torch.cuda.memory_reserved(device) / (1024 ** 2))
+    return (
+        allocated_cur,
+        allocated_peak,
+        total_alloc,
+    )
+
 def log_memory_usage(message: str):
     
     global memory_usage
@@ -26,10 +37,7 @@ def log_memory_usage(message: str):
     # if rank % 8 != 0:
     #     return
 
-    device = torch.cuda.current_device()
-    allocated_cur = torch.cuda.memory_allocated(device) / (1024 ** 2) # MB
-    allocated_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-    total_alloc = (allocated_cur + torch.cuda.memory_reserved(device) / (1024 ** 2))
+    allocated_cur, allocated_peak, total_alloc = get_torch_cuda_memory_usage()
 
     print(f"Ⓜ️ [{message}] Allocated: {(allocated_cur/ 1024):.2f} GB | "
           f"Peak: {(allocated_peak/ 1024):.2f} GB | "
