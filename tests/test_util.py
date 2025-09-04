@@ -510,7 +510,8 @@ def random_tick_shard_from_doclens(
         per_rank_shard_lens, world_size,
     )
 
-# This function world size is actually as_world_size.
+
+# In this function, world size is actually as_world_size.
 def create_qkv_dispatch_pipeline_tick(
     world_size: int, total_num_token: int, num_docs: int, max_cp_degree: int,
     hidden_size_q: int, hidden_size_k: int,

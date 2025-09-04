@@ -646,6 +646,7 @@ def test(args):
     filter_threshold = args.filter_threshold
     filter_ratio = args.filter_ratio
     should_add_debug_cases = args.should_add_debug_cases
+    resend_qkv = args.should_resend_qkv
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
@@ -656,6 +657,16 @@ def test(args):
     normal_forward_fn = (mode in ["baseline", "wlbllm"])
     # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
     os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
+
+    # config = dict(
+    #     mode=mode, tp_size=tp_size, 
+    #     dp_size=dp_size, 
+    #     cp_size=cp_degree, 
+    #     num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, 
+    #     max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, 
+    #     replan_iter=replan_iter, elongate_factor=elongate_factor,
+    # )
+    # log_to_console_and_file(f"🟢 Test Config: {config}")
 
 
     if mode == "wlbllm":
@@ -694,6 +705,9 @@ def test(args):
             world_size, max_cp_degree * 1, tp_size,
             dtype, MegatronE2eWorker
         )
+
+    memory_log_output_dir = os.path.join(output_dir, "mem-log")
+    enable_memory_usage_logging(memory_log_output_dir)
 
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
@@ -998,8 +1012,8 @@ def test(args):
             for tolerance_factor in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
                 planner = Planner(world_size, parallel_config, model_config=model_config, tolerance_factor=tolerance_factor)
                 
-                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0)
-                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1)
+                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv)
+                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv)
 
 
                 if rank % 8 == 0:
@@ -1026,7 +1040,7 @@ def test(args):
                     max_send_sz = max(send_sz)
                     max_recv_sz = max(recv_sz)
                     
-                    rich.print(f"🟡 [Rank {rank}] Overflow check: {max_send_sz // 1024**3} GB, {max_recv_sz // 1024**3} GB recv size, {max(torch.max(o).item() for o in send_last_offset) // 1024**3} GB send last offset, {buffer_size / 1024**3} GB buffer size")
+                    rich.print(f"🟡 [Rank {rank}] Overflow check: {max_send_sz / 1024**3:.2f} GB, {max_recv_sz / 1024**3:.2f} GB recv size, {max(torch.max(o).item() for o in send_last_offset) / 1024**3:.2f} GB send last offset, {buffer_size / 1024**3:.2f} GB buffer size")
 
                     max_size_provisioned = max(
                         max_send_sz, max_recv_sz, max(torch.max(o).item() for o in send_last_offset)
@@ -1074,11 +1088,11 @@ def test(args):
 
             # params for ping-pong batch0
             ping_pang_params_0 = get_single_step_packed_seq_params(
-                fa2a_metadata_0, as_attn_metadata_0, as_rank
+                fa2a_metadata_0, as_attn_metadata_0, as_rank, resend_qkv=resend_qkv
             )
             # params for ping-pong batch1
             ping_pang_params_1 = get_single_step_packed_seq_params(
-                fa2a_metadata_1, as_attn_metadata_1, as_rank
+                fa2a_metadata_1, as_attn_metadata_1, as_rank, resend_qkv=resend_qkv
             )
 
             mlp_seq_params_0 = get_attn_metadata(mlp_shard_len_0[as_rank], get_packed_seq_params=True)
@@ -1332,6 +1346,16 @@ def save_memory_usage_to_file(memory_usage_dir: str):
     rich.print(f"🟢 Memory usage saved to: {memory_usage_output_file}")
     return
 
+
+def enable_memory_usage_logging(memory_usage_dir: str):
+    os.makedirs(memory_usage_dir, exist_ok=True)
+    rank = torch.distributed.get_rank()
+    memory_usage_log_file = os.path.join(memory_usage_dir, f"mem.rank{rank}.log.jsonl")
+    with open(memory_usage_log_file, 'w') as f:
+        pass
+    d2.mem.set_memory_usage_log_file(memory_usage_log_file)
+    pass
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm"], default="baseline", 
@@ -1355,6 +1379,7 @@ if __name__ == "__main__":
     parser.add_argument("--force-exit", action="store_true")
     parser.add_argument("--should-add-debug-cases", action="store_true")
     parser.add_argument("--should-profile-memory", type=str, default=None)
+    parser.add_argument("--should-resend-qkv", action="store_true", help="Whether to resend qkv in the backward pass")
     parser.add_argument("--output-dir", type=str, default=None)    
     
     args = parser.parse_args()
@@ -1368,6 +1393,7 @@ if __name__ == "__main__":
         pass
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
+
         
 
     should_profile_memory = args.should_profile_memory
@@ -1380,7 +1406,10 @@ if __name__ == "__main__":
         pass
 
     memory_usage_output_dir = os.path.join(args.output_dir, "mem")
+    memory_log_output_dir = os.path.join(args.output_dir, "mem-log")
     os.makedirs(memory_usage_output_dir, exist_ok=True)
+    os.makedirs(memory_log_output_dir, exist_ok=True)
+    
     if should_profile_memory:
         with torch.profiler.profile(
             activities=[

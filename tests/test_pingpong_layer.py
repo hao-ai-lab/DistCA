@@ -24,13 +24,14 @@ torchrun --nnodes 1 --nproc_per_node 4 test_pingpong_layer.py \
 
 import argparse
 
+from megatron.core.packed_seq_params import PackedSeqParams
 import torch
 
 from d2.runtime.megatron_patch.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
-from d2.runtime.compute_metadata import from_planner_output, get_attn_metadata
+from d2.runtime.compute_metadata import from_planner_output
 
 from test_util import random_shard_info_linear_layout_dp
-from test_megatron_layer import MegatronLayerWorker, init_megatron_test
+from test_megatron_layer import MegatronLayerWorker
 
 
 class PingPangLayerWorker(MegatronLayerWorker):
@@ -105,7 +106,7 @@ def create_one_batch(
 
 # TODO(yonghao): move this to planner / d2/utils.py because it's not only used for test.
 def get_single_step_packed_seq_params(
-    fa2a_metadata, attn_metadata, rank: int
+    fa2a_metadata, attn_metadata, rank: int, resend_qkv: bool=False
 ):
     (
         qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
@@ -118,6 +119,9 @@ def get_single_step_packed_seq_params(
         qkv_bwd_metadata=qkv_rev_fa2a_metadata.get_slice(rank),
         attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
         attn_out_bwd_metadata=attn_out_rev_fa2a_metadata.get_slice(rank),
+        bwd_packed_seq_params=PackedSeqParams(
+            qkv_format="thd", **attn_metadata[rank]
+        ) if resend_qkv else None,
     )
     return ping_pang_params
 

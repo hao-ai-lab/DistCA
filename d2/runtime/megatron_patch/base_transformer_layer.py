@@ -153,6 +153,7 @@ class TransformerLayer(MegatronTransformerLayer):
         # ==================================
         log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(start)")
         if self.self_attention.checkpoint_core_attention and self.training:
+            log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(before checkpointed attention forward)")
             core_attn_out = self.self_attention._checkpointed_attention_forward(
                 query,
                 key,
@@ -162,12 +163,14 @@ class TransformerLayer(MegatronTransformerLayer):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
+            log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(after checkpointed attention forward)")
         else:
             # Static batching attention kernel.
             # NOTE(yonghao): megatron.core.extensions.transformer_engine.TEDotProductAttention
             # core impl in te.pytorch.DotProductAttention
             # use `set_context_parallel_group` to disable context parallel
             #   cp_size = get_distributed_world_size(self.cp_group)
+            log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(before core attention forward)")
             core_attn_out = self.self_attention.core_attention(
                 query,
                 key,
@@ -177,6 +180,7 @@ class TransformerLayer(MegatronTransformerLayer):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
+            log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(after core attention forward)")
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -184,7 +188,7 @@ class TransformerLayer(MegatronTransformerLayer):
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
-        log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(after core attention)")
+        log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(end)")
         return core_attn_out
 
     def _forward_post_core_attn(

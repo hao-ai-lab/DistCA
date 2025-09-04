@@ -1,11 +1,26 @@
 import torch
 import torch.distributed
-
+import json
 import os
+import inspect
+
+def get_caller_info(depth=1):
+    frame = inspect.currentframe()
+    try:
+        for _ in range(depth):
+            frame = frame.f_back
+        return frame.f_code.co_filename, frame.f_lineno
+    finally:
+        del frame  # avoid reference cycles
 
 
 memory_usage = []
+memory_usage_log_file = None
 
+
+def set_memory_usage_log_file(x: str):
+    global memory_usage_log_file
+    memory_usage_log_file = x
 
 def log_memory_usage(message: str):
     
@@ -26,6 +41,9 @@ def log_memory_usage(message: str):
     # if rank % 8 != 0:
     #     return
 
+    caller_info = get_caller_info(3)
+    message += f" ({caller_info[0]}:{caller_info[1]})"
+
     device = torch.cuda.current_device()
     allocated_cur = torch.cuda.memory_allocated(device) / (1024 ** 2) # MB
     allocated_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
@@ -34,13 +52,19 @@ def log_memory_usage(message: str):
     print(f"Ⓜ️ [{message}] Allocated: {(allocated_cur/ 1024):.2f} GB | "
           f"Peak: {(allocated_peak/ 1024):.2f} GB | "
           f"Total alloc (approx): {(total_alloc/ 1024):.2f} GB")
-
-    memory_usage.append({
+    
+    new_entry = {
         "message": message,
         "allocated_cur": allocated_cur,
         "allocated_peak": allocated_peak,
         "total_alloc": total_alloc,
-    })
+    }
+    memory_usage.append(new_entry)
+    
+    global memory_usage_log_file
+    if memory_usage_log_file is not None:
+        with open(memory_usage_log_file, 'a') as f:
+            f.write(json.dumps(new_entry) + "\n")
 
 
 def get_memory_usage():
