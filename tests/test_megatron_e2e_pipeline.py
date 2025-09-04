@@ -289,6 +289,9 @@ def test(args):
     world_size = args.num_nodes * args.num_gpus_per_node
     assert world_size % (tp_size * pp_size) == 0
     dp_size = world_size // (tp_size * pp_size)
+
+    assert args.num_microbatch >= pp_size, "num_microbatch need bigger than pp_size. Current num_microbatch: {args.num_microbatch}, pp size: {pp_size}"
+
     # Set num_batches. 
     # If None, we use MLP-DP. will get DP number of new batches per tick.
     # If set, num_batches < dp_size && dp_size % num_batches == 0, Will get num_batches number of List per tick.

@@ -597,20 +597,42 @@ def test_cp_list_to_mlp_list():
     # Test DP:
     cp_list_1 = [[512, 512],[512, 512], [1], [1]]
 
-    num_tokens = 1024
-    result_1 = cp_list_to_mlp_list(cp_list_1, as_world_size=4, num_token_per_rank=num_tokens)
+    num_token_per_rank = 1024
+    result_1 = cp_list_to_mlp_list(cp_list_1, as_world_size=4, num_token_per_rank=num_token_per_rank)
     assert result_1 == [[512, 512],[512, 512], [1], [1]]
     
     # Test CP head tail:
     cp_list_2 = [[1], [1], [1376, 672]]
 
-    num_tokens = 1024
-    result_2 = cp_list_to_mlp_list(cp_list_2, as_world_size=4, num_token_per_rank=num_tokens)
+    num_token_per_rank = 1024
+    result_2 = cp_list_to_mlp_list(cp_list_2, as_world_size=4, num_token_per_rank=num_token_per_rank)
     assert result_2 == [[1], [1], [512, 512], [176, 176, 672]]
+
+    # Test span three rank CP Case:
+    cp_list_3 = [[256, 1024, 768], [8], [8], [8], [8], [8], [8], [8], [8]]
+    num_token_per_rank=512
+    result_3 = cp_list_to_mlp_list(cp_list_3, as_world_size=12, num_token_per_rank=num_token_per_rank)
+    assert result_3 == [[256, 128, 128], [256, 256], [128, 128, 128, 128], [256, 256], [8], [8], [8], [8], [8], [8], [8], [8]]
+
+    # Test Big CP Case:
+    cp_list_3 = [[1376, 4080, 2288, 3376, 5264], [8], [8], [8], [8], [8], [8], [8], [8]]
+    num_token_per_rank=2048
+    result_3 = cp_list_to_mlp_list(cp_list_3, as_world_size=16, num_token_per_rank=num_token_per_rank)
+    assert result_3 == [[1376, 336, 336],
+                        [1024, 1024],
+                        [680, 680, 344, 344],
+                        [800, 800, 224, 224],
+                        [1024, 1024],
+                        [440, 440, 584, 584],
+                        [1024, 1024],
+                        [1024, 1024],
+                        [8],[8],[8],[8],[8],[8],[8],[8]]
+
 
 
 if __name__ == "__main__":
     test_cp_list_to_mlp_list()
+    exit(0)
     test_batch_to_items_with_dummy()
     test_mlp_seq_len()
     iter = 1

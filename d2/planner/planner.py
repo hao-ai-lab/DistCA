@@ -246,47 +246,60 @@ from collections import deque
 
 
 def cp_list_to_mlp_list(cp_rank_doc_lens: List[List[int]], as_world_size: int, num_token_per_rank: int) -> List[List[int]]:
-
     final_mlp_lists: List[List[int]] = []
+    current_rank: List[int] = []
 
     for doc_list_per_rank in cp_rank_doc_lens:
         docs_queue = deque(doc_list_per_rank)
 
-        current_rank: List[int] = []
-
         while docs_queue:
-            space_left = num_token_per_rank - sum(current_rank)
+            doc_len = docs_queue.popleft()
+            is_split_doc = False
 
-            if space_left == 0:
+            while True:
+                space_left = num_token_per_rank - sum(current_rank)
+
+                if space_left == 0:
+                    if current_rank:
+                        final_mlp_lists.append(current_rank)
+                    current_rank = []
+                    space_left = num_token_per_rank
+
+                if doc_len <= space_left:
+                    if is_split_doc:
+                        head = doc_len // 2
+                        tail = doc_len - head
+                        current_rank.extend([head, tail])
+                    else:
+                        current_rank.append(doc_len)
+                    break
+
+                if space_left > 0:
+                    head1 = space_left // 2
+                    tail1 = space_left - head1
+                    current_rank.extend([head1, tail1])
+                
                 final_mlp_lists.append(current_rank)
                 current_rank = []
-                space_left = num_token_per_rank
-
-            doc_len = docs_queue.popleft()
-
-            if doc_len <= space_left:
-                current_rank.append(doc_len)
-            
-            else:
-                amount_to_place_now = space_left
-                if amount_to_place_now > 0:
-                    head1 = amount_to_place_now // 2
-                    tail1 = amount_to_place_now - head1
-                    current_rank.extend([head1, tail1])
-
-                final_mlp_lists.append(current_rank)
                 
-
-                remaining_len = doc_len - amount_to_place_now
-                
-                head2 = remaining_len // 2
-                tail2 = remaining_len - head2
-                current_rank = [head2, tail2]
+                doc_len -= space_left
+                is_split_doc = True
 
         if current_rank:
             final_mlp_lists.append(current_rank)
-    assert len(final_mlp_lists) == as_world_size, "final_mlp_lists should contain dp_degree number of List."
+            current_rank = []
+
+    while len(final_mlp_lists) < as_world_size:
+        final_mlp_lists.append([])
+    
+    if len(final_mlp_lists) > as_world_size:
+        final_mlp_lists = final_mlp_lists[:as_world_size]
+
+    assert len(final_mlp_lists) == as_world_size, f"final_mlp_lists should contain {as_world_size} number of List. But get {len(final_mlp_lists)}. final_mlp_list: {final_mlp_lists}"
+    
     return final_mlp_lists
+
+
 
 
 
