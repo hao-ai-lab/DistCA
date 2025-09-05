@@ -11,6 +11,10 @@ bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
 
 """
+# ----------------
+# Main Imports
+# ----------------
+
 import math
 import argparse
 import os
@@ -187,8 +191,11 @@ class MegatronE2eWorker(MegatronBaseWorker):
         # we should modify the forward_backward_func here.
 
         microbatches = [{
-            k: arg_to_cuda(v) for k, v in microbatches[0].items()
-        }]
+            # TODO: If we have gradient accumulation, then need to take all microbatches
+            k: arg_to_cuda(v) 
+            for k, v in mb.items()
+        }for mb in microbatches]
+
         for module in self.train_module:
             unwrap_model(module).set_debug(normal_forward_fn)
         assert len(self.train_module) == 1, "only support one module"
@@ -241,7 +248,11 @@ class MegatronE2eWorker(MegatronBaseWorker):
             )
 
         with torch.cuda.nvtx.range("optimizer_step"):
+            # torch.cuda.synchronize()
+            log_memory_usage("optimizer_step:(start)")
             update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+            # torch.cuda.synchronize()
+            log_memory_usage("optimizer_step:(end)")
         return losses_reduced, grad_norm
 
     def _build_model_optimizer(self,
@@ -859,6 +870,10 @@ def test(args):
             _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
             _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
 
+            if rank % 8 == 0:
+                rich.print(f"🟡 [Rank {rank}] _items_0 = {_items_0}")
+                rich.print(f"🟡 [Rank {rank}] _items_1 = {_items_1}")
+
             
             # Try different tolerance factors and see which one fits the buffer size.
             # This will sacrifice performance for safety.
@@ -867,11 +882,12 @@ def test(args):
             for tolerance_factor in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
                 planner = Planner(world_size, parallel_config, model_config=model_config, tolerance_factor=tolerance_factor)
                 
-                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv)
-                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv)
+                verbose = (rank % 8 == 0)
+                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose)
+                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose)
 
 
-                if rank % 8 == 0:
+                if verbose:
                     qkv_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[0].fa2a_metadata[1] // 1024 // 1024
                     qkv_fwd_fa2a_metadata__recv_transfer_sz_mb = fa2a_metadata_0[0].fa2a_metadata[3] // 1024 // 1024
                     attn_out_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[1] // 1024 // 1024
@@ -895,7 +911,8 @@ def test(args):
                     max_send_sz = max(send_sz)
                     max_recv_sz = max(recv_sz)
                     
-                    rich.print(f"🟡 [Rank {rank}] Overflow check: {max_send_sz / 1024**3:.2f} GB, {max_recv_sz / 1024**3:.2f} GB recv size, {max(torch.max(o).item() for o in send_last_offset) / 1024**3:.2f} GB send last offset, {buffer_size / 1024**3:.2f} GB buffer size")
+                    if rank % 8 == 0:
+                        rich.print(f"🟡 [Rank {rank}] Overflow check: {max_send_sz / 1024**3:.2f} GB, {max_recv_sz / 1024**3:.2f} GB recv size, {max(torch.max(o).item() for o in send_last_offset) / 1024**3:.2f} GB send last offset, {buffer_size / 1024**3:.2f} GB buffer size")
 
                     max_size_provisioned = max(
                         max_send_sz, max_recv_sz, max(torch.max(o).item() for o in send_last_offset)
@@ -969,11 +986,33 @@ def test(args):
                 debug_set_metadata_transfer_size_to_0(ping_pang_params_0)
                 debug_set_metadata_transfer_size_to_0(ping_pang_params_1)
 
+            def debug_set_metadata_transfer_size_to_0(ping_pang_params: 'PingPangSingleStepPackedSeqParams'):
+                for param in [
+                    ping_pang_params.qkv_fwd_metadata,
+                    ping_pang_params.qkv_bwd_metadata,
+                    ping_pang_params.attn_out_fwd_metadata,
+                    ping_pang_params.attn_out_bwd_metadata,
+                ]:
+                    param.fa2a_metadata[1][:] = 1
+                    param.fa2a_metadata[3][:] = 1
+                    param.my_rank_send_sz = 1
+                return
+
+            
+            if os.environ.get("EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0", "0") == "1":
+                debug_set_metadata_transfer_size_to_0(ping_pang_params_0)
+                debug_set_metadata_transfer_size_to_0(ping_pang_params_1)
+
+
             if rank % 8 == 0:
                 rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_fwd_metadata =", ping_pang_params_0.qkv_fwd_metadata.__better_print__())
                 rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_fwd_metadata =", ping_pang_params_1.qkv_fwd_metadata.__better_print__())
                 rich.print(f"🟡 [Rank {rank}] mlp_seq_params_0 =", mlp_seq_params_0)
                 rich.print(f"🟡 [Rank {rank}] mlp_seq_params_1 =", mlp_seq_params_1)
+
+                # Adding backward metadata
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_bwd_metadata =", ping_pang_params_0.qkv_bwd_metadata.__better_print__())
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_bwd_metadata =", ping_pang_params_1.qkv_bwd_metadata.__better_print__())
 
             packed_seq_params = PingPangPackedSeqParams(
                 seq_params=[ping_pang_params_0, ping_pang_params_1],
@@ -1061,18 +1100,28 @@ def test(args):
             N = 3
 
         torch.cuda.synchronize()
+        torch.distributed.barrier()
         
         # Calculate the average duration of the forward_backward_batch
+        iteration_times = []
         start_time = time.time()
         torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
         for repeat_idx in range(N):
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            start_it_time = time.time()
             log_memory_usage(f"forward_backward_batch:start(sample_id={sample_id},repeat={repeat_idx})")
             ref = worker.forward_backward_batch(
                 microbatches=microbatches,
                 normal_forward_fn=normal_forward_fn,
                 forward_only=False,
             )
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            end_it_time = time.time()
             log_memory_usage(f"forward_backward_batch:done(sample_id={sample_id},repeat={repeat_idx})")
+            iteration_time = end_it_time - start_it_time
+            iteration_times.append(iteration_time)
         torch.cuda.nvtx.range_pop()
         
         torch.cuda.synchronize()
@@ -1080,7 +1129,8 @@ def test(args):
         end_time = time.time()
         duration = end_time - start_time
         duration_ms = duration * 1000
-        avg_duration_ms = duration_ms / N
+        # avg_duration_ms = duration_ms / N
+        avg_duration_ms = sum(iteration_times) / len(iteration_times) * 1000
         sample_times.append(avg_duration_ms)
         if rank == 0:
             if mode == "baseline":
