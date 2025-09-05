@@ -18,6 +18,7 @@ stem="bs${BATCH_SIZE}_nt${NUM_TOKENS}_ef${ELONGATE_FACTOR}"
 TS=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)_PST
 OUTPUT_DIR=./logs/${TS}_${stem}
 LOG_DIR=${OUTPUT_DIR}/logs
+NSYS_DIR=${OUTPUT_DIR}/nsys-profiles
 mkdir -p $LOG_DIR
 
 # exec > $OUTPUT_DIR/slurm.stdout 2>&1 # redirect only
@@ -78,16 +79,20 @@ fi
 # nnodes=4
 
 # ngpus=32
-nnodes=1
-ngpus=8
+
+nnodes=2
+ngpus=16
 head_node=fs-mbz-gpu-012
 start_time=$(date +%s)
+# NSYS_PROFILE_PATH=""
+# nsys profile --show-output=true -o ${NSYS_DIR}/%N.%j.nsys-rep
+#   --sample=none -t cuda,nvtx 
 srun --time=00:10:00 -N $nnodes -G $ngpus --ntasks-per-node=1 --jobid=679854 -w "$head_node" \
     --output=${LOG_DIR}/%N.%j.out \
     --error=${LOG_DIR}/%N.%j.out \
     bash -lc "
         set -x
-        exec torchrun --nnodes=$nnodes --nproc_per_node=8 --rdzv_backend=c10d --rdzv_endpoint=$head_node:29500 --rdzv_id=fs-mbz-gpu-017-1 --max_restarts=0 test_e2e_combined.py --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --mode d2 --replan-iter 0 --batch-size $BATCH_SIZE --num-nodes $nnodes --num-gpus-per-node 8 --num-layers $NUM_LAYERS --max-sample-id $MAX_SAMPLE_ID --tp-size 2 --cp-degree 1 --up-sample-factor 4 --num-tokens $NUM_TOKENS --elongate-factor $ELONGATE_FACTOR --filter-threshold 65536 --filter-ratio 0.50 --output-dir ${OUTPUT_DIR} --should-add-debug-cases $EXTRA_ARGS
+        exec torchrun --nnodes=$nnodes --nproc_per_node=8 --rdzv_backend=c10d --rdzv_endpoint=$head_node:29500 --rdzv_id=fs-mbz-gpu-017-1 --max_restarts=0 test_e2e_combined.py --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --mode d2 --replan-iter 0 --batch-size $BATCH_SIZE --num-nodes $nnodes --num-gpus-per-node 8 --num-layers $NUM_LAYERS --max-sample-id $MAX_SAMPLE_ID --tp-size 8 --cp-degree 1 --up-sample-factor 4 --num-tokens $NUM_TOKENS --elongate-factor $ELONGATE_FACTOR --filter-threshold 65536 --filter-ratio 0.50 --output-dir ${OUTPUT_DIR} --should-add-debug-cases $EXTRA_ARGS
     "
 
 
