@@ -14,17 +14,14 @@ from megatron.core.transformer.transformer_block import (
 from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
 from d2.runtime.attn_kernels.ops import FastDispatcherWrapper
-from d2.runtime.megatron.ops import FusedCommAttn, TickSync, post_a2a_attn_out_with_lse
-from d2.runtime.megatron.ops.fused_comm_attn import FlashAttnArgs, dummy_backward
-from d2.runtime.megatron.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
+from d2.runtime.megatron.ops.fused_comm_attn import dummy_backward
+from d2.runtime.megatron.packed_seq_params import PingPangPackedSeqParams
+from d2.runtime.megatron.ping_pong.tick_ops import (
+    forward_pre_core_attn, layout_mlp_to_attn, forward_core_attn,
+    layout_attn_to_mlp, forward_post_core_attn, tick_sync
+)
 from d2.runtime.megatron.ping_pong.transformer_layer import TransformerLayer
 from d2.runtime.megatron.ping_pong.utils import split_all_dict, gather_tensor
-
-
-def log_memory_usage(message: str):
-    import d2.mem
-    d2.mem.log_memory_usage(message)
-    return
 
 
 def add_ping_pong_forward(block: MegatronTransformerBlock):
@@ -149,9 +146,9 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
 
         # tick 0, second half
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].pre_core_attn.0"):
-            arg_group_0 = _forward_pre_core_attn(layer, arg_group_0)
+            arg_group_0 = forward_pre_core_attn(layer, arg_group_0)
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].sync_tick.0"):
-            _tick_sync(
+            tick_sync(
                 compute_stream, self.comm_stream,
                 arg_group_0, "signal",  # compute out
                 # prev layer's comm out, or anything if it's the first layer
@@ -161,15 +158,15 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
         # tick 1
         # communication
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].all2all_mlp_to_attn.0"):
-            arg_group_0 = _layout_mlp_to_attn(layer, arg_group_0)
+            arg_group_0 = layout_mlp_to_attn(layer, arg_group_0)
         # compute
         if l_no > 0:
             with torch.cuda.nvtx.range(f"forward_layers[{l_no}].post_core_attn.1"):
-                arg_group_1 = _forward_post_core_attn(prev_layer, arg_group_1)
+                arg_group_1 = forward_post_core_attn(prev_layer, arg_group_1)
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].pre_core_attn.1"):
-            arg_group_1 = _forward_pre_core_attn(layer, arg_group_1)
+            arg_group_1 = forward_pre_core_attn(layer, arg_group_1)
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].sync_tick.1"):
-            _tick_sync(
+            tick_sync(
                 compute_stream, self.comm_stream,
                 arg_group_0, "signal",  # comm out
                 arg_group_1, "signal",  # compute out
@@ -178,12 +175,12 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
         # tick 2
         # communication
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].all2all_mlp_to_attn.1"):
-            arg_group_1 = _layout_mlp_to_attn(layer, arg_group_1)
+            arg_group_1 = layout_mlp_to_attn(layer, arg_group_1)
         # compute
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].core_attn.0"):
-            arg_group_0 = _forward_core_attn(layer, arg_group_0)
+            arg_group_0 = forward_core_attn(layer, arg_group_0)
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].sync_tick.2"):
-            _tick_sync(
+            tick_sync(
                 compute_stream, self.comm_stream,
                 arg_group_0, "signal",  # compute out
                 arg_group_1, "signal",  # comm out.
@@ -192,12 +189,12 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
         # tick 3
         # communication
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].all2all_attn_to_mlp.0"):
-            arg_group_0 = _layout_attn_to_mlp(layer, arg_group_0)
+            arg_group_0 = layout_attn_to_mlp(layer, arg_group_0)
         # compute
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].core_attn_1"):
-            arg_group_1 = _forward_core_attn(layer, arg_group_1)
+            arg_group_1 = forward_core_attn(layer, arg_group_1)
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].sync_tick.3"):
-            _tick_sync(
+            tick_sync(
                 compute_stream, self.comm_stream,
                 arg_group_0, "signal",  # comm out
                 arg_group_1, "signal",  # compute out
@@ -206,23 +203,23 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
         # tick 4, also the tick 0 of the next layer
         # communication
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].all2all_attn_to_mlp.1"):
-            arg_group_1 = _layout_attn_to_mlp(layer, arg_group_1)
+            arg_group_1 = layout_attn_to_mlp(layer, arg_group_1)
         # compute
         with torch.cuda.nvtx.range(f"forward_layers[{l_no}].post_core_attn.0"):
-            arg_group_0 = _forward_post_core_attn(layer, arg_group_0)
+            arg_group_0 = forward_post_core_attn(layer, arg_group_0)
         # NOTE: sync of this tick is at the next layer.
 
         # if the last layer, do the other half of tick 4 and tick 5
         if l_no == len(self.layers) - 1:
             # No next layer, do the sync here.
             with torch.cuda.nvtx.range(f"forward_layers[{l_no}].sync_tick.4"):
-                _tick_sync(
+                tick_sync(
                     compute_stream, self.comm_stream,
                     arg_group_0, "hidden_states",   # place holder
                     arg_group_1, "signal",          # comm out
                 )
             with torch.cuda.nvtx.range(f"forward_layers[{l_no}].post_core_attn.1"):
-                arg_group_1 = _forward_post_core_attn(layer, arg_group_1)
+                arg_group_1 = forward_post_core_attn(layer, arg_group_1)
             # gathering the result
             with torch.cuda.nvtx.range(f"forward_layers[{l_no}].gather_ping_pong"):
                 hidden_states = gather_tensor([arg_group_0["hidden_states"], arg_group_1["hidden_states"]], 2)
@@ -234,144 +231,6 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
         torch.cuda.nvtx.range_pop()
 
         return arg_group_0, arg_group_1, hidden_states, context
-
-    def _forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(start)")
-        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(before pre core attn)")
-        hidden_states = args.pop("hidden_states")
-        query, key, value, residual, attn_mask_type = layer._forward_pre_core_attn(
-            hidden_states,
-            args["rotary_pos_emb"],
-            args["rotary_pos_cos"],
-            args["rotary_pos_sin"],
-            args["mlp_packed_seq_params"],
-            args["sequence_len_offset"],
-        )
-        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(after pre core attn)")
-
-        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(before pre mlp to attn)")
-        signal = layer._pre_mlp_to_attn(query, key, value, args["packed_seq_params"])
-        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(after pre mlp to attn)")
-
-        args["query"] = query
-        args["key"] = key
-        args["value"] = value
-        args["residual"] = residual
-        args["attn_mask_type"] = attn_mask_type
-        args["signal"] = signal
-        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(return)")
-        return args
-
-    def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        log_memory_usage(f"(L{layer.layer_number}) _layout_mlp_to_attn:(start)")
-        bwd_resend_qkv = args["packed_seq_params"].bwd_packed_seq_params is not None
-        if not bwd_resend_qkv:
-            # qkv are stored until attn_out to resend at backward.
-            args.pop("query"), args.pop("key"), args.pop("value")
-        signal = args.pop("signal")
-        args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=True)
-        log_memory_usage(f"(L{layer.layer_number}) _layout_mlp_to_attn:(end)")
-        return args
-
-    def _forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        # pop out to make sure the tensor is freed
-        log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(start)")
-        signal = args.pop("signal")
-        packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
-        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
-        
-        if bwd_resend_qkv:
-            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before FusedCommAttn)")
-            signal = FusedCommAttn.apply(
-                signal,
-                packed_seq_params.qkv_fwd_metadata,
-                packed_seq_params.qkv_bwd_metadata,
-                packed_seq_params.attn_out_fwd_metadata,
-                packed_seq_params.attn_out_bwd_metadata,
-                packed_seq_params,
-                packed_seq_params.bwd_packed_seq_params,
-                packed_seq_params.dispatcher_id,
-                FlashAttnArgs(
-                    num_heads_q=layer.config.num_attention_heads // layer.config.tensor_model_parallel_size,
-                    num_heads_kv=layer.config.num_query_groups // layer.config.tensor_model_parallel_size,
-                    head_dim=layer.config.hidden_size // layer.config.num_attention_heads,
-                    return_attn_probs=True,
-                    deterministic=True,
-                ),
-            )
-            args["signal"] = signal
-            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after FusedCommAttn)")
-        else:
-            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before post mlp to attn)")
-            query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
-            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after post mlp to attn)")
-
-            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before forward core attn)")
-            core_attn_out = layer._forward_core_attn(
-                query, key, value,
-                args["attention_mask"],
-                args["attention_bias"],
-                args["attn_mask_type"],
-                args["packed_seq_params"],
-            )
-            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after forward core attn)")
-            
-            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before pre attn to mlp)")
-            args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
-            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after pre attn to mlp)")
-        log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(end)")
-        return args
-
-    def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
-        signal = args.pop("signal")
-        args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=False)
-        return args
-
-    def _forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-        log_memory_usage(f"(L{layer.layer_number}) _forward_post_core_attn:(start)")
-        signal = args.pop("signal")
-        packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
-        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
-        if bwd_resend_qkv:
-            core_attn_out = post_a2a_attn_out_with_lse.apply(
-                signal, args["query"], args["key"], args["value"],
-                layer.config.num_attention_heads // layer.config.tensor_model_parallel_size,
-                packed_seq_params.attn_out_fwd_metadata,
-                packed_seq_params.attn_out_bwd_metadata,
-                packed_seq_params.dispatcher_id,
-            )
-            args.pop("query"), args.pop("key"), args.pop("value")
-        else:
-            core_attn_out = layer._post_attn_to_mlp(signal, args["packed_seq_params"])
-        residual = args.pop("residual")
-        mlp_output, context = layer._forward_post_core_attn(
-            core_attn_out,
-            residual,
-            args["context"],
-            args["context_mask"],
-        )
-        args["hidden_states"] = mlp_output
-        args["context"] = context
-        log_memory_usage(f"(L{layer.layer_number}) _forward_post_core_attn:(end)")
-        return args
-
-    def _tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, keys_1):
-        log_memory_usage(f"(L?) _tick_sync:(start)")
-        if isinstance(keys_0, str):
-            keys_0 = [keys_0]
-        if isinstance(keys_1, str):
-            keys_1 = [keys_1]
-        tensors_0 = [arg_group_0[key] for key in keys_0]
-        tensors_1 = [arg_group_1[key] for key in keys_1]
-        tensors = tensors_0 + tensors_1
-        out_tensors = TickSync.apply(compute_stream, comm_stream, *tensors)
-        out_tensors_0 = out_tensors[:len(tensors_0)]
-        out_tensors_1 = out_tensors[len(tensors_0):]
-        for key, out_tensor in zip(keys_0, out_tensors_0):
-            arg_group_0[key] = out_tensor
-        for key, out_tensor in zip(keys_1, out_tensors_1):
-            arg_group_1[key] = out_tensor
-        log_memory_usage(f"(L?) _tick_sync:(end)")
 
     class _debug_monkey_patch:
         def __init__(self, layer_forward_impl):
