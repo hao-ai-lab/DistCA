@@ -84,9 +84,14 @@ class BaseWorker:
     def init_torch_distributed(self,):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size)
-            local_rank = int(os.environ.get("LOCAL_RANK"))
-            self.device = torch.device(f"cuda:{local_rank}")
-            torch.cuda.set_device(self.device)
+            try:
+                local_rank = int(os.environ.get("LOCAL_RANK"))
+                self.device = torch.device(f"cuda:{local_rank}")
+                torch.cuda.set_device(self.device)
+            except:
+                # In slurm environment, only have one visible GPU per node.
+                torch.cuda.set_device('cuda')
+                pass
 
     def init_nvshmem(self, buffer_size: int, local_rank: int = None):
         print("====== init_nvshmem ======")
