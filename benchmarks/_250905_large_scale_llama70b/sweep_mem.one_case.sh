@@ -15,5 +15,5 @@ export JOBID=697090
 export TP_SIZE=8
 export ENABLE_NSYS=0
 export EXPERIMENT_LOG_MEMORY_USAGE=1
-bash test_e2e_combined.salloc-exp.sh
+bash test_e2e_combined.salloc.sh
 

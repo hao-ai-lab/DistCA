@@ -56,7 +56,7 @@ for config in \
         echo "Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
         export MODE=wlbllm CP_SIZE=$CP_SIZE
         if [ $DRY_RUN -eq 0 ]; then
-            bash test_e2e_combined.salloc-exp.sh
+            bash test_e2e_combined.salloc.sh
         fi
     done
     
@@ -64,7 +64,7 @@ for config in \
     export MODE=d2
     echo "Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
     if [ $DRY_RUN -eq 0 ]; then
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
     fi
 
     

@@ -48,7 +48,7 @@ for num_tokens in "${NUM_TOKENS_ARRAY[@]}"; do
         OUTPUT_DIR_SUFFIX=d2_b1_${should_profile_memory} \
         SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="d2" CP_SIZE=1 \
         EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=1 \
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
         # OUTPUT_DIR_SUFFIX=d2_b1_${should_profile_memory} \
         # MODE="d2" CP_SIZE=1 \
         # EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=1 \
@@ -60,38 +60,38 @@ for num_tokens in "${NUM_TOKENS_ARRAY[@]}"; do
         OUTPUT_DIR_SUFFIX=d2_b4_${should_profile_memory} \
         SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="d2" CP_SIZE=1 \
         EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=4 \
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
 
         # 8_65536_32_d2_1_4_8
         export PROFILE_MEMORY_PATH=${OUTPUT_DIR_PREFIX}/d2_b8_1/
         OUTPUT_DIR_SUFFIX=d2_b8_${should_profile_memory} \
         SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="d2" CP_SIZE=1 \
         EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=8 \
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
 
         # 8_65536_2_wlbllm_8_4
         export PROFILE_MEMORY_PATH=${OUTPUT_DIR_PREFIX}/wlbllm_cp8_1/
         OUTPUT_DIR_SUFFIX=wlbllm_cp8_${should_profile_memory} \
         SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="wlbllm" CP_SIZE=8 \
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
 
         # 8_65536_2_wlbllm_4_4
         export PROFILE_MEMORY_PATH=${OUTPUT_DIR_PREFIX}/wlbllm_cp4_1/
         OUTPUT_DIR_SUFFIX=wlbllm_cp4_${should_profile_memory} \
         SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="wlbllm" CP_SIZE=4 \
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
 
         # 8_65536_2_wlbllm_2_4
         export PROFILE_MEMORY_PATH=${OUTPUT_DIR_PREFIX}/wlbllm_cp2_1/
         OUTPUT_DIR_SUFFIX=wlbllm_cp2_${should_profile_memory} \
         SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="wlbllm" CP_SIZE=2 \
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
 
         # 8_65536_2_wlbllm_1_4
         export PROFILE_MEMORY_PATH=${OUTPUT_DIR_PREFIX}/wlbllm_cp1_1/
         OUTPUT_DIR_SUFFIX=wlbllm_cp1_${should_profile_memory} \
         SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="wlbllm" CP_SIZE=1 \
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
       done
     done
   done

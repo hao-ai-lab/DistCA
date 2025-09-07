@@ -1,4 +1,4 @@
-# TODO(Deprecate): Consolidate the `test_e2e_combined.salloc-exp.sh` and `test_e2e_combined.slurm.sh` into a single script.
+# TODO(Deprecate): Consolidate the `test_e2e_combined.salloc.sh` and `test_e2e_combined.slurm.sh` into a single script.
 
 #!/bin/bash
 
