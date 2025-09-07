@@ -79,7 +79,7 @@ for config in \
         echo -e "\033[32mRunning wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR\033[0m"
         export MODE=wlbllm CP_SIZE=$CP_SIZE
         if [ $DRY_RUN -eq 0 ]; then
-            bash test_e2e_combined.salloc-exp.corebind.sh
+            bash test_e2e_combined.salloc-exp.sh
         fi
     done
 
