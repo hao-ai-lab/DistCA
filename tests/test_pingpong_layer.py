@@ -68,7 +68,7 @@ class PingPangLayerWorker(MegatronLayerWorker):
         else:
             ctx = torch.no_grad()
         with ctx:
-            ret = self.layer.ping_pang_forward(tensor_input, packed_seq_params=packed_seq_params)
+            ret = self.layer.ping_pong_forward(tensor_input, packed_seq_params=packed_seq_params)
             if not run_backward:
                 return ret
             output, context = ret

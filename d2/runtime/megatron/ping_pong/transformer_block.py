@@ -32,7 +32,7 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
         self.ping_pong_comm_initialized = True
         FastDispatcherWrapper.comm_stream = self.comm_stream
 
-    def ping_pang_forward(
+    def ping_pong_forward(
         self: MegatronTransformerBlock,
         hidden_states: Union[Tensor, WrappedTensor],
         attention_mask: Optional[Tensor],
@@ -258,12 +258,12 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
                 return self._normal_forward(*args, **kwargs)
 
         assert self.ping_pong_comm_initialized
-        return self.ping_pang_forward(*args, **kwargs)
+        return self.ping_pong_forward(*args, **kwargs)
 
     block._debug_forward_impl = "orig"
     block.forward_layers = types.MethodType(forward_layers, block)
     block.init_ping_pong_communication_ctx = types.MethodType(init_ping_pong_communication_ctx, block)
-    block.ping_pang_forward = types.MethodType(ping_pang_forward, block)
+    block.ping_pong_forward = types.MethodType(ping_pong_forward, block)
     block._normal_forward = block.forward
     block.forward = types.MethodType(forward, block)
     block.ping_pong_comm_initialized = False

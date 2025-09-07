@@ -154,3 +154,22 @@ def tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, key
     for key, out_tensor in zip(keys_1, out_tensors_1):
         arg_group_1[key] = out_tensor
     log_memory_usage(f"(L?) tick_sync:(end)")
+
+
+def tick_nonca_compute(
+    layer: TransformerLayer, prev_layer: Optional[TransformerLayer],
+    arg_group: Dict[str, Any],  is_last_layer_post_attn: bool
+):
+    """
+    Previous layer(if exists) post core attention + this layer's pre core attention.
+    This is the maximum size for a cuda graph tracing, if not consider MoE
+    """
+    # Only run this layer's post-attention
+    if is_last_layer_post_attn:
+        arg_group = forward_post_core_attn(layer, arg_group)
+        return arg_group
+    # Previous layer's (if exists) post core attn and this layer's pre core attn
+    if prev_layer is not None:
+        arg_group = forward_post_core_attn(prev_layer, arg_group)
+    arg_group = forward_pre_core_attn(layer, arg_group)
+    return arg_group

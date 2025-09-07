@@ -144,7 +144,7 @@ class TransformerLayer(BaseTransformerLayer):
         return signal
 
     ########## Ping-Pong ##########
-    def ping_pang_forward(
+    def ping_pong_forward(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
