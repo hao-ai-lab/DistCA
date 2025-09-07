@@ -5,6 +5,15 @@ References
 https://docs.nvidia.com/nsight-systems/2022.1/nsys-exporter/examples.html#thread-summary-composite
 https://docs.nvidia.com/nsight-systems/2022.1/nsys-exporter/exported_data.html
 https://docs.nvidia.com/cupti/main/main.html?highlight=nvtx#nvidia-tools-extension-callbacks
+
+Usage
+
+```bash
+    python analyze.nsys.py \
+        --db fs-mbz-gpu-017.sqlite \
+        --target_thread_name "NVSHMEM PE 0" \
+        --gpu-id 0
+```
 """
 # %% [markdown]
 # NVTX hierarchy (per-thread) from Nsight Systems SQLite
@@ -47,7 +56,7 @@ parser.add_argument('--target-thread-name', type=str, default="NVSHMEM PE 0",
                     help='target thread name to analyze')
 parser.add_argument('--gpu-id', type=int, default=0,
                     help='target GPU deviceId to check kernel launches')
-parser.add_argument('--os-tid', type=int, default=1964964,
+parser.add_argument('--os-tid', type=int, default=None,
                     help='the thread id you saw in the GUI (e.g. "[1964964] NVSHMEM PE0")')
 parser.add_argument('--os-pid', type=int, default=None,
                     help='optional: if you know the OS process id, set it; else leave None')
@@ -116,10 +125,11 @@ filtered_stream_name_to_device_info_mapping = stream_name_to_device_info_mapping
 ]
 
 assert len(filtered_stream_name_to_device_info_mapping) == 1
-OS_TID = filtered_stream_name_to_device_info_mapping['TID'].iloc[0].item()
-# OS_PID = filtered_stream_name_to_device_info_mapping['PID'].iloc[0].item()
-# OS_TID, OS_PID
-OS_TID
+if OS_TID is None:
+    OS_TID = filtered_stream_name_to_device_info_mapping['TID'].iloc[0].item()
+else:
+    OS_TID = OS_TID
+
 
 # %%
 candidates = []
