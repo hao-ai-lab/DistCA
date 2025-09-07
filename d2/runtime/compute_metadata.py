@@ -4,7 +4,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 import torch
 
 from d2.runtime.metadata import (
-    FastAlltoAllMetadata, LogicalShape, SeqLens,
+    AlltoAllMetadata, LogicalShape, SeqLens,
     compute_reverse_a2a_layout_metadata, _get_my_rank_from_metadata,
 )
 from d2.runtime.shard_info import ShardInfo
@@ -341,7 +341,7 @@ def _from_planner_output(
 
     linear_to_attn_seqlens_q = SeqLens(linear_seqlens, attn_q_seqlens)
     linear_to_attn_seqlens_k = SeqLens(linear_seqlens, attn_k_seqlens)
-    qkv_linear_to_attn = FastAlltoAllMetadata(
+    qkv_linear_to_attn = AlltoAllMetadata(
         linear_to_attn_qkv_fa2a_metadata,
         send_memcpy_metadata=(
             tuple(q_offset_sends),
@@ -410,7 +410,7 @@ def _from_planner_output(
         out_grad_recv_shape = _get_logical_shape(
             linear_to_attn_num_tokens_q.T, world_size, out_hidden,
         )
-        out_grad_linear_to_attn = FastAlltoAllMetadata(
+        out_grad_linear_to_attn = AlltoAllMetadata(
             fa2a_metadata=linear_to_attn_out_grad_fa2a_metadata,
             send_memcpy_metadata=(tuple(out_grad_offset_sends),),
             recv_memcpy_metadata=(tuple(out_grad_offset_recvs),),

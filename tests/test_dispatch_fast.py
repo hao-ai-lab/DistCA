@@ -19,7 +19,7 @@ from d2.runtime.attn_kernels.dispatch import (
     fast_a2a_qkv
 )
 from d2.runtime.compute_metadata import from_planner_output
-from d2.runtime.metadata import FastAlltoAllMetadata
+from d2.runtime.metadata import AlltoAllMetadata
 
 from test_util import (
     BaseWorker, init_worker_torch_distributed,
@@ -31,8 +31,8 @@ from test_shard_info_to_fa2a import simulate_all2all
 class Worker(BaseWorker):
 
     def run_qkv(
-        self, fa2a_metadata_fwd: FastAlltoAllMetadata,
-        fa2a_metadata_rev: FastAlltoAllMetadata,
+        self, fa2a_metadata_fwd: AlltoAllMetadata,
+        fa2a_metadata_rev: AlltoAllMetadata,
         tensor_q: torch.Tensor, tensor_kv: torch.Tensor,
     ):
         tensor_q = tensor_q.cuda()
@@ -122,8 +122,8 @@ class Worker(BaseWorker):
 
 
 def create_answer(
-    fwd_qkv_metadata: FastAlltoAllMetadata,
-    bwd_qkv_metadata: FastAlltoAllMetadata,
+    fwd_qkv_metadata: AlltoAllMetadata,
+    bwd_qkv_metadata: AlltoAllMetadata,
     world_size: int, num_tokens: int, max_cp_degree: int,
     hidden_size_q: int, hidden_size_k: int, dtype: torch.dtype,
 ):

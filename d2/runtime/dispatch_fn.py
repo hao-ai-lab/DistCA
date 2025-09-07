@@ -5,7 +5,7 @@ from d2.runtime.attn_kernels.dispatch import (
     pre_fast_a2a_attn_out, post_fast_a2a_attn_out
 )
 from d2.runtime.attn_kernels.ops import fast_a2a
-from d2.runtime.metadata import FastAlltoAllMetadata
+from d2.runtime.metadata import AlltoAllMetadata
 
 
 """
@@ -31,7 +31,7 @@ class pre_all2all_layout_transfer(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        metadata: FastAlltoAllMetadata, bwd_metadata: FastAlltoAllMetadata,
+        metadata: AlltoAllMetadata, bwd_metadata: AlltoAllMetadata,
         dispatcher_id: int, is_qkv: bool,
     ):
         # a signal tensor output to maintain the autograd graph dependency.
@@ -109,8 +109,8 @@ class pre_all2all_layout_transfer(torch.autograd.Function):
 # a stream outside this function.
 class all_to_all(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, signal: torch.Tensor, metadata: FastAlltoAllMetadata,
-                bwd_metadata: FastAlltoAllMetadata, dispatcher_id: int,
+    def forward(ctx, signal: torch.Tensor, metadata: AlltoAllMetadata,
+                bwd_metadata: AlltoAllMetadata, dispatcher_id: int,
                 stream: torch.cuda.Stream = None):
         if stream is None or metadata.single_stream:
             stream = torch.cuda.current_stream()
@@ -141,8 +141,8 @@ class all_to_all(torch.autograd.Function):
 
 class post_all2all_layout_transfer(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, signal: torch.Tensor, metadata: FastAlltoAllMetadata,
-                bwd_metadata: FastAlltoAllMetadata, dispatcher_id: int,
+    def forward(ctx, signal: torch.Tensor, metadata: AlltoAllMetadata,
+                bwd_metadata: AlltoAllMetadata, dispatcher_id: int,
                 is_qkv: bool,):
         # NOTE: no stream because this should always run on the compute stream.
         saved_tensors = []
@@ -206,7 +206,7 @@ class post_all2all_layout_transfer(torch.autograd.Function):
 class qkv_dispatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                metadata: FastAlltoAllMetadata, bwd_metadata: FastAlltoAllMetadata,
+                metadata: AlltoAllMetadata, bwd_metadata: AlltoAllMetadata,
                 stream: torch.cuda.Stream):
         if metadata.single_stream:
             stream = torch.cuda.current_stream()
@@ -303,7 +303,7 @@ class qkv_dispatch(torch.autograd.Function):
 class attn_out_dispatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, attn_out: torch.Tensor,
-                metadata: FastAlltoAllMetadata, bwd_metadata: FastAlltoAllMetadata,
+                metadata: AlltoAllMetadata, bwd_metadata: AlltoAllMetadata,
                 stream: torch.cuda.Stream = None):
         if stream is None or metadata.single_stream:
             stream = torch.cuda.current_stream()

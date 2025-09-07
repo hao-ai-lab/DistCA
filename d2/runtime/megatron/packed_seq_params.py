@@ -5,7 +5,7 @@ import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
 
-from d2.runtime.metadata import FastAlltoAllMetadata
+from d2.runtime.metadata import AlltoAllMetadata
 
 
 def _to_cuda_int32(tensor: Optional[torch.Tensor]):
@@ -23,10 +23,10 @@ def _to_int(tensor):
 
 @dataclass
 class PingPangSingleStepPackedSeqParams(PackedSeqParams):
-    qkv_fwd_metadata: FastAlltoAllMetadata = None
-    qkv_bwd_metadata: FastAlltoAllMetadata = None
-    attn_out_fwd_metadata: FastAlltoAllMetadata = None
-    attn_out_bwd_metadata: FastAlltoAllMetadata = None
+    qkv_fwd_metadata: AlltoAllMetadata = None
+    qkv_bwd_metadata: AlltoAllMetadata = None
+    attn_out_fwd_metadata: AlltoAllMetadata = None
+    attn_out_bwd_metadata: AlltoAllMetadata = None
     bwd_packed_seq_params: PackedSeqParams = None
     stream: torch.cuda.Stream = None
     dispatcher_id: int = None

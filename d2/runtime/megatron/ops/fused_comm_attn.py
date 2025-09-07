@@ -18,7 +18,7 @@ from d2.runtime.attn_kernels.dispatch import (
     # bwd recv attn_out_grad and qkv, fwd recv qkv
     post_fast_a2a_attn_out_grad_resend_qkv, post_fast_a2a_qkv,
 )
-from d2.runtime.metadata import FastAlltoAllMetadata
+from d2.runtime.metadata import AlltoAllMetadata
 
 
 @dataclass
@@ -137,10 +137,10 @@ class FusedCommAttn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, signal: Tensor,
-        fwd_qkv_metadata: FastAlltoAllMetadata,
-        bwd_qkv_metadata: FastAlltoAllMetadata,
-        fwd_attn_out_metadata: FastAlltoAllMetadata,
-        bwd_attn_out_qkv_metadata: FastAlltoAllMetadata,
+        fwd_qkv_metadata: AlltoAllMetadata,
+        bwd_qkv_metadata: AlltoAllMetadata,
+        fwd_attn_out_metadata: AlltoAllMetadata,
+        bwd_attn_out_qkv_metadata: AlltoAllMetadata,
         fwd_fa_params: PackedSeqParams,
         bwd_fa_params: PackedSeqParams,
         dispatcher_id: int,
@@ -271,8 +271,8 @@ class post_a2a_attn_out_with_lse(torch.autograd.Function):
     def forward(ctx, signal: Tensor,
                 q: Tensor, k: Tensor, v: Tensor,
                 num_heads_q: int,
-                metadata: FastAlltoAllMetadata,
-                bwd_attn_out_qkv_metadata: FastAlltoAllMetadata,
+                metadata: AlltoAllMetadata,
+                bwd_attn_out_qkv_metadata: AlltoAllMetadata,
                 dispatcher_id: int,
     ):
         switch_buffer = dispatcher_id is None

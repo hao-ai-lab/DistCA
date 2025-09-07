@@ -6,7 +6,7 @@ import time
 import torch
 
 from d2.runtime.compute_metadata import from_planner_output, backward_from_planner_output
-from d2.runtime.metadata import FastAlltoAllMetadata
+from d2.runtime.metadata import AlltoAllMetadata
 
 from test_util import create_random_shard_info
 from test_fa2a_metadata import (
@@ -17,7 +17,7 @@ from test_fa2a_metadata import (
 
 def simulate_all2all(
     q: list[torch.Tensor], k: list[torch.Tensor], v: list[torch.Tensor],
-    metadata: FastAlltoAllMetadata,
+    metadata: AlltoAllMetadata,
     element_size: int, hidden_q: int, hidden_k: int,
     is_from_linear_layout: bool,
 ):
