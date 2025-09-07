@@ -24,16 +24,37 @@ from d2.runtime.megatron.ping_pong.transformer_layer import TransformerLayer
 from d2.runtime.megatron.ping_pong.utils import split_all_dict, gather_tensor
 
 
-def add_ping_pong_forward(block: MegatronTransformerBlock):
+class _debug_monkey_patch:
+    """
+    Context manager to monkey patch Transformer Layer forward in debugging.
+    """
+    def __init__(self, layer_forward_impl):
+        self._layer_forward_impl = layer_forward_impl
+    def __enter__(self):
+        self.backup_forward = TransformerLayer.forward
+        TransformerLayer.forward = self._layer_forward_impl
+    def __exit__(self, exc_type, exc_value, traceback):
+        TransformerLayer.forward = self.backup_forward
+
+
+class PingPongTransformerBlockInterface(MegatronTransformerBlock):
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError("Interface class should not be instantiated.")
+
+    def init_value(self):
+        self.ping_pong_comm_initialized: bool = False
+        self.comm_stream: torch.cuda.Stream = None
+        self._ping_pong_debug: bool = False
+        self._debug_forward_impl: str = "orig"
+
     def init_ping_pong_communication_ctx(self, device: torch.device):
         assert not self.ping_pong_comm_initialized
         self.comm_stream = torch.cuda.Stream(device=device, priority=-1)
-        self._ping_pong_debug = False
         self.ping_pong_comm_initialized = True
         FastDispatcherWrapper.comm_stream = self.comm_stream
 
     def ping_pong_forward(
-        self: MegatronTransformerBlock,
+        self,
         hidden_states: Union[Tensor, WrappedTensor],
         attention_mask: Optional[Tensor],
         context: Optional[Tensor] = None,
@@ -131,7 +152,6 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
 
         return hidden_states
 
-    # TODO: rename forward_layer_ping_pong -> forward_layer_ping_pong
     def forward_layer_ping_pong(
         self,
         l_no: int,
@@ -237,15 +257,6 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
 
         return arg_group_0, arg_group_1, hidden_states, context
 
-    class _debug_monkey_patch:
-        def __init__(self, layer_forward_impl):
-            self._layer_forward_impl = layer_forward_impl
-        def __enter__(self):
-            self.backup_forward = TransformerLayer.forward
-            TransformerLayer.forward = self._layer_forward_impl
-        def __exit__(self, exc_type, exc_value, traceback):
-            TransformerLayer.forward = self.backup_forward
-
     def forward(self, *args, **kwargs):
         # print(f'{self._ping_pong_debug=}')
         """
@@ -265,19 +276,29 @@ def add_ping_pong_forward(block: MegatronTransformerBlock):
         assert self.ping_pong_comm_initialized
         return self.ping_pong_forward(*args, **kwargs)
 
-    block._debug_forward_impl = "orig"
-    block.forward_layer_ping_pong = types.MethodType(forward_layer_ping_pong, block)
-    block.init_ping_pong_communication_ctx = types.MethodType(init_ping_pong_communication_ctx, block)
-    block.ping_pong_forward = types.MethodType(ping_pong_forward, block)
+
+def add_ping_pong_forward(block: MegatronTransformerBlock) -> PingPongTransformerBlockInterface:
+
     block._normal_forward = block.forward
-    block.forward = types.MethodType(forward, block)
-    block.ping_pong_comm_initialized = False
+    block.init_value = types.MethodType(
+        PingPongTransformerBlockInterface.init_value, block)
+    block.init_ping_pong_communication_ctx = types.MethodType(
+        PingPongTransformerBlockInterface.init_ping_pong_communication_ctx, block)
+    block.ping_pong_forward = types.MethodType(
+        PingPongTransformerBlockInterface.ping_pong_forward, block)
+    block.forward_layer_ping_pong = types.MethodType(
+        PingPongTransformerBlockInterface.forward_layer_ping_pong, block)
+    block.forward = types.MethodType(
+        PingPongTransformerBlockInterface.forward, block)
+
+    return block
 
 
 class PingPongGPTModel(GPTModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        add_ping_pong_forward(self.decoder)
+        self.decoder = add_ping_pong_forward(self.decoder)
+        self.decoder.init_value()
 
     def set_debug(self, debug: bool, debug_fwd_impl: str = None):
         self.decoder._ping_pong_debug = debug
