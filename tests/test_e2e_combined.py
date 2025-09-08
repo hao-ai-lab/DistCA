@@ -9,40 +9,27 @@ Usage:
 ```bash
 bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
-
 """
-
+import psutil, os
+rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID","0")))
+local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID","0")))
+p = psutil.Process(os.getpid())
+p.cpu_affinity([local * 16, local * 16 + 1])  # pin to core based on local rank
+print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
 
 # ----------------
 # Taskset confirm
 # ----------------
-
-import os, re, socket, torch
-
-torch.cuda.set_device(int(os.getenv("LOCAL_RANK", os.getenv("SLURM_LOCALID", "0"))))
-
-def read_status_field(field: str) -> str:
-    with open("/proc/self/status") as f:
-        for line in f:
-            if line.startswith(field + ":"):
-                return line.split(":",1)[1].strip()
-    return "N/A"
-
-aff = read_status_field("Cpus_allowed_list")
-mems = read_status_field("Mems_allowed_list")
-lr = int(os.getenv("LOCAL_RANK", os.getenv("SLURM_LOCALID", "0")))
-dev = torch.cuda.current_device()
-
-print(f"[{socket.gethostname()}] RANK={os.getenv('RANK')} "
-      f"LOCAL_RANK={lr} CUDA_DEV={dev} "
-      f"CPUS={aff} MEMS={mems}", flush=True)
-
-
+import check_cpu_binding
+aff, mems = check_cpu_binding.check_cpu_binding()
+print(f"CPUS={aff} MEMS={mems}")
 
 # ----------------
 # Main Imports
 # ----------------
-
+from torch.profiler import profile, record_function, ProfilerActivity
+import d2.planner.wlb_planner
+import d2.mem
 import math
 import argparse
 import os
@@ -55,10 +42,6 @@ import signal
 import traceback
 import sys
 from contextlib import contextmanager
-
-def timeout_handler(signum, frame):
-    raise TimeoutError("forward_backward_batch operation timed out after 5 minutes")
-
 
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
@@ -86,6 +69,10 @@ from d2.planner.planner import (
     Item,
 )
 
+def timeout_handler(signum, frame):
+    raise TimeoutError("forward_backward_batch operation timed out after 5 minutes")
+
+
 def debug_print(*args, **kwargs):
     if os.getenv("D2_DEBUG_PRINT", "0") == "1":
         if torch.distributed.is_initialized():
@@ -110,12 +97,10 @@ def set_random_seed(seed, set_megatron: bool=True):
 
 
 def log_memory_usage(message: str, force:bool = False):
-    import d2.mem
     d2.mem.log_memory_usage(message, force=force)
 
 @contextmanager
 def log_memory_usage_context():
-    import d2.mem
     old_env_var = os.environ.get("EXPERIMENT_LOG_MEMORY_USAGE", "0")
     os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = "1"
     yield
@@ -481,28 +466,12 @@ def setup_global_batch(
     
     if should_add_debug_cases:
         GLOBAL_BATCH = list(GLOBAL_BATCH)
-        # DP2 case
-        # manual_case = [
-        #     [total_seq_len],
-        #     [total_seq_len // 2] * 2,
-        #     # [total_seq_len],
-        #     # [total_seq_len // 8] * 8,
-        # ]
-        # 🔴 Failed: Cross 3 GPU + non cross for the others
         manual_case = [
             [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
             [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
         ]
-
-        # manual_case = [
-        #     [2 * K] * (total_seq_len // (2 * K)),
-        # ] * 8
         GLOBAL_BATCH = manual_case + GLOBAL_BATCH
         GLOBAL_BATCH = iter(GLOBAL_BATCH)
-    # CP debug batch case.  
-    # GLOBAL_BATCH = [
-    #     [total_seq_len // 4 * 3, total_seq_len // 4],
-    # ] * 100
     return
 
 
@@ -536,13 +505,14 @@ except ImportError:
 
 
 def test(args):
+    num_nodes = args.num_nodes
+    num_gpus_per_node = args.num_gpus_per_node
     seed = args.seed
     batch_size = args.batch_size
     num_tokens = args.num_tokens
     cp_degree = max_cp_degree = args.cp_degree
-    num_seqs = args.num_seqs
     tp_size = args.tp_size
-    world_size = args.num_nodes * args.num_gpus_per_node
+    world_size = num_nodes * num_gpus_per_node
     total_seq_len = args.num_tokens
     num_layers = args.num_layers
     model_path = args.model_path
@@ -557,23 +527,34 @@ def test(args):
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
+
     mode = args.mode
     output_dir = args.output_dir
+    dtype = torch.bfloat16
+    element_size = dtype.itemsize
 
     # Set forward function mode based on test mode
     normal_forward_fn = (mode in ["baseline", "wlbllm"])
     # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
     os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
 
-    # config = dict(
-    #     mode=mode, tp_size=tp_size, 
-    #     dp_size=dp_size, 
-    #     cp_size=cp_degree, 
-    #     num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, 
-    #     max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, 
-    #     replan_iter=replan_iter, elongate_factor=elongate_factor,
-    # )
-    # log_to_console_and_file(f"🟢 Test Config: {config}")
+    start_time__ = time.time()
+    
+    def write_status_log(message):
+        # get the caller's file and line number
+        import traceback
+        stack = traceback.extract_stack()
+        caller_file = stack[-2].filename
+        caller_line = stack[-2].lineno
+
+        status_log_file = os.path.join(output_dir, "status.log")
+        elapsed_time = time.time() - start_time__
+        message = f"🕛 [T{elapsed_time:.2f}] ({caller_file}:{caller_line}) {message}"
+        with open(status_log_file, "a") as f:
+            f.write(message + "\n")
+        print(message)
+        return
+
 
 
     if mode == "wlbllm":
@@ -582,10 +563,17 @@ def test(args):
         import wlbllm.megatron_patch.backends
         wlbllm.megatron_patch.backends.monkey_patch()
         pass
-
-    dtype = torch.bfloat16
-    element_size = dtype.itemsize
-
+    
+    # Check world size
+    if mode == "wlbllm":
+        # assert cp_degree * tp_size == world_size, f"WLBLLM world size ({world_size}) = num_nodes ({args.num_nodes}) * num_gpus_per_node ({args.num_gpus_per_node}) must be divisible by cp_degree ({cp_degree}) * tp_size ({tp_size})"
+        print(f"🟡 Running WLBLLM config: cp_degree={cp_degree}, tp_size={tp_size}, world_size={world_size}")
+    elif mode == "d2":
+        print(f"🟡 Running D2 config: tp_size={tp_size}, world_size={world_size}")
+    else:
+        pass
+        
+    write_status_log(f"Pass world size check")
     
     print(f"🟡 setup_global_batch (mode={mode}): ")
     print(f"  - total_seq_len = {total_seq_len}")
@@ -613,6 +601,8 @@ def test(args):
             dtype, MegatronE2eWorker
         )
 
+    write_status_log(f"Finish init worker")
+
     memory_log_output_dir = os.path.join(output_dir, "mem-log")
     enable_memory_usage_logging(memory_log_output_dir)
 
@@ -635,6 +625,7 @@ def test(args):
     worker.init(model_path, seed=seed)
     rich.print(f"🟡 [Rank {worker.rank}] init done")
     log_memory_usage("init done")
+    write_status_log(f"Finish worker.init()")
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
@@ -725,72 +716,16 @@ def test(args):
 
             def flatten(a):
                 return [y for x in a for y in x]
+
             
-            # Balance the data here for WLBLLM.
-            # TODO: This only works for DP+CP.
-            # ENABLE_BALANCED_FLOS_NO_DEFER = False
-            ENABLE_BALANCED_FLOS_NO_DEFER = True
-            if ENABLE_BALANCED_FLOS_NO_DEFER and dp_size > 1:
-                # how many tokens per dp replicate (with cp) can hold?
-                # max_seq_len_without_cp * cp_size * 2 (ping pong)
-                Lmax = total_seq_len * 2 * batch_size // dp_size
-                # Lmax = total_seq_len * 2 * batch_size // cp_size
-                rich.print(f"🟡 [Rank {rank}] Lmax = {Lmax}")
-
-                all_docs = flatten(_seq_lens)
-                all_docs.sort(reverse=True)
-                new_batch = []
-                for r in range(dp_size):
-                    new_batch.append([])
-                
-                def get_workload(micro_batch: list[int]) -> int:
-                    # TODO: Fix this get_workload function to calculate the `breakpoint` of a model.
-                    a = [ i / (64 * K) for i in micro_batch]
-                    return sum(i ** 2 + i for i in a)
-
-                def get_length(micro_batch: list[int]) -> int:
-                    return sum(micro_batch)
-
-                # Step 1: Pack the docs into the new batch.
-                remained_docs = []
-                for doc in all_docs:
-                    workloads = [get_workload(batch) for batch in new_batch]
-                    lengths = [get_length(batch) for batch in new_batch]
-                    min_workload_idx = workloads.index(min(workloads))
-                    min_length_idx = lengths.index(min(lengths))
-                    
-                    if lengths[min_workload_idx] + doc <= Lmax:
-                        new_batch[min_workload_idx].append(doc)
-                    else:
-                        if lengths[min_length_idx] + doc <= Lmax:
-                            new_batch[min_length_idx].append(doc)
-                        else:
-                            remained_docs.append(doc)
-                    pass
-
-                # Step 2: Pack the remained docs, by workload.
-                for doc in remained_docs:
-                    workloads = [get_workload(batch) for batch in new_batch]
-                    lengths = [get_length(batch) for batch in new_batch]
-                    min_workload_idx = workloads.index(min(workloads))
-                    new_batch[min_workload_idx].append(doc)
-
-                if rank == 0:
-                    rich.print(f"🟡 [Rank {rank}] WLBLLM Reordered Batch: new_batch = {new_batch}")
-
-                modified_batches.append(new_batch)
-
-                
-                # print(f"🟡 [Rank {rank}] Before - assigning seq_lens={_seq_lens}")
-                # print(f"🟡 new_batch={new_batch}")
-                seq_lens = [new_batch[dp_rank]]
-
-            else:
-                seq_lens = _seq_lens
-                # seq_lens = _seq_lens[
-                #     dp_rank * cp_size * 2: 
-                #     (dp_rank + 1) * cp_size * 2
-                # ]
+            seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
+                dp_size, dp_rank, total_seq_len, batch_size, 
+                rank, _seq_lens, 
+                ENABLE_BALANCED_FLOS_NO_DEFER=True
+            )
+            
+            # TODO: Estimate and calculate flops imbalance and print it here...
+            print(f"🟡 [Rank {rank}] WLBLLM Reordered Batch: new_batch={new_batch}")
             print(f"🟡 [Rank {rank}] Taking seq_lens={seq_lens}")
 
 
@@ -838,15 +773,6 @@ def test(args):
                 device=torch.cuda.current_device()
             )
             
-            if rank % 8 == 0:
-                # debug_print(f"doc_lens", doc_lens)
-                # debug_print(f"doc_shards", doc_shards)
-                debug_print(f"cu_seqlens_q_list", cu_seqlens_q_list)
-                debug_print(f"cu_seqlens_k_list", cu_seqlens_k_list)
-            #     debug_print(f"max_seqlen_q_list", max_seqlen_q_list)
-            #     debug_print(f"max_seqlen_k_list", max_seqlen_k_list)
-            #     debug_print(f"kv_idx_list", kv_idx_list)
-            # exit(0)
 
             input_ids = torch.randint(100, 10000, (as_world_size, local_context_length))
             input_ids_local = input_ids[cp_rank]
@@ -875,6 +801,16 @@ def test(args):
 
             
             # Now save some context for the use of WLBLLM function
+            if rank % 8 == 0:
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] doc_lens", doc_lens)
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] doc_shards", doc_shards)
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] cu_seqlens_q_list", cu_seqlens_q_list)
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] cu_seqlens_k_list", cu_seqlens_k_list)
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] max_seqlen_q_list", max_seqlen_q_list)
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] max_seqlen_k_list", max_seqlen_k_list)
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] kv_idx_list", kv_idx_list)
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] input_ids_local", input_ids_local.shape)
+                rich.print(f"[Rank {rank}] [sample_id = {sample_id}] position_ids_local", position_ids_local.shape)
 
 
             # Create for wlbllm
@@ -933,12 +869,12 @@ def test(args):
             
             # Try different tolerance factors and see which one fits the buffer size.
             # This will sacrifice performance for safety.
+            verbose = (rank % 8 == 0)
             did_pass_overflow_check = False
             required_buffer_size = []
-            for tolerance_factor in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+            for tolerance_factor in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
                 planner = Planner(world_size, parallel_config, model_config=model_config, tolerance_factor=tolerance_factor)
                 
-                verbose = (rank % 8 == 0)
                 fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose)
                 fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose)
 
@@ -961,14 +897,19 @@ def test(args):
                 buffer_size = FastDispatcherWrapper.instance[0].buffer_size
                 def _check_overflow(fa2a_metadata):
                     send_sz = [torch.sum(m.fa2a_metadata[1][as_rank]).item() for m in fa2a_metadata]
-                    # send_sz + sender_recv_offset = sender_recv_last_token
+                    # self_send_sz = send_sz - m.fa2a_metadata[1][as_rank][as_rank]
                     send_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank] for m in fa2a_metadata]
                     recv_sz = [torch.sum(m.fa2a_metadata[3][as_rank]).item() for m in fa2a_metadata]
                     max_send_sz = max(send_sz)
                     max_recv_sz = max(recv_sz)
                     
                     if rank % 8 == 0:
-                        rich.print(f"🟡 [Rank {rank}] Overflow check: {max_send_sz / 1024**3:.2f} GB, {max_recv_sz / 1024**3:.2f} GB recv size, {max(torch.max(o).item() for o in send_last_offset) / 1024**3:.2f} GB send last offset, {buffer_size / 1024**3:.2f} GB buffer size")
+                        rich.print(
+                            f"🟡 [Rank {rank}] Overflow check: {max_send_sz / 1024**3:.2f} GB, "
+                            f"{max_recv_sz / 1024**3:.2f} GB recv size, "
+                            f"{max(torch.max(o).item() for o in send_last_offset) / 1024**3:.2f} GB send last offset, "
+                            f"{buffer_size / 1024**3:.2f} GB buffer size"
+                        )
 
                     max_size_provisioned = max(
                         max_send_sz, max_recv_sz, max(torch.max(o).item() for o in send_last_offset)
@@ -976,11 +917,6 @@ def test(args):
                     if not (buffer_size >= max_size_provisioned):
                         return False, max_size_provisioned
                     return True, max_size_provisioned
-                    
-                    # assert buffer_size >= max_send_sz and buffer_size >= max_recv_sz, f"{buffer_size / 1024**3} GB buffer, {
-                    #     [s / 1024**3 for s in send_sz]} GB send sizes, {
-                    #     [sz / 1024**3 for sz in recv_sz]} GB recv sizes"
-                    # assert max(torch.max(o).item() for o in send_last_offset) <= buffer_size, f"{buffer_size / 1024**3} GB buffer, {[o / 1024**3 for o in send_last_offset]} GB send last offsets"
 
                 check_0, max_size_provisioned_0 = _check_overflow(fa2a_metadata_0)
                 check_1, max_size_provisioned_1 = _check_overflow(fa2a_metadata_1)
@@ -992,8 +928,6 @@ def test(args):
                 else:
                     did_pass_overflow_check = True
                     break
-                # rich.print("🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0")
-                # rich.print("🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_1")
             
             if not did_pass_overflow_check:
                 rich.print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
@@ -1003,14 +937,10 @@ def test(args):
                 buffer_size = recommended_buffer_size * 1024**3 # bytes
 
                 FastDispatcherWrapper.update_buffer_size(buffer_size)
-                # FastDispatcherWrapper.instance[0]._update_buffer_size(buffer_size)
-                # FastDispatcherWrapper.instance[1]._update_buffer_size(buffer_size)
 
                 rich.print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
                 buffer_size = FastDispatcherWrapper.instance[0].buffer_size
-                
-                # raise ValueError(f"[Rank {rank}] Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with all tolerance_factor with buffer_size {buffer_size / 1024**3} GB. Try a bigger buffer size instead. Inspected required_buffer_size = {required_buffer_size}")
-            
+                            
             rich.print(f"🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0 and fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB")
 
 
@@ -1086,8 +1016,8 @@ def test(args):
             position_ids_local = torch.arange(num_batched_token_per_as_rank, dtype=torch.int64).repeat(1, 2)[0]
 
             if rank % 8 == 0:
-                rich.print(f"🟡 [Rank {rank}] input_ids_local.shape =", input_ids_local.shape)
-                rich.print(f"🟡 [Rank {rank}] position_ids_local.shape =", position_ids_local.shape)
+                rich.print(f"🟡 [Rank {rank}] [{sample_id = }] input_ids_local.shape =", input_ids_local.shape)
+                rich.print(f"🟡 [Rank {rank}] [{sample_id = }] position_ids_local.shape =", position_ids_local.shape)
 
             microbatch = {
                 "input_ids": input_ids_local,
@@ -1101,10 +1031,9 @@ def test(args):
 
         microbatches = [microbatch]
 
-
-
         if sample_id == 0:
             log_memory_usage("warmup start")
+            write_status_log(f"Warmup start")
             with log_memory_usage_context():
                 # Warmup
                 warmup_times = 5
@@ -1134,6 +1063,7 @@ def test(args):
                     sys.exit(1)
 
             
+            write_status_log(f"Finish warmup first time.")
             for warmup_idx in range(max(warmup_times - 1, 0)):
                 ref = worker.forward_backward_batch(
                     microbatches=microbatches,
@@ -1147,6 +1077,7 @@ def test(args):
             if rank == 0:
                 print("=" * 20 + "warmup done")
             log_memory_usage("warmup done")
+            write_status_log(f"Finish warmup.")
         
         # Real Experiment
         N = 3
@@ -1164,6 +1095,7 @@ def test(args):
         start_time = time.time()
         torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
         for repeat_idx in range(N):
+            write_status_log(f"Start Forward_backward_batch (sample_id={sample_id},repeat={repeat_idx})")
             torch.cuda.synchronize()
             torch.distributed.barrier()
             start_it_time = time.time()
@@ -1179,6 +1111,7 @@ def test(args):
             log_memory_usage(f"forward_backward_batch:done(sample_id={sample_id},repeat={repeat_idx})")
             iteration_time = end_it_time - start_it_time
             iteration_times.append(iteration_time)
+            write_status_log(f"Finish Forward_backward_batch (sample_id={sample_id},repeat={repeat_idx})")
         torch.cuda.nvtx.range_pop()
         
         torch.cuda.synchronize()
@@ -1207,8 +1140,8 @@ def test(args):
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
+
         # Write to the benchmark jsonl log
-        
         if rank == 0:
             # benchmark_data
             items = {
@@ -1231,17 +1164,6 @@ def test(args):
     timestamp = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S PST")
     now_ts = datetime.now(pst).strftime("%Y%m%d_%H%M%S")
     
-    file_dir = os.path.dirname(os.path.abspath(__file__))
-    benchmark_dir = os.path.join(file_dir, "..", "benchmarks", "_250809_e2e_benchmark", "data")
-    os.makedirs(benchmark_dir, exist_ok=True)
-    benchmark_file = os.path.join(benchmark_dir, f"benchmark.{now_ts}.{mode}.json")
-    
-    # rank = torch.distributed.get_rank()
-    # with open(attn_output_file, "w") as f:
-    #     attention_durations = get_attention_duration()
-    #     json.dump(attention_durations, f)
-    #     formatted_durations = [f"{duration:.2f}" for duration in attention_durations]
-    #     rich.print(f"🟢 Attention durations: {formatted_durations}")
 
     if rank % 8 == 0:
 
@@ -1251,14 +1173,18 @@ def test(args):
 
         def log_to_console_and_file(*args, **kwargs):
             rich.print(*args, **kwargs)
-            with open(summary_log_file, "a") as f:
-                rich.print(*args, **kwargs, file=f)
+            if rank == 0:
+                with open(summary_log_file, "a") as f:
+                    rich.print(*args, **kwargs, file=f)
 
         
         log_to_console_and_file(f"🟢 Test {__file__} passed")
         
         config = dict(
-            mode=mode, tp_size=tp_size, dp_size=dp_size, cp_size=cp_degree, 
+            mode=mode, 
+            nodes=num_nodes,
+            num_gpus_per_node=num_gpus_per_node,
+            tp_size=tp_size, dp_size=dp_size, cp_size=cp_degree, 
             num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, 
             max_sample_id=max_sample_id, up_sample_factor=up_sample_factor, filter_threshold=filter_threshold, filter_ratio=filter_ratio, 
             replan_iter=replan_iter, elongate_factor=elongate_factor,
@@ -1280,7 +1206,6 @@ def test(args):
         for idx in range(len(sample_times)):
             samples = iterated_samples[idx]
             duration = sample_times[idx]
-            # total_flops_factor = 
             log_to_console_and_file(f"🟢 Sample {idx}: duration: {duration:.2f} ms, samples = {samples}")
             benchmark_data["samples"].append({
                 "sample_id": idx,
@@ -1288,10 +1213,14 @@ def test(args):
                 "duration_ms": duration
             })
         
-        # Write benchmark results to file
-        # TODO: Make the output directory configurable.
         
     if rank == 0:
+        # Write benchmark results to file
+        # TODO: Legacy behavior. Can delete this later... just treat this as a log file.
+        file_dir = os.path.dirname(os.path.abspath(__file__))
+        benchmark_dir = os.path.join(file_dir, "..", "benchmarks", "_250809_e2e_benchmark", "data")
+        os.makedirs(benchmark_dir, exist_ok=True)
+        benchmark_file = os.path.join(benchmark_dir, f"benchmark.{now_ts}.{mode}.json")
         with open(benchmark_file, 'w') as f:
             json.dump(benchmark_data, f, indent=2)
 
@@ -1311,15 +1240,14 @@ def test(args):
 
     # Cleanup and exit
     rich.print(f"❄️ [Rank {rank}] Finished test and exit.")        
+    write_status_log(f"Finish test and exit.")
     # if False: # Only use it when force exit
     if args.force_exit: 
         print(f"[Rank {rank}] Starting aggressive cleanup process...")
         os._exit(0)
 
 
-from torch.profiler import profile, record_function, ProfilerActivity
 
-import d2.mem
 def save_memory_usage_to_file(memory_usage_dir: str):
     os.makedirs(memory_usage_dir, exist_ok=True)
     
@@ -1349,7 +1277,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--cp-degree", type=int, default=2)
-    parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--num-gpus-per-node", type=int, default=2)
@@ -1380,8 +1307,7 @@ if __name__ == "__main__":
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-        
-
+    
     should_profile_memory = args.should_profile_memory
     if should_profile_memory:
         torch.cuda.memory._record_memory_history()
@@ -1389,12 +1315,13 @@ if __name__ == "__main__":
         os.makedirs(mem_snapshots_dir, exist_ok=True)
         print(f"🟡 Will save mem snapshots to: {mem_snapshots_dir}")
         pass
-        pass
 
     memory_usage_output_dir = os.path.join(args.output_dir, "mem")
     memory_log_output_dir = os.path.join(args.output_dir, "mem-log")
     os.makedirs(memory_usage_output_dir, exist_ok=True)
     os.makedirs(memory_log_output_dir, exist_ok=True)
+
+    start_time = time.time()
     
     if should_profile_memory:
         with torch.profiler.profile(
@@ -1423,7 +1350,10 @@ if __name__ == "__main__":
         finally:
             save_memory_usage_to_file(memory_usage_output_dir)
     log_memory_usage("test:end", force=True)
-        
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    rich.print(f"🕛 Test elapsed time: {elapsed_time:.2f} seconds")
     
     if should_profile_memory:
         mode = args.mode

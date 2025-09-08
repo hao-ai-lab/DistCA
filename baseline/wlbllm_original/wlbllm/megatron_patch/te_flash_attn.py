@@ -22,6 +22,10 @@ def wlbllm_func(*args, **kwargs):
     ) = args
     softmax_scale = kwargs["softmax_scale"]
 
+    # import traceback
+    # print("🟡 Inside wlbllm_func:")
+    # traceback.print_stack()
+
     doc_lens = wlbllm.registry.get("doc_lens")
     doc_shards = wlbllm.registry.get("doc_shards")
     kv_idx_list = wlbllm.registry.get("kv_idx_list")
