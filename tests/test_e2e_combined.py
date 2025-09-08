@@ -27,6 +27,7 @@ import check_cpu_binding
 aff, mems = check_cpu_binding.check_cpu_binding()
 print(f"CPUS={aff} MEMS={mems}")
 
+
 # ----------------
 # Main Imports
 # ----------------
@@ -72,8 +73,11 @@ from d2.planner.planner import (
     Item,
 )
 
+
 def timeout_handler(signum, frame):
     raise TimeoutError("forward_backward_batch operation timed out after 5 minutes")
+
+# from d2.utils.torch_profiler import ProfilerCtx
 
 
 def debug_print(*args, **kwargs):
@@ -1099,7 +1103,50 @@ def test(args):
             log_memory_usage("warmup done")
             write_status_log(f"Finish warmup.")
         
+        
+        # # --------------
+        # # Profiling Run
+        # # --------------
+        # Useless - doesn't dump as much information as nsys profile as we want.
+        # EXPERIMENT_PROFILE_RUN = os.environ.get("EXPERIMENT_PROFILE_RUN", "0")
+        # try:
+        #     EXPERIMENT_PROFILE_RUN = int(EXPERIMENT_PROFILE_RUN)
+        # except:
+        #     EXPERIMENT_PROFILE_RUN = 0
+        #     pass
+        # EXPERIMENT_PROFILE_RUN = 1
+
+        
+        # print(f"[Rank {rank}] ⚪ Reaching profiling run.")
+        # if EXPERIMENT_PROFILE_RUN > 0:
+        #     print(f"[Rank {rank}] ⚪ Running profiling run...")
+        #     profile_output_dir = os.path.join(output_dir, "profile_runs")
+        #     profile_chrom_trace = os.path.join(profile_output_dir, f"prof_trace.sid{sample_id}.r{rank}.json")
+        #     os.makedirs(profile_output_dir, exist_ok=True)
+            
+        #     with ProfilerCtx(profile_output_dir, chrome_name=profile_chrom_trace) as prof:
+        #         for run_id in range(EXPERIMENT_PROFILE_RUN):
+        #             print(f"[Rank {rank}] ⚪ Running profiling run (repeat={run_id})...")
+        #             torch.cuda.synchronize()  
+        #             torch.distributed.barrier()
+
+        #             ref = worker.forward_backward_batch(
+        #                 microbatches=microbatches,
+        #                 normal_forward_fn=normal_forward_fn,
+        #                 forward_only=False,
+        #             )
+        #             torch.cuda.synchronize()  
+        #             torch.distributed.barrier()
+        #             print(f"[Rank {rank}] ⚪ Finish profiling run (repeat={run_id}).")
+        #             prof.step()
+        #             print(f"[Rank {rank}] ⚪ Finish step in profiling run (repeat={run_id})...")
+
+        # exit(1)   
+
+            
+        # --------------
         # Real Experiment
+        # --------------
         N = 3
         
         try:
@@ -1140,7 +1187,9 @@ def test(args):
         duration = end_time - start_time
         # duration_ms = duration * 1000
         # avg_duration_ms = duration_ms / N
-        avg_duration_ms = sum(iteration_times) / len(iteration_times) * 1000
+        avg_duration_ms = 0
+        if iteration_times:
+            avg_duration_ms = sum(iteration_times) / len(iteration_times) * 1000
         sample_times.append(avg_duration_ms)
         if rank == 0:
             rich.print(f"[Sample ID=({sample_id})] Mode={mode} forward_backward_batch: avg_time_per_iteration = {avg_duration_ms:.2f} ms")
@@ -1169,10 +1218,11 @@ def test(args):
                 "duration_ms": avg_duration_ms,
                 "samples": iterated_samples[-1],
             }
-            output_file = os.path.join(output_dir, "benchmark.raw.jsonl")
-            with open(output_file, 'a') as f:
-                f.write(json.dumps(items))
-                f.write('\n')
+            if os.environ.get("EXPERIMENT_ENABLE_BENCHMARK_SAVING", "0") == "1":
+                output_file = os.path.join(output_dir, "benchmark.raw.jsonl")
+                with open(output_file, 'a') as f:
+                    f.write(json.dumps(items))
+                    f.write('\n')
 
     torch.cuda.synchronize()
     torch.distributed.barrier()
