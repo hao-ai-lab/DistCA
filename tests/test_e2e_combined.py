@@ -736,9 +736,9 @@ def test(args):
 
             
             seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
-                dp_size, dp_rank, total_seq_len, batch_size, 
-                rank, _seq_lens, 
-                ENABLE_BALANCED_FLOS_NO_DEFER=True
+                dp_size, dp_rank, total_seq_len, batch_size, _seq_lens, 
+                ENABLE_BALANCED_FLOS_NO_DEFER=True,
+                model_config=hf_config, # TODO: (Refactor) This is a hack to pass the model config to the WLBLLM planner.
             )
             
             # TODO: Estimate and calculate flops imbalance and print it here...

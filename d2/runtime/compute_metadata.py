@@ -459,7 +459,7 @@ def from_planner_output(
     # qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
     #  out_grad_linear_to_attn, attn_metadata
     rank = torch.distributed.get_rank()
-    if rank % 8 == 0:
+    if rank % 8 == 1:
         rich.print(f"from_planner_output: qkv_linear_to_attn=", qkv_linear_to_attn)
         rich.print(f"from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear)
         rich.print(f"from_planner_output: out_attn_to_linear=", out_attn_to_linear)

@@ -30,6 +30,20 @@ from megatron_test_utils import (
     gptmodel_forward, make_batch_generator, unwrap_model,
 )
 
+import d2.planner.wlb_planner
+
+try:
+    import wlbllm
+    import wlbllm.utils
+    import wlbllm.registry
+except ImportError:
+    print("""⚠️ WLBLLM is not installed. This only affects if you're testing WLBLLM tests. To install:
+
+    cd d2/baseline/wlbllm_original
+    pip install -e .
+    """)
+    # exit(1)
+
 
 NVTE_ALLOW_NONDETERMINISTIC_ALGO = os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
 if NVTE_ALLOW_NONDETERMINISTIC_ALGO == "0":
@@ -342,8 +356,11 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
                            num_head_in_dtype: int, tp_size: int, dp_size: int,
                            num_token_per_rank: int,
                            num_batches: int = None,
-                           use_planner: bool=False):
-    tick_per_rank_doc_lens = None
+                           use_planner: bool = False, # TODO: should deprecate this flag.
+                           return_original_doclen: bool = False,
+                           
+                           ):
+    tick_per_rank_doc_lens: Optional[list[list[int]]] = None
     bwd_metadata = []
     microbatches = []
     if use_planner:
@@ -355,12 +372,12 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
         # add a dummy forward microbatch at PP rank 0.
         add_dummy_forward = i >= num_microbatch
 
-        
         (
             fa_fwd_params, fa_bwd_params,
             qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
             attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
             tick_per_rank_doc_lens,
+            orig_cur_tick_per_rank_doc_lens,
         ) = create_qkv_dispatch_pipeline_tick(
             as_world_size, total_seq_len, num_seqs, max_cp_degree,
             hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
@@ -370,7 +387,8 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
             dp_size=dp_size,
             num_token_per_rank=num_token_per_rank,
             num_batches=num_batches,
-            use_planner=use_planner
+            use_planner=use_planner,
+            return_original_doclen=True,
         )
         
         # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, so each rank knows its number of tokens.
@@ -432,7 +450,14 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
         packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
         packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
         packed_seq_params.bwd_packed_seq_params = bwd_packed_seq_params
-    return microbatches
+    
+    # Prepare the return values.
+    # - microbatches: list[dict]
+    # - (if specified `return_original_doclen``) orig_cur_tick_per_rank_doc_lens: list[list[int]]
+    ret = (microbatches, )
+    if return_original_doclen:
+        ret += (orig_cur_tick_per_rank_doc_lens,)
+    return ret
 
 
 def test(args):
@@ -471,6 +496,7 @@ def test(args):
     # Set num_batches. 
     # If None, we use MLP-DP. will get DP number of new batches per tick.
     # If set, num_batches < dp_size && dp_size % num_batches == 0, Will get num_batches number of List per tick.
+    # TODO: (Refactor) Rename all `total_seq_len` to just `per_rank_seq_len`. This creates a huge miscommunication.
     if num_batches == None:
         num_batches = dp_size
         num_token_per_rank = args.num_tokens
@@ -518,7 +544,7 @@ def test(args):
     hidden_size_k_tp = hidden_size_kv // tp_size
     num_head_in_dtype = (hf_config.num_attention_heads *
                          torch.float32.itemsize // element_size // tp_size)
-    # if args.use_planner:
+
     from global_batch_provider import setup_global_batch
     setup_global_batch(total_seq_len=total_seq_len)
         
@@ -529,24 +555,150 @@ def test(args):
     # - num_batches: 
     #   For each tick, getting `num_batches` number of list from the data loader (GLOBAL_BATCH iterator). 
     #   This is the parameter controlling the number of batches per tick.
-    # 
-    microbatches_0 = create_pp_microbatches(
+
+    
+    # ---------------------------
+    # Prepare the microbatches
+    # ---------------------------
+    should_run_baseline_dummy = True
+    should_run_baseline_no_dummy = True
+    should_run_wlbllm = False
+    should_run_pingpong_dummy = True
+    # microbatch - dict(
+    #   position_ids: tensor, 
+    #   packed_seq_params: PingPangSingleStepPackedSeqParams, 
+    # )
+    # orig_cur_tick_per_rank_doc_lens_x -> prepare for wlbllm to use.
+
+    microbatches_0, orig_cur_tick_per_rank_doc_lens_0 = create_pp_microbatches(
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
         tp_size, dp_size, 
-        num_token_per_rank, num_batches, args.use_planner,  
+        num_token_per_rank, num_batches, args.use_planner,  return_original_doclen=True,
     )
-    microbatches_1 = create_pp_microbatches(
+    microbatches_1, orig_cur_tick_per_rank_doc_lens_1 = create_pp_microbatches(
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
         tp_size, dp_size, 
-        num_token_per_rank, num_batches, args.use_planner,
+        num_token_per_rank, num_batches, args.use_planner, return_original_doclen=True,
     )
     set_random_seed(seed, set_megatron=True)
-    microbatches = []
     orig_impl_microbatches = []
+    wlbllm_microbatches = []
+    wlbllm_metadatas = [] # used to register for wlbllm.registry.
+    d2_microbatches = []
+
+    # Constrcut WLBLLM microbatches
+    # - use the `orig_cur_tick_per_rank_doc_lens_0` and `orig_cur_tick_per_rank_doc_lens_1` ticks.
+    # - create balanced microbatches by reordering.
+    # - construct the microbatch: dict(input_ids, position_ids, packed_seq_params: PackedSeqParams)
+    # - register these variables as global variables into the wlbllm utils. 
+    #     This is a historic hack from us to enable WLBLLM: 
+    #     variables like cp_stream, etc, are slightly hard to pass down the chain. 
+    all_doc_lens = orig_cur_tick_per_rank_doc_lens_0 + orig_cur_tick_per_rank_doc_lens_1
+    debug_print(f"wlbllm all_doc_lens: {all_doc_lens}")
+
+    
+    wlb_plan_size = dp_size * pp_size
+    wlb_plan_rank = dp_rank + pp_rank * dp_size
+    _, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
+        wlb_plan_size, wlb_plan_rank, total_seq_len, 
+        # Here, the number of batches we pass is (num_batches * num_microbatch).
+        # Inside the function, we use (num_batches * num_microbatch * 2) to distribute the workload.
+        # This is becuase `orig_cur_tick_per_rank_doc_lens_0` has num_microbatch * batches, elements.
+        # and we are taking 2 of them.
+        num_batches * num_microbatch, 
+        all_doc_lens,
+        ENABLE_BALANCED_FLOS_NO_DEFER=True,
+        model_config=hf_config, # TODO: (Refactor) This is a hack to pass the model config to the WLBLLM planner.
+    )
+    # TODO: Log the workload of differnet batches...
+    debug_print(f"wlbllm: taking {num_batches * num_microbatch} batches, getting new_batch: {new_batch}")
+    assert len(new_batch) == num_batches * num_microbatch
+
+    # Take this DP-rank's all PP batches, and organizes them into a list of microbatch(es).
+    wlb_my_dp_rank_microbatches: list[list[int]] = new_batch[dp_rank * pp_size: (dp_rank + 1) * pp_size]
+    debug_print(f"wlbllm: taking {dp_rank * pp_size} to {dp_rank + pp_size} batches, getting wlb_my_batches: {wlb_my_dp_rank_microbatches}")
+    debug_print(f"wlbllm: dp_rank: {dp_rank} - token_per_batch: {[sum(mb) for mb in wlb_my_dp_rank_microbatches]}")
+
+
+
+    
+    if should_run_wlbllm:
+        cp_rank = mpu.get_context_parallel_rank()
+        assert cp_size == mpu.get_context_parallel_world_size()
+        
+        wlbllm.registry.clear()
+        cp_stream = torch.cuda.current_stream()
+        wlbllm.registry.set("cp_stream", cp_stream)
+
+        for idx, wlb_mb in enumerate(wlb_my_dp_rank_microbatches):
+            assert isinstance(wlb_mb, list) and isinstance(wlb_mb[0], int), f"wlb_mb must be a list of ints. Current wlb_mb: {wlb_mb}"
+            
+            doc_lens = wlb_mb
+            num_tokens: int = sum(doc_lens)
+            position_ids = torch.arange(num_tokens, dtype=torch.int64)
+            
+            local_context_length = num_tokens // cp_size
+            context_length = local_context_length * cp_size
+
+            doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
+                doc_lens, context_length, cp_size,
+            )
+            (
+                cu_seqlens_q_list, cu_seqlens_k_list, 
+                max_seqlen_q_list, max_seqlen_k_list, 
+                kv_idx_list,
+            ) = wlbllm.utils.compute_per_doc_metadate_combined__metadata_only(    
+                context_length, 
+                doc_lens, 
+                doc_shards,
+                cp_size, 
+                cp_rank, 
+                device=torch.cuda.current_device()
+            )
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                # TODO(HACK): These variables are not used in the WLBLLM functions.
+                # If anywhere we used them, we will fail.
+                # See PerDocCPAttention in the wlbllm/per_doc_cp_attn.py
+                cu_seqlens_q=cu_seqlens_q_list[-1],
+                cu_seqlens_kv=cu_seqlens_k_list[-1],
+                max_seqlen_q=max_seqlen_q_list[-1],
+                max_seqlen_kv=max_seqlen_k_list[-1],
+            )
+
+            mb = {
+                "input_ids": torch.randint(10, 1000, (num_tokens,)),
+                "position_ids": position_ids,
+                "packed_seq_params": packed_seq_params,
+            }
+            wlbllm_microbatches.append(mb)
+
+            # Now actually registering the wlbllm variables into the registry.
+            # The registry takes care of the context of the variables. 
+
+            # TODO: (HACK) I'm really sorry I should not have done this.
+            def register_wlbllm_variables():
+                wlbllm.registry.set("doc_lens", doc_lens)
+                wlbllm.registry.set("doc_shards", doc_shards)
+                wlbllm.registry.set("kv_idx_list", kv_idx_list)
+                wlbllm.registry.set("cp_stream", cp_stream)
+                wlbllm.registry.set("cu_seqlens_q_list", cu_seqlens_q_list)
+                wlbllm.registry.set("cu_seqlens_kv_list", cu_seqlens_k_list)
+                wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
+                wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
+                wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
+
+
+            pass
+
+
+
+    # Construct D2 and baseline microbatches
+    
     for mb_0, mb_1 in zip(microbatches_0, microbatches_1):
         mb_0_psp = mb_0["packed_seq_params"]
         mb_1_psp = mb_1["packed_seq_params"]
@@ -567,7 +719,7 @@ def test(args):
             "position_ids": torch.concat([mb_0["position_ids"], mb_1["position_ids"]]),
             "packed_seq_params": ping_pong_params,
         }
-        microbatches.append(mb)
+        d2_microbatches.append(mb)
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q = torch.concat([
@@ -594,7 +746,7 @@ def test(args):
         with open(microbatch_log_file, "a") as f:
             for mb in mb_list:
                 f.write(f"{mb}\n")
-        pass
+        return
     
     # debug_print(f"orig_impl_microbatches[0]: {orig_impl_microbatches[0]}")
     # debug_print(f"microbatches[0]: {microbatches[0]}")
@@ -605,52 +757,17 @@ def test(args):
         filter_path="/mnt/weka/home/yonghao.zhuang/jd/d2/"
     )
     stack_tracer.__enter__()
-    debug_print("Start Forward backward baseline with dummy")
-    start_time = time.time()
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
-    loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
-        microbatches=orig_impl_microbatches,
-        forward_only=False,
-        mode="orig_reimpl",
-        with_dummy=True,
-    )
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
-    end_time = time.time()
-    duration = end_time - start_time
-    duration_ms = duration * 1000
-    debug_print(f"⚪ Finish Baseline with dummy in {duration_ms:.2f} ms")
 
 
-
-    debug_print("Start Forward backward baseline without dummy")
-    start_time = time.time()
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
-    loss_orig, grad_orig = worker.forward_backward_batch(
-        microbatches=orig_impl_microbatches,
-        forward_only=False,
-        mode="orig_reimpl",
-        with_dummy=False,
-    )
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
-    end_time = time.time()
-    duration = end_time - start_time
-    duration_ms = duration * 1000
-    debug_print(f"⚪ Finish Baseline without dummy in {duration_ms:.2f} ms")
-
-    debug_print("Start Forward backward pingpong with dummy")
-    for idx in range(3):
-        time.sleep(2)
+    if should_run_baseline_dummy:
+        debug_print("Start Forward backward baseline with dummy")
+        start_time = time.time()
         torch.cuda.synchronize()
         torch.distributed.barrier()
-        start_time = time.time()
-        loss_reduced, grad_sample = worker.forward_backward_batch(
-            microbatches=microbatches,
+        loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
+            microbatches=orig_impl_microbatches,
             forward_only=False,
-            mode="ping_pong",
+            mode="orig_reimpl",
             with_dummy=True,
         )
         torch.cuda.synchronize()
@@ -658,8 +775,79 @@ def test(args):
         end_time = time.time()
         duration = end_time - start_time
         duration_ms = duration * 1000
-        debug_print(f"⚪ [idx={idx}] Finish D2 with dummy in {duration_ms:.2f} ms")
-        print(f"{loss_reduced=}, {loss_orig_reimpl=}, {loss_orig=}")
+        debug_print(f"⚪ Finish Baseline with dummy in {duration_ms:.2f} ms")
+    else:
+        debug_print(f"⚪ Skipping Baseline with dummy")
+        pass
+
+
+    if should_run_baseline_no_dummy:
+        debug_print("Start Forward backward baseline without dummy")
+        start_time = time.time()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        loss_orig, grad_orig = worker.forward_backward_batch(
+            microbatches=orig_impl_microbatches,
+            forward_only=False,
+            mode="orig_reimpl",
+            with_dummy=False,
+        )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        end_time = time.time()
+        duration = end_time - start_time
+        duration_ms = duration * 1000
+        debug_print(f"⚪ Finish Baseline without dummy in {duration_ms:.2f} ms")
+    else:
+        debug_print(f"⚪ Skipping Baseline without dummy")
+        pass
+
+
+    if should_run_wlbllm:
+        debug_print("Start Forward backward wlbllm")
+        start_time = time.time()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        # Patch the attention and all stuff...
+        loss_wlbllm, grad_wlbllm = worker.forward_backward_batch(
+            microbatches=wlbllm_microbatches,
+            forward_only=False,
+            mode="wlbllm",
+            with_dummy=False,
+        )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        end_time = time.time()
+        duration = end_time - start_time
+        duration_ms = duration * 1000
+        debug_print(f"⚪ Finish WLBLLM in {duration_ms:.2f} ms")
+    else:
+        debug_print(f"⚪ Skipping WLBLLM")
+        pass
+
+    
+    if should_run_pingpong_dummy:
+        debug_print("Start Forward backward pingpong with dummy")
+        for idx in range(3):
+            time.sleep(2)
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            start_time = time.time()
+            loss_reduced, grad_sample = worker.forward_backward_batch(
+                microbatches=d2_microbatches,
+                forward_only=False,
+                mode="ping_pong",
+                with_dummy=True,
+            )
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            end_time = time.time()
+            duration = end_time - start_time
+            duration_ms = duration * 1000
+            debug_print(f"⚪ [idx={idx}] Finish D2 with dummy in {duration_ms:.2f} ms")
+    else:
+        debug_print(f"⚪ Skipping D2 with dummy")
+        pass
 
     torch.cuda.synchronize()
     stack_tracer.__exit__(None, None, None)
@@ -667,15 +855,18 @@ def test(args):
     is_close = False
     try:
         # torch.testing.assert_close(grad_orig_reimpl, grad_orig)
+        print(f"{loss_reduced=}, {loss_orig_reimpl=}, {loss_orig=}")
         torch.testing.assert_close(grad_orig_reimpl, grad_sample, rtol=1.1e-3, atol=1.1e-3)
         is_close = True
-    except Exception as e:
+    except AssertionError as e:
         debug_print(f"⚪ Gradients are not close: {e}")
         is_close = False
-    # print(f"{worker.rank} finish pingpong")
-    # print("=" * 20 + "forward_backward_batch attention server, done")
-    prompt = "🟢" if is_close else "🔴"
-    print(f"{prompt} Passing e2e pipeline pingpong test")
+    except Exception as e:
+        debug_print(f"👻 Unexpected error. Maybe we skipped some tests?: {e}")
+        is_close = False
+
+    prompt = "🟢" if is_close else "⚠️"
+    print(f"{prompt} Passing e2e pipeline pingpong test. loss tensor is_close = {is_close}")
 
 
 if __name__ == "__main__":
