@@ -41,7 +41,10 @@ def get_torch_cuda_memory_usage(device):
     return allocated_cur, allocated_peak, total_alloc
 
 def log_memory_usage(message: str, force: bool = False):
-    if os.getenv("EXPERIMENT_LOG_MEMORY_USAGE", "0") != "1":
+    EXPERIMENT_LOG_MEMORY_USAGE = os.getenv("EXPERIMENT_LOG_MEMORY_USAGE", "0")
+    # print(f"Ⓜ️", EXPERIMENT_LOG_MEMORY_USAGE)
+    # return
+    if EXPERIMENT_LOG_MEMORY_USAGE != "1":
         return
     
     global memory_usage
