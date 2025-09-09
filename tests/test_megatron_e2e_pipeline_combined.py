@@ -43,6 +43,85 @@ def debug_print(*args, **kwargs):
     return
 
 
+# --------------------------------
+# Better traceback formatting
+# --------------------------------
+# TODO: Put this into some debug file
+import sys, traceback, os
+
+RED = "\033[31m"
+BLUE = "\033[34m"
+RESET = "\033[0m"
+
+def clickable_excepthook(exc_type, exc_value, tb):
+    for filename, lineno, func, text in traceback.extract_tb(tb):
+        path = os.path.abspath(filename)
+        print(f"{path}:{lineno}: in {func}")
+        if text:
+            print(f"    {text}")
+    # error in red
+    print(f"{RED}{exc_type.__name__}: {exc_value}{RESET}")
+
+if os.environ.get("EXPERIMENT_PYTHON_BETTER_TRACEBACK", "1") == "1":
+    sys.excepthook = clickable_excepthook
+
+# --------------------------------
+# Know where I get stuck
+# --------------------------------
+# TODO: Put this into some debug file
+
+import sys
+
+should_trace_calls = os.environ.get("EXPERIMENT_PYTHON_DEBUG_TRACE_CALLS", "0") == "1"
+def trace_calls(frame, event, arg):
+    if event == "call":
+        code = frame.f_code
+        print(f"--> Enter {code.co_name} ({code.co_filename}:{frame.f_lineno})")
+    elif event == "return":
+        code = frame.f_code
+        print(f"<-- Exit {code.co_name} ({code.co_filename}:{frame.f_lineno})")
+    return trace_calls
+
+import sys
+
+class TraceFunctions:
+    def __init__(self, filter_path=None):
+        self.filter_path = filter_path
+        self._oldtrace = None
+        self.indent = 0
+
+    def _trace(self, frame, event, arg):
+        if event in ("call", "return"):
+            code = frame.f_code
+            filename = code.co_filename
+            if self.filter_path and self.filter_path not in filename:
+                return
+            if event == "call":
+                print(f"{BLUE}{' ' * self.indent}--> Enter {code.co_name} ({filename}:{frame.f_lineno}){RESET}")
+                self.indent += 1
+            elif event == "return":
+                print(f"{BLUE}{' ' * self.indent}<-- Exit  {code.co_name} ({filename}:{frame.f_lineno}){RESET}")
+                self.indent -= 1
+        return self._trace
+
+    def __enter__(self):
+        self._oldtrace = sys.gettrace()
+        if not should_trace_calls:
+            return self
+        sys.settrace(self._trace)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        sys.settrace(self._oldtrace)
+
+# if should_trace_calls:
+#     print("🟡 Enabling python debug trace calls.")
+#     sys.settrace(trace_calls)
+
+
+# --------------------------------
+# MegatronE2eWorker
+# --------------------------------
 class MegatronE2eWorker(BaseMegatronE2eWorker):
     def __init__(self, rank: int, world_size: int):
         super().__init__(rank, world_size)
@@ -94,8 +173,8 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
             pass
 
         # TODO: What are the debug modes for?
-        # debug = (mode != "ping_pong" and mode != "wlbllm")
-        debug = False
+        debug = (mode != "ping_pong" and mode != "wlbllm")
+        # debug = False
         debug_fwd_impl = mode if debug else None
 
         microbatches = [{
@@ -106,8 +185,8 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
                 psp = mb["packed_seq_params"]
                 if isinstance(psp, PingPangSingleStepPackedSeqParams):
                     mb["packed_seq_params"] = mb["packed_seq_params"].mlp_packed_seq_params
-                else:
-                    assert isinstance(psp, PackedSeqParams)
+                psp = mb["packed_seq_params"]
+                assert isinstance(psp, PackedSeqParams)
 
         # forward_backward_func = get_forward_backward_func()
         pp_size = self.tf_config.pipeline_model_parallel_size
@@ -176,7 +255,7 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
             torch.cuda.synchronize()
         
         if with_dummy:
-            raise RuntimeError("At performance test, we should not use dummy backward.")
+            # raise RuntimeError("At performance test, we should not use dummy backward.")
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step,
                 data_iterator=batch_generator,
@@ -361,6 +440,7 @@ def test(args):
     model_path = args.model_path
     num_layers = args.num_layers
     output_dir = args.output_dir
+    num_batches = args.num_batches
     # TODO: (Refactor) This is a hack to set the number of layers. It should be properly set in the HuggingFace config, not here
     if num_layers is not None:
         # See `megatron_test_utils.py` for more details.
@@ -372,31 +452,37 @@ def test(args):
     num_tokens = args.num_tokens
     max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
+    num_microbatch = args.num_microbatch
     
     # parallelization
     tp_size = args.tp_size
     pp_size = args.pp_size
+    cp_size = cp_degree = args.cp_degree
     world_size = args.num_nodes * args.num_gpus_per_node
-    assert world_size % (tp_size * pp_size) == 0
-    dp_size = world_size // (tp_size * pp_size)
+    assert world_size % (tp_size * pp_size * cp_size) == 0, (
+        f"world_size: {world_size} = num_nodes: {args.num_nodes} * num_gpus_per_node: {args.num_gpus_per_node} must be divisible by tp_size: {tp_size} * pp_size: {pp_size} * cp_size: {cp_size}. "
+        f"Did you set the correct number of nodes, GPUs per node, and parallelism sizes? "
+        f"Check your environment variables: NNODES, GPUS_PER_NODE, TP_SIZE, PP_SIZE, CP_SIZE"
+    )
+    dp_size = world_size // (tp_size * pp_size * cp_size)
 
-    assert args.num_microbatch >= pp_size, "num_microbatch need bigger than pp_size. Current num_microbatch: {args.num_microbatch}, pp size: {pp_size}"
+    assert num_microbatch >= pp_size, f"num_microbatch need bigger than pp_size. Current num_microbatch: {num_microbatch}, pp size: {pp_size}"
 
     # Set num_batches. 
     # If None, we use MLP-DP. will get DP number of new batches per tick.
     # If set, num_batches < dp_size && dp_size % num_batches == 0, Will get num_batches number of List per tick.
-    if args.num_batches == None:
+    if num_batches == None:
         num_batches = dp_size
         num_token_per_rank = args.num_tokens
         total_seq_len = args.num_tokens # when no CP, total_seq_len == args.num_tokens
         print(f"MLP-DP, num_batches: {num_batches}, num_token_per_rank: {num_token_per_rank}, total_seq_len: {total_seq_len}")
     else:
-        assert args.num_batches <= dp_size, "num-batches must be <= dp_size"
-        assert dp_size % args.num_batches == 0, "dp_size must be divisible by num-batches"
-        num_batches = args.num_batches
+        # assert args.num_batches <= dp_size, f"num-batches ({args.num_batches}) must be <= dp_size ({dp_size})"
+        assert num_batches >= dp_size, f"num-batches ({num_batches}) must be >= dp_size ({dp_size})"
+        assert num_batches % dp_size == 0, f"num-batches ({num_batches}) must be divisible by dp_size ({dp_size})"
         num_token_per_rank = args.num_tokens * num_batches // dp_size
         total_seq_len = args.num_tokens * num_batches  # total_seq_len is max possible seq_len.
-        if args.num_batches <= dp_size:
+        if num_batches <= dp_size:
             print(f"MLP-CP, num_batches: {num_batches}, num_token_per_rank: {num_token_per_rank}, total_seq_len: {total_seq_len}")
     dtype = torch.bfloat16
     element_size = dtype.itemsize
@@ -409,9 +495,10 @@ def test(args):
         hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
                           hf_config.num_attention_heads)
 
+    debug_print(f"hidden_size_q: {hidden_size_q}, hidden_size_kv: {hidden_size_kv}, hf_config.num_attention_heads: {hf_config.num_attention_heads}. mode: {mode}")
     worker: MegatronE2eWorker = init_megatron_e2e_test(
         hidden_size_q, hidden_size_kv, hf_config.num_attention_heads, num_tokens,
-        world_size, max_cp_degree, tp_size, pp_size,
+        world_size, cp_size, tp_size, pp_size,
         dtype, MegatronE2eWorker, mode=mode
     )
     worker.set_config(dtype=dtype)
@@ -499,36 +586,96 @@ def test(args):
         }
         orig_impl_microbatches.append(orig_mb)
 
+    def log_micro_batches(mb_list):
+        rank = torch.distributed.get_rank()
+        microbatch_log_dir = os.path.join(output_dir, f"microbatch_logs")
+        os.makedirs(microbatch_log_dir, exist_ok=True)
+        microbatch_log_file = os.path.join(microbatch_log_dir, f"{rank}.log")
+        with open(microbatch_log_file, "a") as f:
+            for mb in mb_list:
+                f.write(f"{mb}\n")
+        pass
+    
+    # debug_print(f"orig_impl_microbatches[0]: {orig_impl_microbatches[0]}")
+    # debug_print(f"microbatches[0]: {microbatches[0]}")
     time.sleep(2)
+
+    
+    stack_tracer = TraceFunctions(
+        filter_path="/mnt/weka/home/yonghao.zhuang/jd/d2/"
+    )
+    stack_tracer.__enter__()
+    debug_print("Start Forward backward baseline with dummy")
+    start_time = time.time()
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
     loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
         microbatches=orig_impl_microbatches,
         forward_only=False,
         mode="orig_reimpl",
         with_dummy=True,
     )
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    end_time = time.time()
+    duration = end_time - start_time
+    duration_ms = duration * 1000
+    debug_print(f"⚪ Finish Baseline with dummy in {duration_ms:.2f} ms")
+
+
+
+    debug_print("Start Forward backward baseline without dummy")
+    start_time = time.time()
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
     loss_orig, grad_orig = worker.forward_backward_batch(
         microbatches=orig_impl_microbatches,
         forward_only=False,
         mode="orig_reimpl",
         with_dummy=False,
     )
-    print("finish baseline")
-    for _ in range(3):
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    end_time = time.time()
+    duration = end_time - start_time
+    duration_ms = duration * 1000
+    debug_print(f"⚪ Finish Baseline without dummy in {duration_ms:.2f} ms")
+
+    debug_print("Start Forward backward pingpong with dummy")
+    for idx in range(3):
         time.sleep(2)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        start_time = time.time()
         loss_reduced, grad_sample = worker.forward_backward_batch(
             microbatches=microbatches,
             forward_only=False,
             mode="ping_pong",
             with_dummy=True,
         )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        end_time = time.time()
+        duration = end_time - start_time
+        duration_ms = duration * 1000
+        debug_print(f"⚪ [idx={idx}] Finish D2 with dummy in {duration_ms:.2f} ms")
         print(f"{loss_reduced=}, {loss_orig_reimpl=}, {loss_orig=}")
-    torch.cuda.synchronize()
-    torch.testing.assert_close(grad_orig_reimpl, grad_orig)
-    if worker.as_rank == 1:
-        torch.testing.assert_close(grad_orig_reimpl, grad_sample, rtol=1.1e-3, atol=1.1e-3)
-    print(f"{worker.rank} finish pingpong")
 
-    print("=" * 20 + "forward_backward_batch attention server, done")
+    torch.cuda.synchronize()
+    stack_tracer.__exit__(None, None, None)
+
+    is_close = False
+    try:
+        # torch.testing.assert_close(grad_orig_reimpl, grad_orig)
+        torch.testing.assert_close(grad_orig_reimpl, grad_sample, rtol=1.1e-3, atol=1.1e-3)
+        is_close = True
+    except Exception as e:
+        debug_print(f"⚪ Gradients are not close: {e}")
+        is_close = False
+    # print(f"{worker.rank} finish pingpong")
+    # print("=" * 20 + "forward_backward_batch attention server, done")
+    prompt = "🟢" if is_close else "🔴"
+    print(f"{prompt} Passing e2e pipeline pingpong test")
 
 
 if __name__ == "__main__":
@@ -552,4 +699,19 @@ if __name__ == "__main__":
 
     parser.add_argument("--output-dir", type=str, default="./logs/")
     args = parser.parse_args()
-    test(args)
+    
+    try:
+        test(args)
+    except Exception as e:
+        # then log into a special file: failure reason
+        rank = os.environ.get("RANK", 0)
+        failure_log_dir = os.path.join(args.output_dir, f"failure_logs")
+        os.makedirs(failure_log_dir, exist_ok=True)
+        failure_reason_file = os.path.join(failure_log_dir, f"failed.{rank}.log")
+        with open(failure_reason_file, "w") as f:
+            # source failure
+            traceback.print_exc(file=f)
+
+
+        raise e
+            

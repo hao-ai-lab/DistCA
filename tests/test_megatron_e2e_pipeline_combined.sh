@@ -19,7 +19,8 @@
 # ------------------------------------------------------
 
 # Model configuration
-MODEL_PATH=${MODEL_PATH:-codellama/CodeLlama-34b-hf}
+# MODEL_PATH=${MODEL_PATH:-codellama/CodeLlama-34b-hf}
+MODEL_PATH=${MODEL_PATH:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}
 NUM_LAYERS=${NUM_LAYERS:-8}
 
 # Parallelism settings
@@ -27,11 +28,13 @@ TP_SIZE=${TP_SIZE:-$GPUS_PER_NODE}   # Tensor Parallelism size, defaults to GPUs
 TP_SIZE=${TP_SIZE:-8}
 PP_SIZE=${PP_SIZE:-1}                # Pipeline Parallelism size
 CP_SIZE=${CP_SIZE:-1}                # Only useful in WLBLLM (D2 will have DPCP anyways)
+NUM_MICROBATCH=${PP_SIZE}            # Number of microbatches per pipeline stage, has to be >= PP_SIZE - 1
 
 # Experiment settings
 MODE=${MODE:-d2}               # Experiment mode (baseline, dynamic, etc.)
 BATCH_SIZE=${BATCH_SIZE:-1}          # Batch size for training
-NUM_TOKENS=${NUM_TOKENS:-131072}     # Number of tokens to process
+# NUM_TOKENS=${NUM_TOKENS:-131072}     # Number of tokens to process
+NUM_TOKENS=${NUM_TOKENS:-16384}     # Number of tokens to process
 MAX_SAMPLE_ID=${MAX_SAMPLE_ID:-3}   # Maximum sample ID
 # SAMPLE_EXPR=${SAMPLE_EXPR:-""}   # Sample expression
 
@@ -219,7 +222,9 @@ TORCHRUN_CMD=(
   --rdzv_endpoint=${RZV_ENDPOINT}
   --rdzv_id=${RZV_ID}
   --max_restarts=0
-  --no-python bash ./bind_and_exec.sh python test_megatron_e2e_pipeline_with_cp.py
+  --no-python bash ./bind_and_exec.sh 
+    # python test_megatron_e2e_pipeline_with_cp.py
+    python test_megatron_e2e_pipeline_combined.py
     --num-tokens ${NUM_TOKENS}
     --num-batches ${BATCH_SIZE}
     --num-nodes ${NNODES}

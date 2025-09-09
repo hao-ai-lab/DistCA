@@ -207,12 +207,15 @@ def fast_a2a(
     my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
     instance_id: int=None,
 ):
+    should_fa2a_barrier = os.environ.get("EXPERIMENT_FA2A_BARRIER", "0") == "1"
+    should_skip_fa2a_op = os.environ.get("EXPERIMENT_SKIP_FA2A_OP", "0") == "1"
+    
     if instance_id is not None:
         assert not FastDispatcherWrapper.is_acquired[instance_id]
         # acquiring here ensures the sync in acquire is always on the same stream as all2all
         FastDispatcherWrapper.acquire(instance_id)
 
-    if os.environ.get("EXPERIMENT_FA2A_BARRIER", "0") == "1":
+    if should_fa2a_barrier:
         rank = torch.distributed.get_rank()
         if rank == 0:
             print("🛑 enabled fast_a2a barrier - reached barrier")
@@ -220,6 +223,14 @@ def fast_a2a(
         torch.distributed.barrier()
         if rank == 0:
             print("🛑 enabled fast_a2a barrier - passed")
+    
+    if should_skip_fa2a_op:
+        # Use a module-level variable to track if we've printed the message
+        if not hasattr(fast_a2a, '_printed_skip_message'):
+            print("🛑 skipping fast_a2a op. This usually happens at debugging. If this is not expected, please set EXPERIMENT_SKIP_FA2A_OP to 0.")
+            fast_a2a._printed_skip_message = True
+        return
+    
     ret = _ops.fast_a2a(
         FastDispatcherWrapper.get_instance(instance_id).handle,
         sender_send_disp, sender_transfer_sz,

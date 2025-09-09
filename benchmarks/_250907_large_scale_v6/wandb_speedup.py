@@ -1,4 +1,8 @@
 # %%
+
+import os
+os.chdir("/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250907_large_scale_v6")
+# %%
 import wandb
 import json
 import os
@@ -112,7 +116,7 @@ for folder in folders:
             data = f.read()
         if "OutOfMemory" in data:
             # nodes	batch_size	num_tokens	mode	cp_size
-            print(f"{nodes}\t{batch_size}\t{num_tokens}\t{mode}\t{cp_size}\t{name}\t - OOM")
+            print(f"{nodes}\t{batch_size}\t{num_tokens}\t{mode}\t{cp_size}\t- OOM\t{name}")
             break
 
 # %%
