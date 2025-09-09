@@ -2,6 +2,7 @@
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--folder", type=str, required=True)
+parser.add_argument("--output_file", type=str, required=True)
 args = parser.parse_args()
 root_folder = args.folder
 
@@ -44,7 +45,7 @@ print(eids)
 
 # %%
 # output eids to a file
-with open("success_eids.txt", "w") as f:
+with open(args.output_file, "w") as f:
     all_eids = " ".join(eids)
     f.write(all_eids)
 

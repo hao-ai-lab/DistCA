@@ -469,7 +469,6 @@ class TransformerLayer(BaseTransformerLayer):
                     num_heads_kv=self.config.num_query_groups // self.config.tensor_model_parallel_size,
                     head_dim=self.config.hidden_size // self.config.num_attention_heads,
                     return_attn_probs=True,
-                    deterministic=True,
                 ),
             )
         else:
@@ -768,8 +767,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(start)")
         signal = args.pop("signal")
         packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
-        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
-        
+        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None        
         if bwd_resend_qkv:
             log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before FusedCommAttn)")
             signal = FusedCommAttn.apply(
@@ -786,7 +784,6 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                     num_heads_kv=layer.config.num_query_groups // layer.config.tensor_model_parallel_size,
                     head_dim=layer.config.hidden_size // layer.config.num_attention_heads,
                     return_attn_probs=True,
-                    deterministic=True,
                 ),
             )
             args["signal"] = signal

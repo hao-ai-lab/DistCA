@@ -1,3 +1,4 @@
+
 """
 Combined Megatron E2E Test (D2 + Baseline)
 
@@ -284,7 +285,11 @@ class MegatronE2eWorker(MegatronBaseWorker):
             # torch.cuda.synchronize()
             log_memory_usage("optimizer_step:(start)")
             if os.getenv("EXPERIMENT_SKIP_OPTIMIZER_STEP", "0") == "1":
+                # when testing numerical correctness, instead of running optimizer step, reset grads.
                 update_successful, grad_norm, num_zeros_in_grad = True, 0.0, 0
+                for tm in self.train_module:
+                    for param in unwrap_model(tm).parameters():
+                        param.main_grad.zero_()
             else:
                 update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
             # torch.cuda.synchronize()
@@ -863,9 +868,29 @@ def test(args):
                 _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
             except StopIteration:
                 break
-            seq_lens_0: list[list[int]] = _seq_lens[:batch_size]
-            seq_lens_1: list[list[int]] = _seq_lens[batch_size:]
+            
+            # Rebalance Ping pong
+            should_d2_balance_ping_pong = os.environ.get("EXPERIMENT_D2_BALANCE_PING_PONG", "0") == "1"
+            def balance_ping_pong(seq_lens: list[list[int]]) -> list[list[int]]:
+                # taking a list of batch, and interleave them by sorted workload.
+                sorted_attn_workload = sorted(seq_lens, key=lambda x: sum(y ** 2 for y in x))
+                ping = []
+                pong = []
+                for batch in sorted_attn_workload:
+                    if len(ping) < len(pong):
+                        ping.append(batch)
+                    else:
+                        pong.append(batch)
+                assert len(ping) == len(pong)
+                return ping, pong
+                
             rich.print(f"🟡 [Rank {rank}] _seq_lens = {_seq_lens}")
+            if should_d2_balance_ping_pong:
+                seq_lens_0, seq_lens_1 = balance_ping_pong(_seq_lens)
+            else:
+                seq_lens_0, seq_lens_1 = _seq_lens, _seq_lens
+            rich.print(f"🟡 [Rank {rank}] seq_lens_0 = {seq_lens_0}")
+            rich.print(f"🟡 [Rank {rank}] seq_lens_1 = {seq_lens_1}")
 
             # num_batched_token_per_as_rank = tokens per as rank = tokens per batch * num batch / (as_world_size = dp_size)
             num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
@@ -896,13 +921,57 @@ def test(args):
                     attn_out_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[1] // 1024 // 1024
                     attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[3] // 1024 // 1024
                             
+                    def print_2d_tensor(name: str, tensor):
+                        rich.print(f"🟡 [Rank {rank}] {name} = ")
+                        for row in tensor.tolist():
+                            rich.print(f"    {row}")
+
                     # Print qkv_fwd_fa2a_metadata
-                    rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.send_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__send_transfer_sz_mb.tolist())
-                    rich.print(f"🟡 [Rank {rank}] qkv_fwd_fa2a_metadata.recv_transfer_sz_mb = ", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist())
+                    print_2d_tensor("qkv_fwd_fa2a_metadata.send_transfer_sz_mb", qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
+                    print_2d_tensor("qkv_fwd_fa2a_metadata.recv_transfer_sz_mb", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
                     
-                    # Print attn_out_fwd_fa2a_metadata
-                    rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.send_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__send_transfer_sz_mb.tolist())
-                    rich.print(f"🟡 [Rank {rank}] attn_out_fwd_fa2a_metadata.recv_transfer_sz_mb = ", attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist())
+                    # Print attn_out_fwd_fa2a_metadata  
+                    print_2d_tensor("attn_out_fwd_fa2a_metadata.send_transfer_sz_mb", attn_out_fwd_fa2a_metadata__send_transfer_sz_mb)
+                    print_2d_tensor("attn_out_fwd_fa2a_metadata.recv_transfer_sz_mb", attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb)
+
+                    def exclude_self_and_sum(t):
+                        for i in range(len(t)):
+                            t[i][i] = 0
+                        return t.sum(dim=1)
+
+                    # Calculate send size from me to others by subtracting diagonal (self-send) from total send
+                    qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
+                    qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
+                    
+                    print_2d_tensor("qkv_fwd_fa2a_metadata.send_transfer_sz_mb_to_others", qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others)
+                    print_2d_tensor("qkv_fwd_fa2a_metadata.recv_transfer_sz_mb_to_others", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others)
+                    
+                    # Expected send-recv time
+                    bandwidth_mb = 40 # MB/ms
+                    send_time_ms = qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others / bandwidth_mb
+                    recv_time_ms = qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others / bandwidth_mb
+                    print_2d_tensor("send_time_ms", send_time_ms)
+                    print_2d_tensor("recv_time_ms", recv_time_ms)
+
+                    if rank == 0:
+                        network_inspect_file = os.path.join(output_dir, "network_inspect.jsonl")
+                        with open(network_inspect_file, "a") as f:
+                            f.write(json.dumps({
+                                "sample_id": sample_id,
+                                "tolerance_factor": tolerance_factor,
+                                "qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others": qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others.tolist(),
+                                "qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others": qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others.tolist(),
+                                "qkv_fwd_fa2a_metadata__send_transfer_sz_mb": qkv_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
+                                "qkv_fwd_fa2a_metadata__recv_transfer_sz_mb": qkv_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
+                                "attn_out_fwd_fa2a_metadata__send_transfer_sz_mb": attn_out_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
+                                "attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb": attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
+                                "bandwidth_mb": bandwidth_mb,
+                                "send_time_ms": send_time_ms.tolist(),
+                                "recv_time_ms": recv_time_ms.tolist(),
+                            }) + "\n")
+                            pass
+                    
+                    
 
                 # Check size:
                 buffer_size = FastDispatcherWrapper.instance[0].buffer_size
@@ -1218,10 +1287,10 @@ def test(args):
                 "duration_ms": avg_duration_ms,
                 "samples": iterated_samples[-1],
             }
-            if os.environ.get("EXPERIMENT_ENABLE_BENCHMARK_SAVING", "0") == "1":
-                output_file = os.path.join(output_dir, "benchmark.raw.jsonl")
-                with open(output_file, 'a') as f:
-                    f.write(json.dumps(items))
+            # if os.environ.get("EXPERIMENT_ENABLE_BENCHMARK_SAVING", "1") == "1":
+            output_file = os.path.join(output_dir, "benchmark.raw.jsonl")
+            with open(output_file, 'a') as f:
+                f.write(json.dumps(items))
                     f.write('\n')
 
     torch.cuda.synchronize()
