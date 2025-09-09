@@ -339,7 +339,6 @@ def dummy_backward_single_sided(
 ):
     """
     Dummy backward for a single layer. This is exactly the backward of FusedCommAttn + All2All.
-    TODO(yonghao): make it ping-pong.
     """
     assert packed_seq_params.bwd_packed_seq_params is not None
 

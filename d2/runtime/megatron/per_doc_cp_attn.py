@@ -35,6 +35,8 @@ from transformer_engine.pytorch.attention.dot_product_attention.utils import (
 )
 
 
+# FIXME: in ping-pong this is recomputed every time. Should avoid this.
+# deprioritized because we use fused comm attn which skips this code.
 def get_attention_backend(attention_params):
     # NOTE: As part of refactoring attention.py, populating the _attention_backends cache in attention
     # is no longer performed at the end of get_attention_backend(), but the responsibility of doing so
