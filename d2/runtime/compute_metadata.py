@@ -255,7 +255,7 @@ def _from_planner_output(
         for l_rank in range(world_size)
     ]
     max_cp_on_ranks: list[int] = [
-        max(num_send_k_on_rank[l_rank]) for l_rank in range(world_size)
+        max(num_send_k_on_rank[l_rank], default=0) for l_rank in range(world_size)
     ]
     # logical shape
     q_hidden = q_bytes // element_size
