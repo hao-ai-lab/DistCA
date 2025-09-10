@@ -55,19 +55,36 @@ def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int
     rank_budgets = [num_tokens_per_rank] * as_world_size
     current_rank_idx = 0
 
-    for batch in batches:
+    # FIXME: Two potential bugs in this code:
+    #  1. else statement - why checking equality instead of >= or <=? This will just result in sending more stuff.
+    #  2. Dummy sequence should just stay in place and don't go anywehre. 
+
+    for batch_idx, batch in enumerate(batches):
         if len(batch) == 1 and batch[0] < num_tokens_per_rank:
-            while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
-                current_rank_idx += 1
-            assert rank_budgets[current_rank_idx] == num_tokens_per_rank, "dummy doc should put on a empty rank"
-            # dummy doc, this rank only put this dummy item.
+            # Handle dummy doc. The dummy doc should be put exactly in place of that rank.
+            # No change of "current_rank_idx".
             doc_len = batch[0]
             item_dict = {'q': doc_len, 'kv': doc_len}
-            new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
-                            item_dict, is_original=True)
+            src_gpuid = batch_idx
+            gpuid = batch_idx
+            new_item = Item(
+                model_config, doc_len, seqid,
+                gpuid, src_gpuid,
+                item_dict, is_original=True
+            )
             items.append(new_item)
-            current_rank_idx += 1
             seqid += 1
+            # while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
+            #     current_rank_idx += 1
+            # assert rank_budgets[current_rank_idx] == num_tokens_per_rank, "dummy doc should put on a empty rank"
+            # # dummy doc, this rank only put this dummy item.
+            # doc_len = batch[0]
+            # item_dict = {'q': doc_len, 'kv': doc_len}
+            # new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+            #                 item_dict, is_original=True)
+            # items.append(new_item)
+            # current_rank_idx += 1
+            # seqid += 1
         else:
             for doc_length in batch:
                 doc_len = doc_length
