@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 import rich
 import torch
-from d2.planner.planner import (Item, Planner, Planner_DP, batch_to_items,
+from d2.planner.planner import (Item, Planner,
                                 batch_to_items_general,
                                 batch_to_items_with_dummy, cp_list_to_mlp_list,
                                 get_flops)
@@ -381,14 +381,8 @@ def test_cp_planner():
     replanned_items = planner.plan_items(initial_items, verbose=True, plot=True)
     end_time = time.time()
     rich.print(replanned_items)
-
-    # Items => metadata
-    start_time_plan = time.time()
-    final_metadata = planner.plan(initial_items, verbose=False)
-    end_time_plan = time.time()
     
     rich.print(f"\nPlanner execution time: {end_time - start_time:.4f} seconds")
-    rich.print(f"Planner execution time: {end_time_plan - start_time_plan:.4f} seconds")
 
     initial_dict = []
     replan_dict = []
@@ -521,7 +515,6 @@ def test_batch_to_items_with_dummy():
         Item(model_config, 502, 10, 7, 7, {'q': 502, 'kv': 502})
     ]
 
-
     compare_items(list_items_1, expected_items)
     # Test dummy CP:
     batches_2: List[List[int]] = [[tp_size], [tp_size], [tp_size], [tp_size], [256, 768],[512, 10, 502] ]
@@ -530,7 +523,7 @@ def test_batch_to_items_with_dummy():
                               num_tokens_per_rank=num_tokens_per_rank,
                               as_world_size=as_world_size,
                               model_config=model_config)
-    rich.print(list_items_2)
+
     expected_items = [
         Item(model_config, 8, 0, 0, 0, {'q': 8, 'kv': 8}, is_original=True),
         Item(model_config, 8, 1, 1, 1, {'q': 8, 'kv': 8}, is_original=True),
@@ -587,10 +580,8 @@ def test_cp_list_to_mlp_list():
 
 if __name__ == "__main__":
     test_cp_list_to_mlp_list()
-    exit(0)
     test_batch_to_items_with_dummy()
     test_mlp_seq_len()
     iter = 1
     for _ in range(iter):
-        test_dp_planner()
         test_cp_planner()
