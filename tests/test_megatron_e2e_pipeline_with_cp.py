@@ -547,6 +547,7 @@ def test(args):
                 "position_ids": torch.concat([mb_0["position_ids"], mb_1["position_ids"]]),
                 "packed_seq_params": ping_pong_params,
             }
+            print(f"🟡 input_ids: {input_ids.shape}")
             microbatches.append(mb)
             packed_seq_params = PackedSeqParams(
                 qkv_format="thd",
@@ -569,7 +570,7 @@ def test(args):
 
 
         should_run_baseline_with_dummy = False
-        should_run_baseline = False
+        should_run_baseline = True
         should_run_d2 = True
 
         n_repeats = 2
@@ -581,7 +582,7 @@ def test(args):
             durations = []
             for _ in range(n_repeats):
                 print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start baseline dummy {_}")
-                with torch.cuda.nvtx.range(f"baseline_dummy_{_}"):
+                with torch.cuda.nvtx.range(f"baseline_dummy[sample={sample_idx}][repeat={_}]"):
                     torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                     loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
                         microbatches=orig_impl_microbatches,
@@ -593,20 +594,22 @@ def test(args):
                     duration_ms = (end_time - start_time) * 1000
                     durations.append(duration_ms)
                     print(f"⚪ [Rank {rank}] [sample {sample_idx}] baseline dummy {_}: {duration_ms} ms")
+                    time.sleep(1)
             
-            with open(benchmark_log_path__baseline_with_dummy, "a") as f:
-                f.write(json.dumps({
-                    "sample_id": sample_idx,
-                    "duration_ms": duration_ms,
-                    "duration_list": durations,
-                    "seq_lens": seq_lens,
-                }) + "\n")
+            if rank == 0:
+                with open(benchmark_log_path__baseline_with_dummy, "a") as f:
+                    f.write(json.dumps({
+                        "sample_id": sample_idx,
+                        "duration_ms": duration_ms,
+                        "duration_list": durations,
+                        "seq_lens": seq_lens,
+                    }) + "\n")
 
         if should_run_baseline:
             durations = []
             for _ in range(n_repeats):
                 print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start baseline {_}")
-                with torch.cuda.nvtx.range(f"baseline_{_}"):
+                with torch.cuda.nvtx.range(f"baseline[sample={sample_idx}][repeat={_}]"):
                     torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                     loss_orig, grad_orig = worker.forward_backward_batch(
                         microbatches=orig_impl_microbatches,
@@ -618,14 +621,16 @@ def test(args):
                     duration_ms = (end_time - start_time) * 1000
                     durations.append(duration_ms)
                     print(f"⚪ [Rank {rank}] [sample {sample_idx}] baseline {_}: {duration_ms} ms")
+                    time.sleep(1)
             
-            with open(benchmark_log_path__baseline, "a") as f:
-                f.write(json.dumps({
-                    "sample_id": sample_idx,
-                    "duration_ms": duration_ms,
-                    "duration_list": durations,
-                    "seq_lens": seq_lens,
-                }) + "\n")
+            if rank == 0:
+                with open(benchmark_log_path__baseline, "a") as f:
+                    f.write(json.dumps({
+                        "sample_id": sample_idx,
+                        "duration_ms": duration_ms,
+                        "duration_list": durations,
+                        "seq_lens": seq_lens,
+                    }) + "\n")
 
         
 
@@ -633,7 +638,7 @@ def test(args):
             durations = []
             for _ in range(n_repeats):
                 print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start pingpong dummy {_}")
-                with torch.cuda.nvtx.range(f"pingpong_dummy_{_}"):
+                with torch.cuda.nvtx.range(f"d2[sample={sample_idx}][repeat={_}]"):
                     torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                     loss_reduced, grad_sample = worker.forward_backward_batch(
                         microbatches=microbatches,
@@ -645,6 +650,7 @@ def test(args):
                     duration_ms = (end_time - start_time) * 1000
                     durations.append(duration_ms)
                     print(f"⚪ [Rank {rank}] [sample {sample_idx}] pingpong with dummy {_}: {duration_ms} ms")
+                    time.sleep(1)
                 
             if rank == 0:
                 with open(benchmark_log_path, "a") as f:
