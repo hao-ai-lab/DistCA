@@ -599,6 +599,22 @@ def test_cp_list_to_mlp_list():
                         [1024, 1024],
                         [8],[8],[8],[8],[8],[8],[8],[8]]
 
+    # Test Big CP Reversed Case:
+    cp_list_4 = [[8], [8], [8], [8], [8], [8], [8], [8], [1376, 4080, 2288, 3376, 5264]]
+    num_token_per_rank=2048
+    result_4 = cp_list_to_mlp_list(cp_list_4, as_world_size=16, num_token_per_rank=num_token_per_rank)
+    assert result_4 == [
+        [8], [8], [8], [8], [8], [8], [8], [8],
+        [1376, 336, 336],
+        [1024, 1024],
+        [680, 680, 344, 344],
+        [800, 800, 224, 224],
+        [1024, 1024],
+        [440, 440, 584, 584],
+        [1024, 1024],
+        [1024, 1024]
+    ]
+
 if __name__ == "__main__":
     test_cp_list_to_mlp_list()
     test_batch_to_items_with_dummy()
