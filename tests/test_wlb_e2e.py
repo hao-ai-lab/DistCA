@@ -369,13 +369,15 @@ def test(args):
             # This is the global batch for this iteration (including DP)
             _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
             _all_seq_lens.append(_seq_lens)
+            print(f"🟡 get_next_batch[{mb_idx}]: _seq_lens: {_seq_lens}")
             
             # Take only the DP shard of the _seq_lens
             _seq_lens = _seq_lens[
-                dp_rank * batch_size: (dp_rank + 1) * batch_size
+                dp_rank * batch_size * 2: (dp_rank + 1) * batch_size * 2
             ]
 
-            print(f"🟡 get_next_batch[{mb_idx}]: _seq_lens: {_seq_lens}")
+            print(f"🟡 get_next_batch[{mb_idx}] after shard by dp_rank: _seq_lens: {_seq_lens}")
+            print(f"🟡 dp_size: {dp_size}, dp_rank: {dp_rank}, batch_size: {batch_size}, total_seq_len: {total_seq_len}")
             seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
                 dp_size, dp_rank, total_seq_len, batch_size, _seq_lens, 
                 ENABLE_BALANCED_FLOS_NO_DEFER=True,
@@ -383,7 +385,7 @@ def test(args):
                 model_config=hf_config, 
             )
             doc_lens = flatten(seq_lens)
-            print(f"🟡 balance_data_for_wlbllm[{mb_idx}]: doc_lens: {doc_lens}")
+            print(f"🟡 balance_data_for_wlbllm[{mb_idx}]: doc_lens: {doc_lens}, seq_lens: {seq_lens}")
             print(f"🟡 new_batch: {new_batch}")
             context_length = sum(doc_lens) # maximum possible context length is just the num_tokens
             print(f"🟡 context_length: {context_length}")
@@ -414,8 +416,9 @@ def test(args):
             # seq_lens is already the dp_rank's doc_lens. 
             # so here we only take the cp-shard of it.
             input_ids = torch.randint(10, 1000, (num_tokens_this_rank,))
+            print(f"🟡 input_ids: {input_ids.shape}")
             position_ids = torch.arange(num_tokens_this_rank)
-            
+            print(f"🟡 position_ids: {position_ids.shape}")
             wlb_metadata = dict(
                 doc_lens=doc_lens,
                 doc_shards=doc_shards,
@@ -459,7 +462,7 @@ def test(args):
     
             print(f"[Rank {rank}] [repeat {repeat_idx}] Start running wlbllm")
             
-            with torch.cuda.nvtx.range(f"sample_{sample_idx}(repeat={repeat_idx})"):
+            with torch.cuda.nvtx.range(f"wlbllm[sample={sample_idx}][repeat={repeat_idx}]"):
                 torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                 loss, grad = worker.forward_backward_batch(
                     microbatches=microbatches,
@@ -475,6 +478,7 @@ def test(args):
                 if repeat_idx >= max_warmup_cnt:
                     durations_ms.append(duration_ms)
                     pass
+            time.sleep(1)
             log_memory_usage(f"forward_backward_batch:done(sample_id={sample_idx},repeat={repeat_idx})")
 
         average_duration_ms = sum(durations_ms) / len(durations_ms) if durations_ms else 0
