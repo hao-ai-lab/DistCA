@@ -5,14 +5,13 @@ from typing import Any, Dict, List
 
 import rich
 import torch
-from d2.planner.planner import (Item, Planner,
-                                batch_to_items_general,
-                                batch_to_items_with_dummy, cp_list_to_mlp_list,
-                                get_flops)
 from rich.console import Console
 from rich.table import Table
-
 from test_util import ParallelConfig
+
+from d2.planner.planner import (Item, Planner, batch_to_items_general,
+                                batch_to_items_with_dummy, cp_list_to_mlp_list,
+                                get_flops)
 
 console = Console()
 
@@ -516,6 +515,7 @@ def test_batch_to_items_with_dummy():
     ]
 
     compare_items(list_items_1, expected_items)
+    
     # Test dummy CP:
     batches_2: List[List[int]] = [[tp_size], [tp_size], [tp_size], [tp_size], [256, 768],[512, 10, 502] ]
     num_tokens_per_rank = 512
@@ -538,6 +538,29 @@ def test_batch_to_items_with_dummy():
     ]
 
     compare_items(list_items_2, expected_items)
+
+    # Test reversed CP & dummy Case:
+    batches_3: List[List[int]] = [[256, 768],[512, 10, 502], [tp_size], [tp_size], [tp_size], [tp_size]]
+    num_tokens_per_rank = 512
+    list_items_3 = batch_to_items_with_dummy(batches=batches_3,
+                              num_tokens_per_rank=num_tokens_per_rank,
+                              as_world_size=as_world_size,
+                              model_config=model_config)
+
+    expected_items = [
+        Item(model_config, 256, 0, 0, 0, {'q': 256, 'kv': 256}, is_original=True),
+        Item(model_config, 768, 1, 0, 0, {'q': 128, 'kv': 128}, {'q': 128, 'kv': 768}, is_original=True),
+        Item(model_config, 768, 1, 1, 1, {'q': 256, 'kv': 384}, {'q': 256, 'kv': 640}, is_original=False),
+        Item(model_config, 512, 2, 2, 2, {'q': 512, 'kv': 512}, is_original=True),
+        Item(model_config, 10, 3, 3, 3, {'q': 10, 'kv': 10}, is_original=True),
+        Item(model_config, 502, 4, 3, 3, {'q': 502, 'kv': 502}, is_original=True),
+        Item(model_config, 8, 5, 4, 4, {'q': 8, 'kv': 8}, is_original=True),
+        Item(model_config, 8, 6, 5, 5, {'q': 8, 'kv': 8}, is_original=True),
+        Item(model_config, 8, 7, 6, 6, {'q': 8, 'kv': 8}, is_original=True),
+        Item(model_config, 8, 8, 7, 7, {'q': 8, 'kv': 8}, is_original=True),
+    ]
+
+    compare_items(list_items_3, expected_items)
     return
 
 
@@ -563,6 +586,22 @@ def test_cp_list_to_mlp_list():
     assert result_3 == [[256, 128, 128], [256, 256], [128, 128, 128, 128], [256, 256], [8], [8], [8], [8], [8], [8], [8], [8]]
 
     # Test Big CP Case:
+    cp_list_4 = [[8], [8], [8], [8], [8], [8], [8], [8], [1376, 4080, 2288, 3376, 5264]]
+    num_token_per_rank=2048
+    result_4 = cp_list_to_mlp_list(cp_list_4, as_world_size=16, num_token_per_rank=num_token_per_rank)
+    assert result_4 == [
+        [8], [8], [8], [8], [8], [8], [8], [8],
+        [1376, 336, 336],
+        [1024, 1024],
+        [680, 680, 344, 344],
+        [800, 800, 224, 224],
+        [1024, 1024],
+        [440, 440, 584, 584],
+        [1024, 1024],
+        [1024, 1024]
+    ]
+    
+    # Test Big CP Reversed Case:
     cp_list_3 = [[1376, 4080, 2288, 3376, 5264], [8], [8], [8], [8], [8], [8], [8], [8]]
     num_token_per_rank=2048
     result_3 = cp_list_to_mlp_list(cp_list_3, as_world_size=16, num_token_per_rank=num_token_per_rank)

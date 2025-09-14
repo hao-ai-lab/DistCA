@@ -599,8 +599,6 @@ class Planner:
             flops_per_gpu[item.gpuid] += item.total_flops
         total_flops = sum(flops_per_gpu)
         
-        if self.attention_server_world_size == 0:
-            return []
         avg_flops_per_gpu = total_flops / self.attention_server_world_size
         rlog(f"Total FLOPs: {total_flops:.2f}, Average FLOPs per GPU: {avg_flops_per_gpu:.2f}")
         
