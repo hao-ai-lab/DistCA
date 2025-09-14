@@ -612,6 +612,7 @@ def create_qkv_dispatch_pipeline_tick(
             cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
             **create_pp_doclen_kwargs,
         )
+    print(f"🟡 cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
     print(f"🟡 bwd_tick_per_rank_doc_lens: {bwd_tick_per_rank_doc_lens}")
     if use_planner:
         items = batch_to_items_with_dummy(batches=bwd_tick_per_rank_doc_lens, 
