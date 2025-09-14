@@ -227,7 +227,7 @@ def create_pp_microbatches(
         # For the last few ticks (drain-out ticks)
         # add a dummy forward microbatch at PP rank 0.
         add_dummy_forward = i >= num_microbatch
-
+        print(f"🟡 tick_per_rank_doc_lens: {tick_per_rank_doc_lens}")
         (
             fa_fwd_params, fa_bwd_params,
             qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
