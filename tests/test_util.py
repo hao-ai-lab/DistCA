@@ -557,8 +557,20 @@ def create_qkv_dispatch_pipeline_tick(
         dp_size=dp_size,
     )
     # for perf test. Get doc_lens from GLOBAL_BATCH
+    # This should be a general function for DP and CP. 
+    # After call this function: len(cur_tick_per_rank_doc_lens) == as_world_size
+    # For CP: 
+    #   We need to tranfer CP list to MLP list for each rank, to match forward and backward.
+    #   If we use CP list directly, the PP flip can't have an effect.
+    # Example: 
+    # DEBUG: before: cur_tick_per_rank_doc_lens = [[2048], [1], [1]], as_world_size = 4, num_token_per_rank = 1024
+    # DEBUG: after: cur_tick_per_rank_doc_lens = [[512, 512], [512, 512], [1], [1]]
+
+    per_rank_ref_doc_lens = cp_list_to_mlp_list(ref_doc_lens, as_world_size=world_size, num_token_per_rank = num_token_per_rank)
+    print(f"per_rank_ref_doc_lens: {per_rank_ref_doc_lens}")
+    # Input before create_pipeline_doclens should be doc_len per rank.
     cur_tick_per_rank_doc_lens, original_cur_tick_per_rank_doc_lens = create_pipeline_doclens(
-        ref_doc_lens, add_dummy, is_backward=False, num_batches = num_batches, use_planner=use_planner,
+        per_rank_ref_doc_lens, add_dummy, is_backward=False, num_batches = num_batches, use_planner=use_planner,
         **create_pp_doclen_kwargs, return_original_doclen=True,
     )
     assert isinstance(cur_tick_per_rank_doc_lens, list), f"cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens} is not a list"
@@ -633,18 +645,6 @@ def create_qkv_dispatch_pipeline_tick(
          softmax_lse_size, element_size,
     )
 
-    # This should be a general function for DP and CP. But we only call it when CP: len(cur_tick_per_rank_doc_lens) <= world_size.
-    # After call this function: len(cur_tick_per_rank_doc_lens) == as_world_size
-    # For CP: 
-    #   We need to tranfer CP list to MLP list for each rank, to match forward and backward.
-    #   If we use CP list directly, the PP flip can't have an effect.
-    # Example: 
-    # DEBUG: before: cur_tick_per_rank_doc_lens = [[2048], [1], [1]], as_world_size = 4, num_token_per_rank = 1024
-    # DEBUG: after: cur_tick_per_rank_doc_lens = [[512, 512], [512, 512], [1], [1]]
-    # if len(cur_tick_per_rank_doc_lens) < world_size:
-    #     #print(f"DEBUG, before : {cur_tick_per_rank_doc_lens}")
-    #     cur_tick_per_rank_doc_lens = cp_list_to_mlp_list(cur_tick_per_rank_doc_lens, as_world_size=world_size, num_token_per_rank = num_token_per_rank)
-    #     #print(f"DEBUG: after: {cur_tick_per_rank_doc_lens}")
 
     ret = (fwd_attn_metadata, bwd_attn_metadata,
             qkv_linear_to_attn_fa2a, qkv_grad_attn_to_linear_fa2a,
