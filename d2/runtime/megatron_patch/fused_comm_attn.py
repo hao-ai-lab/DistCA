@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import os
 from typing import Tuple
 
 from flash_attn.flash_attn_interface import (
@@ -32,9 +33,16 @@ class FlashAttnArgs:
     window_size: Tuple[int, int] = (-1, -1)
     softcap: float = 0.0
     alibi_slopes = None
-    deterministic: bool = False
+    deterministic: bool = None
     return_attn_probs: bool = False
     block_table=None
+
+    def __post_init__(self):
+        if self.deterministic is None:
+            env_val = os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+            self.deterministic = env_val != "1"
+            print(f"[FlashAttnArgs] Set deterministic to {self.deterministic} (NVTE_ALLOW_NONDETERMINISTIC_ALGO={env_val})")
+
 
 
 def _qkv_to_attn_out_fwd(q: Tensor, k: Tensor, v: Tensor,
@@ -401,7 +409,6 @@ def dummy_backward_single_sided(
             num_heads_kv=config.num_query_groups // config.tensor_model_parallel_size,
             head_dim=hidden_size_tp // num_heads,
             return_attn_probs=True,
-            deterministic=True,
         ),
         bwd_fa_params.cu_seqlens_q, bwd_fa_params.cu_seqlens_kv,
         bwd_fa_params.max_seqlen_q, bwd_fa_params.max_seqlen_kv,
