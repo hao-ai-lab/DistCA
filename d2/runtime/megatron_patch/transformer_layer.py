@@ -469,7 +469,6 @@ class TransformerLayer(BaseTransformerLayer):
                     num_heads_kv=self.config.num_query_groups // self.config.tensor_model_parallel_size,
                     head_dim=self.config.hidden_size // self.config.num_attention_heads,
                     return_attn_probs=True,
-                    deterministic=True,
                 ),
             )
         else:
@@ -786,7 +785,6 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                     num_heads_kv=layer.config.num_query_groups // layer.config.tensor_model_parallel_size,
                     head_dim=layer.config.hidden_size // layer.config.num_attention_heads,
                     return_attn_probs=True,
-                    deterministic=True,
                 ),
             )
             args["signal"] = signal

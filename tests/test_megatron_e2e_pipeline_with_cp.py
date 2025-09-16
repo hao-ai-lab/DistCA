@@ -1,13 +1,21 @@
 """
 Debug example:
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 
 Planner example:
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner
 
 Planner + CP layout example:
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner --num-batches 1 --num-tokens 2048
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner --num-batches 1 --num-tokens 2048
+
+Nsys + CP layout example:
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 NUM_LAYERS=4 \
+nsys profile -o /home/pangbo/nsys_reports/pp_16k.nsys-rep \
+--trace=cuda,nvtx,osrt,cudnn,cublas --force-overwrite true \
+torchrun --nnodes 1 --nproc_per_node 4 \
+test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner --num-batches 1 --num-tokens 16384
 """
+
 import argparse
 from functools import partial
 import os
@@ -222,12 +230,13 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
         # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 768],[512, 10, 502] ]
         # tick_per_rank_doc_lens mlp list: [[8], [8], [8], [8], [256, 128, 128], [256, 256], [512], [10, 502]]
 
-        tick_per_rank_doc_lens = cp_list_to_mlp_list(tick_per_rank_doc_lens, as_world_size, num_token_per_rank)
-        this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
+        tick_per_rank_doc_lens_after_cp_transfer = cp_list_to_mlp_list(tick_per_rank_doc_lens, as_world_size, num_token_per_rank)
+        
+        this_rank_num_tokens = sum(tick_per_rank_doc_lens_after_cp_transfer[as_rank])
         bwd_packed_seq_params = PackedSeqParams(
             qkv_format="thd", **fa_bwd_params[as_rank]
         )
-        tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens[as_rank], dtype=torch.int32)
+        tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens_after_cp_transfer[as_rank], dtype=torch.int32)
         mlp_packed_seq_params = get_attn_metadata(tensor_doc_lens, get_packed_seq_params=True)
 
         # Create packed_params. Note that we do not add backward params here.

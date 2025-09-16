@@ -616,8 +616,55 @@ def test_cp_list_to_mlp_list():
                         [8],[8],[8],[8],[8],[8],[8],[8]]
 
 
+def test_batch_to_items_with_dummy_pp_fwd_bwd():
+    dp_size = 4
+    pp_size = 2
+    tp_size = 8
+    as_world_size = dp_size * pp_size
+    # Test CP Simple Case:
+    batches: List[List[int]] = [[256, 768],[512, 10, 502], [tp_size], [tp_size], [tp_size], [tp_size]]
+    num_tokens_per_rank = 512
+    num_batch = 2
+
+    model_config = MockConfig()
+    list_items = batch_to_items_with_dummy(batches=batches,
+                              num_tokens_per_rank=num_tokens_per_rank,
+                              as_world_size=as_world_size,
+                              model_config=model_config)
+    rich.print(list_items)
+    from test_util import _block_reverse_list
+    reversed_batches = _block_reverse_list(batches, num_batch)
+    reversed_items = batch_to_items_with_dummy(batches=reversed_batches,
+                              num_tokens_per_rank=num_tokens_per_rank,
+                              as_world_size=as_world_size,
+                              model_config=model_config)
+    rich.print(reversed_items)
+    
+    # Test CP Big Case:
+    dp_size = 8
+    pp_size = 2
+    tp_size = 8
+    as_world_size = dp_size * pp_size
+    batches = [[8], [8], [8], [8], [8], [8], [8], [8], [1376, 4080, 2288, 3376, 5264]]
+    num_tokens_per_rank=2048
+    num_batch = 1
+    model_config = MockConfig()
+    list_items = batch_to_items_with_dummy(batches=batches,
+                                num_tokens_per_rank=num_tokens_per_rank,
+                                as_world_size=as_world_size,
+                                model_config=model_config)
+    rich.print(list_items)
+    from test_util import _block_reverse_list
+    reversed_batches = _block_reverse_list(batches, num_batch)
+    reversed_items = batch_to_items_with_dummy(batches=reversed_batches,
+                              num_tokens_per_rank=num_tokens_per_rank,
+                              as_world_size=as_world_size,
+                              model_config=model_config)
+    rich.print(reversed_items)
+    return
 
 if __name__ == "__main__":
+    test_batch_to_items_with_dummy_pp_fwd_bwd()
     test_cp_list_to_mlp_list()
     test_batch_to_items_with_dummy()
     test_mlp_seq_len()

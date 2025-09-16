@@ -10,6 +10,7 @@ from datetime import timedelta
 from megatron.core import parallel_state as mpu
 import ray
 import torch
+import rich
 
 from d2.runtime.attn_kernels.ops import (
     nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, FastDispatcherWrapper
@@ -490,8 +491,13 @@ def create_pipeline_doclens(
     # Next step is based on the previous batch, move the batch. 
     # Get existing microbatch seqlens
     if ref_doc_lens is not None:
+        if num_batches == None:
+            num_batches = dp_size
         # Not the first microbatch
-        other_pp_doc_len = ref_doc_lens[:-dp_size]
+        if ref_doc_lens[-1] == [tp_size]:
+            other_pp_doc_len = ref_doc_lens[:-dp_size]
+        else:
+            other_pp_doc_len = ref_doc_lens[:-num_batches]
     else:
         dummy_fwd_num = world_size - dp_size
         other_pp_doc_len = [[tp_size] for _ in range(dummy_fwd_num)]
@@ -543,26 +549,13 @@ def create_qkv_dispatch_pipeline_tick(
         tp_size=tp_size,
         dp_size=dp_size,
     )
-    # for perf test. Get doc_lens from GLOBAL_BATCH
+
     cur_tick_per_rank_doc_lens = create_pipeline_doclens(
         ref_doc_lens, add_dummy, is_backward=False, num_batches = num_batches, use_planner=use_planner,
-        **create_pp_doclen_kwargs, 
+        **create_pp_doclen_kwargs,
     )
     assert isinstance(cur_tick_per_rank_doc_lens, list), f"cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens} is not a list"
     print(f"🟡 cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
-
-    # This should be a general function for DP and CP. But we only call it when CP: len(cur_tick_per_rank_doc_lens) <= world_size.
-    # After call this function: len(cur_tick_per_rank_doc_lens) == as_world_size
-    # For CP: 
-    #   We need to tranfer CP list to MLP list for each rank, to match forward and backward.
-    #   If we use CP list directly, the PP flip can't have an effect.
-    # Example: 
-    # DEBUG: before: cur_tick_per_rank_doc_lens = [[2048], [1], [1]], as_world_size = 4, num_token_per_rank = 1024
-    # DEBUG: after: cur_tick_per_rank_doc_lens = [[512, 512], [512, 512], [1], [1]]
-    if len(cur_tick_per_rank_doc_lens) < world_size:
-        print(f"DEBUG, before : {cur_tick_per_rank_doc_lens}")
-        cur_tick_per_rank_doc_lens = cp_list_to_mlp_list(cur_tick_per_rank_doc_lens, as_world_size=world_size, num_token_per_rank = num_token_per_rank)
-        print(f"DEBUG: after: {cur_tick_per_rank_doc_lens}")
 
     if use_planner:
         from d2.planner.planner import Planner
@@ -582,11 +575,13 @@ def create_qkv_dispatch_pipeline_tick(
             num_hidden_layers = 1
         )
         # Use batch_to_items_with_dummy to handle dummy doc to item.
-        items = batch_to_items_with_dummy(batches=cur_tick_per_rank_doc_lens, 
+        fwd_items = batch_to_items_with_dummy(batches=cur_tick_per_rank_doc_lens, 
                                           num_tokens_per_rank = num_token_per_rank,
                                           as_world_size=world_size,
                                           model_config=temp_model_config)
-        fwd_planner_out = planner.items_to_shardinfo(items)
+        rich.print(f"🟡Debug Forward items before plan: {fwd_items}")
+        fwd_planner_out = planner.items_to_shardinfo(fwd_items, verbose=True)
+        rich.print(f"🟡Debug Forward items after plan: {fwd_planner_out}")
     else:
         fwd_planner_out = random_tick_shard_from_doclens(
             cur_tick_per_rank_doc_lens, tp_size, max_cp_degree,
@@ -599,16 +594,28 @@ def create_qkv_dispatch_pipeline_tick(
          softmax_lse_size, element_size, is_pipeline_tick=True
         )
 
-    bwd_tick_per_rank_doc_lens = create_pipeline_doclens(
-        cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
-        **create_pp_doclen_kwargs,
-    )
+    # CP flip logic.
+    print(f"🟡 fwd_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
+    if len(cur_tick_per_rank_doc_lens) < world_size:
+        print("🟡 CP flip logic.")
+        bwd_tick_per_rank_doc_lens = _block_reverse_list(cur_tick_per_rank_doc_lens, num_batches)
+    else:
+        # None CP flip logic.
+        print("🟡 None CP flip logic.")
+        bwd_tick_per_rank_doc_lens = create_pipeline_doclens(
+            cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
+            **create_pp_doclen_kwargs,
+        )
+    print(f"🟡 bwd_tick_per_rank_doc_lens: {bwd_tick_per_rank_doc_lens}")
+    
     if use_planner:
-        items = batch_to_items_with_dummy(batches=bwd_tick_per_rank_doc_lens, 
+        bwd_items = batch_to_items_with_dummy(batches=bwd_tick_per_rank_doc_lens, 
                                           num_tokens_per_rank=num_token_per_rank,
                                           as_world_size=world_size,
                                           model_config=temp_model_config)
-        bwd_planner_out = planner.items_to_shardinfo(items)
+        rich.print(f"🟡Debug Backward items before plan: {bwd_items}")
+        bwd_planner_out = planner.items_to_shardinfo(bwd_items, verbose=True)
+        rich.print(f"🟡Debug Backward items after plan: {bwd_planner_out}")
     else:
         bwd_planner_out = random_tick_shard_from_doclens(
             bwd_tick_per_rank_doc_lens, tp_size, max_cp_degree,
@@ -617,7 +624,7 @@ def create_qkv_dispatch_pipeline_tick(
      bwd_attn_metadata) = backward_from_planner_output(
          world_size, bwd_planner_out, hidden_size_q, hidden_size_k,
          softmax_lse_size, element_size,
-     )
+    )
 
     return (fwd_attn_metadata, bwd_attn_metadata,
             qkv_linear_to_attn_fa2a, qkv_grad_attn_to_linear_fa2a,
