@@ -1,13 +1,21 @@
 """
 Debug example:
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 
 Planner example:
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner
 
 Planner + CP layout example:
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner --num-batches 1 --num-tokens 2048
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner --num-batches 1 --num-tokens 2048
+
+Nsys + CP layout example:
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 NUM_LAYERS=4 \
+nsys profile -o /home/pangbo/nsys_reports/pp_16k.nsys-rep \
+--trace=cuda,nvtx,osrt,cudnn,cublas --force-overwrite true \
+torchrun --nnodes 1 --nproc_per_node 4 \
+test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner --num-batches 1 --num-tokens 16384
 """
+
 import argparse
 from functools import partial
 import os

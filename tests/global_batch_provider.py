@@ -63,7 +63,7 @@ def setup_global_batch(
             # [total_seq_len], [total_seq_len // 8] * 8,
             # [total_seq_len], [total_seq_len // 8] * 8,
         ]
-        GLOBAL_BATCH = manual_case * 4 + GLOBAL_BATCH
+        GLOBAL_BATCH = manual_case * 100 + GLOBAL_BATCH
     GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
 

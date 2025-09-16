@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import os
 from typing import Tuple
 
 from flash_attn.flash_attn_interface import (
@@ -21,11 +22,11 @@ from d2.runtime.attn_kernels.dispatch import (
 from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata
 import os
 
-is_deterministic = (os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0") == "0")
-if is_deterministic:
-    print("🟡 Using deterministic = True as default value in FusedCommAttn! This is not recommended for production use! Forcefully set it back to False. If you need to test, come to FusedCommAttn.py to modify this logic.")
-    os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "1"
-    is_deterministic = False
+# is_deterministic = (os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0") == "0")
+# if is_deterministic:
+#     print("🟡 Using deterministic = True as default value in FusedCommAttn! This is not recommended for production use! Forcefully set it back to False. If you need to test, come to FusedCommAttn.py to modify this logic.")
+#     os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "1"
+#     is_deterministic = False
 
 @dataclass
 class FlashAttnArgs:
@@ -38,9 +39,18 @@ class FlashAttnArgs:
     window_size: Tuple[int, int] = (-1, -1)
     softcap: float = 0.0
     alibi_slopes = None
-    deterministic: bool = is_deterministic
+    deterministic: bool = None
     return_attn_probs: bool = False
     block_table=None
+
+    def __post_init__(self):
+        if self.deterministic is None:
+            env_val = os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+            self.deterministic = env_val != "1"
+            print(f"[FlashAttnArgs] Set deterministic to {self.deterministic} (NVTE_ALLOW_NONDETERMINISTIC_ALGO={env_val})")
+        if self.deterministic:
+            print("⚠️⚠️⚠️ Using deterministic = True! This is not recommended when profiling for performance as it will degrade backward pass performance!")
+
 
 
 def _qkv_to_attn_out_fwd(q: Tensor, k: Tensor, v: Tensor,
@@ -446,7 +456,6 @@ def dummy_backward_single_sided(
             num_heads_kv=config.num_query_groups // config.tensor_model_parallel_size,
             head_dim=hidden_size_tp // num_heads,
             return_attn_probs=True,
-            deterministic=True,
         ),
         bwd_fa_params.cu_seqlens_q, bwd_fa_params.cu_seqlens_kv,
         bwd_fa_params.max_seqlen_q, bwd_fa_params.max_seqlen_kv,
