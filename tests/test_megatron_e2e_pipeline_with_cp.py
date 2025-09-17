@@ -232,6 +232,7 @@ def create_pp_microbatches(
 
     all_original_seq_lens = []
     for i in range(num_microbatch + pp_degree - 1):
+        print(f"=========== [Prepare to get microbatch = {i}] ========")
         # For the last few ticks (drain-out ticks)
         # add a dummy forward microbatch at PP rank 0.
         add_dummy_forward = i >= num_microbatch
@@ -254,6 +255,7 @@ def create_pp_microbatches(
             return_original_doclen=return_seq_lens,
         )
         print(f"🟡 fa_fwd_params: {fa_fwd_params}")
+        print(f"🟡 fa_bwd_params: {fa_bwd_params}")
         all_original_seq_lens.append(original_tick_per_rank_doc_lens)
         
         # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, so each rank knows its number of tokens.
@@ -338,6 +340,7 @@ def time_me(msg):
     print(f"⚪ [Rank {rank}] finish {msg}, duration: {duration_ms} ms")
 
 def test(args):
+
     seed = args.seed
     # test scale
     num_tokens = args.num_tokens
@@ -522,7 +525,7 @@ def test(args):
         should_run_d2 = True
 
         n_warmup = 1
-        n_repeats = 1
+        n_repeats = 2
 
         rank = torch.distributed.get_rank()
         d2.mem.enable_memory_usage_logging(memory_usage_dir)
@@ -670,6 +673,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-sample-id", type=int, default=3)
 
     parser.add_argument("--output-dir", type=str, default="./logs/")
+
 
     args = parser.parse_args()
     print("args: ", args)

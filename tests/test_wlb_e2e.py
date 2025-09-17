@@ -502,7 +502,7 @@ def test(args):
         rank = torch.distributed.get_rank()
         
         max_warmup_cnt = 1
-        max_repeat_cnt = 1
+        max_repeat_cnt = 2
         durations_ms = []
         for repeat_idx in range(max_repeat_cnt + max_warmup_cnt):
             wlbllm.registry.set("forward_cnt", 0)
