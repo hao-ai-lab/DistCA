@@ -64,6 +64,7 @@ export SHOULD_ADD_DEBUG_CASES=1 # usually this case will find all the bugs
 #    s r b  tok   e N
 for config in \
     "1 1 4 131072 2 4 d2" \
+    "1 1 4 131072 2 4 d2-cuda-graph" \
     "1 1 4 131072 2 4 wlbllm" \
     ; do
 
@@ -94,6 +95,20 @@ for config in \
             echo "🟡 Finished running d2-signal with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
             echo "\a"
         fi
+    fi
+
+    if [ "$mode" == "d2-cuda-graph" ]; then
+        # Run d2 
+        export MODE=d2
+        export MIN_TOLERANCE_FACTOR=0.05
+        export D2_USE_CUDA_GRAPH=1
+        echo "🟡 Running d2-signal with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
+        if [ $DRY_RUN -eq 0 ]; then
+            bash test_e2e_combined.salloc.sh
+            echo "🟡 Finished running d2-signal with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
+            echo "\a"
+        fi
+        unset D2_USE_CUDA_GRAPH
     fi
 
     if [ "$mode" == "wlbllm" ]; then
