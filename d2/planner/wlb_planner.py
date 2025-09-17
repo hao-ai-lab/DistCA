@@ -2,6 +2,7 @@
 
 
 import rich
+import os
 K = 1024
 
 def get_length(micro_batch: list[int]) -> int:
@@ -13,6 +14,10 @@ def get_workload(micro_batch: list[int], model_config: dict | None = None) -> in
     # TODO: Fix this get_workload function to calculate the `breakpoint` of a model.
     global _warning_shown
     attn_linear_breakpoint = 128 * K
+    try:
+        attn_linear_breakpoint = int(os.environ["ATTN_LINEAR_BREAKPOINT"])
+    except Exception:
+        pass
     if model_config is not None and not _warning_shown:
         print(f"⚠️ In `get_workload`, model_config is not used right now (becuase we have not implemented model config -> attn linear breakpoint yet). Constant is set to {attn_linear_breakpoint} for now.")
         _warning_shown = True
