@@ -19,7 +19,7 @@ SLURM_NNODES=8 NNODES=8  \
 SLURM_JOB_NODELIST="fs-mbz-gpu-[051,061,070,091,157,192,206,214]" \
 MODE="d2" BATCH_SIZE=32 NUM_TOKENS=65536 MAX_SAMPLE_ID=3 \
 NUM_LAYERS=4 TP_SIZE=8 PP_SIZE=1 CP_SIZE=1 \
-bash test_e2e_combined.salloc-exp.sh
+bash test_e2e_combined.salloc.sh
 
 
 # 8_65536_2_wlbllm_8_4
@@ -30,5 +30,5 @@ SLURM_NNODES=8 NNODES=8  \
 SLURM_JOB_NODELIST="fs-mbz-gpu-[051,061,070,091,157,192,206,214]" \
 MODE="wlbllm" BATCH_SIZE=32 NUM_TOKENS=65536 MAX_SAMPLE_ID=3 \
 NUM_LAYERS=4 TP_SIZE=8 PP_SIZE=1 CP_SIZE=8 \
-bash test_e2e_combined.salloc-exp.sh
+bash test_e2e_combined.salloc.sh
 

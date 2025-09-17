@@ -13,7 +13,7 @@ _ops = torch.ops.dispatch_kernels
 
 ###### NVSHMEM utils ######
 
-
+_is_nvshmem_initialized = False
 def nvshmem_get_unique_id() -> torch.Tensor:
     return _ops.nvshmem_get_unique_id()
 
@@ -35,6 +35,7 @@ def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int=
     import traceback
     # traceback.print_stack()
     print("nvshmem_init passed barrier.")
+    _is_nvshmem_initialized = True
     return status
 
 def nvshmem_alltoall(dest: torch.Tensor, source: torch.Tensor) -> None:
@@ -58,9 +59,13 @@ def nvshmem_malloc(
     return _ops.nvshmem_malloc(shape, dtype, device)
 
 def nvshmem_barrier_all() -> None:
+    if not _is_nvshmem_initialized:
+        return
     _ops.nvshmem_barrier_all()
 
 def nvshmem_barrier_all_on_current_stream() -> None:
+    if not _is_nvshmem_initialized:
+        return
     _ops.nvshmem_barrier_all_on_current_stream()
 
 
@@ -206,17 +211,47 @@ def fast_a2a(
     my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
     instance_id: int=None,
 ):
+    should_fa2a_barrier = os.environ.get("EXPERIMENT_FA2A_BARRIER", "0") == "1"
+    should_skip_fa2a_op = os.environ.get("EXPERIMENT_SKIP_FA2A_OP", "0") == "1"
+    should_fa2a_split_sendrecv = os.environ.get("EXPERIMENT_FA2A_SPLIT_SENDRECV", "0") == "1"
+    
     if instance_id is not None:
         assert not DispatcherWrapper.is_acquired[instance_id]
         # acquiring here ensures the sync in acquire is always on the same stream as all2all
         DispatcherWrapper.acquire(instance_id)
 
-    return _ops.fast_a2a(
-        DispatcherWrapper.get_instance(instance_id).handle,
-        sender_send_disp, sender_transfer_sz,
-        sender_recv_disp, recver_transfer_sz,
-        my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz
-    )
+    if should_fa2a_barrier:
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            print("🛑 enabled fast_a2a barrier - reached barrier")
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        if rank == 0:
+            print("🛑 enabled fast_a2a barrier - passed")
+
+    if should_skip_fa2a_op:
+        # Use a module-level variable to track if we've printed the message
+        if not hasattr(fast_a2a, '_printed_skip_message'):
+            print("🛑 skipping fast_a2a op. This usually happens at debugging. If this is not expected, please set EXPERIMENT_SKIP_FA2A_OP to 0.")
+            fast_a2a._printed_skip_message = True
+        return
+
+    if should_fa2a_split_sendrecv:
+        ret = _ops.fast_a2a(
+            DispatcherWrapper.get_instance(instance_id).handle,
+            sender_send_disp, sender_transfer_sz,
+            sender_recv_disp, recver_transfer_sz,
+            my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz,
+            True
+        )
+    else:
+        ret = _ops.fast_a2a(
+            DispatcherWrapper.get_instance(instance_id).handle,
+            sender_send_disp, sender_transfer_sz,
+            sender_recv_disp, recver_transfer_sz,
+            my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz,
+        )
+
 
 
 def _debug_dump_buffer(

@@ -239,6 +239,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
     pp_rank = as_rank // dp_size
     dp_rank = as_rank % dp_size
 
+
     # put bwd metadata to the corresponding side
     for i, microbatch in enumerate(microbatches):
         # When mb_i is computed on pp_rank at forward tick t, assume the backward right after this forward is at tick t'.

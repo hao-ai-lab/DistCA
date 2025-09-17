@@ -1,87 +1,3 @@
-# TODO(Deprecate): Consolidate the `test_e2e_combined.salloc-exp.sh` and `test_e2e_combined.slurm.sh` into a single script.
-
-#!/bin/bash
-
-#SBATCH --job-name=d2-e2e
-#SBATCH --nodes=4
-#SBATCH --output=logs/slurm/stdout.%j.log
-#SBATCH --error=logs/slurm/stderr.%j.log
-#SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=96
-#SBATCH --mem=512G
-#SBATCH --exclusive
-#SBATCH --time=01:00:00
-#SBATCH --exclude=fs-mbz-gpu-684,fs-mbz-gpu-697,fs-mbz-gpu-286,fs-mbz-gpu-877,fs-mbz-gpu-757,fs-mbz-gpu-806,fs-mbz-gpu-377,fs-mbz-gpu-906,fs-mbz-gpu-168,fs-mbz-gpu-708,fs-mbz-gpu-868
-#SBATCH --mail-user=seiners_uncut_9y@icloud.com
-#SBATCH --mail-type=END,FAIL
-#SBATCH --partition=lowprio 
-#SBATCH --qos=lowprio
-#SBATCH --requeue 
-
-# ===================================
-# D2 E2E Combined Test - Slurm Script
-# ===================================
-#
-# USAGE:
-#   sbatch test_e2e_combined.slurm.sh                      # Run with default parameters
-#   PP_SIZE=4 BATCH_SIZE=2 sbatch test_e2e_combined.slurm.sh  # Override specific parameters
-#
-# CHANGING NODE/GPU CONFIGURATION:
-# - To change the number of nodes:
-#   * Edit the "#SBATCH --nodes=4" line at the top of this script
-#   * Or use: sbatch --nodes=8 test_e2e_combined.slurm.sh
-#
-# - To change the number of GPUs per node:
-#   * Edit the "#SBATCH --gres=gpu:8" line at the top of this script
-#   * Or use: sbatch --gres=gpu:4 test_e2e_combined.slurm.sh
-#   * The script automatically detects GPU count from Slurm environment variables
-#
-# PARAMETER CONFIGURATION:
-# - All experiment parameters can be set as environment variables before submission
-# - Parameters will use default values if not explicitly set
-# - Key parameters to consider setting:
-#   * PP_SIZE: Pipeline parallelism size (default: 2)
-#   * TP_SIZE: Tensor parallelism size (default: GPUS_PER_NODE)
-#   * BATCH_SIZE: Batch size for training (default: 1)
-#   * NUM_TOKENS: Number of tokens to process (default: 262144)
-#   * NUM_LAYERS: Number of model layers (default: 4)
-#   * MODE: Experiment mode (default: baseline)
-#   * MODEL_PATH: Path to the model (default: deepseek-ai/DeepSeek-R1-Distill-Llama-8B)
-#
-# EXAMPLES:
-#   PP_SIZE=4 TP_SIZE=2 MODE=dynamic sbatch test_e2e_combined.slurm.sh
-#   BATCH_SIZE=2 NUM_TOKENS=131072 sbatch test_e2e_combined.slurm.sh
-#   sbatch --nodes=2 test_e2e_combined.slurm.sh
-#
-
-
-
-# ------------------------------------------------------
-# Setup loggings and artifact directories
-# ------------------------------------------------------
-TS=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)
-
-# Get the current directory of the script
-cd $HOME/jd/d2/tests
-
-# TOOD: Fix this hardcode output dir.
-OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
-OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${SLURM_JOB_ID}"}
-OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX"
-mkdir -p "$OUTPUT_DIR"
-
-# Redirect the output of this script to the output directory
-# exec > $OUTPUT_DIR/slurm.stdout 2> $OUTPUT_DIR/slurm.stderr
-# exec > $OUTPUT_DIR/slurm.stdout 2>&1
-exec > >(tee "$OUTPUT_DIR/slurm.stdout") 2>&1
-
-
-
-LOG_DIR="$OUTPUT_DIR/logs"
-mkdir -p "$LOG_DIR"
-
-set -x
 
 # ------------------------------------------------------
 # Handle salloc+srun env variables
@@ -100,6 +16,7 @@ NUM_LAYERS=${NUM_LAYERS:-4}
 
 # Parallelism settings
 TP_SIZE=${TP_SIZE:-$GPUS_PER_NODE}   # Tensor Parallelism size, defaults to GPUs per node
+TP_SIZE=${TP_SIZE:-8}
 PP_SIZE=${PP_SIZE:-1}                # Pipeline Parallelism size
 CP_SIZE=${CP_SIZE:-1}                # Only useful in WLBLLM (D2 will have DPCP anyways)
 
@@ -117,9 +34,34 @@ FILTER_RATIO=${FILTER_RATIO:-0.50}
 SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-0}
 PROFILE_MEMORY_PATH=${PROFILE_MEMORY_PATH:"${OUTPUT_DIR}/"}
 
-NNODES=$SLURM_NNODES
+NNODES=${NNODES:-$SLURM_NNODES}
 
 cmd="MODE=$MODE MODEL_PATH=$MODEL_PATH BATCH_SIZE=$BATCH_SIZE NUM_TOKENS=$NUM_TOKENS MAX_SAMPLE_ID=$MAX_SAMPLE_ID TP_SIZE=$TP_SIZE CP_SIZE=$CP_SIZE NUM_LAYERS=$NUM_LAYERS sbatch --nodes $NNODES test_e2e_combined.slurm.sh"
+
+
+# ------------------------------------------------------
+# Setup loggings and artifact directories
+# ------------------------------------------------------
+TS=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)
+
+# Get the current directory of the script
+cd $HOME/jd/d2/tests
+
+# TOOD: Fix this hardcode output dir.
+OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
+OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${SLURM_JOB_ID}.${MODE}-cp${CP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}"}
+OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX"
+mkdir -p "$OUTPUT_DIR"
+
+# Redirect the output of this script to the output directory
+# exec > $OUTPUT_DIR/slurm.stdout 2> $OUTPUT_DIR/slurm.stderr
+# exec > $OUTPUT_DIR/slurm.stdout 2>&1
+exec > >(tee "$OUTPUT_DIR/slurm.stdout") 2>&1
+
+export LOG_DIR="$OUTPUT_DIR/logs"
+mkdir -p "$LOG_DIR"
+
+set -x
 
 
 # ------------------------------------------------------
@@ -192,9 +134,13 @@ EXPERIMENT_WARMUP_TIMES=${EXPERIMENT_REPEAT_TIMES:-5}
 EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=${EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB:--1}
 EXPERIMENT_SHOULD_FORCE_EXIT=${EXPERIMENT_SHOULD_FORCE_EXIT:-0}
 EXPERIMENT_EMIT_BACKWARD_NVTX=${EXPERIMENT_EMIT_BACKWARD_NVTX:-0}
-EXPERIMENT_WARMUP_TIMEOUT_SEC=${EXPERIMENT_WARMUP_TIMEOUT_SEC:-90}
+EXPERIMENT_WARMUP_TIMEOUT_SEC=${EXPERIMENT_WARMUP_TIMEOUT_SEC:-240}
+EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=${EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0:-0}
 D2_SHOULD_REPLAN=${D2_SHOULD_REPLAN:-1}
 SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-1}
+EXPERIMENT_LOG_MEMORY_USAGE=${EXPERIMENT_LOG_MEMORY_USAGE:-0}
+EXPERIMENT_ADD_SELECTIVE_CKPT=${EXPERIMENT_ADD_SELECTIVE_CKPT:-0}
+EXPERIMENT_SHOULD_RESEND_QKV=${EXPERIMENT_SHOULD_RESEND_QKV:-0}
 
 export NVTE_NVTX_ENABLED=1
 export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
@@ -220,9 +166,18 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 # scontrol show hostnames "$SLURM_STEP_NODELIST"  # expand to one hostname per line
 # exit 0
 
-nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+# nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+JOBID=${JOBID:-SLURM_JOB_ID}
+if [ -z "$JOBID" ]; then
+  echo "JOBID is not set"
+  exit 1
+fi
+
+nodes=( $(scontrol show hostnames $(scontrol show job $JOBID | awk -F= '/NodeList=fs/ {print $2}') ) )
 echo nodes "${nodes[@]}"
-export head_node_ip=${nodes[0]}
+export head_node=${nodes[0]}
+# export head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+export head_node_ip=$head_node
 port=29500
 echo head_node_ip=$head_node_ip port=$port
 
@@ -232,17 +187,18 @@ echo RZV_ENDPOINT=$RZV_ENDPOINT
 
 # Get GPU count from Slurm's environment variables
 # SLURM_GPUS_PER_NODE is set by Slurm when using --gpus-per-node or --gres=gpu:N
-if [ -n "$SLURM_GPUS_ON_NODE" ]; then
-  GPUS_PER_NODE=$SLURM_GPUS_ON_NODE
-else
-  GPUS_PER_NODE=$(nvidia-smi -L | wc -l)
-fi
-NUM_NODES=$SLURM_NNODES
+GPUS_PER_NODE=8
+# if [ -n "$SLURM_GPUS_ON_NODE" ]; then
+#   GPUS_PER_NODE=$SLURM_GPUS_ON_NODE
+# else
+#   GPUS_PER_NODE=8
+# fi
+NUM_NODES=${NUM_NODES:-$NNODES}
 WORLD_SIZE=$((GPUS_PER_NODE * NUM_NODES))
 
 
 # Build the common stem *format* (anything that needs per-node must be computed on the node)
-COMMON_STEM="nnodes${NNODES}.bs${BATCH_SIZE}.maxid${MAX_SAMPLE_ID}.tp${TP_SIZE}.pp${PP_SIZE}.cp${CP_SIZE}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}"
+COMMON_STEM="mode${MODE}.nnodes${NNODES}.bs${BATCH_SIZE}.maxid${MAX_SAMPLE_ID}.tp${TP_SIZE}.pp${PP_SIZE}.cp${CP_SIZE}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}"
 
 touch ${OUTPUT_DIR}/desc.${COMMON_STEM} # just a description of this experiment, in its file name
 
@@ -253,6 +209,8 @@ RZV_ID=${RZV_ID:-$head_node_ip}
 REPLAN_ITER=${REPLAN_ITER:-0}
 SHOULD_PROFILE_MEMORY=${SHOULD_PROFILE_MEMORY:-0}
 
+
+# bash ./redirect_log.sh 
 TORCHRUN_CMD=(
   --nnodes=${NNODES} \
   --nproc_per_node=${NPROC_PER_NODE} \
@@ -260,7 +218,8 @@ TORCHRUN_CMD=(
   --rdzv_endpoint=${RZV_ENDPOINT} \
   --rdzv_id=${RZV_ID} \
   --max_restarts=0 \
-  test_e2e_combined.py \
+  --no-python \
+  python test_e2e_combined.py \
     --model-path ${MODEL_PATH} \
     --mode ${MODE} \
     --replan-iter ${REPLAN_ITER} \
@@ -291,6 +250,10 @@ if [ ${SHOULD_PROFILE_MEMORY} -eq 1 ]; then
     TORCHRUN_CMD+=(--should-profile-memory ${PROFILE_MEMORY_PATH} )
 fi
 
+if [ ${EXPERIMENT_SHOULD_RESEND_QKV} -eq 1 ]; then
+    TORCHRUN_CMD+=(--should-resend-qkv)
+fi
+
 # Serialize TORCHRUN_CMD array so we can pass it through bash -lc cleanly
 TORCHRUN_STR=$(printf " %q" "${TORCHRUN_CMD[@]}")
 
@@ -302,13 +265,20 @@ SRUN_BASE=(
   srun
   -N ${NNODES}
   -G ${WORLD_SIZE}
-  --ntasks-per-node=1
-  # --gpus-per-task=${GPUS_PER_NODE}     # <= crucial
-  # --gpu-bind=per_task:${GPUS_PER_NODE} # <= bind GPUs to the task
-  --kill-on-bad-exit=1
-  --jobid=${JOBID:-SLURM_JOB_ID}
+  # --ntasks-per-node=1
+  # --gpus-per-task=8
+  # --cpus-per-task=64
+  # --cpu-bind=cores
+  # --gpu-bind=closest
+  # --kill-on-bad-exit=1
+  -w "$head_node"
   --mem=0 # inherit the memory from the salloc
 )
+
+#   --jobid=${JOBID:-SLURM_JOB_ID}
+if [ ${JOBID} -ne 0 ]; then
+  SRUN_BASE+=(--jobid=${JOBID})
+fi
 
 
 # ---------------------------
@@ -318,6 +288,7 @@ env > $OUTPUT_DIR/slurm.env
 
 EXP_README="$OUTPUT_DIR/README.md"
 echo "Running experiment with the following parameters:" > $EXP_README
+echo "## Model settings" >> $EXP_README
 echo "- MODE: $MODE" >> $EXP_README
 echo "- MODEL_PATH: $MODEL_PATH" >> $EXP_README
 echo "- NNODES: $NNODES" >> $EXP_README
@@ -333,7 +304,16 @@ echo "- ELONGATE_FACTOR: $ELONGATE_FACTOR" >> $EXP_README
 echo "- FILTER_THRESHOLD: $FILTER_THRESHOLD" >> $EXP_README
 echo "- FILTER_RATIO: $FILTER_RATIO" >> $EXP_README
 echo "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES" >> $EXP_README
+echo "## Experiment Flags" >> $EXP_README
 echo "- EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB: $EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB" >> $EXP_README
+echo "- EXPERIMENT_LOG_MEMORY_USAGE: $EXPERIMENT_LOG_MEMORY_USAGE" >> $EXP_README
+echo "- EXPERIMENT_SHOULD_FORCE_EXIT: $EXPERIMENT_SHOULD_FORCE_EXIT" >> $EXP_README
+echo "- EXPERIMENT_EMIT_BACKWARD_NVTX: $EXPERIMENT_EMIT_BACKWARD_NVTX" >> $EXP_README
+echo "- EXPERIMENT_WARMUP_TIMEOUT_SEC: $EXPERIMENT_WARMUP_TIMEOUT_SEC" >> $EXP_README
+echo "- D2_SHOULD_REPLAN: $D2_SHOULD_REPLAN" >> $EXP_README
+echo "- EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0: $EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0" >> $EXP_README
+echo "- EXPERIMENT_ADD_SELECTIVE_CKPT: $EXPERIMENT_ADD_SELECTIVE_CKPT" >> $EXP_README
+echo "- EXPERIMENT_SHOULD_RESEND_QKV: $EXPERIMENT_SHOULD_RESEND_QKV" >> $EXP_README
 
 # Generate equivalent command
 echo "" >> $EXP_README
@@ -344,51 +324,58 @@ echo "- Command: $cmd" >> $EXP_README
 # Run the experiment
 # ---------------------------
 
-if [ ${DRY_RUN} -eq 1 ]; then
-  echo "Dry run, skipping the actual experiment"
-  echo "${SRUN_BASE[@]}" \
-        --output="${LOG_DIR}/%N.%j.out" \
-        --error="${LOG_DIR}/%N.%j.out" \
-        bash -lc '
-            set -x
-            hostname
-            nvidia-smi topo -p2p w     # Check nvidia-smi topology
-            python -c "import torch; print(torch.cuda.is_available()); torch.cuda.set_device(0); print(torch.cuda.get_device_name()); x = torch.ones(1).cuda(); print(x)"
-            env # to check the nvshmem environment variables
-            exec torchrun '"$TORCHRUN_STR"'
-        '
-  exit 0
-fi
+DRY_RUN=${DRY_RUN:-0}
 
+if [ ${DRY_RUN} -eq 1 ]; then
+  SRUN_BASE=(
+    echo
+    ${SRUN_BASE[@]}
+  )
+    
+fi
 
 echo "Start running sbatch at $(TZ='America/Los_Angeles' date)"
 
+NSYS_PATH="${OUTPUT_DIR}/nsys-reps"
+mkdir -p ${NSYS_PATH}
+
+nsys_str=""
 if [ ${ENABLE_NSYS} -eq 1 ]; then
-  "${SRUN_BASE[@]}" \ \
-    --output="${LOG_DIR}/${TS}.${MODE}.%N.%j.%s.out" \
-    --error="${LOG_DIR}/${TS}.${MODE}.%N.%j.%s.out" \
-      nsys profile --show-output=true --force-overwrite=true \
-        -o "${OUTPUT_DIR}/%h.nsys-rep" --sample=none -t cuda,nvtx \
-        torchrun $TORCHRUN_STR
-else
-
-
-    "${SRUN_BASE[@]}" \
-        --output="${LOG_DIR}/%N.%j.%s.out" \
-        --error="${LOG_DIR}/%N.%j.%s.out" \
-        bash -lc '
-            set -x
-            hostname
-            nvidia-smi topo -p2p w     # Check nvidia-smi topology
-            python -c "import torch; print(torch.cuda.is_available()); torch.cuda.set_device(0); print(torch.cuda.get_device_name()); x = torch.ones(1).cuda(); print(x)"
-            env # to check the nvshmem environment variables
-            exec torchrun '"$TORCHRUN_STR"'
-        '
+  nsys_str="nsys profile --show-output=true --force-overwrite=true -o ${NSYS_PATH}/%h.nsys-rep --sample=none -t cuda,nvtx"
 fi
+
+unset OMP_NUM_THREADS
+start_time=$(TZ='America/Los_Angeles' date +%s)
+
+"${SRUN_BASE[@]}" \
+    --output="${LOG_DIR}/%N.%j.%s.out" \
+    --error="${LOG_DIR}/%N.%j.%s.out" \
+    bash -lc '
+        set -x
+        # export OMP_NUM_THREADS=1
+        hostname
+        nvidia-smi topo -p2p w     # Check nvidia-smi topology
+        
+        env # to check the nvshmem environment variables
+        '"$nsys_str"' torchrun '"$TORCHRUN_STR"'
+    '
+
+end_time=$(TZ='America/Los_Angeles' date +%s)
+elapsed_time=$((end_time - start_time))
+echo "Finished running sbatch at $(TZ='America/Los_Angeles' date). Does not guarantee that the experiment finished successfully. Please check if the benchmark.json file exists."
+echo "Elapsed time: $elapsed_time seconds"
+echo "Elapsed time: $elapsed_time seconds" >> $OUTPUT_DIR/README.md
+
+
+# Check if the experiment finished successfully
+if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
+    echo "Experiment failed. The benchmark.json file does not exist."
+fi
+
 
 set +x
 
-echo "Finished running sbatch at $(TZ='America/Los_Angeles' date). Does not guarantee that the experiment finished successfully. Please check if the benchmark.json file exists."
-
-
+echo '\a'
+echo '\a'
+echo '\a'
 # set -euox pipefail

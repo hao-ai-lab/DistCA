@@ -17,7 +17,7 @@ def _to_cuda_int32(tensor: Optional[torch.Tensor]):
 def _to_int(tensor):
     if isinstance(tensor, torch.Tensor):
         return tensor.cpu().item()
-    assert isinstance(tensor, int)
+    assert isinstance(tensor, int), f"Must be int. Current type: {type(tensor)}"
     return tensor
 
 

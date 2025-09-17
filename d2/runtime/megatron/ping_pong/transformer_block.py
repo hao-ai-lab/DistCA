@@ -1,10 +1,11 @@
 from contextlib import contextmanager, nullcontext
 import functools
+import os
 from typing import Any, Dict, Optional, Union
 import types
+
 import torch
 from torch import Tensor
-
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -51,6 +52,8 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
         assert not self.ping_pong_comm_initialized
         self.comm_stream = torch.cuda.Stream(device=device, priority=-1)
         self.ping_pong_comm_initialized = True
+        if os.getenv("D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE", "0") == "1":
+            self.comm_stream = torch.cuda.current_stream(device=device)
         DispatcherWrapper.comm_stream = self.comm_stream
 
     def ping_pong_forward(
@@ -360,8 +363,10 @@ class PingPongGPTModel(GPTModel):
             packed_seq_params.seq_params[1].dispatcher_id = 1
             packed_seq_params.seq_params[0].stream = self.decoder.comm_stream
             packed_seq_params.seq_params[1].stream = self.decoder.comm_stream
-        for _ in self.decoder.layers:
-            dummy_backward(self.config, packed_seq_params, dtype, device)
+        with torch.cuda.nvtx.range(f"backward(with_dummy)"):
+            for i, layer in enumerate(self.decoder.layers):
+                with torch.cuda.nvtx.range(f"backward_layer[{i}]"):
+                    dummy_backward(self.config, packed_seq_params, dtype, device)
 
     def init_ping_pong_communication_ctx(self, device: torch.device):
         self.decoder.init_ping_pong_communication_ctx(device)

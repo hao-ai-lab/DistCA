@@ -50,7 +50,7 @@ for num_tokens in "${NUM_TOKENS_ARRAY[@]}"; do
         #   export PROFILE_MEMORY_PATH=${OUTPUT_DIR_PREFIX}/wlbllm_cp${cp_size}_1/
         #   OUTPUT_DIR_SUFFIX=wlbllm_cp${cp_size}_${should_profile_memory} \
         #   SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="wlbllm" CP_SIZE=${cp_size} \
-        #   bash test_e2e_combined.salloc-exp.sh
+        #   bash test_e2e_combined.salloc.sh
         # done
 
         # 8_65536_32_d2_1_4_1
@@ -58,7 +58,7 @@ for num_tokens in "${NUM_TOKENS_ARRAY[@]}"; do
         OUTPUT_DIR_SUFFIX=d2_b1_${should_profile_memory} \
         SHOULD_PROFILE_MEMORY=$should_profile_memory MODE="d2" CP_SIZE=1 \
         EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=1 \
-        bash test_e2e_combined.salloc-exp.sh
+        bash test_e2e_combined.salloc.sh
 
       done
     done

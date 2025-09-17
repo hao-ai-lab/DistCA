@@ -97,7 +97,7 @@ class AlltoAllMetadata:
         ) = self.fa2a_metadata
 
         def convert_to_mb(x):
-            y = x / (1024 ** 2)
+            y = x // (1024 ** 2)
             return y.to('cpu')
         
         sender_send_offset = convert_to_mb(__sender_send_offset)
@@ -123,28 +123,28 @@ class AlltoAllMetadata:
                 _recv_memcpy_metadata.append(t)
         recv_memcpy_metadata = tuple(_recv_memcpy_metadata)
 
-        my_rank_send_offset = self.my_rank_send_offset  
-        my_rank_recv_offset = self.my_rank_recv_offset
-        my_rank_send_sz = self.my_rank_send_sz
+        my_rank_send_offset = [i // (1024 ** 2) for i in self.my_rank_send_offset] if isinstance(self.my_rank_send_offset, list) else self.my_rank_send_offset // (1024 ** 2)
+        my_rank_recv_offset = [i // (1024 ** 2) for i in self.my_rank_recv_offset] if isinstance(self.my_rank_recv_offset, list) else self.my_rank_recv_offset // (1024 ** 2)
+        my_rank_send_sz = [i // (1024 ** 2) for i in self.my_rank_send_sz] if isinstance(self.my_rank_send_sz, list) else self.my_rank_send_sz // (1024 ** 2)
         seq_lens = self.seq_lens
         tensor_shape = self.tensor_shape
         kv_replica_mask = self.kv_replica_mask
         single_stream = self.single_stream
 
         return dict(
-            sender_send_offset=sender_send_offset,
-            sender_transfer_sz=sender_transfer_sz,
-            sender_recv_offset=sender_recv_offset,
-            recver_transfer_sz=recver_transfer_sz,
-            send_memcpy_metadata=send_memcpy_metadata,
-            recv_memcpy_metadata=recv_memcpy_metadata,
-            my_rank_send_offset=my_rank_send_offset,
-            my_rank_recv_offset=my_rank_recv_offset,   
-            my_rank_send_sz=my_rank_send_sz,
+            sender_send_offset_mb=sender_send_offset,
+            sender_transfer_sz_mb=sender_transfer_sz,
+            sender_recv_offset_mb=sender_recv_offset,
+            recver_transfer_sz_mb=recver_transfer_sz,
+            send_memcpy_metadata='omit',
+            recv_memcpy_metadata='omit',
+            my_rank_send_offset_mb=my_rank_send_offset,
+            my_rank_recv_offset_mb=my_rank_recv_offset,   
+            my_rank_send_sz_mb=my_rank_send_sz,
             seq_lens=seq_lens,
-            tensor_shape=tensor_shape,
-            kv_replica_mask=kv_replica_mask,
-            single_stream=single_stream,
+            # tensor_shape=tensor_shape,
+            # kv_replica_mask=kv_replica_mask,
+            # single_stream=single_stream,
         )
 
     def get_slice(self, rank):

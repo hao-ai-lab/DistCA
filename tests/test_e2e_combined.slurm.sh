@@ -139,8 +139,6 @@ echo "- Command: $cmd" >> $EXP_README
 # Env and Sanity Check
 # ---------------------------
 
-conda activate jd-d2
-
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 nvidia-smi --query-gpu=index,name --format=csv
 
