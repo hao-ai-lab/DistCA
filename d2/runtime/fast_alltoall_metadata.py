@@ -122,9 +122,9 @@ class FastAlltoAllMetadata:
                 _recv_memcpy_metadata.append(t)
         recv_memcpy_metadata = tuple(_recv_memcpy_metadata)
 
-        my_rank_send_offset = [i // (1024 ** 2) for i in self.my_rank_send_offset  ]
-        my_rank_recv_offset = [i // (1024 ** 2) for i in self.my_rank_recv_offset]
-        my_rank_send_sz = [i // (1024 ** 2) for i in self.my_rank_send_sz]
+        my_rank_send_offset = [i // (1024 ** 2) for i in self.my_rank_send_offset] if isinstance(self.my_rank_send_offset, list) else self.my_rank_send_offset // (1024 ** 2)
+        my_rank_recv_offset = [i // (1024 ** 2) for i in self.my_rank_recv_offset] if isinstance(self.my_rank_recv_offset, list) else self.my_rank_recv_offset // (1024 ** 2)
+        my_rank_send_sz = [i // (1024 ** 2) for i in self.my_rank_send_sz] if isinstance(self.my_rank_send_sz, list) else self.my_rank_send_sz // (1024 ** 2)
         seq_lens = self.seq_lens
         tensor_shape = self.tensor_shape
         kv_replica_mask = self.kv_replica_mask
