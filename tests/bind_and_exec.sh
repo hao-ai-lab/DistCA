@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Inside bind_and_exec.sh"
+# echo "Inside bind_and_exec.sh"
 
 # Resolve rank ids
 LR=${LOCAL_RANK:-${SLURM_LOCALID:-0}}
@@ -15,7 +15,7 @@ LOGFILE="${LOGDIR}/${HOST}.r${RID}.lr${LR}.log"
 ENVFOLDER="${LOGDIR}/envs"
 ENVFILE="${ENVFOLDER}/${HOST}.r${RID}.lr${LR}.env"
 mkdir -p "$ENVFOLDER"
-echo "Logging $RID to $LOGFILE"
+# echo "Logging $RID to $LOGFILE"
 
 # ---- Logging + exec ----
 # exec > >(tee -a "$LOGFILE") 2>&1

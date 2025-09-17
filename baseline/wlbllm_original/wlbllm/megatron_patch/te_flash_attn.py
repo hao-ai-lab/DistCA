@@ -2,6 +2,7 @@ import wlbllm
 import wlbllm.registry
 from wlbllm.per_doc_cp_attn import PerDocumentCPAttention
 import rich
+import time
 
 def wlbllm_func(*args, **kwargs):
     """
@@ -10,6 +11,11 @@ def wlbllm_func(*args, **kwargs):
     
     This is a wrapper of PerDocumentCPAttention.apply()
     """
+    # import traceback    
+    # traceback.print_stack()
+    # print("kwargs:", kwargs)
+    # time.sleep(10)
+    # exit(0)
     (
         q, 
         k,
@@ -21,10 +27,6 @@ def wlbllm_func(*args, **kwargs):
         dropout_p,
     ) = args
     softmax_scale = kwargs["softmax_scale"]
-
-    # import traceback
-    # print("🟡 Inside wlbllm_func:")
-    # traceback.print_stack()
 
     doc_lens = wlbllm.registry.get("doc_lens")
     doc_shards = wlbllm.registry.get("doc_shards")

@@ -40,8 +40,12 @@ def get_torch_cuda_memory_usage(device):
     total_alloc = (allocated_cur + torch.cuda.memory_reserved(device) / (1024 ** 2))
     return allocated_cur, allocated_peak, total_alloc
 
+
 def log_memory_usage(message: str, force: bool = False):
-    if os.getenv("EXPERIMENT_LOG_MEMORY_USAGE", "0") != "1":
+    EXPERIMENT_LOG_MEMORY_USAGE = os.getenv("EXPERIMENT_LOG_MEMORY_USAGE", "0")
+    # print(f"Ⓜ️", EXPERIMENT_LOG_MEMORY_USAGE)
+    # return
+    if EXPERIMENT_LOG_MEMORY_USAGE != "1":
         return
     
     global memory_usage
@@ -88,7 +92,49 @@ def log_memory_usage(message: str, force: bool = False):
         with open(memory_usage_log_file, 'a') as f:
             f.write(json.dumps(new_entry) + "\n")
 
+from contextlib import contextmanager
+
+@contextmanager
+def log_memory_usage_context():
+    old_env_var = os.environ.get("EXPERIMENT_LOG_MEMORY_USAGE", "0")
+    os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = "1"
+    yield
+    os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = old_env_var
+
+
+def enable_memory_usage_logging(memory_usage_dir: str):
+    os.makedirs(memory_usage_dir, exist_ok=True)
+    rank = torch.distributed.get_rank()
+    memory_usage_log_file = os.path.join(memory_usage_dir, f"mem.rank{rank}.log.jsonl")
+    with open(memory_usage_log_file, 'w') as f:
+        pass
+    set_memory_usage_log_file(memory_usage_log_file)
+    pass
+
+
 
 def get_memory_usage():
     global memory_usage
     return memory_usage
+
+
+import glob
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def plot_memory_usage_figure(memory_usage_dir: str):
+    # list the memory usage log files in the directory, 
+    # read each file and plot the memory usage
+    memory_usage_log_files = glob.glob(os.path.join(memory_usage_dir, "mem.rank*"))
+    
+    # allocated_cur
+    for rank, memory_usage_log_file in enumerate(memory_usage_log_files):
+        with open(memory_usage_log_file, 'r') as f:
+            memory_usage = [json.loads(line) for line in f]
+            df = pd.DataFrame(memory_usage)
+            plt.plot(df.index, df['allocated_cur'], label=f'Rank {rank}', alpha=0.5)
+    plt.legend()
+    plt.show()
+    plt.savefig(os.path.join(memory_usage_dir, "memory_usage.allocated_cur.png"))
+    return

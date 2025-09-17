@@ -20,7 +20,13 @@ from d2.runtime.attn_kernels.dispatch import (
     post_fast_a2a_attn_out_grad_resend_qkv, post_fast_a2a_qkv,
 )
 from d2.runtime.fast_alltoall_metadata import FastAlltoAllMetadata
+import os
 
+# is_deterministic = (os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0") == "0")
+# if is_deterministic:
+#     print("🟡 Using deterministic = True as default value in FusedCommAttn! This is not recommended for production use! Forcefully set it back to False. If you need to test, come to FusedCommAttn.py to modify this logic.")
+#     os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "1"
+#     is_deterministic = False
 
 @dataclass
 class FlashAttnArgs:
@@ -69,7 +75,25 @@ def _qkv_to_attn_out_fwd(q: Tensor, k: Tensor, v: Tensor,
         q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
         k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
         v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-    # rng_states seems only to be debug used. Skip it.
+    
+    if False:
+        print("🟡 _qkv_to_attn_out_fwd: q.shape = ", q.shape)
+        print("🟡 _qkv_to_attn_out_fwd: k.shape = ", k.shape)
+        print("🟡 _qkv_to_attn_out_fwd: v.shape = ", v.shape)
+        print("🟡 _qkv_to_attn_out_fwd: cu_seqlens_q.shape = ", fa_params.cu_seqlens_q, fa_params.cu_seqlens_q.shape)
+        print("🟡 _qkv_to_attn_out_fwd: cu_seqlens_kv.shape = ", fa_params.cu_seqlens_kv, fa_params.cu_seqlens_kv.shape)
+        print("🟡 _qkv_to_attn_out_fwd: max_seqlen_q = ", fa_params.max_seqlen_q)
+        print("🟡 _qkv_to_attn_out_fwd: max_seqlen_kv = ", fa_params.max_seqlen_kv)
+        print("🟡 _qkv_to_attn_out_fwd: dropout_p = ", fa_args.dropout_p)
+        print("🟡 _qkv_to_attn_out_fwd: softmax_scale = ", softmax_scale)
+        print("🟡 _qkv_to_attn_out_fwd: causal = ", fa_args.causal)
+        print("🟡 _qkv_to_attn_out_fwd: window_size_left = ", fa_args.window_size[0])
+        print("🟡 _qkv_to_attn_out_fwd: window_size_right = ", fa_args.window_size[1])
+        print("🟡 _qkv_to_attn_out_fwd: softcap = ", fa_args.softcap)
+        print("🟡 _qkv_to_attn_out_fwd: alibi_slopes.shape = ", fa_args.alibi_slopes.shape if fa_args.alibi_slopes is not None else None)
+        print("🟡 _qkv_to_attn_out_fwd: return_attn_probs = ", fa_args.return_attn_probs)
+        print("🟡 _qkv_to_attn_out_fwd: block_table.shape = ", fa_args.block_table.shape if fa_args.block_table is not None else None)
+    
     out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
         q, k, v,
         fa_params.cu_seqlens_q,
@@ -123,7 +147,28 @@ def _qkv_to_attn_out_bwd(
         out_padded = torch.nn.functional.pad(out_padded, [0, 8 - head_dim % 8])
         dout_padded = torch.nn.functional.pad(dout_padded, [0, 8 - head_dim % 8])
 
+
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    if False:
+        print("🟡 _qkv_to_attn_out_bwd: dout_padded.shape = ", dout_padded.shape)
+        print("🟡 _qkv_to_attn_out_bwd: q.shape = ", q.shape)
+        print("🟡 _qkv_to_attn_out_bwd: k.shape = ", k.shape)
+        print("🟡 _qkv_to_attn_out_bwd: v.shape = ", v.shape)
+        print("🟡 _qkv_to_attn_out_bwd: out_padded.shape = ", out_padded.shape)
+        print("🟡 _qkv_to_attn_out_bwd: softmax_lse.shape = ", softmax_lse.shape)
+        print("🟡 _qkv_to_attn_out_bwd: cu_seqlen_q.shape = ", cu_seqlen_q, cu_seqlen_q.shape)
+        print("🟡 _qkv_to_attn_out_bwd: cu_seqlen_kv.shape = ", cu_seqlen_kv, cu_seqlen_kv.shape)
+        print("🟡 _qkv_to_attn_out_bwd: max_seqlen_q = ", max_seqlen_q)
+        print("🟡 _qkv_to_attn_out_bwd: max_seqlen_kv = ", max_seqlen_kv)
+        print("🟡 _qkv_to_attn_out_bwd: dropout_p = ", fa_args.dropout_p)
+        print("🟡 _qkv_to_attn_out_bwd: softmax_scale = ", softmax_scale)
+        print("🟡 _qkv_to_attn_out_bwd: causal = ", fa_args.causal)
+        print("🟡 _qkv_to_attn_out_bwd: window_size_left = ", fa_args.window_size[0])
+        print("🟡 _qkv_to_attn_out_bwd: window_size_right = ", fa_args.window_size[1])
+        print("🟡 _qkv_to_attn_out_bwd: softcap = ", fa_args.softcap)
+        print("🟡 _qkv_to_attn_out_bwd: alibi_slopes.shape = ", fa_args.alibi_slopes.shape if fa_args.alibi_slopes is not None else None)
+        print("🟡 _qkv_to_attn_out_bwd: deterministic = ", fa_args.deterministic)
+
     _wrapped_flash_attn_varlen_backward(
         dout_padded, q, k, v, out_padded.contiguous(), softmax_lse, dq, dk, dv,
         cu_seqlen_q, cu_seqlen_kv, max_seqlen_q, max_seqlen_kv,

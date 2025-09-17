@@ -24,54 +24,58 @@ sleep 1
 
 
 TS=$(TZ=America/Los_Angeles date +%m%d_%H%M%S)_PST
-export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250907_large_scale_v6/logs.v5-compare/${TS}
-export MAX_SAMPLE_ID=3
+export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250907_large_scale_v6/logs.v2-large_scale/
+export MAX_SAMPLE_ID=10
 export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2
 export TP_SIZE=8
 export ENABLE_NSYS=1
 # export EXPERIMENT_LOG_MEMORY_USAGE=1
 export EXPERIMENT_LOG_MEMORY_USAGE=0
-export EXPERIMENT_REPEAT_TIMES=1
-export EXPERIMENT_WARMUP_TIMES=0
+export EXPERIMENT_REPEAT_TIMES=3
+export EXPERIMENT_WARMUP_TIMES=3
 export EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND=1 # default 1
 export SHOULD_ADD_DEBUG_CASES=0
 export EXPERIMENT_SKIP_OPTIMIZER_STEP=1
+export EXPERIMENT_FA2A_BARRIER=0
+export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=0
 # export EXPERIMENT_FA2A_BARRIER=1
 # export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=0 # default 0
+
 
 DRY_RUN=${DRY_RUN:-0}
 
 # export MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 # export MODEL_PATH=codellama/CodeLlama-34b-hf
 export MODEL_PATH=codellama/CodeLlama-34b-hf
-export NUM_LAYERS=6
+export NUM_LAYERS=48
 
 
 # ------------------------------------
 # Check and skip success runs
 # ------------------------------------
-
-python query_success_runs.py --folder $OUTPUT_DIR_PREFIX
+eid_file=$OUTPUT_DIR_PREFIX/success_eids.txt
+python /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250907_large_scale_v6/query_success_runs.py --folder $OUTPUT_DIR_PREFIX --output_file $eid_file
 
 # check the success_eids.txt file
 SUCCESS_EIDS=""
-if [ -f success_eids.txt ]; then
-    SUCCESS_EIDS=$(cat success_eids.txt)
+if [ -f $eid_file ]; then
+    SUCCESS_EIDS=$(cat $eid_file)
     echo "🟡 SUCCESS_EIDS=$SUCCESS_EIDS"
 else
-    echo "🟡 success_eids.txt file does not exist"
+    echo "🟡 $eid_file file does not exist"
 fi
 
 
-    # "1 1 1 524288 8" \
-    # "1 1 4 131072 2" \
 
-# "1 1 4 131072 2 1" \
-
-    # "1 1 4 262144 4" \
-    # "1 1 4 524288 8" \
+# Run one d2 + one wlbllm-cpMax to justify the result.
 for config in \
     "1 1 4 131072 2" \
+    "1 1 4 262144 4" \
+    "1 1 1 131072 2" \
+    "1 1 1 262144 4" \
+    "1 1 1 524288 8" \
+    "1 1 2 524288 8" \
+    "1 1 4 524288 8" \
     ; do
 
 
@@ -85,49 +89,21 @@ for config in \
 
     # Run d2 mode with all on
     export MODE=d2
-    export EXPERIMENT_FA2A_BARRIER=0
-    export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=0
+    export EXPERIMENT_D2_BALANCE_PING_PONG=0
     export OUTPUT_DIR_SUFFIX_ADDON="-normal"
-    if [ $skip_optimizer_step -eq 1 ]; then
-        export OUTPUT_DIR_SUFFIX_ADDON="$OUTPUT_DIR_SUFFIX_ADDON-skoptimizer"
+    eid="d2-cp1-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}"
+    if [[ "$SUCCESS_EIDS" =~ "$eid" ]]; then
+        echo "🟢 Skip: $eid"
+        continue
     fi
     echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
     if [ $DRY_RUN -eq 0 ]; then
         bash test_e2e_combined.salloc.sh
         echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
+        echo "\a"
     fi
 
     
-
-    # # Run d2 mode setting send signal to 0
-    # export MODE=d2
-    # export EXPERIMENT_FA2A_BARRIER=1
-    # export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=0 # <- 
-    # export OUTPUT_DIR_SUFFIX_ADDON="-barrier"
-    # if [ $skip_optimizer_step -eq 1 ]; then
-    #     export OUTPUT_DIR_SUFFIX_ADDON="$OUTPUT_DIR_SUFFIX_ADDON-skoptimizer"
-    # fi
-    # echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-    # if [ $DRY_RUN -eq 0 ]; then
-    #     bash test_e2e_combined.salloc.sh
-    #     echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-    # fi
-
-    # # Run d2 mode setting send signal to 0 ablate signal 
-    # export MODE=d2
-    # export EXPERIMENT_FA2A_BARRIER=1 # <-
-    # export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=1 # <- 
-    # export OUTPUT_DIR_SUFFIX_ADDON="-signal-barrier"
-    # if [ $skip_optimizer_step -eq 1 ]; then
-    #     export OUTPUT_DIR_SUFFIX_ADDON="$OUTPUT_DIR_SUFFIX_ADDON-skoptimizer"
-    # fi
-    # echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-    # if [ $DRY_RUN -eq 0 ]; then
-    #     bash test_e2e_combined.salloc.sh
-    #     echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-    # fi
-
-
     # Run wlbllm mode with different CP sizes
     counter=0
     for CP_SIZE in 32 16 8 4 2 1; do
@@ -139,39 +115,87 @@ for config in \
             continue
         fi
 
-        echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
         export MODE=wlbllm CP_SIZE=$CP_SIZE
         export OUTPUT_DIR_SUFFIX_ADDON=""
-        if [ $skip_optimizer_step -eq 1 ]; then
-            export OUTPUT_DIR_SUFFIX_ADDON="$OUTPUT_DIR_SUFFIX_ADDON-skoptimizer"
+        eid="wlbllm-cp${CP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}"
+        if [[ "$SUCCESS_EIDS" =~ "$eid" ]]; then
+            echo "🟢 Skip: $eid"
+            continue
         fi
+        echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
         if [ $DRY_RUN -eq 0 ]; then
             bash test_e2e_combined.salloc.sh
             echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
+            echo "\a"
         fi
+        break # <- breaking after the max permissible cp size is run
+    done
+
+done
+
+
+# Run all wlbllm-cp except max 
+for config in \
+    "1 1 4 131072 2" \
+    "1 1 4 262144 4" \
+    "1 1 2 524288 8" \
+    "1 1 1 131072 2" \
+    "1 1 1 262144 4" \
+    "1 1 1 524288 8" \
+    "1 1 4 524288 8" \
+    ; do
+
+
+    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor <<< "$config"
+    
+    export EXPERIMENT_ADD_SELECTIVE_CKPT=$selective_ckpt
+    export EXPERIMENT_SHOULD_RESEND_QKV=$resend_qkv
+    export BATCH_SIZE=$batch_size
+    export NUM_TOKENS=$num_tokens
+    export ELONGATE_FACTOR=$elongate_factor
+    
+    # Run wlbllm mode with different CP sizes
+    counter=0
+    for CP_SIZE in 32 16 8 4 2 1; do
+        if [ $CP_SIZE -gt $NNODES ]; then
+            continue
+        fi
+        DP_SIZE=$((NNODES / CP_SIZE))
+        if [ $DP_SIZE -gt $(($BATCH_SIZE * 2)) ]; then
+            continue
+        fi
+
         counter=$((counter + 1))
-        if [ $counter -ge 2 ]; then
-            break
+        if [ $counter -le 1 ]; then
+            continue # <- skipping the first one case as it has been run before
+        fi
+
+        echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
+        export MODE=wlbllm CP_SIZE=$CP_SIZE
+        export OUTPUT_DIR_SUFFIX_ADDON=""
+        if [ $DRY_RUN -eq 0 ]; then
+            bash test_e2e_combined.salloc.sh
+            echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
+            echo "\a"
         fi
     done
 
-    # # Run d2 mode setting send signal to 0
+
+    # # Run d2 mode with balance ping pong
     # export MODE=d2
-    # export EXPERIMENT_FA2A_BARRIER=0
-    # export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=1 # <- 
-    # export OUTPUT_DIR_SUFFIX_ADDON="-signal"
-    # if [ $skip_optimizer_step -eq 1 ]; then
-    #     export OUTPUT_DIR_SUFFIX_ADDON="$OUTPUT_DIR_SUFFIX_ADDON-skoptimizer"
-    # fi
+    # export EXPERIMENT_D2_BALANCE_PING_PONG=1
+    # export OUTPUT_DIR_SUFFIX_ADDON="-pingpong_balance"
     # echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
     # if [ $DRY_RUN -eq 0 ]; then
     #     bash test_e2e_combined.salloc.sh
     #     echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
+    #     echo "\a"
     # fi
+
+
     
+
 done
 
 
-
-# salloc -N 8 -G 64 bash salloc_srun.sh
 set +e

@@ -1,6 +1,7 @@
 import contextlib
 from typing import Union, Iterator, List
 
+import os
 import torch
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
@@ -90,6 +91,30 @@ def send_forward_backward_recv_forward_backward(output_tensors, input_tensor_gra
 forward_backward_pipelining_without_interleaving_first_run = True
 
 
+import wlbllm.registry
+def wlb_swap_next_forward_metadata():
+    # Call this function before entering forward step.
+    swap_metadata_fn = wlbllm.registry.get("swap_metadata_fn")
+    forward_cnt = wlbllm.registry.get("forward_cnt")
+    print(f"🟡 wlb_swap_next_forward_metadata[{forward_cnt}]: start swapping forward metadata")
+    swap_metadata_fn(forward_cnt)
+    print(f"🟡 wlb_swap_next_forward_metadata[{forward_cnt}]: end swapping forward metadata")
+    wlbllm.registry.set("forward_cnt", forward_cnt + 1)
+    return
+
+def wlb_swap_next_backward_metadata():
+    # Call this function before entering backward step.
+    swap_metadata_fn = wlbllm.registry.get("swap_metadata_fn")
+    backward_cnt = wlbllm.registry.get("backward_cnt")
+    print(f"🟡 wlb_swap_next_backward_metadata[{backward_cnt}]: start swapping backward metadata")
+    swap_metadata_fn(backward_cnt)
+    print(f"🟡 wlb_swap_next_backward_metadata[{backward_cnt}]: end swapping backward metadata")
+    wlbllm.registry.set("backward_cnt", backward_cnt + 1)
+    return
+
+def is_wlb_func():
+    return os.environ.get("WLBLLM_MODE", "0") == "1"
+
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -106,6 +131,42 @@ def forward_backward_pipelining_without_interleaving(
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
+
+    # -------------------------------------------------- 
+    # Redefine the forward and backward step.
+    # -------------------------------------------------- 
+    
+    # Prepare the `forward_step__` and `backward_step__` functions.
+    forward_batch_id = 0
+    backward_batch_id = 0
+
+    def forward_step__(*args, **kwargs):
+        nonlocal forward_batch_id
+        with torch.cuda.nvtx.range(f"forward_step[{forward_batch_id}]"):
+            forward_batch_id += 1
+            if is_wlb_func():
+                wlb_swap_next_forward_metadata()
+            return forward_step(*args, **kwargs)
+        pass
+    
+    def backward_step__(*args, **kwargs):
+        nonlocal backward_batch_id
+        with torch.cuda.nvtx.range(f"backward_step[{backward_batch_id}]"):
+            backward_batch_id += 1
+            if is_wlb_func():
+                wlb_swap_next_backward_metadata()
+            return backward_step(*args, **kwargs)
+        pass
+
+    def dummy_bwd_func__(*args, **kwargs):
+        nonlocal backward_batch_id
+        with torch.cuda.nvtx.range(f"backward_step(dummy)[{backward_batch_id}]"):
+            backward_batch_id += 1
+            ret = dummy_bwd_func(*args, **kwargs)
+            return ret
+        pass
+
+    # --------------------------------------------------
 
     if isinstance(model, list):
         assert (
@@ -153,6 +214,7 @@ def forward_backward_pipelining_without_interleaving(
 
     disable_grad_sync()
 
+    
     # Compute number of warmup microbatches.
     num_warmup_microbatches = (
         parallel_state.get_pipeline_model_parallel_world_size()
@@ -219,10 +281,12 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches_including_dummy = parallel_state.get_pipeline_model_parallel_world_size() - 1
 
     # Run warmup forward passes.
+    print(f"pp warmup phase - {num_warmup_microbatches_including_dummy = } steps")
     for i in range(num_warmup_microbatches_including_dummy):
+        print(f"pp warmup phase - {i = }, {rank = }")
         if i < rank:
             with torch.no_grad():
-                _ = forward_step(
+                _ = forward_step__(
                     forward_step_func,
                     data_iterator,
                     model,
@@ -247,9 +311,10 @@ def forward_backward_pipelining_without_interleaving(
                 checkpoint_activations_microbatch = None
 
             if i == rank:
-                input_tensor = recv_forward(recv_tensor_shapes, config)
+                with torch.cuda.nvtx.range(f"recv_forward[r={rank},f={forward_batch_id}]"):
+                    input_tensor = recv_forward(recv_tensor_shapes, config)
 
-            output_tensor, num_tokens = forward_step(
+            output_tensor, num_tokens = forward_step__(
                 forward_step_func,
                 data_iterator,
                 model,
@@ -267,9 +332,10 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensors.append(input_tensor)
                 output_tensors.append(output_tensor)
 
-            input_tensor = send_forward_recv_forward(
-                output_tensor, not parallel_state.is_pipeline_first_stage(), send_tensor_shapes, config
-            )
+            with torch.cuda.nvtx.range(f"send_f_recv_f[r={rank},f={forward_batch_id}]"):
+                input_tensor = send_forward_recv_forward(
+                    output_tensor, not parallel_state.is_pipeline_first_stage(), send_tensor_shapes, config
+                )
 
             if not forward_only:
                 deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
@@ -284,19 +350,23 @@ def forward_backward_pipelining_without_interleaving(
     #     input_tensor = recv_forward(recv_tensor_shapes, config)
 
     # Run 1F1B in steady state.
+    print(f"pp steady state - {num_microbatches = } steps")
     for i in range(num_microbatches):
+        print(f"pp steady state - {i = }, {rank = }")
         forward_dummy = i >= num_microbatches_remaining
         backward_dummy = i < num_warmup_microbatches
         next_forward_dummy = i + 1 >= num_microbatches_remaining
         next_backward_dummy = i + 1 < num_warmup_microbatches
         if i == 0 == num_warmup_microbatches:
-            output_tensor_grad = recv_backward(send_tensor_shapes, config)
+            with torch.cuda.nvtx.range(f"recv_backward[r={rank},b={backward_batch_id}]"):
+                output_tensor_grad = recv_backward(send_tensor_shapes, config)
         if i == 0 == num_warmup_microbatches:
-            input_tensor = recv_forward(recv_tensor_shapes, config)
+            with torch.cuda.nvtx.range(f"recv_forward[r={rank},f={forward_batch_id}]"):
+                input_tensor = recv_forward(recv_tensor_shapes, config)
 
         if forward_dummy:
             with torch.no_grad():
-                _ = forward_step(
+                _ = forward_step__(
                     forward_step_func,
                     data_iterator,
                     model,
@@ -321,7 +391,7 @@ def forward_backward_pipelining_without_interleaving(
             else:
                 checkpoint_activations_microbatch = None
 
-            output_tensor, num_tokens = forward_step(
+            output_tensor, num_tokens = forward_step__(
                 forward_step_func,
                 data_iterator,
                 model,
@@ -342,9 +412,10 @@ def forward_backward_pipelining_without_interleaving(
             if forward_only:
                 if parallel_state.is_pipeline_last_stage():
                     output_tensor = [None]
-                input_tensor = send_forward_recv_forward(
-                    output_tensor, not parallel_state.is_pipeline_first_stage() and not next_forward_dummy, send_tensor_shapes, config
-                )
+                with torch.cuda.nvtx.range(f"send_f_recv_f[r={rank},f={forward_batch_id}]"):
+                    input_tensor = send_forward_recv_forward(
+                        output_tensor, not parallel_state.is_pipeline_first_stage() and not next_forward_dummy, send_tensor_shapes, config
+                    )
 
             if not forward_only:
                 # Add input_tensor and output_tensor to end of list.
@@ -356,7 +427,7 @@ def forward_backward_pipelining_without_interleaving(
             pass
         else:
             if backward_dummy:
-                dummy_bwd_func(model)
+                dummy_bwd_func__(model)
 
             else:
 
@@ -371,7 +442,7 @@ def forward_backward_pipelining_without_interleaving(
                     if config.grad_sync_func is None or rank == 0:
                         enable_grad_sync()
 
-                input_tensor_grad = backward_step(
+                input_tensor_grad = backward_step__(
                     input_tensor, output_tensor, output_tensor_grad, model_type, config
                 )
 
@@ -379,23 +450,26 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor_grad = [None]
             if parallel_state.is_pipeline_last_stage() or forward_dummy:
                 save_output_tensor = [None]
-            torch.cuda.nvtx.range_push(f'send forward backward {rank=}, {i=}')
-            input_tensor, output_tensor_grad = send_forward_backward_recv_forward_backward(
-                save_output_tensor, input_tensor_grad,
-                not parallel_state.is_pipeline_first_stage() and not next_forward_dummy,
-                not parallel_state.is_pipeline_last_stage() and not next_backward_dummy,
-                send_tensor_shapes, config
-            )
+            # torch.cuda.nvtx.range(f'send forward backward {rank=}, {i=}')
+            with torch.cuda.nvtx.range(f"send_fb_recv_fb[r={rank},f={forward_batch_id},b={backward_batch_id}]"):
+                input_tensor, output_tensor_grad = send_forward_backward_recv_forward_backward(
+                    save_output_tensor, input_tensor_grad,
+                    not parallel_state.is_pipeline_first_stage() and not next_forward_dummy,
+                    not parallel_state.is_pipeline_last_stage() and not next_backward_dummy,
+                    send_tensor_shapes, config
+                )
             deallocate_output_tensor(save_output_tensor[0], config.deallocate_pipeline_outputs)
-            torch.cuda.nvtx.range_pop()
+            # torch.cuda.nvtx.range_pop()
 
     # Run cooldown backward passes.
     if not forward_only:
+        print(f"pp cooldown phase - {num_warmup_microbatches_including_dummy = } steps")
         for i in range(num_warmup_microbatches_including_dummy):
+            print(f"pp cooldown phase - {i = }, {rank = }")
             dummy = i + rank >= num_warmup_microbatches_including_dummy
             next_dummy = i + 1 + rank >= num_warmup_microbatches_including_dummy
             if dummy:
-                dummy_bwd_func(model)
+                dummy_bwd_func__(model)
             else:
                 # Enable async grad reduction in the last backward pass
                 # Note: If grad sync function is provided, only enable
@@ -409,13 +483,14 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = input_tensors.pop(0)
                 output_tensor = output_tensors.pop(0)
 
-                input_tensor_grad = backward_step(
+                input_tensor_grad = backward_step__(
                     input_tensor, output_tensor, output_tensor_grad, model_type, config
                 )
 
-                output_tensor_grad = send_backward_recv_backward(
-                    input_tensor_grad, not parallel_state.is_pipeline_last_stage() and not next_dummy, recv_tensor_shapes, config
-                )
+                with torch.cuda.nvtx.range(f"send_b_recv_b[r={rank},b={backward_batch_id}]"):
+                    output_tensor_grad = send_backward_recv_backward(
+                        input_tensor_grad, not parallel_state.is_pipeline_last_stage() and not next_dummy, recv_tensor_shapes, config
+                    )
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
@@ -427,7 +502,8 @@ def forward_backward_pipelining_without_interleaving(
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
-        finish_embedding_wgrad_compute(config, embedding_module)
+        with torch.cuda.nvtx.range("finish_embedding_wgrad_compute"):
+            finish_embedding_wgrad_compute(config, embedding_module)
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and

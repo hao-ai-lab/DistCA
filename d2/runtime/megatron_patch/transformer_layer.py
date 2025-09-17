@@ -767,8 +767,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(start)")
         signal = args.pop("signal")
         packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
-        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
-        
+        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None        
         if bwd_resend_qkv:
             log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before FusedCommAttn)")
             signal = FusedCommAttn.apply(
@@ -875,6 +874,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         """
         For Pipeline Parallel debugging, we use single-sided to ease debugging.
         """
+        # with torch.cuda.nvtx.range("PingPangGPTModel.forward"):
         if self._ping_pang_debug:
             assert self._debug_forward_impl in ["orig", "single_sided", "orig_reimpl"], self._debug_forward_impl
             if self._debug_forward_impl == "single_sided":
@@ -963,8 +963,11 @@ class PingPangGPTModel(GPTModel):
             packed_seq_params.seq_params[1].dispatcher_id = 1
             packed_seq_params.seq_params[0].stream = self.decoder.comm_stream
             packed_seq_params.seq_params[1].stream = self.decoder.comm_stream
-        for _ in self.decoder.layers:
-            dummy_backward(self.config, packed_seq_params, dtype, device)
+        
+        with torch.cuda.nvtx.range(f"backward(with_dummy)"):
+            for i,layer in enumerate(self.decoder.layers):
+                with torch.cuda.nvtx.range(f"backward_layer[{i}]"):
+                    dummy_backward(self.config, packed_seq_params, dtype, device)
 
     def init_ping_pong_communication_ctx(self, device: torch.device):
         self.decoder.init_ping_pang_communication_ctx(device)

@@ -1,6 +1,6 @@
 #! /bin/bash
 
-#SBATCH --job-name=d2-e2e
+#SBATCH --job-name=d2pp-e2e
 #SBATCH --nodes=4
 #SBATCH --output=logs/slurm/stdout.%j.log
 #SBATCH --error=logs/slurm/stderr.%j.log
@@ -19,19 +19,22 @@
 # ------------------------------------------------------
 
 # Model configuration
+# MODEL_PATH=${MODEL_PATH:-codellama/CodeLlama-34b-hf}
 MODEL_PATH=${MODEL_PATH:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}
-NUM_LAYERS=${NUM_LAYERS:-4}
+NUM_LAYERS=${NUM_LAYERS:-8}
 
 # Parallelism settings
 TP_SIZE=${TP_SIZE:-$GPUS_PER_NODE}   # Tensor Parallelism size, defaults to GPUs per node
 TP_SIZE=${TP_SIZE:-8}
 PP_SIZE=${PP_SIZE:-1}                # Pipeline Parallelism size
 CP_SIZE=${CP_SIZE:-1}                # Only useful in WLBLLM (D2 will have DPCP anyways)
+NUM_MICROBATCH=${PP_SIZE}            # Number of microbatches per pipeline stage, has to be >= PP_SIZE - 1
 
 # Experiment settings
 MODE=${MODE:-d2}               # Experiment mode (baseline, dynamic, etc.)
 BATCH_SIZE=${BATCH_SIZE:-1}          # Batch size for training
-NUM_TOKENS=${NUM_TOKENS:-65536}     # Number of tokens to process
+# NUM_TOKENS=${NUM_TOKENS:-131072}     # Number of tokens to process
+NUM_TOKENS=${NUM_TOKENS:-16384}     # Number of tokens to process
 MAX_SAMPLE_ID=${MAX_SAMPLE_ID:-3}   # Maximum sample ID
 # SAMPLE_EXPR=${SAMPLE_EXPR:-""}   # Sample expression
 
@@ -42,8 +45,6 @@ FILTER_THRESHOLD=${FILTER_THRESHOLD:-65536}
 FILTER_RATIO=${FILTER_RATIO:-0.50}
 SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-0}
 PROFILE_MEMORY_PATH=${PROFILE_MEMORY_PATH:"${OUTPUT_DIR}/"}
-SAMPLE_NAME=${SAMPLE_NAME:-"wlbllm"}
-CHANGE_LONG_DOC_RATIO=${CHANGE_LONG_DOC_RATIO:-0.0}
 
 JOBID=${JOBID:-${SLURM_JOB_ID}}
 if [ -z "$JOBID" ]; then
@@ -63,8 +64,6 @@ if [ -z "$NNODES" ]; then
 fi
 echo -e "\033[33mRecognized JOBID=$JOBID, NNODES=$NNODES\033[0m"
 sleep 1
-
-# cmd="MODE=$MODE MODEL_PATH=$MODEL_PATH BATCH_SIZE=$BATCH_SIZE NUM_TOKENS=$NUM_TOKENS MAX_SAMPLE_ID=$MAX_SAMPLE_ID TP_SIZE=$TP_SIZE CP_SIZE=$CP_SIZE NUM_LAYERS=$NUM_LAYERS sbatch --nodes $NNODES test_e2e_combined.slurm.sh"
 
 
 # ------------------------------------------------------
@@ -89,21 +88,6 @@ exec > >(tee "$OUTPUT_DIR/slurm.stdout") 2>&1
 
 export LOG_DIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOG_DIR"
-
-
-
-
-# ------------------------------------------------------
-
-# ---------------------------
-# Env and Sanity Check
-# ---------------------------
-
-# conda activate jd-d2
-
-echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-nvidia-smi --query-gpu=index,name --format=csv
-
 
 
 # ---------------------------
@@ -152,6 +136,12 @@ export OPENMPI_DIR=/mnt/weka/home/yonghao.zhuang/opt/openmpi
 export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:${CUDA_DIR}/lib64:${OPENMPI_DIR}/lib:${NCCL_LIB}/:$LD_LIBRARY_PATH"
 export PATH="${NVSHMEM_DIR}/bin:${OPENMPI_DIR}/bin:${CUDA_DIR}/bin:$PATH"
 
+export NVTE_NVTX_ENABLED=1
+export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
+
+# export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+
 # ---------------------------
 # Setup experiment variables
 # ---------------------------
@@ -159,43 +149,6 @@ export PATH="${NVSHMEM_DIR}/bin:${OPENMPI_DIR}/bin:${CUDA_DIR}/bin:$PATH"
 DRY_RUN=${DRY_RUN:-0}
 
 ENABLE_NSYS=${ENABLE_NSYS:-0}
-WLBLLM_SYNC_TIME_AG=${WLBLLM_SYNC_TIME_AG:-0}
-# How many time should each iteration repeat
-EXPERIMENT_REPEAT_TIMES=${EXPERIMENT_REPEAT_TIMES:-3}
-EXPERIMENT_WARMUP_TIMES=${EXPERIMENT_REPEAT_TIMES:-5}
-EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=${EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB:--1}
-EXPERIMENT_SHOULD_FORCE_EXIT=${EXPERIMENT_SHOULD_FORCE_EXIT:-0}
-EXPERIMENT_EMIT_BACKWARD_NVTX=${EXPERIMENT_EMIT_BACKWARD_NVTX:-0}
-EXPERIMENT_WARMUP_TIMEOUT_SEC=${EXPERIMENT_WARMUP_TIMEOUT_SEC:-240}
-EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=${EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0:-0}
-D2_SHOULD_REPLAN=${D2_SHOULD_REPLAN:-1}
-D2_SKIP_FLOAT_CONVERSION=${D2_SKIP_FLOAT_CONVERSION:-1}
-SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-1}
-# EXPERIMENT_LOG_MEMORY_USAGE: 
-#   Log memory usage (using torch.cuda.memory_summary and pynvml) to file and console.
-#   May have overhead, so only enable it when needed.
-EXPERIMENT_LOG_MEMORY_USAGE=${EXPERIMENT_LOG_MEMORY_USAGE:-0}
-EXPERIMENT_ADD_SELECTIVE_CKPT=${EXPERIMENT_ADD_SELECTIVE_CKPT:-0}
-# EXPERIMENT_SHOULD_RESEND_QKV:
-#   Flag to resend QKV to the WLBLLM.
-#   If set to 1, the QKV will be resend to the WLBLLM after the first forward pass.
-#   This is useful when the WLBLLM is not able to process the QKV in the first forward pass.
-#   However, this may have overhead, so only enable it when needed.
-EXPERIMENT_SHOULD_RESEND_QKV=${EXPERIMENT_SHOULD_RESEND_QKV:-0}
-EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=${EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0:-0}
-EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND=${EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND:-1}
-EXPERIMENT_SKIP_OPTIMIZER_STEP=${EXPERIMENT_SKIP_OPTIMIZER_STEP:-0}
-EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP=${EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP:-0}
-EXPERIMENT_SHOULD_DUMP_TRACEBACK=${EXPERIMENT_SHOULD_DUMP_TRACEBACK:-0}
-EXPERIMENT_TORCH_DIST_TIMEOUT=${EXPERIMENT_TORCH_DIST_TIMEOUT:--1}
-EXPERIMENT_ENABLE_BENCHMARK_SAVING=${EXPERIMENT_ENABLE_BENCHMARK_SAVING:-1}
-EXPERIMENT_D2_BALANCE_PING_PONG=${EXPERIMENT_D2_BALANCE_PING_PONG:-0}
-SAMPLE_START_IDX=${SAMPLE_START_IDX:-0}
-
-export NVTE_NVTX_ENABLED=1
-export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
-export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-
 
 # ---------------------------
 # Setup distributed args
@@ -213,11 +166,6 @@ echo head_node_ip=$head_node_ip port=$port
 RZV_BACKEND=c10d
 RZV_ENDPOINT=$head_node_ip:$port
 echo RZV_ENDPOINT=$RZV_ENDPOINT
-if [ -z "$head_node" ]; then
-    echo -e "\033[31mERROR: head_node is empty. Please set HEAD_NODE_IP environment variable.\033[0m"
-    exit 1
-fi
-
 
 # Get GPU count from Slurm's environment variables
 # SLURM_GPUS_PER_NODE is set by Slurm when using --gpus-per-node or --gres=gpu:N
@@ -227,7 +175,7 @@ WORLD_SIZE=$((GPUS_PER_NODE * NNODES))
 
 
 # Build the common stem *format* (anything that needs per-node must be computed on the node)
-COMMON_STEM="mode${MODE}.nnodes${NNODES}.bs${BATCH_SIZE}.maxid${MAX_SAMPLE_ID}.tp${TP_SIZE}.pp${PP_SIZE}.cp${CP_SIZE}.t${NUM_TOKENS}.elong${ELONGATE_FACTOR}.up${UP_SAMPLE_FACTOR}.ft${FILTER_THRESHOLD}.fr${FILTER_RATIO}"
+COMMON_STEM="mode${MODE}.nnodes${NNODES}.bs${BATCH_SIZE}.maxid${MAX_SAMPLE_ID}.tp${TP_SIZE}.pp${PP_SIZE}.cp${CP_SIZE}.t${NUM_TOKENS}"
 
 touch ${OUTPUT_DIR}/desc.${COMMON_STEM} # just a description of this experiment, in its file name
 
@@ -247,7 +195,7 @@ SRUN_BASE=(
   srun --kill-on-bad-exit=1 
   -N ${NNODES}
   -G ${WORLD_SIZE}
-  # -vv
+  -vv
   --ntasks-per-node=1
   # --gpus-per-task=${GPUS_PER_NODE}     # <= crucial
   --cpus-per-task=128
@@ -266,6 +214,7 @@ if [ ${JOBID} -ne 0 ]; then
   fi
 fi
 
+
 TORCHRUN_CMD=(
   --nnodes=${NNODES}
   --nproc_per_node=${NPROC_PER_NODE}
@@ -273,48 +222,39 @@ TORCHRUN_CMD=(
   --rdzv_endpoint=${RZV_ENDPOINT}
   --rdzv_id=${RZV_ID}
   --max_restarts=0
-  --no-python bash ./bind_and_exec.sh python test_e2e_combined.py
-    --model-path ${MODEL_PATH}
-    --mode ${MODE}
-    --replan-iter ${REPLAN_ITER}
-    --batch-size ${BATCH_SIZE}
+  --no-python bash ./bind_and_exec.sh 
+    # python test_megatron_e2e_pipeline_with_cp.py
+    python test_megatron_e2e_pipeline_combined.py
+    --num-tokens ${NUM_TOKENS}
+    --num-batches ${BATCH_SIZE}
     --num-nodes ${NNODES}
     --num-gpus-per-node ${NPROC_PER_NODE}
-    --num-layers ${NUM_LAYERS}
-    --max-sample-id ${MAX_SAMPLE_ID}
-    --tp-size ${TP_SIZE}
     --cp-degree ${CP_SIZE}
-    --up-sample-factor ${UP_SAMPLE_FACTOR}
-    --num-tokens ${NUM_TOKENS}
-    --elongate-factor ${ELONGATE_FACTOR}
-    --filter-threshold ${FILTER_THRESHOLD}
-    --filter-ratio ${FILTER_RATIO}
+    --tp-size ${TP_SIZE}
+    --pp-size ${PP_SIZE}
+    --num-microbatch ${NUM_MICROBATCH}
+    
+    --mode ${MODE}
+    --model-path ${MODEL_PATH}
+    --num-layers ${NUM_LAYERS}
+
+    # TODO: 
+    # --max-sample-id ${MAX_SAMPLE_ID}
+
+    # --up-sample-factor ${UP_SAMPLE_FACTOR}
+    # --elongate-factor ${ELONGATE_FACTOR}
+    # --filter-threshold ${FILTER_THRESHOLD}
+    # --filter-ratio ${FILTER_RATIO}
     --output-dir ${OUTPUT_DIR}
-    --sample-name ${SAMPLE_NAME}
-    --change-long-doc-ratio ${CHANGE_LONG_DOC_RATIO}
 )
 
-if [ ${SHOULD_ADD_DEBUG_CASES} -eq 1 ]; then
-    TORCHRUN_CMD+=(--should-add-debug-cases)
-fi
-
-if [ ${EXPERIMENT_SHOULD_FORCE_EXIT} -eq 1 ]; then
-    TORCHRUN_CMD+=(--force-exit)
-fi
-
-if [ ${SHOULD_PROFILE_MEMORY} -eq 1 ]; then
-    TORCHRUN_CMD+=(--should-profile-memory ${PROFILE_MEMORY_PATH} )
-fi
-
-if [ ${EXPERIMENT_SHOULD_RESEND_QKV} -eq 1 ]; then
-    TORCHRUN_CMD+=(--should-resend-qkv)
-fi
-if [ ${SAMPLE_START_IDX} -ne "" ]; then
-    TORCHRUN_CMD+=(--sample-start-idx ${SAMPLE_START_IDX})
+if [ ${USE_PLANNER} -eq 1 ]; then
+    TORCHRUN_CMD+=(--use-planner)
 fi
 
 # Serialize TORCHRUN_CMD array so we can pass it through bash -lc cleanly
 TORCHRUN_STR=$(printf " %q" "${TORCHRUN_CMD[@]}")
+
 
 # ---- Per-node logs + per-node NSYS outputs ----
 # %N and %j are expanded by Slurm *only* in --output/--error.
@@ -343,48 +283,47 @@ echo_and_tee "$EXP_README" "- NUM_LAYERS: $NUM_LAYERS"
 echo_and_tee "$EXP_README" "- TP_SIZE: $TP_SIZE"
 echo_and_tee "$EXP_README" "- PP_SIZE: $PP_SIZE"
 echo_and_tee "$EXP_README" "- CP_SIZE: $CP_SIZE"
+echo_and_tee "$EXP_README" "- NUM_MICROBATCH: $NUM_MICROBATCH"
 echo_and_tee "$EXP_README" "- BATCH_SIZE: $BATCH_SIZE"
 echo_and_tee "$EXP_README" "- NUM_TOKENS: $NUM_TOKENS"
 echo_and_tee "$EXP_README" "- MAX_SAMPLE_ID: $MAX_SAMPLE_ID"
-echo_and_tee "$EXP_README" "- UP_SAMPLE_FACTOR: $UP_SAMPLE_FACTOR"
-echo_and_tee "$EXP_README" "- ELONGATE_FACTOR: $ELONGATE_FACTOR"
-echo_and_tee "$EXP_README" "- FILTER_THRESHOLD: $FILTER_THRESHOLD"
-echo_and_tee "$EXP_README" "- FILTER_RATIO: $FILTER_RATIO"
-echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
-echo_and_tee "$EXP_README" "- SAMPLE_START_IDX: $SAMPLE_START_IDX"
+# echo_and_tee "$EXP_README" "- UP_SAMPLE_FACTOR: $UP_SAMPLE_FACTOR"
+# echo_and_tee "$EXP_README" "- ELONGATE_FACTOR: $ELONGATE_FACTOR"
+# echo_and_tee "$EXP_README" "- FILTER_THRESHOLD: $FILTER_THRESHOLD"
+# echo_and_tee "$EXP_README" "- FILTER_RATIO: $FILTER_RATIO"
+# echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
+# echo_and_tee "$EXP_README" "- SAMPLE_START_IDX: $SAMPLE_START_IDX"
 
 echo_and_tee "$EXP_README" "## Experiment Flags"
 echo_and_tee "$EXP_README" "- ENABLE_NSYS: $ENABLE_NSYS"
-echo_and_tee "$EXP_README" "- WLBLLM_SYNC_TIME_AG: $WLBLLM_SYNC_TIME_AG"
+# echo_and_tee "$EXP_README" "- WLBLLM_SYNC_TIME_AG: $WLBLLM_SYNC_TIME_AG"
 echo_and_tee "$EXP_README" "- EXPERIMENT_REPEAT_TIMES: $EXPERIMENT_REPEAT_TIMES"
 echo_and_tee "$EXP_README" "- EXPERIMENT_WARMUP_TIMES: $EXPERIMENT_WARMUP_TIMES"
-echo_and_tee "$EXP_README" "- EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB: $EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_FORCE_EXIT: $EXPERIMENT_SHOULD_FORCE_EXIT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_EMIT_BACKWARD_NVTX: $EXPERIMENT_EMIT_BACKWARD_NVTX"
-echo_and_tee "$EXP_README" "- EXPERIMENT_WARMUP_TIMEOUT_SEC: $EXPERIMENT_WARMUP_TIMEOUT_SEC"
-echo_and_tee "$EXP_README" "- D2_SHOULD_REPLAN: $D2_SHOULD_REPLAN"
-echo_and_tee "$EXP_README" "- SHOULD_PROFILE_MEMORY: $SHOULD_PROFILE_MEMORY"
-echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
-echo_and_tee "$EXP_README" "- EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0: $EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0"
-echo_and_tee "$EXP_README" "- EXPERIMENT_LOG_MEMORY_USAGE: $EXPERIMENT_LOG_MEMORY_USAGE"
-echo_and_tee "$EXP_README" "- EXPERIMENT_ADD_SELECTIVE_CKPT: $EXPERIMENT_ADD_SELECTIVE_CKPT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_RESEND_QKV: $EXPERIMENT_SHOULD_RESEND_QKV"
-echo_and_tee "$EXP_README" "- D2_SKIP_FLOAT_CONVERSION: $D2_SKIP_FLOAT_CONVERSION"
-echo_and_tee "$EXP_README" "- EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND: $EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SKIP_OPTIMIZER_STEP: $EXPERIMENT_SKIP_OPTIMIZER_STEP"
-echo_and_tee "$EXP_README" "- EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP: $EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"
-echo_and_tee "$EXP_README" "- EXPERIMENT_D2_BALANCE_PING_PONG: $EXPERIMENT_D2_BALANCE_PING_PONG"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_DUMP_TRACEBACK: $EXPERIMENT_SHOULD_DUMP_TRACEBACK"
-echo_and_tee "$EXP_README" "- EXPERIMENT_TORCH_DIST_TIMEOUT: $EXPERIMENT_TORCH_DIST_TIMEOUT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_ENABLE_BENCHMARK_SAVING: $EXPERIMENT_ENABLE_BENCHMARK_SAVING"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB: $EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_FORCE_EXIT: $EXPERIMENT_SHOULD_FORCE_EXIT"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_EMIT_BACKWARD_NVTX: $EXPERIMENT_EMIT_BACKWARD_NVTX"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_WARMUP_TIMEOUT_SEC: $EXPERIMENT_WARMUP_TIMEOUT_SEC"
+# echo_and_tee "$EXP_README" "- D2_SHOULD_REPLAN: $D2_SHOULD_REPLAN"
+# echo_and_tee "$EXP_README" "- SHOULD_PROFILE_MEMORY: $SHOULD_PROFILE_MEMORY"
+# echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0: $EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_LOG_MEMORY_USAGE: $EXPERIMENT_LOG_MEMORY_USAGE"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_ADD_SELECTIVE_CKPT: $EXPERIMENT_ADD_SELECTIVE_CKPT"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_RESEND_QKV: $EXPERIMENT_SHOULD_RESEND_QKV"
+# echo_and_tee "$EXP_README" "- D2_SKIP_FLOAT_CONVERSION: $D2_SKIP_FLOAT_CONVERSION"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND: $EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_SKIP_OPTIMIZER_STEP: $EXPERIMENT_SKIP_OPTIMIZER_STEP"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP: $EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_D2_BALANCE_PING_PONG: $EXPERIMENT_D2_BALANCE_PING_PONG"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_DUMP_TRACEBACK: $EXPERIMENT_SHOULD_DUMP_TRACEBACK"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_TORCH_DIST_TIMEOUT: $EXPERIMENT_TORCH_DIST_TIMEOUT"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_ENABLE_BENCHMARK_SAVING: $EXPERIMENT_ENABLE_BENCHMARK_SAVING"
 
 
 echo_and_tee "$EXP_README" "## Other Variables"
 echo_and_tee "$EXP_README" "- TS: $TS"
 echo_and_tee "$EXP_README" "- JOBID: $JOBID"
 echo_and_tee "$EXP_README" "- OUTPUT_DIR: $OUTPUT_DIR"
-# Generate equivalent command
-
 
 
 # ---------------------------
@@ -409,73 +348,6 @@ fi
 
 start_time=$(TZ='America/Los_Angeles' date +%s)
 
-# export OMP_NUM_THREADS=1
-
-# Add some sanity checks here to ensure torchrun is functioning correctly, or no connectivity issue arises.
-# srun -N 32 -G 256 --jobid=$JOBID torchrun --nnodes=32 --nproc_per_node=8 --rdzv_backend=c10d --rdzv_endpoint=fs-mbz-gpu-033:29500 --rdzv_id=59090 --no-python hostname
-
-# Test 1
-# "${SRUN_BASE[@]}" hostname
-
-# Test 2
-set -x
-# "${SRUN_BASE[@]}" torchrun --nnodes=${NNODES} \
-#   --nproc_per_node=${NPROC_PER_NODE} \
-#   --rdzv_backend=${RZV_BACKEND} \
-#   --rdzv_endpoint=${RZV_ENDPOINT} \
-#   --rdzv_id=${RZV_ID} \
-#   --max_restarts=0 \
-#   --no-python hostname
-
-
-# This checks torchrun is working correctly, and allreduce is working correctly.
-PRECHECK_TORCHRUN_SIMPLE_ALL_REDUCE=${PRECHECK_TORCHRUN_SIMPLE_ALL_REDUCE:-0}
-if [ ${PRECHECK_TORCHRUN_SIMPLE_ALL_REDUCE} -eq 1 ]; then
-  "${SRUN_BASE[@]}" --output="${LOG_DIR}/%N.%j.%s.out" \
-    --error="${LOG_DIR}/%N.%j.%s.out" \
-    torchrun --nnodes=${NNODES} \
-    --nproc_per_node=${NPROC_PER_NODE} \
-    --rdzv_backend=${RZV_BACKEND} \
-    --rdzv_endpoint=${RZV_ENDPOINT} \
-    --rdzv_id=${RZV_ID} \
-    --max_restarts=0 \
-    --no-python python simple_torch.py
-fi
-
-# Test 3
-# "${SRUN_BASE[@]}" --output="${LOG_DIR}/%N.%j.%s.out" \
-#   --error="${LOG_DIR}/%N.%j.%s.out" \
-#   torchrun --nnodes=${NNODES} \
-#   --nproc_per_node=${NPROC_PER_NODE} \
-#   --rdzv_backend=${RZV_BACKEND} \
-#   --rdzv_endpoint=${RZV_ENDPOINT} \
-#   --rdzv_id=${RZV_ID} \
-#   --max_restarts=0 \
-#   --no-python python -c "
-# import torch
-# import torch.distributed as dist
-# import os
-# local_rank = int(os.environ.get('LOCAL_RANK'))
-# print(f'CUDA available: {torch.cuda.is_available()}')
-# torch.cuda.set_device(f'cuda:{local_rank}')
-# print(f'Using device: {torch.cuda.get_device_name()}')
-
-# dist.init_process_group('nccl')
-# rank = dist.get_rank()
-# world_size = dist.get_world_size()
-# print(f'Rank {rank}/{world_size} initialized')
-
-# x = torch.ones(1).cuda()
-# dist.all_reduce(x)
-# print(f'Rank {rank}: After all_reduce x = {x} (should be {world_size})')
-# "
-
-
-# exit 1
-
-
-# --output="${LOG_DIR}/%N.%j.%s.out" \
-# --error="${LOG_DIR}/%N.%j.%s.out" \
 "${SRUN_BASE[@]}" \
     bash -lc '
         '"$nsys_str"' torchrun '"$TORCHRUN_STR"'

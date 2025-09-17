@@ -24,7 +24,7 @@ sleep 1
 
 TS=$(TZ=America/Los_Angeles date +%m%d_%H%M%S)_PST
 export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250907_large_scale_v6/logs.v-sweep
-export MAX_SAMPLE_ID=5
+export MAX_SAMPLE_ID=20
 export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2
 export TP_SIZE=8
 export ENABLE_NSYS=1
@@ -42,7 +42,7 @@ DRY_RUN=${DRY_RUN:-0}
 # export MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 # export MODEL_PATH=codellama/CodeLlama-34b-hf
 export MODEL_PATH=codellama/CodeLlama-34b-hf
-export NUM_LAYERS=6
+export NUM_LAYERS=3
 
 
 # ------------------------------------
@@ -82,10 +82,15 @@ fi
 #     "1 1 1 1048576 8" \
 #     ; do
 
-    # "1 1 4 524288 8" \
-    # "1 1 4 262144 4" \
 for config in \
+    "1 1 2 524288 8" \
+    "1 1 4 262144 4" \
     "0 0 4 131072 2" \
+    "1 1 1 524288 8" \
+    "1 1 2 262144 4" \
+    "0 0 2 131072 2" \
+    "1 1 4 524288 8" \
+    "1 1 4 1048576 16" \
     ; do
 
 
@@ -110,8 +115,7 @@ for config in \
         bash test_e2e_combined.salloc.sh
         echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
     fi
-    exit 0
-
+    
     # Run wlbllm mode with different CP sizes
 
     # for CP_SIZE in 16 ; do

@@ -1,8 +1,8 @@
 from typing import Any, Optional
-
+import time
 import torch
 from torch import Tensor
-
+import os
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -151,6 +151,11 @@ class TransformerLayer(MegatronTransformerLayer):
         # ==================================
         # core attention computation
         # ==================================
+        should_d2_sync_time_core_attn = os.getenv("D2_SYNC_TIME_CORE_ATTN", "0") == "1"
+        start_time = time.time()
+        if should_d2_sync_time_core_attn:
+            torch.cuda.synchronize()
+            # torch.distributed.barrier()
         log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(start)")
         if self.self_attention.checkpoint_core_attention and self.training:
             log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(before checkpointed attention forward)")
@@ -181,6 +186,15 @@ class TransformerLayer(MegatronTransformerLayer):
                 packed_seq_params=packed_seq_params,
             )
             log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(after core attention forward)")
+        if should_d2_sync_time_core_attn:
+            torch.cuda.synchronize()
+            # torch.distributed.barrier()
+        end_time = time.time()
+        duration = end_time - start_time
+        duration_ms = duration * 1000
+        
+        if should_d2_sync_time_core_attn:
+            print(f"🟡 TransformerLayer._forward_core_attn[{self.layer_number}] duration: {duration_ms:.3f} ms")
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -281,52 +295,60 @@ class TransformerLayer(MegatronTransformerLayer):
         inference_params: Optional[Any] = None,
         return_debug: bool = False,
     ):
+        # import traceback
+        # traceback.print_stack()
+        # print(packed_seq_params)
+        # exit(0)
         """Debug use. normal forward with output hooked."""
-        assert inference_params is None, "inference not supported yet"
-        assert inference_context is None, "inference not supported yet"
-        assert context is None, "cross-attention not supported yet"
-        assert context_mask is None, "cross-attention not supported yet"
+        
+        layer_number = self.layer_number
+        with torch.cuda.nvtx.range(f"forward[L={layer_number}]"):
 
-        setattr(packed_seq_params, "stream", torch.cuda.current_stream())
-        # FIXME(yonghao): fix rope
-        rotary_pos_emb = None
+            assert inference_params is None, "inference not supported yet"
+            assert inference_context is None, "inference not supported yet"
+            assert context is None, "cross-attention not supported yet"
+            assert context_mask is None, "cross-attention not supported yet"
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(before pre core attn)")
+            setattr(packed_seq_params, "stream", torch.cuda.current_stream())
+            # FIXME(yonghao): fix rope
+            rotary_pos_emb = None
 
-        query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
-            hidden_states,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            packed_seq_params,
-            sequence_len_offset,
-        )
-        debug_tensors = [(query, key, value),]
+            log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(before pre core attn)")
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after pre core attn)")
+            query, key, value, residual, attn_mask_type = self._forward_pre_core_attn(
+                hidden_states,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                packed_seq_params,
+                sequence_len_offset,
+            )
+            debug_tensors = [(query, key, value),]
 
-        core_attn_out = self._forward_core_attn(
-            query,
-            key,
-            value,
-            attention_mask,
-            attention_bias,
-            attn_mask_type,
-            packed_seq_params,
-        )
+            log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after pre core attn)")
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after core attention)")
-        debug_tensors.append(core_attn_out)
-        mlp_output, context = self._forward_post_core_attn(
-            core_attn_out,
-            residual,
-            context,
-            context_mask,
-        )
+            core_attn_out = self._forward_core_attn(
+                query,
+                key,
+                value,
+                attention_mask,
+                attention_bias,
+                attn_mask_type,
+                packed_seq_params,
+            )
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after post core attn)")
+            log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after core attention)")
+            debug_tensors.append(core_attn_out)
+            mlp_output, context = self._forward_post_core_attn(
+                core_attn_out,
+                residual,
+                context,
+                context_mask,
+            )
 
-        return (mlp_output, context,) + (
-            (debug_tensors,) if return_debug else ()
-        )
+            log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after post core attn)")
+
+            return (mlp_output, context,) + (
+                (debug_tensors,) if return_debug else ()
+            )
 

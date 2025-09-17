@@ -460,7 +460,7 @@ def from_planner_output(
     # qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
     #  out_grad_linear_to_attn, attn_metadata
     rank = torch.distributed.get_rank()
-    if rank % 8 == 0:
+    if rank % 8 == 1:
         rich.print(f"from_planner_output: qkv_linear_to_attn=", qkv_linear_to_attn)
         rich.print(f"from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear)
         rich.print(f"from_planner_output: out_attn_to_linear=", out_attn_to_linear)
@@ -515,9 +515,10 @@ def backward_from_planner_output(
     )
     import rich
     rank = torch.distributed.get_rank()
-    if rank % 8 == 0:
-        rich.print(f"backward_from_planner_output: qkv_resend_and_out_grad_linear_to_attn=", qkv_resend_and_out_grad_linear_to_attn)
-        rich.print(f"backward_from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear)
-        rich.print(f"backward_from_planner_output: bwd_attn_metadata=", bwd_attn_metadata)
+    if rank % 8 == 1:
+        rich.print(f"backward_from_planner_output: qkv_resend_and_out_grad_linear_to_attn=", qkv_resend_and_out_grad_linear_to_attn.__better_print__())
+        rich.print(f"backward_from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear.__better_print__())
+        for i, metadata in enumerate(bwd_attn_metadata):
+            rich.print(f"backward_from_planner_output: bwd_attn_metadata[{i}]=", metadata)
         pass
     return qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear, bwd_attn_metadata

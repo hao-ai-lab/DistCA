@@ -91,7 +91,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         if should_sync_time_perdocattn:
             torch.cuda.synchronize()
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             start_time__fwd = time.time()
 
         global fake_lse
@@ -182,7 +182,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         if should_sync_time_perdocattn:
             torch.cuda.synchronize()
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             end_time__gather = time.time()
             duration_ms__gather = (end_time__gather - start_time__gather) * 1000
             debug_print(f"🟡 PerDocumentCPAttention allgather time (with barrier): {duration_ms__gather} ms")
