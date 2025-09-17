@@ -53,18 +53,6 @@ export EXPERIMENT_D2_BALANCE_PING_PONG=0
 # ------------------------------------
 # Check and skip success runs
 # ------------------------------------
-eid_file=$OUTPUT_DIR_PREFIX/success_eids.txt
-python /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250907_large_scale_v6/query_success_runs.py --folder $OUTPUT_DIR_PREFIX --output_file $eid_file
-
-# check the success_eids.txt file
-# SUCCESS_EIDS=""
-# if [ -f $eid_file ]; then
-#     SUCCESS_EIDS=$(cat $eid_file)
-#     echo "🟡 SUCCESS_EIDS=$SUCCESS_EIDS"
-# else
-#     echo "🟡 $eid_file file does not exist"
-# fi
-
 # Distribution Name
 # CHANGE_LONG_DOC_RATIO  
 # ATTN_LINEAR_BREAKPOINT
@@ -130,18 +118,21 @@ for config in \
         echo "🟡 Finished running d2-signal with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
         echo "\a"
     fi
+    unset MIN_TOLERANCE_FACTOR
         
 
-    # # Run d2 with no pingpong
-    # export MODE=d2
-    # export MIN_TOLERANCE_FACTOR=0.05
-    # export OUTPUT_DIR_SUFFIX_ADDON="-no-pingpong"
-    # echo "🟡 Running d2-signal with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
-    # if [ $DRY_RUN -eq 0 ]; then
-    #     bash test_e2e_combined.salloc.sh
-    #     echo "🟡 Finished running d2-signal with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
-    #     echo "\a"
-    # fi
+    # Run d2 with same comm and compute stream
+    export MODE=d2
+    export MIN_TOLERANCE_FACTOR=0.05
+    export D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE=1
+    export OUTPUT_DIR_SUFFIX_ADDON="-single-stream"
+    echo "🟡 Running d2-onestream with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
+    if [ $DRY_RUN -eq 0 ]; then
+        bash test_e2e_combined.salloc.sh
+        echo "🟡 Finished running d2-onestream with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
+        echo "\a"
+    fi
+    unset D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE
 
     # Run d2 with sweeping some tolerance factors
     for tolerance_factor in 0.05 0.2 0.5 0.8 1.0; do

@@ -1,5 +1,6 @@
 from contextlib import contextmanager, nullcontext
 import functools
+import os
 from typing import Any, Dict, List, Optional, Union
 import types
 import warnings
@@ -520,6 +521,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         self.comm_stream = torch.cuda.Stream(device=device, priority=-1)
         self._ping_pang_debug = True
         self.ping_pong_comm_initialized = True
+        if os.getenv("D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE", "0") == "1":
+            self.comm_stream = torch.cuda.current_stream(device=device)
         FastDispatcherWrapper.comm_stream = self.comm_stream
 
     def ping_pang_forward(
