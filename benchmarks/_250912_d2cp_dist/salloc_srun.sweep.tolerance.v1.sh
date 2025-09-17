@@ -25,7 +25,7 @@ sleep 1
 
 
 TS=$(TZ=America/Los_Angeles date +%m%d_%H%M%S)_PST
-export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250912_d2cp_dist/logs.v2-sweep-prolong
+export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250912_d2cp_dist/logs.v1-tolerance-sweep
 export MAX_SAMPLE_ID=8
 export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2
 export TP_SIZE=8
@@ -68,18 +68,19 @@ fi
 # Run experiments
 # ------------------------------------
 
+
+# "1 1 4 524288 8 0.8" \
+#     "0 0 4 131072 2 0.8" \
+#     "1 1 2 524288 8 0.8" \
+#     "1 1 4 262144 4 0.8" \
+#     "0 0 2 131072 2 0.8" \
+#     "1 1 1 524288 8 0.8" \
+#     "1 1 1 262144 4 0.8" \
+#     "0 0 1 131072 2 0.8" \
 # selective_ckpt resend_qkv batch_size num_tokens elongate_factor change_long_doc_ratio
 #  (ck rs b tok   e ratio)
 for config in \
-    "1 1 4 262144 4 0.8" \
-    "1 1 4 524288 8 0.8" \
-    "1 1 1 524288 8 0.8" \
-    "1 1 1 262144 4 0.8" \
     "1 1 2 524288 8 0.8" \
-    "1 1 2 262144 4 0.8" \
-    "0 0 4 131072 2 0.8" \
-    "0 0 1 131072 2 0.8" \
-    "0 0 2 131072 2 0.8" \
 ; do
 
     read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor change_long_doc_ratio <<< "$config"
@@ -101,49 +102,23 @@ for config in \
 
     # Run d2 mode
     export MODE=d2
-    eid="d2-cp1-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}"
-    if [[ "$SUCCESS_EIDS" =~ "$eid" ]]; then
-        echo "🟢 Skip: $eid"
-        continue
-    fi
+    # eid="d2-cp1-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}"
+    # if [[ "$SUCCESS_EIDS" =~ "$eid" ]]; then
+    #     echo "🟢 Skip: $eid"
+    #     continue
+    # fi
 
-    echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-    if [ $DRY_RUN -eq 0 ]; then
-        bash test_e2e_combined.salloc.sh
-        echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-    fi
-    # exit 0
-
-    # Run wlbllm mode with different CP sizes
-
-    # for CP_SIZE in 16 ; do
-    max_cnt=2
-    for CP_SIZE in 32 16 8 4 2 1; do
-        if [ $max_cnt -eq 0 ]; then
-            break
-        fi
-        max_cnt=$((max_cnt - 1))
-        if [ $CP_SIZE -gt $NNODES ]; then
-            continue
-        fi
-        DP_SIZE=$((NNODES / CP_SIZE))
-        if [ $DP_SIZE -gt $(($BATCH_SIZE * 2)) ]; then
-            continue
-        fi
-        eid="wlbllm-cp${CP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}"
-        if [[ "$SUCCESS_EIDS" =~ "$eid" ]]; then
-            echo "🟢 Skip: $eid"
-            continue
-        fi
-
-        echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-        export MODE=wlbllm CP_SIZE=$CP_SIZE
+    for tolerance_factor in 0.2 0.4 0.3; do
+        export MIN_TOLERANCE_FACTOR=$tolerance_factor
+        export OUTPUT_DIR_SUFFIX_ADDON="-tol${tolerance_factor}"
+        echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
         if [ $DRY_RUN -eq 0 ]; then
             bash test_e2e_combined.salloc.sh
-            echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
+            echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
         fi
     done
     
+
 done
 
 

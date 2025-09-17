@@ -33,10 +33,8 @@ export EXPERIMENT_SKIP_OPTIMIZER_STEP=1
 # export NNODES=8
 export MAX_SAMPLE_ID=1
 
-export NUM_LAYERS=4
-
 export MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Llama-70B
-
+export D2_SHOULD_PRINT_ATTN_CALL_ARGS=1
 
 set -e
 
@@ -53,8 +51,8 @@ cases=(
     # "1  1 4 131072 wlbllm 2 2 2  deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
     # "1  1 4 131072     d2 2 2 2  deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 
-    "4  1 4 131072 wlbllm 2 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
-    "4  1 4 131072     d2 2 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
+    # "4  1 4 131072 wlbllm 2 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+    "4  1 2 131072     d2 2 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 
     # "1  1 4 16384 wlbllm 2 2 2  dphn/Dolphin3.0-Llama3.2-3B"
     # "1  1 4 16384     d2 2 2 2  dphn/Dolphin3.0-Llama3.2-3B"
@@ -133,14 +131,14 @@ cases=(
     # "8  2 4 262144     d2 4 2 8"
     # "8  2 4 262144 wlbllm 4 2 8"
     
-    "8  2 4 262144     d2 4 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
-    "8  2 4 262144 wlbllm 4 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
+    # "8  2 4 262144     d2 4 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
+    # "8  2 4 262144 wlbllm 4 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
     # "8  2 8 262144     d2 4 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
     # "8  2 8 262144 wlbllm 4 2 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
     
     "8  2 4 262144     d2 2 4 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
-    "8  2 4 262144 wlbllm 2 4 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
+    # "8  2 4 262144 wlbllm 2 4 8  deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
     # "8  2 4 262144     d2 2 4 8"
     # "8  2 4 262144 wlbllm 2 4 8"
