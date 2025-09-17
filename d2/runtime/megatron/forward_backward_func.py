@@ -213,7 +213,6 @@ def forward_backward_pipelining_without_interleaving(
 
     disable_grad_sync()
 
-    
     # Compute number of warmup microbatches.
     num_warmup_microbatches = (
         parallel_state.get_pipeline_model_parallel_world_size()

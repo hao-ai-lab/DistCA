@@ -35,6 +35,7 @@ def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int=
     import traceback
     # traceback.print_stack()
     print("nvshmem_init passed barrier.")
+    global _is_nvshmem_initialized
     _is_nvshmem_initialized = True
     return status
 
@@ -252,6 +253,7 @@ def fast_a2a(
             my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz,
         )
 
+    return ret
 
 
 def _debug_dump_buffer(

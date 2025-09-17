@@ -59,7 +59,6 @@ def forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
     signal = args.pop("signal")
     packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
     bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
-    deterministic = os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1") == "0"
     
     if bwd_resend_qkv:
         log_memory_usage(f"(L{layer.layer_number}) forward_core_attn:(before FusedCommAttn)")
@@ -77,7 +76,6 @@ def forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
                 num_heads_kv=layer.config.num_query_groups // layer.config.tensor_model_parallel_size,
                 head_dim=layer.config.hidden_size // layer.config.num_attention_heads,
                 return_attn_probs=True,
-                deterministic=deterministic,
             ),
         )
         args["signal"] = signal

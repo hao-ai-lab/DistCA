@@ -391,7 +391,6 @@ class TransformerLayer(BaseTransformerLayer):
 
         signal = self._pre_mlp_to_attn(query, key, value, packed_seq_params)
         signal = self._all_to_all(signal, packed_seq_params, is_qkv=True)
-        deterministic = os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1") == "0"
 
         if backward_resend_qkv:
             signal = FusedCommAttn.apply(
@@ -408,7 +407,6 @@ class TransformerLayer(BaseTransformerLayer):
                     num_heads_kv=self.config.num_query_groups // self.config.tensor_model_parallel_size,
                     head_dim=self.config.hidden_size // self.config.num_attention_heads,
                     return_attn_probs=True,
-                    deterministic=deterministic,
                 ),
             )
         else:
