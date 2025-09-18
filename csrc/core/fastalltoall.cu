@@ -180,13 +180,6 @@ int launch_alltoallv(
       stream
     ));
   // The local communication
-  // Print the arguments
-  printf(
-    "Calling cudaMemcpyAsync with arguments: %ld, %ld, %ld\n",
-    my_rank_recv_offset,
-    my_rank_send_offset,
-    my_rank_send_sz
-  );
   CUDACHECK(cudaMemcpyAsync(
     buf->recv_buffer + my_rank_recv_offset,
     buf->send_buffer + my_rank_send_offset,
