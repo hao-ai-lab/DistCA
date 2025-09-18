@@ -34,8 +34,18 @@ from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     check_set_window_size, get_qkv_format, tex, _NVTE_FLASH_ATTN, _get_supported_versions
 )
 
-
+__already_called_get_attention_backend = False
+__ret_value = None
 def get_attention_backend(attention_params):
+    global __already_called_get_attention_backend
+    global __ret_value
+
+    # if __already_called_get_attention_backend:
+    #     pass
+    if os.getenv("EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND", "1") == "1" and __already_called_get_attention_backend:
+        return __ret_value
+
+    
     # NOTE: As part of refactoring attention.py, populating the _attention_backends cache in attention
     # is no longer performed at the end of get_attention_backend(), but the responsibility of doing so
     # is shifted over to the caller of this function
@@ -689,7 +699,7 @@ def get_attention_backend(attention_params):
         selected_backend = "UnfusedDotProductAttention"
     logger.debug("Selected backend = %s", selected_backend)
 
-    return (
+    __ret_value = (
         use_flash_attention,
         flash_attention_backend,
         use_fused_attention,
@@ -697,6 +707,7 @@ def get_attention_backend(attention_params):
         use_unfused_attention,
         available_backends,
     )
+    return __ret_value
 
 
 @torch.no_grad()

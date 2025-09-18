@@ -465,7 +465,11 @@ def forward(
             # print(f"🟢 Calling inside the patched version of FlashAttention: {func}.")
             is_wlbllm_mode = (os.environ["WLBLLM_MODE"] == "1")
             if is_wlbllm_mode:
-                func = wlbllm_func
+                def wlbllm_func_add_metadata(*args, **kwargs):
+                    # metadata = ...
+                    r = wlbllm_func(*args, **kwargs)
+                    return r
+                func = wlbllm_func_add_metadata
             else:
                 func = baseline_func
             
@@ -643,3 +647,14 @@ def monkey_patch():
     tex_backends.FlashAttention.forward = forward
 
     print("Monkey patching wlbllm.megatron_patch.backends.forward() into transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()")
+
+from contextlib import contextmanager
+@contextmanager
+def monkey_patch_context():
+    import transformer_engine.pytorch.attention.dot_product_attention.backends as tex_backends
+    old_forward = tex_backends.FlashAttention.forward
+    tex_backends.FlashAttention.forward = forward
+    print("Monkey patching wlbllm.megatron_patch.backends.forward() into transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()")
+    yield
+    tex_backends.FlashAttention.forward = old_forward
+    print("Unmonkey patching wlbllm.megatron_patch.backends.forward() from transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()")

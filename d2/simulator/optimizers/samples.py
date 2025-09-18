@@ -157,6 +157,7 @@ def sample_wlbllm_docs_upsample(
     filter_ratio: float = 1.0,
     upsample_long_factor: int = 2,
     elongate_factor: int = 1,
+    change_long_doc_ratio=0.0,
 ) -> list[int]:
     """
     Sample `size` documents from the WLB-LLM distribution, upsampling long docs.
@@ -201,6 +202,53 @@ def sample_wlbllm_docs_upsample(
     sampled_docs = rng.choice(combined_docs, size=size, replace=False)
     sampled_docs = sampled_docs * elongate_factor
     return sampled_docs.tolist()
+
+
+def sample_prolong_docs(
+    *,
+    size: int,
+    seed: int = 42,
+    filter_threshold: int = 10000,
+    filter_ratio: float = 1.0,
+    upsample_long_factor: int = 2,
+    elongate_factor: int = 1,
+    change_long_doc_ratio=0.5,
+):
+
+    ctx_length = 64 * 1024 * elongate_factor
+    print("ctx_length", ctx_length)
+    # short_doc_dist = []
+    docpath = data_folder / "textbook.json"
+    with open(docpath, "r") as f:
+        docs = json.load(f)
+
+    # as usualy, we 
+    shorter_docs = [doc for doc in docs if doc < filter_threshold]
+    longer_docs = [doc for doc in docs if doc >= filter_threshold]
+    # Downsample short docs
+    if 0 < filter_ratio < 1.0:
+        shorter_docs = shorter_docs[:int(len(shorter_docs) * filter_ratio)]
+
+    # Upsample long docs
+    # if upsample_long_factor > 1.0:
+    longer_docs = longer_docs * int(upsample_long_factor)
+
+    # Change some long_docs into long_doc_fixed_length
+    rng = np.random.default_rng(seed)
+    for i in range(len(longer_docs)):
+        if rng.random() < change_long_doc_ratio:
+            # print("change long doc", i, "to", ctx_length)
+            longer_docs[i] = ctx_length
+
+    combined_docs = longer_docs + shorter_docs
+
+    # rng = np.random.default_rng(seed)
+    # rng.shuffle(combined_docs)
+    sampled_docs = combined_docs
+    # sampled_docs = rng.choice(combined_docs, size=size, replace=False)
+    # return sampled_docs.tolist()
+    return sampled_docs
+
 
 def batch_documents(
     docs: Sequence[int],

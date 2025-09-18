@@ -5,11 +5,10 @@ import torch
 
 from d2.runtime.fast_alltoall_metadata import (
     FastAlltoAllMetadata, LogicalShape, SeqLens,
-    compute_reverse_a2a_layout_metadata,
-    exclusive_cumsum, size_pad_by_int4, _get_my_rank_from_metadata,
+    compute_reverse_a2a_layout_metadata, _get_my_rank_from_metadata,
 )
-from d2.runtime.inplace_metadata import prepend_zero_fn
 from d2.runtime.shard_info import ShardInfo
+from d2.runtime.utils import size_pad_by_int4, prepend_zero_fn, exclusive_cumsum
 
 
 # (doc_id, logical_id)
@@ -256,6 +255,7 @@ def _from_planner_output(
         for l_rank in range(world_size)
     ]
     max_cp_on_ranks: list[int] = [
+        # max(num_send_k_on_rank[l_rank], default=0) for l_rank in range(world_size)
         max(num_send_k_on_rank[l_rank]) for l_rank in range(world_size)
     ]
     # logical shape
@@ -440,21 +440,43 @@ def from_planner_output(
     lse_size_in_hidden_dtype: int,
     element_size: int,
     is_pipeline_tick: bool,
+    is_resend_qkv: bool = False,
 ):
     """NOTE: for PP, this only computes the Forward"""
+    if is_resend_qkv:
+        assert not is_pipeline_tick, "is_resend_qkv is for Non-PP but resend QKV to make memory balanced"
+    is_send_lse_in_fwd = is_pipeline_tick or is_resend_qkv
+
     q_bytes, k_bytes, out_bytes = get_per_token_bytes(
         hidden_size_q, hidden_size_kv, lse_size_in_hidden_dtype, element_size,
-        is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=is_pipeline_tick,
+        is_resend_qkv_in_bwd=False, is_send_lse_in_fwd=is_send_lse_in_fwd,
     )
     (qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
      out_grad_linear_to_attn, attn_metadata) = _from_planner_output(
         world_size, scheduler_output, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=True, attn_out_bytes=out_bytes,
     )
+    import rich
+    # qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
+    #  out_grad_linear_to_attn, attn_metadata
+    rank = torch.distributed.get_rank()
+    if rank % 8 == 1:
+        rich.print(f"from_planner_output: qkv_linear_to_attn=", qkv_linear_to_attn)
+        rich.print(f"from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear)
+        rich.print(f"from_planner_output: out_attn_to_linear=", out_attn_to_linear)
+        rich.print(f"from_planner_output: out_grad_linear_to_attn=", out_grad_linear_to_attn)
+        rich.print(f"from_planner_output: attn_metadata=", attn_metadata)
+        pass
+
     if is_pipeline_tick:
         # Force them to None to avoid being misused.
         qkv_grad_attn_to_linear = None
         out_grad_linear_to_attn = None
+    if is_resend_qkv:
+        out_grad_linear_to_attn, qkv_grad_attn_to_linear, _ = backward_from_planner_output(
+            world_size, scheduler_output, hidden_size_q, hidden_size_kv,
+            lse_size_in_hidden_dtype, element_size
+        )
     return (
         qkv_linear_to_attn, qkv_grad_attn_to_linear,
         out_attn_to_linear, out_grad_linear_to_attn,
@@ -491,4 +513,12 @@ def backward_from_planner_output(
         world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=False, attn_out_bytes=None
     )
+    import rich
+    rank = torch.distributed.get_rank()
+    if rank % 8 == 1:
+        rich.print(f"backward_from_planner_output: qkv_resend_and_out_grad_linear_to_attn=", qkv_resend_and_out_grad_linear_to_attn.__better_print__())
+        rich.print(f"backward_from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear.__better_print__())
+        for i, metadata in enumerate(bwd_attn_metadata):
+            rich.print(f"backward_from_planner_output: bwd_attn_metadata[{i}]=", metadata)
+        pass
     return qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear, bwd_attn_metadata

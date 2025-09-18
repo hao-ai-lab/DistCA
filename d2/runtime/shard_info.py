@@ -4,9 +4,6 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 
-from d2.runtime.inplace_metadata import (compute_attn_layout_seqlens,
-                                         compute_metadata, compute_metadata_kv)
-
 
 @dataclass
 class ShardInfo:
@@ -113,64 +110,6 @@ def handle_planner_metadata(
         q_to_num_kv_tokens,
     )
 
-def plan_to_metadata(
-    world_size: int,
-    sequence_plans: List[List[ShardInfo]],
-    return_intermediate: bool = False
-):
-    (
-        mlp_num_seqs,
-        mlp_q_dispatch,
-        mlp_seq_lens,
-        kv_to_q_mapping,
-        kv_to_q_rank,
-        kv_context_size,
-        q_to_num_kv_seq,
-        q_to_num_kv_tokens,
-    ) = handle_planner_metadata(world_size, sequence_plans)
-
-    # TODO(pb): Use this e2d function after fixed shape error.
-    # final_metadata = compute_e2e_metadata(
-    #     mlp_seq_len=mlp_seq_lens,
-    #     mlp_num_seqs=mlp_num_seqs,
-    #     mlp_q_dispatch=mlp_q_dispatch,
-    #     kv_to_q_mapping=kv_to_q_mapping,
-    #     kv_to_q_rank=kv_to_q_rank,
-    #     kv_context_size=kv_context_size,
-    #     q_to_num_kv_seq=q_to_num_kv_seq,
-    #     q_to_num_kv_token=q_to_num_kv_tokens,
-    #     return_intermediate=return_intermediate
-    # )
-    
-    fwd_metadata_q, rev_metadata_q, q_intermediates = compute_metadata(
-        mlp_seq_lens, mlp_q_dispatch, return_intermediate=True
-    )
-    # reshape 
-    max_num_local_seqs = mlp_q_dispatch.shape[1]
-    _, q_seq_to_dst, num_received_seqs_q = q_intermediates
-
-    # TODO(pb): Fix this in compute_metadata. Shape problem of q_seq_to_dst.
-    q_seq_to_dst = q_seq_to_dst.squeeze(2)
-
-    fwd_metadata_kv, rev_metadata_kv, kv_intermediates = compute_metadata_kv(
-        kv_to_q_mapping, kv_to_q_rank, kv_context_size,
-        q_to_num_kv_seq, q_to_num_kv_tokens, mlp_seq_lens, mlp_num_seqs,
-        mlp_q_dispatch, q_seq_to_dst, max_num_local_seqs,
-        return_intermediate=True
-    )
-
-    (
-        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-        num_local_seqs_recv
-    ) = compute_attn_layout_seqlens(
-        mlp_seq_lens, q_to_num_kv_tokens, mlp_q_dispatch, shard_to_tuple=True
-    )
-    fa_params = (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-
-    ret = fwd_metadata_q, rev_metadata_q, fwd_metadata_kv, rev_metadata_kv, fa_params
-    if return_intermediate:
-        ret += (q_intermediates + kv_intermediates,)
-    return ret
 
 # Transfer Items output from planner to List[List[ShardInfo]]
 def items_into_shardinfos(data: List[Dict[str, Any]]) -> List[List[ShardInfo]]:

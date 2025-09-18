@@ -5,7 +5,7 @@ import pandas as pd
 import glob
 
 # %%
-log_path = "logs.v3"
+log_path = "logs.v1"
 a = os.listdir(log_path)
 len(a)
 # %%
@@ -104,6 +104,13 @@ for exp_name in a:
         int(config.get("CP_SIZE")) * int(config.get("PP_SIZE"))
     )
 
+    is_slurm_exited = False
+    slurm_log_file = f"{log_path}/{exp_name}/slurm.stdout"
+    with open(slurm_log_file, "r") as f:
+        log_text = f.read()
+        if "Finished running" in log_text:
+            is_slurm_exited = True
+
     log_files = glob.glob(f"{log_path}/{exp_name}/logs/*")
     is_started = False
     is_comm_init = False # "Communication groups initialized"
@@ -112,6 +119,7 @@ for exp_name in a:
     is_past_one_test = False # "avg_time_per_iteration"
     iteration_reached = -1
     is_exited = False # "Finished test and exit"
+    is_oom = False
 
     for i, log_file in enumerate(log_files):
         # print(f"\n\n=== {log_file} ===")
@@ -131,6 +139,9 @@ for exp_name in a:
                 is_past_warmup = True
             if "avg_time_per_iteration" in log_text:
                 is_past_one_test = True
+            if "OutOfMemoryError" in log_text:
+                is_oom = True
+                print(f"Found oom: {log_file}")
             # Search for [Sample ID=(%d)] and take the largest one
             try:
                 sample_id_matches = re.findall(r"Sample ID=\(\d+\)", log_text)
@@ -152,7 +163,11 @@ for exp_name in a:
 
     # Check if the job id is still active
     # squeue --me --noheader -o "%A"
-    jobid = slurm_env_dict["SLURM_JOB_ID"]
+    # print(slurm_env_dict)
+    if 'JOBID' in slurm_env_dict:
+        jobid = slurm_env_dict['JOBID']
+    else:
+        jobid = slurm_env_dict.get("SLURM_JOB_ID", None)
     jobid = str(jobid)
     is_running = jobid in active_jobs
     
@@ -170,6 +185,8 @@ for exp_name in a:
         is_past_one_test=is_past_one_test,
         it_reached=iteration_reached,
         is_exited=is_exited,
+        is_oom=is_oom,
+        is_slurm_exited=is_slurm_exited,
         exp_name=exp_name,
         buffer_size=EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB,
         nnodes=nnodes,
@@ -198,7 +215,35 @@ df_display = df.copy()
 
 if DF_ONLY_SHOW_SUCCESS:
     df_display = df_display[df_display['success'] == True]
-df_display['success'] = df_display['success'].map({True: '✅', False: '❌'})
+def get_success_emoji(row):
+    # Successfully exited. 
+    if row['success']:
+        return '✅'
+    
+    # Probably still Running.
+    if not row['is_slurm_exited']:
+        return '[running]⚪'
+    
+    # Failed. Try to find reasons in the log.
+    if row['is_oom']:
+        return '[oom]⚠️'
+
+    # is_started	is_comm_init	is_reached_fa3	is_past_warmup	is_past_one_test	it_reached	is_exited	is_oom	is_slurm_exited
+    if not row['is_started']:
+        return '[start]❌'
+    if not row['is_comm_init']:
+        return '[comm]❌'
+    if not row['is_reached_fa3']:
+        return '[hang]❌'
+    if not row['is_past_warmup']:
+        return '[warmup]❌'
+    if not row['is_past_one_test']:
+        return '[onetest]❌'
+    it_reached = row['it_reached']
+    return f'[it={it_reached}]❌'
+
+df_display['success'] = df_display.apply(get_success_emoji, axis=1)
+
 df_display['modji'] = df_display['MODE'].map({
     'wlbllm': '🟥',
     'd2': '🟦',
@@ -291,6 +336,9 @@ df_display = df_display.sort_values(by=['num_layers', 'nnodes', 'NUM_TOKENS', 'B
 df_display
 
 # %%
+df_display
+
+# %%
 # Save this to a file
 df_display.to_csv("analyze_status.tsv", index=False, sep="\t")
 # %%
@@ -312,11 +360,11 @@ for gid, group in df_display.groupby('gid'):
     for idx, d2_row in d2_rows.iterrows():
         d2_time = d2_row['total_time']
         if d2_time == 0 or pd.isna(d2_time):
-            break
+            continue
         speedup = wlbllm_min_time / d2_time
         speedup = f"{speedup:.2f} (🟢)" if is_wlbllm_all_success else f"{speedup:.2f} (❌)"
         speedups.append((idx, speedup))
-    break
+
 
 speedups
 # %%
@@ -410,10 +458,10 @@ for i in sorted(failed_groups['eid'].unique().tolist()):
 
 # %%
 
-# Get all of the eid that has at least one success run
-success_eids = df_display[df_display['success'] == '✅']['eid'].unique()
-a = " ".join(success_eids.tolist())
-with open("success_eids.txt", "w") as f:
-    f.write(a)
+# # Get all of the eid that has at least one success run
+# success_eids = df_display[df_display['success'] == '✅']['eid'].unique()
+# a = " ".join(success_eids.tolist())
+# with open("success_eids.txt", "w") as f:
+#     f.write(a)
 
 # %%

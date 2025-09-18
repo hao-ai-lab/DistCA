@@ -75,6 +75,7 @@ def forward(
     fast_zero_fill: bool = True,
     inference_params: Optional[InferenceParams] = None,
     pad_between_seqs: Optional[bool] = None,
+    **other_packed_seq_kwargs,
 ) -> torch.Tensor:
     with self.prepare_forward(
         query_layer,
@@ -514,6 +515,7 @@ def forward(
             # debug_print(inspect.getsource(self.flash_attention.forward))
             
             nvtx_range_push("te.DotProductAttention.flash_attention.forward")
+            # Goes into d2/baseline/wlbllm_original/wlbllm/megatron_patch/backends.py
             ret = self.flash_attention(
                 query_layer,
                 key_layer,
@@ -668,3 +670,14 @@ def monkey_patch():
     import transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention as dpa
     dpa.DotProductAttention.forward = forward
     print("Monkey patching wlbllm.megatron_patch.dot_product_attention.forward() into transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()")
+
+from contextlib import contextmanager
+@contextmanager
+def monkey_patch_context():
+    import transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention as dpa
+    old_forward = dpa.DotProductAttention.forward
+    dpa.DotProductAttention.forward = forward
+    print("Monkey patching wlbllm.megatron_patch.dot_product_attention.forward() into transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()")
+    yield
+    dpa.DotProductAttention.forward = old_forward
+    print("Unmonkey patching wlbllm.megatron_patch.dot_product_attention.forward() from transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()")

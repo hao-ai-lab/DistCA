@@ -48,6 +48,10 @@ def debug_print(*args, **kwargs):
 
 fake_lse = None
 
+def log_memory_usage(message: str):
+    import d2.mem
+    d2.mem.log_memory_usage(message)
+
 class PerDocumentCPAttention(torch.autograd.Function):
     """
     Attention with per-document context parallelism.
@@ -77,16 +81,17 @@ class PerDocumentCPAttention(torch.autograd.Function):
         allreduce_events: 'Optional[List[torch.cuda.Event]]',
         attn_events: 'Optional[List[torch.cuda.Event]]',
     ):
+        log_memory_usage("PerDocumentCPAttention.forward(init)")
         # TODO(HACK): obviously cursor don't know how to use warning to do log the first time...
         # print("👻 Inside PerDocumentCPAttention.forward()")
         should_sync_time_flash_attn = os.getenv("WLBLLM_SYNC_TIME_FLASH_ATTN", "0") == "1"
         should_sync_time_perdocattn = os.getenv("WLBLLM_SYNC_TIME_PERDOC_ATTN", "0") == "1"
         should_sync_time_ag = os.getenv("WLBLLM_SYNC_TIME_AG", "0") == "1"
-        ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "1") == "1"
+        ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "0") == "1"
 
         if should_sync_time_perdocattn:
             torch.cuda.synchronize()
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             start_time__fwd = time.time()
 
         global fake_lse
@@ -137,7 +142,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
                     duration_ms__ag = (end_time__ag - start_time__ag) * 1000
                     print(f"🟡 PerDocumentCPAttention allgather-v time: {duration_ms__ag} ms")
 
-                print("🟡 All gather local_k.shape =", local_k.shape)
+                # print("🟡 All gather local_k.shape =", local_k.shape)
 
             start_time__shuffle = time.time()
             
@@ -177,7 +182,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         if should_sync_time_perdocattn:
             torch.cuda.synchronize()
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             end_time__gather = time.time()
             duration_ms__gather = (end_time__gather - start_time__gather) * 1000
             debug_print(f"🟡 PerDocumentCPAttention allgather time (with barrier): {duration_ms__gather} ms")
@@ -296,6 +301,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
             duration_ms__fwd = (end_time__fwd - start_time__fwd) * 1000
             debug_print(f"🟡 PerDocumentCPAttention total forward time (with barrier): {duration_ms__fwd} ms")
             
+        log_memory_usage("PerDocumentCPAttention.forward(end)")
         return final_out
 
     @staticmethod
@@ -303,6 +309,8 @@ class PerDocumentCPAttention(torch.autograd.Function):
         """
         Backward pass for PerDocumentCPAttention.
         """
+        log_memory_usage("PerDocumentCPAttention.backward(init)")
+
         ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "1") == "1"
 
         nvtx_range_push("wlbllm.PerDocumentCPAttention.bwd")
@@ -408,6 +416,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
                                     op=dist.ReduceOp.SUM, group=cp_group)
 
         nvtx_range_pop()
+        log_memory_usage("PerDocumentCPAttention.backward(end)")
 
         return (
             dq_local,        # grad w.r.t. local_q

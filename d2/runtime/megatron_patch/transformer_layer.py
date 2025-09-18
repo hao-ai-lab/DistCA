@@ -1,5 +1,6 @@
 from contextlib import contextmanager, nullcontext
 import functools
+import os
 from typing import Any, Dict, List, Optional, Union
 import types
 import warnings
@@ -23,6 +24,12 @@ from d2.runtime.megatron_patch.stream_sync_fn import TickSync
 from d2.runtime.fast_dispatch_fn import (
     all_to_all, post_all2all_layout_transfer, pre_all2all_layout_transfer
 )
+
+def log_memory_usage(message: str):
+    import d2.mem
+    d2.mem.log_memory_usage(message)
+    return
+
 
 
 #### Tool functions for splitting and gathering args ####
@@ -463,7 +470,6 @@ class TransformerLayer(BaseTransformerLayer):
                     num_heads_kv=self.config.num_query_groups // self.config.tensor_model_parallel_size,
                     head_dim=self.config.hidden_size // self.config.num_attention_heads,
                     return_attn_probs=True,
-                    deterministic=True,
                 ),
             )
         else:
@@ -515,6 +521,8 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         self.comm_stream = torch.cuda.Stream(device=device, priority=-1)
         self._ping_pang_debug = True
         self.ping_pong_comm_initialized = True
+        if os.getenv("D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE", "0") == "1":
+            self.comm_stream = torch.cuda.current_stream(device=device)
         FastDispatcherWrapper.comm_stream = self.comm_stream
 
     def ping_pang_forward(
@@ -624,6 +632,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         arg_group_1: Dict[str, Any],
         compute_stream: torch.cuda.Stream,
     ):
+        log_memory_usage(f"(L{l_no}) forward_layers:(start)")
         nvtx_range_push(f"PingPong.forward_layers[{l_no}]")
 
         layer = self.layers[l_no]
@@ -715,9 +724,12 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
 
         nvtx_range_pop(f"PingPong.forward_layers[{l_no}]")
 
+        log_memory_usage(f"(L{l_no}) forward_layers:(end)")
         return arg_group_0, arg_group_1, hidden_states, context
 
     def _forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(start)")
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(before pre core attn)")
         hidden_states = args.pop("hidden_states")
         query, key, value, residual, attn_mask_type = layer._forward_pre_core_attn(
             hidden_states,
@@ -727,30 +739,40 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             args["mlp_packed_seq_params"],
             args["sequence_len_offset"],
         )
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(after pre core attn)")
+
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(before pre mlp to attn)")
         signal = layer._pre_mlp_to_attn(query, key, value, args["packed_seq_params"])
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(after pre mlp to attn)")
+
         args["query"] = query
         args["key"] = key
         args["value"] = value
         args["residual"] = residual
         args["attn_mask_type"] = attn_mask_type
         args["signal"] = signal
+        log_memory_usage(f"(L{layer.layer_number}) _forward_pre_core_attn:(return)")
         return args
 
     def _layout_mlp_to_attn(layer: TransformerLayer, args: Dict[str, Any]):
+        log_memory_usage(f"(L{layer.layer_number}) _layout_mlp_to_attn:(start)")
         bwd_resend_qkv = args["packed_seq_params"].bwd_packed_seq_params is not None
         if not bwd_resend_qkv:
             # qkv are stored until attn_out to resend at backward.
             args.pop("query"), args.pop("key"), args.pop("value")
         signal = args.pop("signal")
         args["signal"] = layer._all_to_all(signal, args["packed_seq_params"], is_qkv=True)
+        log_memory_usage(f"(L{layer.layer_number}) _layout_mlp_to_attn:(end)")
         return args
 
     def _forward_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         # pop out to make sure the tensor is freed
+        log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(start)")
         signal = args.pop("signal")
         packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
-        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
+        bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None        
         if bwd_resend_qkv:
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before FusedCommAttn)")
             signal = FusedCommAttn.apply(
                 signal,
                 packed_seq_params.qkv_fwd_metadata,
@@ -765,12 +787,16 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                     num_heads_kv=layer.config.num_query_groups // layer.config.tensor_model_parallel_size,
                     head_dim=layer.config.hidden_size // layer.config.num_attention_heads,
                     return_attn_probs=True,
-                    deterministic=True,
                 ),
             )
             args["signal"] = signal
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after FusedCommAttn)")
         else:
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before post mlp to attn)")
             query, key, value = layer._post_mlp_to_attn(signal, args["packed_seq_params"])
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after post mlp to attn)")
+
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before forward core attn)")
             core_attn_out = layer._forward_core_attn(
                 query, key, value,
                 args["attention_mask"],
@@ -778,7 +804,12 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
                 args["attn_mask_type"],
                 args["packed_seq_params"],
             )
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after forward core attn)")
+            
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(before pre attn to mlp)")
             args["signal"] = layer._pre_attn_to_mlp(core_attn_out, args["packed_seq_params"])
+            log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(after pre attn to mlp)")
+        log_memory_usage(f"(L{layer.layer_number}) _forward_core_attn:(end)")
         return args
 
     def _layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
@@ -787,6 +818,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         return args
 
     def _forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
+        log_memory_usage(f"(L{layer.layer_number}) _forward_post_core_attn:(start)")
         signal = args.pop("signal")
         packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
         bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
@@ -810,9 +842,11 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         )
         args["hidden_states"] = mlp_output
         args["context"] = context
+        log_memory_usage(f"(L{layer.layer_number}) _forward_post_core_attn:(end)")
         return args
 
     def _tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, keys_1):
+        log_memory_usage(f"(L?) _tick_sync:(start)")
         if isinstance(keys_0, str):
             keys_0 = [keys_0]
         if isinstance(keys_1, str):
@@ -827,6 +861,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
             arg_group_0[key] = out_tensor
         for key, out_tensor in zip(keys_1, out_tensors_1):
             arg_group_1[key] = out_tensor
+        log_memory_usage(f"(L?) _tick_sync:(end)")
 
     class _debug_monkey_patch:
         def __init__(self, layer_forward_impl):
@@ -842,6 +877,7 @@ def add_ping_pang_forward(block: MegatronTransformerBlock):
         """
         For Pipeline Parallel debugging, we use single-sided to ease debugging.
         """
+        # with torch.cuda.nvtx.range("PingPangGPTModel.forward"):
         if self._ping_pang_debug:
             assert self._debug_forward_impl in ["orig", "single_sided", "orig_reimpl"], self._debug_forward_impl
             if self._debug_forward_impl == "single_sided":
@@ -930,8 +966,11 @@ class PingPangGPTModel(GPTModel):
             packed_seq_params.seq_params[1].dispatcher_id = 1
             packed_seq_params.seq_params[0].stream = self.decoder.comm_stream
             packed_seq_params.seq_params[1].stream = self.decoder.comm_stream
-        for _ in self.decoder.layers:
-            dummy_backward(self.config, packed_seq_params, dtype, device)
+        
+        with torch.cuda.nvtx.range(f"backward(with_dummy)"):
+            for i,layer in enumerate(self.decoder.layers):
+                with torch.cuda.nvtx.range(f"backward_layer[{i}]"):
+                    dummy_backward(self.config, packed_seq_params, dtype, device)
 
     def init_ping_pong_communication_ctx(self, device: torch.device):
         self.decoder.init_ping_pang_communication_ctx(device)

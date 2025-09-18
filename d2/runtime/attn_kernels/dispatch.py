@@ -6,6 +6,7 @@ from d2.runtime.attn_kernels.ops import (
     FastDispatcherWrapper, fast_a2a_memcpy_non_cp,
     fast_a2a_memcpy_cp, fast_a2a,
 )
+from d2.runtime.utils import size_pad_by_int4
 
 
 # NOTE: currently, we use the original q,k,v as the output of pre_fast_a2a memcpy.
@@ -179,26 +180,6 @@ def fast_a2a_attn_out(
 #### Functions for PP and grad ckpt:
 #### during forward, attention out will be sent with softmax_lse.
 #### during backward, attn_out_grad, attn_out, softmax_lse, and qkv are all sent.
-_CUDA_INT4_BYTES = 16
-
-
-def size_pad_by_int4(hidden_size: int, itemsize: int):
-    """
-    Args:
-        hidden_size: num elements
-        itemsize: of each element
-    Returns:
-        hidden_size_pad: padded num elements
-        pad_size: padding size, in number of elements
-    """
-    hidden_bytes = hidden_size * itemsize
-    if hidden_bytes % _CUDA_INT4_BYTES != 0:
-        hidden_bytes += _CUDA_INT4_BYTES - (hidden_bytes % _CUDA_INT4_BYTES)
-    hidden_size_pad = hidden_bytes // itemsize
-    pad_size = hidden_size_pad - hidden_size
-    return hidden_size_pad, pad_size
-
-
 def _concat_with_uint8_and_pad(tensors: list[Tensor], dim: int):
     tensor = torch.concat([t.view(torch.uint8) for t in tensors], dim=dim)
     pad_bytes, pad_len = size_pad_by_int4(tensor.shape[dim], tensor.itemsize)

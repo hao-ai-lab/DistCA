@@ -189,7 +189,8 @@ void fast_a2a(
   const at::Tensor &recver_transfer_sz_tensor,
   int64_t my_rank_send_offset,
   int64_t my_rank_recv_offset,
-  int64_t my_rank_send_sz
+  int64_t my_rank_send_sz,
+  bool separate_send_recv
 ) {
   auto dispatch_helper = (FastA2aDispatchHelper*)fptr;
   _CHECK_TENSOR(1, sender_send_disp_tensor);
@@ -229,7 +230,9 @@ void fast_a2a(
     my_rank_send_offset,
     my_rank_recv_offset,
     my_rank_send_sz,
-    stream
+    stream,
+    dispatch_helper->_buffer_size,
+    separate_send_recv
   );
 }
 

@@ -544,7 +544,7 @@ def create_raw_qkv_dispatch(
     q_to_num_kv_seq = torch.zeros((world_size, pad_len), dtype=torch.int64)
 
     # cumulative number of cp shards before this one.
-    from test_util import exclusive_cumsum
+    from d2.runtime.utils import exclusive_cumsum
     num_cul_cp_shards = exclusive_cumsum(cp_num, dim=1)
     print_if_verbose("num_cul_cp_shards =", num_cul_cp_shards)
 

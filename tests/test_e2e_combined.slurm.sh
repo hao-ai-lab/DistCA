@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --job-name=d2-e2e
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --output=logs/slurm/stdout.%j.log
 #SBATCH --error=logs/slurm/stderr.%j.log
 #SBATCH --ntasks-per-node=1
@@ -138,8 +138,6 @@ echo "- Command: $cmd" >> $EXP_README
 # ---------------------------
 # Env and Sanity Check
 # ---------------------------
-
-conda activate jd-d2
 
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 nvidia-smi --query-gpu=index,name --format=csv
@@ -356,6 +354,12 @@ fi
 set +x
 
 echo "Finished running sbatch at $(TZ='America/Los_Angeles' date). Does not guarantee that the experiment finished successfully. Please check if the benchmark.json file exists."
+
+# Check if the experiment finished successfully
+if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
+    echo "Experiment failed. The benchmark.json file does not exist."
+fi
+
 
 
 # set -euox pipefail

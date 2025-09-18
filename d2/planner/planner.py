@@ -5,13 +5,12 @@ from typing import Any, Dict, List, Optional
 
 import rich
 import torch
+from d2.runtime.compute_metadata import from_planner_output
+from d2.runtime.shard_info import (ShardInfo, handle_planner_metadata,
+                                   items_into_shardinfos)
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-
-from d2.runtime.compute_metadata import from_planner_output
-from d2.runtime.shard_info import (ShardInfo, handle_planner_metadata,
-                                   items_into_shardinfos, plan_to_metadata)
 
 K = 1024
 
@@ -49,6 +48,73 @@ def batch_to_items_class(batches: list[list[int]], model_config=None):
             seqid += 1
     return items
 
+def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int, as_world_size: int, model_config: dict):
+
+    items = []
+    seqid = 0
+    rank_budgets = [num_tokens_per_rank] * as_world_size
+    current_rank_idx = 0
+
+    for batch in batches:
+        if len(batch) == 1 and batch[0] < num_tokens_per_rank:
+            while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
+                current_rank_idx += 1
+            assert rank_budgets[current_rank_idx] == num_tokens_per_rank, "dummy doc should put on a empty rank"
+            # dummy doc, this rank only put this dummy item.
+            doc_len = batch[0]
+            item_dict = {'q': doc_len, 'kv': doc_len}
+            new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                            item_dict, is_original=True)
+            items.append(new_item)
+            current_rank_idx += 1
+            seqid += 1
+        else:
+            for doc_length in batch:
+                doc_len = doc_length
+                remaining_len = doc_len
+                head_prefix_len = 0
+                tail_suffix_start_pos = doc_len
+                is_original_flag = True
+
+                while remaining_len > 0:
+                    while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
+                        current_rank_idx += 1
+                    if current_rank_idx >= as_world_size:
+                        raise ValueError(f"Not enough space for seqid {seqid}, remaining_len {remaining_len}.")
+                    
+                    chunk_size = min(remaining_len, rank_budgets[current_rank_idx])
+                    
+                    if remaining_len == doc_len and chunk_size == doc_len:
+                        item_dict = {'q': doc_len, 'kv': doc_len}
+                        new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                                        item_dict, is_original=True)
+                        items.append(new_item)
+                    else:
+                        q_len_head = chunk_size // 2
+                        q_len_tail = chunk_size - q_len_head
+                        
+                        new_head_kv = head_prefix_len + q_len_head
+                        head_item = {'q': q_len_head, 'kv': new_head_kv}
+                        tail_item = {'q': q_len_tail, 'kv': tail_suffix_start_pos}
+
+                        new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                                        head_item, tail_item, is_original=is_original_flag)
+                        items.append(new_item)
+
+                        head_prefix_len = new_head_kv
+                        tail_suffix_start_pos -= q_len_tail
+                        is_original_flag = False
+
+                    rank_budgets[current_rank_idx] -= chunk_size
+                    remaining_len -= chunk_size
+
+                seqid += 1
+        
+    return items
+
+
+
+
 
 """
 Partition and place a batch of variable-length documents onto GPU ranks under a
@@ -63,7 +129,7 @@ Steps
 Args
   batches : List[List[int]]
       Outer list = per-sequence groups, inner list = document lengths in tokens.
-  num_batched_token : int
+  num_tokens_per_rank : int
       Maximum tokens that one rank can accept in this micro-batch.
   DP_degree : int
       Number of data-parallel ranks.
@@ -78,7 +144,7 @@ Examples
 ----------
 Example 1 : documents fit into DP ranks
     batch           = [[16K], [8K, 8K], [4K]*4, [2K]*8]
-    num_batched_token = 16K
+    num_tokens_per_rank = 16K
     DP_degree         = 4
 
     Item0  q=16K kv=16K  gpu=0 seq=0 src=0 is_orig=True
@@ -86,7 +152,7 @@ Example 1 : documents fit into DP ranks
     ...
 Example 2 : CP split required
     batch           = [[32K], [8K, 8K], [4K]*4]
-    num_batched_token = 16K
+    num_tokens_per_rank = 16K
     DP_degree         = 4
 
     # 32K doc split across 2 ranks (16K each)
@@ -103,13 +169,13 @@ Example 2 : CP split required
     Item3  q=8K kv=8K  gpu=2 seq=2 src=2 is_orig=True
     ...
 """
-def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_degree: int, model_config: dict):
+def batch_to_items_general(batches: List[List[int]], num_tokens_per_rank: int, DP_degree: int, model_config: dict):
     """
     Put a batch of documents onto GPU ranks and return a list of Item objects.
     Args:
         batches: List[List[int]]
             Outer list = per-sequence groups, inner list = document lengths in tokens.
-        num_batched_token: int
+        num_tokens_per_rank: int
             Maximum tokens that one rank can accept in this micro-batch.
         DP_degree: int
             Number of data-parallel ranks.
@@ -124,7 +190,7 @@ def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_
     """
     items = []
     seqid = 0
-    rank_budgets = [num_batched_token] * DP_degree
+    rank_budgets = [num_tokens_per_rank] * DP_degree
     current_rank_idx = 0
 
     # Flatten the batches into a list of dicts, each dict contains the length of the document.
@@ -175,6 +241,64 @@ def batch_to_items_general(batches: List[List[int]], num_batched_token: int, DP_
         seqid += 1
         
     return items
+
+from collections import deque
+
+
+def cp_list_to_mlp_list(cp_rank_doc_lens: List[List[int]], as_world_size: int, num_token_per_rank: int) -> List[List[int]]:
+    final_mlp_lists: List[List[int]] = []
+    current_rank: List[int] = []
+
+    for doc_list_per_rank in cp_rank_doc_lens:
+        docs_queue = deque(doc_list_per_rank)
+
+        while docs_queue:
+            doc_len = docs_queue.popleft()
+            is_split_doc = False
+
+            while True:
+                space_left = num_token_per_rank - sum(current_rank)
+
+                if space_left == 0:
+                    if current_rank:
+                        final_mlp_lists.append(current_rank)
+                    current_rank = []
+                    space_left = num_token_per_rank
+
+                if doc_len <= space_left:
+                    if is_split_doc:
+                        head = doc_len // 2
+                        tail = doc_len - head
+                        current_rank.extend([head, tail])
+                    else:
+                        current_rank.append(doc_len)
+                    break
+
+                if space_left > 0:
+                    head1 = space_left // 2
+                    tail1 = space_left - head1
+                    current_rank.extend([head1, tail1])
+                
+                final_mlp_lists.append(current_rank)
+                current_rank = []
+                
+                doc_len -= space_left
+                is_split_doc = True
+
+        if current_rank:
+            final_mlp_lists.append(current_rank)
+            current_rank = []
+
+    while len(final_mlp_lists) < as_world_size:
+        final_mlp_lists.append([])
+    
+    if len(final_mlp_lists) > as_world_size:
+        final_mlp_lists = final_mlp_lists[:as_world_size]
+    
+    # for l in final_mlp_lists, sum(l) should be either num_token_per_rank or dummy(tp_size).
+    assert len(final_mlp_lists) == as_world_size, f"final_mlp_lists should contain {as_world_size} number of List. But get {len(final_mlp_lists)}. final_mlp_list: {final_mlp_lists}"
+    return final_mlp_lists
+
 
 
 
@@ -386,258 +510,6 @@ class Item:
             border_style="blue"
         )
 
-class Planner_DP:
-    def __init__(self,
-                world_size: int,
-                parallel_config,
-                tolerance_factor: float = 0.1,
-                model_config = None) -> None:
-        self.model_config = model_config
-        self.world_size = world_size
-        self.parallel_config = parallel_config
-        self.data_parallel = world_size // (parallel_config.pipeline_model_parallel_size * parallel_config.tensor_model_parallel_size)
-        self.attention_server_world_size = self.data_parallel * parallel_config.pipeline_model_parallel_size
-
-        self.tolerance_factor = tolerance_factor
-
-    def plan(self, items_, verbose=False, plot=False):
-        """
-        Plan relocation of sequences across GPUs to balance FLOPs.
-        """        
-        items = self.plan_items(items_, verbose, plot)
-        items = self.postprocess_items(items)
-        metadata = self.item_to_metadata(items)
-        return metadata
-
-    def plan_items(self, items_, verbose=False, plot=False) -> list[dict]:
-        """
-        Plan relocation of sequences across GPUs to balance FLOPs.
-        
-        Args:
-            items_: List of item dictionaries
-            verbose: Whether to print verbose output
-            
-        Returns:
-            List of item dictionaries after relocation planning
-        """
-        items = deepcopy(items_)
-
-        def rlog(message):
-            if verbose:
-                rich.print(message)
-
-        # Get total flops, and avg flops per GPU
-        flops_per_gpu = [0.0] * self.attention_server_world_size
-        for item in items:
-            flops_per_gpu[item['gpuid']] += get_flops(**item)
-        total_flops = sum(flops_per_gpu)
-        
-        assert self.attention_server_world_size > 0, "No worker to dispatch to."
-        avg_flops_per_gpu = total_flops / self.attention_server_world_size
-        rlog(f"Total FLOPs: {total_flops:.2f}, Average FLOPs per GPU: {avg_flops_per_gpu:.2f}")
-        
-        surplus_deficit = [f - avg_flops_per_gpu for f in flops_per_gpu]
-
-        recipients = sorted(
-            [(i, deficit) for i, deficit in enumerate(surplus_deficit) if deficit < 0],
-            key=lambda x: x[1]
-        )
-        rlog("\n[bold cyan]Balancing Plan[/bold cyan]")
-        rlog(f"Average FLOPs Target: {avg_flops_per_gpu:.2f}")
-        for gpu_id, deficit in recipients:
-            rlog(f"  - GPU {gpu_id} needs {-deficit:.2f} FLOPs.")
-
-        threshold_flops = avg_flops_per_gpu * self.tolerance_factor
-        rlog(f"\n[bold cyan]Threshold for moving FLOPs: {threshold_flops:.2f}[/bold cyan]")
-        
-        for recipient_id, deficit in recipients:
-            needed_flops = -deficit
-            rlog(f"\n[bold yellow]Planning for GPU {recipient_id}[/bold yellow] (needs {needed_flops:.2f} FLOPs)")
-            
-            while abs(needed_flops) > threshold_flops:
-                
-                donor_gpus = {i for i, s in enumerate(surplus_deficit) if s > 0}
-                if not donor_gpus:
-                    rlog("[red]No more donor GPUs with surplus FLOPs. Stopping.[/red]")
-                    break
-
-                candidates = []
-                for item in items:
-                    if item['gpuid'] in donor_gpus:
-                        seq_len = item['seq_len']
-                        item_flops = get_flops(**item)
-
-                        # Maximum amount of FLOPs could move for current item
-                        max_flops_to_move = min(needed_flops, item_flops, surplus_deficit[item['gpuid']])
-
-                        communication_cost = (max_flops_to_move / seq_len) + (2 * seq_len)
-                        priority = communication_cost / max_flops_to_move
-
-                        candidates.append({
-                            'priority': priority,
-                            'item': item,
-                            'donor_id': item['gpuid'],
-                            'max_flops': max_flops_to_move
-                        })
-                
-                if not candidates:
-                    rlog("[yellow]No more candidate items to move. Stopping for this recipient.[/yellow]")
-                    break
-                
-                candidates.sort(key=lambda x: x['priority'])
-
-                moved_something = False
-                for best_candidate in candidates:
-                    item_to_move = best_candidate['item']
-                    donor_id = best_candidate['donor_id']
-        
-                    max_flops_to_move = best_candidate['max_flops']
-                    item_total_flops = get_flops(**item_to_move)
-
-                    rlog(f"  - Candidate: item (q={item_to_move['q']}, kv={item_to_move.get('kv')}, on_gpu={donor_id}) with priority {best_candidate['priority']:.4f}")
-                    rlog(f"    - Provides: {item_total_flops:.2f} FLOPs, Max possible: {max_flops_to_move:.2f}, Recipient needs: {needed_flops:.2f} FLOPs, Difference: {max_flops_to_move - needed_flops:.2f} FLOPs")
-                
-                    # 3. If moving almost the entire item, just move it all
-                    if item_total_flops <= max_flops_to_move:
-                        rlog(f"    - [bold]Moving entire item[/bold] as its FLOPs ({max_flops_to_move:.2f}) are less than needed ({needed_flops:.2f}).")
-                        
-                        surplus_deficit[donor_id] -= max_flops_to_move
-                        surplus_deficit[recipient_id] += max_flops_to_move
-                        needed_flops -= max_flops_to_move
-                        item_to_move['gpuid'] = recipient_id
-                        item_to_move['is_original'] = False
-                    else:
-                        flops_per_q = item_to_move['seq_len'] + 1
-                        q_to_move = int(max_flops_to_move / flops_per_q)
-
-                        if q_to_move <= 0:
-                            continue
-
-                        moved_flops_actual = q_to_move * flops_per_q
-                        original_q = item_to_move['q']
-                        original_kv = item_to_move['kv']
-                        rlog(f"    - [bold]Splitting item[/bold]: Actual Moving q={q_to_move*2} ({moved_flops_actual:.2f} FLOPs) to satisfy need.")
-
-                        head_chunk = deepcopy(item_to_move)
-                        head_chunk.update({'kv': original_kv - original_q + q_to_move, 'q': q_to_move, 'gpuid': recipient_id, 'is_original': False})
-                        
-                        tail_chunk = deepcopy(item_to_move)
-                        tail_chunk.update({'kv': original_kv, 'q': q_to_move, 'gpuid': recipient_id, 'is_original': False})
-                        rlog(f"    - Created head chunk: q={head_chunk['q']}, kv={head_chunk['kv']}, on GPU {recipient_id}")
-                        rlog(f"    - Created tail chunk: q={tail_chunk['q']}, kv={tail_chunk['kv']}, on GPU {recipient_id}")
-                        items.extend([head_chunk, tail_chunk])
-
-                        item_to_move['q'] = original_q - (2 * q_to_move)
-                        item_to_move['kv'] = original_kv - q_to_move
-                        item_to_move['is_original'] = False
-
-                        surplus_deficit[donor_id] -= moved_flops_actual
-                        surplus_deficit[recipient_id] += moved_flops_actual
-                        needed_flops -= moved_flops_actual
-                        
-                        rlog(f"    - [bold]Splitting item[/bold]: moved {moved_flops_actual:.2f} FLOPs (q={q_to_move*2}) to GPU {recipient_id}. Remaining q={item_to_move['q']} on GPU {donor_id}")
-                                
-                    moved_something = True
-                    break
-
-                if not moved_something:
-                    rlog(f"[yellow]Could not find a suitable item to move for GPU {recipient_id}. Remaining need: {needed_flops:.2f}[/yellow]")
-                    break
-        
-        final_items = [item for item in items if item['q'] > 0]
-        post_processed_items = []
-        for item in final_items:
-            # Split dispatched sequences to two chunks.
-            if item['is_original'] == False and item['gpuid'] == item['src_gpuid']:
-                rlog(f"  - Found item to split on GPU {item['gpuid']}: q={item['q']}, kv={item['kv']}")
-                
-                half_q = item['q'] // 2
-                
-                head_chunk = deepcopy(item)
-                head_chunk['q'] = half_q
-                head_chunk['kv'] = item['kv'] - item['q'] + half_q
-                
-                if item['q'] % 2 != 0:
-                    tail_chunk = deepcopy(item)
-                    tail_chunk['q'] = half_q+1
-                else:
-                    tail_chunk = deepcopy(item)
-                    tail_chunk['q'] = half_q
-                    
-                post_processed_items.extend([head_chunk, tail_chunk])
-                rlog(f"    - [bold]Split into two chunks[/bold]:")
-                rlog(f"      - Head: q={head_chunk['q']}, kv={head_chunk['kv']}")
-                rlog(f"      - Tail: q={tail_chunk['q']}, kv={tail_chunk['kv']}")
-
-            else:
-                post_processed_items.append(item)
-        final_items = post_processed_items
-        rlog("\n[bold green]Relocation planning finished.[/bold green]")
-        
-        final_flops_per_gpu = [0.0] * self.attention_server_world_size
-        for item in final_items:
-            final_flops_per_gpu[item['gpuid']] += get_flops(**item)
-        
-        rlog("Final FLOPs distribution per GPU:")
-        for i, f in enumerate(final_flops_per_gpu):
-            rlog(f"  - GPU {i}: {f:.2f} FLOPs (Target: {avg_flops_per_gpu:.2f})")
-
-        return final_items    
-    
-    def postprocess_items(self, items) -> list[dict]:
-        """
-        Postprocess the items to add a "shard_id" field.
-        The "shard_id" field is always 0 for the original sequence.
-        For each non-original sequence, shard_id = how short the `kv` is among all the shards in the same sequence (ranking of `kv` sort ASC)
-        - collect all the sequences that has the same `src_gpuid` and `seqid`
-        - sort them by the `kv` to determine the shard id of that sequence.
-        """
-        items = deepcopy(items)
-
-        for item in items:
-            if item["is_original"]:
-                item["shard_id"] = 0
-        
-        # now handle the non-original sequences.
-        non_original_items = [item for item in items if not item["is_original"]]
-        src_gpuid_seqid_to_items = defaultdict(list)
-        for item in non_original_items:
-            src_gpuid_seqid_to_items[(item["src_gpuid"], item["seqid"])].append(item)
-        
-        for src_gpuid_seqid, items_ in src_gpuid_seqid_to_items.items():
-            items_.sort(key=lambda x: x["kv"])
-            for i, item in enumerate(items_):
-                item["shard_id"] = i
-        return items
-    
-    def item_to_metadata(self, items):
-        """
-        Convert items to metadata objects.
-        
-        Args:
-            items: List of item dictionaries
-            hidden_size_q: Hidden size for query
-            hidden_size_k: Hidden size for key/value
-            element_size: Element size in bytes
-            
-        Returns:
-            Metadata object for fast all-to-all communication
-        """
-        
-        shard_infos = self.items_into_shardinfos(items)
-        metadatas = plan_to_metadata(
-        self.world_size, shard_infos, return_intermediate=True)
-        return metadatas
-
-    def items_into_shardinfos(self, items):
-        """
-        Convert the items to intermediate tensors for metadata generation.
-        """
-        
-        return items_into_shardinfos(items)
-    
-
-
 class Planner:
     def __init__(self,
                 world_size: int,
@@ -656,11 +528,12 @@ class Planner:
         self.tolerance_factor = tolerance_factor
 
     # from item to metadata.
-    def plan(self, items_: list[Item], verbose=False, plot=False):
+    def plan(self, items_: list[Item], verbose=False, plot=False, is_resend_qkv:bool=False):
         mlp_shard_len = self.items_to_mlp_doc_len(items_)
         planned_items: list[Item] = self.plan_items(items_, verbose, plot)
         planned_items: list[Item] = self.postprocess_items(planned_items)
         planner_output: list[list[ShardInfo]] = self.items_into_shardinfos(planned_items)
+        tp_size = self.parallel_config.tensor_model_parallel_size
         if self.parallel_config.pipeline_model_parallel_size == 1:
             hidden_size_q = self.model_config.hidden_size
             hidden_size_kv = hidden_size_q
@@ -668,25 +541,29 @@ class Planner:
                 hidden_size_kv = (hidden_size_kv * self.model_config.num_key_value_heads //
                                 self.model_config.num_attention_heads)
 
-            hidden_size_q_tp = hidden_size_q // self.parallel_config.tensor_model_parallel_size
-            hidden_size_k_tp = hidden_size_kv // self.parallel_config.tensor_model_parallel_size
+            hidden_size_q_tp = hidden_size_q // tp_size
+            hidden_size_k_tp = hidden_size_kv // tp_size
 
-            lse_size = 0    # we don't send lse when pp = 1.
+            lse_size = self.model_config.num_attention_heads // tp_size
             element_size = self.dtype.itemsize
+            # TODO: We should get the transformer config
+            if getattr(self.model_config, "attention_softmax_in_fp32", True): # if self.model_config.attention_softmax_in_fp32:
+                # lse_size *= torch.float32.element_size // element_size
+                lse_size *= torch.float32.itemsize // element_size
 
             (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
             attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
             as_attn_metadata,
             ) = from_planner_output(
                 self.attention_server_world_size, planner_output, hidden_size_q_tp, hidden_size_k_tp,
-                lse_size, element_size, is_pipeline_tick=False
+                lse_size, element_size, is_pipeline_tick=False, is_resend_qkv=is_resend_qkv,
             )
             fa2a_metadata = (
                 qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
                 attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
             )
             return fa2a_metadata, as_attn_metadata, mlp_shard_len
-        else:   
+        else:
             # new metadata computation for pipeline parallel is in test_util. hard to import.
             # Now PP 3D parallel is directly support in: test_megatron_e2e_pipeline.py
             raise NotImplementedError("PP > 1 will be supported very soon.")
@@ -722,8 +599,6 @@ class Planner:
             flops_per_gpu[item.gpuid] += item.total_flops
         total_flops = sum(flops_per_gpu)
         
-        if self.attention_server_world_size == 0:
-            return []
         avg_flops_per_gpu = total_flops / self.attention_server_world_size
         rlog(f"Total FLOPs: {total_flops:.2f}, Average FLOPs per GPU: {avg_flops_per_gpu:.2f}")
         
@@ -855,14 +730,6 @@ class Planner:
             ]
         return doc_lens_per_rank
 
-
-    def item_to_metadata(self, items: list[dict]):
-        shard_infos = self.items_into_shardinfos(items)
-        metadatas = plan_to_metadata(
-            self.attention_server_world_size, shard_infos, return_intermediate=True
-        )
-        return metadatas
-
     def items_into_shardinfos(self, item_dicts):
         return items_into_shardinfos(item_dicts)
     
@@ -889,8 +756,6 @@ class Planner:
             world_size=world_size,
             parallel_config=parallel_config,
             model_config=model_config)
-
-
 
     
 def get_flops(q=None, kv=None, **kwargs):

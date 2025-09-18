@@ -39,7 +39,9 @@ int launch_alltoallv(
   int64_t my_rank_send_offset,
   int64_t my_rank_recv_offset,
   int64_t my_rank_send_sz,
-  cudaStream_t stream
+  cudaStream_t stream,
+  int64_t buffer_size,
+  bool separate_send_recv
 );
 
 void launch_buffer_availability_kernel(
@@ -83,8 +85,9 @@ struct FastA2aDispatchHelper {
     if (_buffer_size < target_size) {
       nvshmem_free(buffer.send_buffer);
       nvshmem_free(buffer.recv_buffer);
-      buffer.send_buffer = (uint8_t *)nvshmem_malloc(_buffer_size);
-      buffer.recv_buffer = (uint8_t *)nvshmem_malloc(_buffer_size);
+      buffer.send_buffer = (uint8_t *)nvshmem_malloc(target_size);
+      buffer.recv_buffer = (uint8_t *)nvshmem_malloc(target_size);
+      _buffer_size = target_size;
     }
   }
 };

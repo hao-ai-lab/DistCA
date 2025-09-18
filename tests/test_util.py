@@ -5,12 +5,10 @@ import os
 import random
 import socket
 from typing import Optional
-
+from datetime import timedelta
 
 from megatron.core import parallel_state as mpu
-from transformers import AutoConfig
 import ray
-import rich
 import torch
 
 from d2.runtime.attn_kernels.ops import (
@@ -19,20 +17,13 @@ from d2.runtime.attn_kernels.ops import (
 from d2.runtime.compute_metadata import (
     from_planner_output, backward_from_planner_output,
 )
-from d2.runtime.fast_alltoall_metadata import (
-    compute_backward_resend_e2e_metadata,
-    compute_e2e_fa2a_metadata,
-)
-from d2.runtime.inplace_metadata import (
-    compute_attn_layout_seqlens, compute_metadata,
-    compute_metadata_kv, exclusive_cumsum
-)
 from d2.runtime.shard_info import ShardInfo
 from d2.runtime.megatron_patch.create_group import (
     initialize_attention_server_comm, get_attn_server_group_gloo,
     get_attn_server_rank, get_attn_server_group_src_rank
 )
-from d2.planner.planner import Planner, batch_to_items_class
+from d2.planner.planner import batch_to_items_with_dummy, cp_list_to_mlp_list
+
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +83,27 @@ class BaseWorker:
 
     def init_torch_distributed(self,):
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size)
-            local_rank = int(os.environ.get("LOCAL_RANK"))
-            self.device = torch.device(f"cuda:{local_rank}")
-            torch.cuda.set_device(self.device)
+
+            timeout = None
+            EXPERIMENT_TORCH_DIST_TIMEOUT = os.environ.get("EXPERIMENT_TORCH_DIST_TIMEOUT", "-1")
+            try:
+                EXPERIMENT_TORCH_DIST_TIMEOUT = int(EXPERIMENT_TORCH_DIST_TIMEOUT)
+                if EXPERIMENT_TORCH_DIST_TIMEOUT > 0:
+                    timeout = timedelta(seconds=EXPERIMENT_TORCH_DIST_TIMEOUT)
+            except:
+                pass
+                
+            torch.distributed.init_process_group(
+                backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world_size, timeout=timeout
+            )
+            try:
+                local_rank = int(os.environ.get("LOCAL_RANK"))
+                self.device = torch.device(f"cuda:{local_rank}")
+                torch.cuda.set_device(self.device)
+            except:
+                # In slurm environment, only have one visible GPU per node.
+                torch.cuda.set_device('cuda')
+                pass
 
     def init_nvshmem(self, buffer_size: int, local_rank: int = None):
         print("====== init_nvshmem ======")
@@ -175,9 +183,9 @@ class MegatronBaseWorker(BaseWorker):
             uid = nvshmem_get_unique_id()
         else:
             uid = nvshmem_alloc_empty_unique_id()
-        print(f"[Rank {as_rank}] init nvshmem with uid = {uid}")
+        # print(f"[Rank {as_rank}] init nvshmem with uid = {uid}")
         torch.distributed.broadcast(uid, src=as_src_rank, group=group)
-        print(f"[Rank {as_rank}] after broadcast uid = {uid}")
+        # print(f"[Rank {as_rank}] after broadcast uid = {uid}")
         FastDispatcherWrapper.init(
             as_rank, local_rank, as_world_size, buffer_size, uid
         )
@@ -202,9 +210,9 @@ class MegatronBaseWorker(BaseWorker):
 
 
 def init_worker_torch_distributed(
-    world_size, buffer_size, worker_cls=BaseWorker, parallel_config=None
+    world_size, buffer_size, worker_cls, parallel_config
 ):
-    assert world_size == int(os.environ.get("WORLD_SIZE"))
+    assert world_size == int(os.environ.get("WORLD_SIZE")), f"world_size: {world_size} != WORLD_SIZE: {os.environ.get('WORLD_SIZE')}"
     rank = int(os.environ.get("RANK"))
     local_rank = int(os.environ.get("LOCAL_RANK"))
     worker = worker_cls(
@@ -427,7 +435,7 @@ def _block_reverse_list(l: list, d: int):
     """
     return [item for i in range(len(l), 0, -d) for item in l[max(0, i - d):i]]
 
-
+from global_batch_provider import get_next_batch, GLOBAL_BATCH
 def create_pipeline_doclens(
     ref_doc_lens: Optional[list[list[int]]],
     add_dummy: bool,
@@ -437,9 +445,14 @@ def create_pipeline_doclens(
     num_docs: int,
     tp_size: int,
     dp_size: int,
+    num_batches: int = None,
     use_planner: bool = False,
-):
+    return_original_doclen: bool = False,
+) -> list[list[int]]: # list of batch[int]
     """
+    Create `num_batches` batch for a microbatch (one pp-tick).
+    - Take a batch from get_next_batch (or random) and also handle some padding logic.
+
     For a forward tick, its sequence length follows:
         [new_microbatch, last_tick_seq_len[:PP_stage_-1]]
 
@@ -462,6 +475,7 @@ def create_pipeline_doclens(
         pp_head_new_doc_len = [[tp_size] for _ in range(dp_size)]
     else:
         assert total_token_on_rank % tp_size == 0, "Sequence Parallel requires total token divisible by tp_size"
+        # TODO: Do not do "use_planner" to decide if we should grab batch from global batch or random.
         if use_planner == False:
             pp_head_new_doc_len = [
                 create_list(random.randint(1, num_docs), total_token_on_rank, tp_size, 1)
@@ -470,21 +484,32 @@ def create_pipeline_doclens(
         else:
             # we need to use GLOBAL_BATCH to get dp number of list.
             #from test_megatron_e2e_pipeline_planner import GLOBAL_BATCH, get_next_batch
-            from global_batch_provider import get_next_batch, GLOBAL_BATCH
             print(f"In util.py, before calling get_next_batch: GLOBAL_BATCH is: {GLOBAL_BATCH}")
-            pp_head_new_doc_len = get_next_batch(dp_size)
+            num_batches = num_batches or dp_size 
+            pp_head_new_doc_len = get_next_batch(num_batches)
+    print(f"In util.py, after calling get_next_batch: pp_head_new_doc_len is: {pp_head_new_doc_len}")
 
     #  pp_head_new_doc_len : shape : [dp, num_seqs]  We should sample seq_len here.
     # And add the sampled seq_len to the batch. 
     # Next step is based on the previous batch, move the batch. 
     # Get existing microbatch seqlens
     if ref_doc_lens is not None:
+        if num_batches == None:
+            num_batches = dp_size
         # Not the first microbatch
-        other_pp_doc_len = ref_doc_lens[:-dp_size]
+        if ref_doc_lens[-1] == [tp_size]:
+            other_pp_doc_len = ref_doc_lens[:-dp_size]
+        else:
+            other_pp_doc_len = ref_doc_lens[:-num_batches]
     else:
         dummy_fwd_num = world_size - dp_size
         other_pp_doc_len = [[tp_size] for _ in range(dummy_fwd_num)]
     tick_per_rank_doc_len = pp_head_new_doc_len + other_pp_doc_len
+    print(f"In util.py, finally tick_per_rank_doc_len is: {tick_per_rank_doc_len}")
+
+    if return_original_doclen:
+        return (tick_per_rank_doc_len, pp_head_new_doc_len)
+    # exit(0)
     return tick_per_rank_doc_len
 
 
@@ -507,7 +532,10 @@ def random_tick_shard_from_doclens(
         per_rank_shard_lens, world_size,
     )
 
-# This function world size is actually as_world_size.
+from d2.planner.planner import Planner
+from types import SimpleNamespace
+
+# In this function, world size is actually as_world_size.
 def create_qkv_dispatch_pipeline_tick(
     world_size: int, total_num_token: int, num_docs: int, max_cp_degree: int,
     hidden_size_q: int, hidden_size_k: int,
@@ -516,12 +544,16 @@ def create_qkv_dispatch_pipeline_tick(
     ref_doc_lens: Optional[torch.Tensor],
     add_dummy: bool,
     tp_size: int, dp_size: int,
-    use_planner: bool = False
+    num_token_per_rank: int,
+    num_batches: int = None,
+    use_planner: bool = False,
+    return_original_doclen: bool = False,
 ):
     """
     softmax_lse_size (int): size of the softmax_lse tensor when viewed as the dtype,
         should be num_heads_local * fp32.itemsize // element_size.
     """
+    print(f"🟡 Inside create_qkv_dispatch_pipeline_tick: {world_size = }. Please check the world size as this is acutlaly should just be dp * pp.")
     create_pp_doclen_kwargs = dict(
         world_size=world_size,
         total_token_on_rank=total_num_token,
@@ -529,22 +561,28 @@ def create_qkv_dispatch_pipeline_tick(
         tp_size=tp_size,
         dp_size=dp_size,
     )
-    # for perf test. Get doc_lens from GLOBAL_BATCH
-    cur_tick_per_rank_doc_lens = create_pipeline_doclens(
-        ref_doc_lens, add_dummy, is_backward=False, use_planner=use_planner,
-        **create_pp_doclen_kwargs, 
+
+    cur_tick_per_rank_doc_lens, original_cur_tick_per_rank_doc_lens = create_pipeline_doclens(
+        ref_doc_lens, add_dummy, is_backward=False, num_batches = num_batches, use_planner=use_planner,
+        **create_pp_doclen_kwargs, return_original_doclen=True,
     )
+    assert isinstance(cur_tick_per_rank_doc_lens, list), f"cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens} is not a list"
+    print(f"🟡 cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}, len(cur_tick_per_rank_doc_lens): {len(cur_tick_per_rank_doc_lens)}")
+    print(f"🟡 original_cur_tick_per_rank_doc_lens: {original_cur_tick_per_rank_doc_lens}, len(original_cur_tick_per_rank_doc_lens): {len(original_cur_tick_per_rank_doc_lens)}")
+
 
     if use_planner:
-        from d2.planner.planner import Planner
-        from types import SimpleNamespace
+        # TODO: This pp_size should really come from mpu or some module that handles the world size...
         pp_size = world_size // dp_size        # in this function, world size is actual as_world_size. pp = world_size // dp_size
-        planner = Planner.from_individual_params(tp_size=tp_size,
-                                                 pp_size=pp_size,
-                                                 dp_size=dp_size,
-                                                 world_size=tp_size * pp_size * dp_size,
-                                                 hidden_size_q=hidden_size_q,
-                                                 hidden_size_k=hidden_size_k)
+        planner = Planner.from_individual_params(
+            tp_size=tp_size,
+            pp_size=pp_size,
+            dp_size=dp_size,
+            world_size=tp_size * pp_size * dp_size,
+            hidden_size_q=hidden_size_q,
+            hidden_size_k=hidden_size_k
+        )
+        
         # Create a temp_model_config for item initialization.
         temp_model_config = SimpleNamespace(
             hidden_size=hidden_size_q * tp_size,
@@ -552,10 +590,11 @@ def create_qkv_dispatch_pipeline_tick(
             num_key_value_heads = hidden_size_q // hidden_size_k,
             num_hidden_layers = 1
         )
-        # This function only works for MLP-DP.
-        # TODO: For PP MLP-CP, return items directly can be better.
-        # We can't directly use batch_to_items_general.
-        items = batch_to_items_class(cur_tick_per_rank_doc_lens, temp_model_config)
+        # Use batch_to_items_with_dummy to handle dummy doc to item.
+        items = batch_to_items_with_dummy(batches=cur_tick_per_rank_doc_lens, 
+                                          num_tokens_per_rank = num_token_per_rank,
+                                          as_world_size=world_size,
+                                          model_config=temp_model_config)
         fwd_planner_out = planner.items_to_shardinfo(items)
     else:
         fwd_planner_out = random_tick_shard_from_doclens(
@@ -569,12 +608,25 @@ def create_qkv_dispatch_pipeline_tick(
          softmax_lse_size, element_size, is_pipeline_tick=True
         )
 
-    bwd_tick_per_rank_doc_lens = create_pipeline_doclens(
-        cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
-        **create_pp_doclen_kwargs,
-    )
+    # CP flip logic.
+    print(f"🟡 fwd_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
+    if len(cur_tick_per_rank_doc_lens) < world_size:
+        print("🟡 CP flip logic.")
+        bwd_tick_per_rank_doc_lens = _block_reverse_list(cur_tick_per_rank_doc_lens, num_batches)
+    else:
+        # None CP flip logic.
+        print("🟡 None CP flip logic.")
+        bwd_tick_per_rank_doc_lens = create_pipeline_doclens(
+            cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
+            **create_pp_doclen_kwargs,
+        )
+    print(f"🟡 bwd_tick_per_rank_doc_lens: {bwd_tick_per_rank_doc_lens}")
+    
     if use_planner:
-        items = batch_to_items_class(bwd_tick_per_rank_doc_lens, temp_model_config)
+        items = batch_to_items_with_dummy(batches=bwd_tick_per_rank_doc_lens, 
+                                          num_tokens_per_rank=num_token_per_rank,
+                                          as_world_size=world_size,
+                                          model_config=temp_model_config)
         bwd_planner_out = planner.items_to_shardinfo(items)
     else:
         bwd_planner_out = random_tick_shard_from_doclens(
@@ -584,12 +636,16 @@ def create_qkv_dispatch_pipeline_tick(
      bwd_attn_metadata) = backward_from_planner_output(
          world_size, bwd_planner_out, hidden_size_q, hidden_size_k,
          softmax_lse_size, element_size,
-     )
+    )
 
-    return (fwd_attn_metadata, bwd_attn_metadata,
+
+    ret = (fwd_attn_metadata, bwd_attn_metadata,
             qkv_linear_to_attn_fa2a, qkv_grad_attn_to_linear_fa2a,
             out_attn_to_linear_fa2a, qkv_resend_and_out_grad_linear_to_attn_fa2a,
             cur_tick_per_rank_doc_lens,)
+    if return_original_doclen:
+        ret += (original_cur_tick_per_rank_doc_lens,)
+    return ret
 
 
 ######## TODO: deprecate all below
@@ -601,310 +657,3 @@ def gen_seq_lens(world_size: int, num_seqs: int, total_len: int) -> torch.Tensor
     seq_len_total_error = seq_len_total - total_len
     seq_len[:, -1] -= seq_len_total_error
     return seq_len
-
-
-def create_qkv_dispatch_pipeline_tick_planned(
-    world_size: int, total_seq_len: int, num_seqs: int, max_cp_degree: int,
-    hidden_size_q: int, hidden_size_k: int,
-    element_size: int, # dtype's size
-    softmax_lse_size: int, # size of the softmax_lse tensor, should be num_heads
-    ref_seq_lens: Optional[torch.Tensor],
-    add_dummy: bool,
-    tp_size: int, dp_size: int, pp_size: int,
-    hf_config: Optional[AutoConfig] = None,
-):
-    create_pp_doclen_kwargs = dict(
-        world_size=world_size,
-        total_seq_len=total_seq_len,
-        num_seqs=num_seqs,
-        max_cp_degree=max_cp_degree,
-    )
-    seq_lens = create_pipeline_seqlens(
-        ref_seq_lens, add_dummy, is_backward=False,
-        **create_pp_doclen_kwargs,
-        tp_size=tp_size,
-        dp_size=dp_size,
-    )
-    
-    # Create parallel config for the planner.
-    parallel_config = ParallelConfig(
-        tensor_model_parallel_size=tp_size,
-        pipeline_model_parallel_size=pp_size,
-    )
-    planner_ws = tp_size * dp_size * pp_size
-    planner = Planner(
-            world_size=planner_ws,  # Should be the number of GPU. Not Attention server world size.
-            parallel_config = parallel_config,
-            tolerance_factor = 0.1,
-            model_config = None)
-    batch = seq_lens.tolist()
-    print("batch =", batch)
-    
-    items = batch_to_items_class(batch,model_config=hf_config)
-
-    (
-        mlp_num_seqs,
-        mlp_q_dispatch_fwd,
-        mlp_seq_len,
-        kv_to_q_mapping,
-        kv_to_q_rank,
-        kv_context_size,
-        q_to_num_kv_seq,
-        q_to_num_kv_tokens
-    ) = planner.plan_to_raw_qkv_dispatch(items, verbose=True)
-
-    (_, _, _, _,
-     fa_fwd_params, fa2a_fwd_metadata) = compute_e2e_fa2a_metadata(
-        mlp_seq_len, mlp_num_seqs, mlp_q_dispatch_fwd,
-        kv_to_q_mapping, kv_to_q_rank,
-        kv_context_size, q_to_num_kv_seq, q_to_num_kv_tokens,
-        hidden_size_q, hidden_size_k,
-        element_size, softmax_lse_size
-    )
-    (qkv_fwd_fa2a_metadata, _, attn_out_fwd_fa2a_metadata, _,
-    ) = fa2a_fwd_metadata
-
-    reversed_seqlens = create_pipeline_seqlens(
-        seq_lens, add_dummy=False, is_backward=True,
-        **create_pp_doclen_kwargs,
-        tp_size=tp_size,
-        dp_size=dp_size,
-    )
-    # NOTE: those begin with bwd_ is mostly the flip of the original value.
-    (bwd_mlp_seq_len, bwd_mlp_num_seqs, mlp_q_dispatch_bwd,
-     bwd_kv_to_q_mapping, bwd_kv_to_q_rank, bwd_kv_context_size,
-     bwd_q_to_num_kv_seq, bwd_q_to_num_kv_tokens
-    ) = create_raw_qkv_dispatch(
-        world_size, total_seq_len, num_seqs, max_cp_degree,
-        return_mlp_no_shard_seq_lens=False,
-        seq_lens=reversed_seqlens,
-    )
-
-    (fa_bwd_params, attn_out_qkv_bwd_fa2a_metadata, qkv_bwd_fa2a_metadata
-     ) = compute_backward_resend_e2e_metadata(
-        bwd_mlp_seq_len, bwd_mlp_num_seqs, mlp_q_dispatch_bwd,
-        bwd_kv_to_q_mapping, bwd_kv_to_q_rank, bwd_kv_context_size,
-        bwd_q_to_num_kv_seq, bwd_q_to_num_kv_tokens,
-        hidden_size_q, hidden_size_k, element_size, softmax_lse_size,
-    )
-    return (fa_fwd_params, fa_bwd_params,
-            qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
-            attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
-            seq_lens,)
-
-
-def create_qkv_dispatch_with_custom_mapping(
-    world_size: int, 
-    seq_lens: 'torch.Tensor[world_size, max_num_seqs]',
-    # cp_num[src_rank, seq_id] = num_cp_shards
-    cp_num: 'torch.Tensor[world_size, max_num_seqs]',
-    # cp_dst[src_rank, seq_id, shard_id] = dst_rank (or -1 as null)
-    cp_dst: 'torch.Tensor[world_size, max_num_seqs, max_cp_degree]',
-    # seq_shard_lens[src_rank, seq_id, shard_id] = shard_len (or 0 as null)
-    seq_shard_lens: 'torch.Tensor[world_size, max_num_seqs, max_cp_degree]',
-    return_intermediate: bool=False, return_mlp_no_shard_seq_lens: bool=False,
-    verbose: bool=False,
-):
-    """
-    Test a case where we deliberately construct a flops-balanced 2CP case..
-    """
-    VERBOSE = verbose
-    def print_if_verbose(*args, **kwargs):
-        if VERBOSE:
-            rich.print(*args, **kwargs)
-
-    num_seqs = seq_lens.shape[1]
-    max_cp_degree = cp_dst.shape[2]
-    
-    assert seq_lens.shape == (world_size, num_seqs)
-    assert seq_lens.min() >= 0
-    assert cp_num.shape == (world_size, num_seqs)
-    assert cp_num.min() >= 0
-    assert cp_dst.shape == (world_size, num_seqs, max_cp_degree)
-
-    
-    print_if_verbose("seq_lens =", seq_lens)
-    print_if_verbose("cp_num =", cp_num)
-
-    def check_seq_lens():
-        for i in range(world_size):
-            for j in range(num_seqs):
-                if seq_lens[i, j] == 0:
-                    # Then everything k > j should also be 0
-                    for k in range(j + 1, num_seqs):
-                        assert seq_lens[i, k] == 0, f"seq_lens[{i}, {k}] = {seq_lens[i, k]} is not 0"
-        return
-
-    check_seq_lens()
-    print_if_verbose("seq_lens =", seq_lens)
-
-    # # init cp send dstination.
-    # cp_dst_helper = torch.rand((world_size, num_seqs, max_cp_degree)).argsort(dim=2)
-    # cp_dst_helper = cp_dst_helper % world_size # ensure everything is in the range of world_size
-    # cp_dst = cp_dst_helper[:, :, :max_cp_degree]
-    # mask = torch.arange(max_cp_degree).expand(world_size, num_seqs, max_cp_degree)
-    # cp_num_expanded = cp_num.unsqueeze(-1)
-    # mask = mask >= cp_num_expanded
-    # cp_dst[mask] = -1
-
-    # check: cp_dst[src_rank, seq_id, shard_id] >= 0 if shard_id < cp_num[src_rank, seq_id]
-    def check_cp_dst():
-        for i in range(world_size):
-            for j in range(num_seqs):
-                num_cp = int((cp_num[i, j]).item())
-                for k in range(max_cp_degree):
-                    if k < num_cp:
-                        assert cp_dst[i, j, k] >= 0, f"cp_dst[{i}, {j}, {k}] = {cp_dst[i, j, k]} is not >= 0"
-                    else:
-                        assert cp_dst[i, j, k] == -1, f"cp_dst[{i}, {j}, {k}] = {cp_dst[i, j, k]} is not -1"
-        return
-    
-    check_cp_dst()
-    print_if_verbose("cp_dst =", cp_dst)
-
-    # Prepare the sequence length for each shard
-    # seq_shard_lens = torch.zeros((world_size, num_seqs, max_cp_degree), dtype=torch.int64)
-    # for i in range(world_size):
-    #     for j in range(num_seqs):
-    #         num_cp = int((cp_num[i, j]).item())
-    #         seq_len = seq_lens[i, j]
-    #         seq_shard_lens[i, j, :num_cp] = seq_len // num_cp
-    def check_seq_shard_lens():
-        for i in range(world_size):
-            for j in range(num_seqs):
-                # Check if the shard length is valid.
-                num_cp = int((cp_num[i, j]).item())
-                for k in range(max_cp_degree):
-                    if k < num_cp:
-                        assert seq_shard_lens[i, j, k] > 0, f"seq_shard_lens[{i}, {j}, {k}] = {seq_shard_lens[i, j, k]} is not >= 0"
-                    else:
-                        assert seq_shard_lens[i, j, k] == 0, f"seq_shard_lens[{i}, {j}, {k}] = {seq_shard_lens[i, j, k]} is not 0"
-                # Check the sum of this sequence matches seq_len[i, j]
-                assert seq_shard_lens[i, j, :num_cp].sum() == seq_lens[i, j], f"seq_shard_lens[{i}, {j}, :{num_cp}].sum() = {seq_shard_lens[i, j, :num_cp].sum()} is not equal to seq_lens[{i}, {j}] = {seq_lens[i, j]}"
-        return
-    
-    check_seq_shard_lens()
-    print_if_verbose("seq_shard_lens =", seq_shard_lens)
-
-    # q_global_dispatch tensor:
-    num_cp_shards = cp_num.sum(dim=1)
-    pad_len = torch.max(num_cp_shards)
-    print_if_verbose("num_cp_shards =", num_cp_shards)
-
-    cp_seq_lens = torch.zeros(world_size, pad_len, dtype=torch.int64)
-    cp_query_dst = torch.ones(world_size, pad_len, dtype=torch.int64) * -1
-    kv_to_q_mapping = torch.ones((world_size, pad_len, max_cp_degree, 2), dtype=torch.int64) * -1
-    kv_to_q_rank = torch.ones((world_size, pad_len, max_cp_degree), dtype=torch.int64) * -1
-    kv_context_size = torch.zeros((world_size, pad_len), dtype=torch.int64)
-    q_to_num_kv_seq = torch.zeros((world_size, pad_len), dtype=torch.int64)
-
-
-    # cumulative number of cp shards before this one.
-    num_cul_cp_shards = exclusive_cumsum(cp_num, dim=1)
-    print_if_verbose("num_cul_cp_shards =", num_cul_cp_shards)
-
-    # breakpoint()
-
-    for i in range(world_size):
-        cp_seq_lens_local = []
-        cp_query_dst_local = []
-        kv_to_q_mapping_local = []
-        kv_to_q_rank_local = []
-        kv_context_size_local = []
-        q_to_num_kv_seq_local = []
-
-        for j in range(num_seqs):
-            num_cp = int((cp_num[i, j]).item())
-            seq_len = seq_lens[i, j]
-            if seq_len == 0:
-                break
-            # seq_shard_len = seq_len // num_cp
-            _seq_shard_len = seq_shard_lens[i, j, :num_cp]
-            try:
-                _kv_context_size_seq = exclusive_cumsum(_seq_shard_len, dim=0)
-            except Exception as e:
-                breakpoint()
-
-            cp_seq_lens_local.append(_seq_shard_len)
-            cp_query_dst_local.append(cp_dst[i, j, :num_cp].flatten())
-            #### Compute kv_to_q_mapping.
-            row_indices = torch.arange(num_cp).view(-1, 1)
-            col_indices = torch.arange(max_cp_degree).view(1, -1)
-            mask = col_indices < (num_cp - row_indices)
-            kv_to_q_mapping_seq = torch.empty((num_cp, max_cp_degree, 2), dtype=torch.int64)
-            # All q shards are on this node (TODO: we are testing MLP-DP. For MLP-CP, this is different).
-            kv_to_q_mapping_seq[..., 0] = torch.where(mask, i, -1)
-            vals_ch1 = row_indices + col_indices + num_cul_cp_shards[i, j]
-            kv_to_q_mapping_seq[..., 1] = torch.where(mask, vals_ch1, -1)
-            kv_to_q_mapping_local.append(kv_to_q_mapping_seq)
-            #### Compute kv_to_q_rank (Index of this KV to the query's dst).
-            kv_to_q_rank_seq = torch.arange(num_cp).view(-1, 1).repeat(1, max_cp_degree) * mask + (mask.int() - 1)
-            kv_to_q_rank_local.append(kv_to_q_rank_seq)
-            #### Compute kv context size (For this kv, how many tokens are in the context).
-            kv_context_size_seq = _kv_context_size_seq
-            kv_context_size_local.append(kv_context_size_seq)
-            #### Compute q_to_num_kv_seq (For this kv, how many shards are in the context).
-            q_to_num_kv_seq_seq = torch.arange(num_cp) + 1
-            q_to_num_kv_seq_local.append(q_to_num_kv_seq_seq)
-
-        cp_seq_lens_local = torch.cat(cp_seq_lens_local, dim=0)
-        cp_query_dst_local = torch.cat(cp_query_dst_local, dim=0)
-        kv_to_q_mapping_local = torch.cat(kv_to_q_mapping_local, dim=0)
-        kv_to_q_rank_local = torch.cat(kv_to_q_rank_local, dim=0)
-        kv_context_size_local = torch.cat(kv_context_size_local, dim=0)
-        q_to_num_kv_seq_local = torch.cat(q_to_num_kv_seq_local, dim=0)
-        # shape check:
-        seq_shards = cp_seq_lens_local.shape[0]
-        assert cp_seq_lens_local.shape == (seq_shards,)
-        assert cp_query_dst_local.shape == (seq_shards,)
-        assert kv_to_q_mapping_local.shape == (seq_shards, max_cp_degree, 2)
-        assert kv_to_q_rank_local.shape == (seq_shards, max_cp_degree)
-        assert kv_context_size_local.shape == (seq_shards,)
-        assert q_to_num_kv_seq_local.shape == (seq_shards,)
-
-        cp_seq_lens[i, :seq_shards] = cp_seq_lens_local
-        cp_query_dst[i, :seq_shards] = cp_query_dst_local
-        kv_to_q_mapping[i, :seq_shards] = kv_to_q_mapping_local
-        kv_to_q_rank[i, :seq_shards] = kv_to_q_rank_local
-        kv_context_size[i, :seq_shards] = kv_context_size_local
-        q_to_num_kv_seq[i, :seq_shards] = q_to_num_kv_seq_local
-
-    q_to_num_kv_tokens = kv_context_size + cp_seq_lens
-
-    print_if_verbose("cp_seq_lens =", cp_seq_lens)
-    print_if_verbose("cp_query_dst =", cp_query_dst)
-    print_if_verbose("kv_to_q_mapping =", kv_to_q_mapping)
-    print_if_verbose("kv_to_q_rank =", kv_to_q_rank)
-    print_if_verbose("kv_context_size =", kv_context_size)
-    print_if_verbose("q_to_num_kv_seq =", q_to_num_kv_seq)
-    print_if_verbose("q_to_num_kv_tokens =", q_to_num_kv_tokens)
-
-    # TODO: Use the compute_metadata_e2e() instead.
-    fwd_q_metadata, rev_q_metadata, q_intermediates = compute_metadata(
-        cp_seq_lens, cp_query_dst, return_intermediate=True
-    )
-    _, q_seq_to_dst, _ = q_intermediates
-    fwd_k_metadata, rev_k_metadata, kv_intermediates = compute_metadata_kv(
-        kv_to_q_mapping, kv_to_q_rank, kv_context_size, q_to_num_kv_seq,
-        q_to_num_kv_tokens, cp_seq_lens, num_cp_shards, cp_query_dst,
-        q_seq_to_dst.squeeze(2), pad_len,
-        return_intermediate=True
-    )
-    attention_metadata = compute_attn_layout_seqlens(
-        cp_seq_lens, q_to_num_kv_tokens, cp_query_dst, shard_to_tuple=True
-    )
-    ret = (
-        fwd_q_metadata, rev_q_metadata, fwd_k_metadata, rev_k_metadata, attention_metadata
-    )
-    print_if_verbose("fwd_q_metadata =", fwd_q_metadata)
-    print_if_verbose("rev_q_metadata =", rev_q_metadata)
-    print_if_verbose("fwd_k_metadata =", fwd_k_metadata)
-    print_if_verbose("rev_k_metadata =", rev_k_metadata)
-    print_if_verbose("attention_metadata =", attention_metadata)
-
-    if return_intermediate:
-        intermediates = q_intermediates + kv_intermediates
-        ret += (intermediates,)
-    if return_mlp_no_shard_seq_lens:
-        ret += (seq_lens,)
-    return ret

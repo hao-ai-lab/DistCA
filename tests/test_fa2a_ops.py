@@ -1,7 +1,5 @@
 import torch
 
-from d2.runtime.inplace_metadata import Metadata
-
 from d2.runtime.attn_kernels.ops import (
     fast_a2a_memcpy_non_cp, fast_a2a_memcpy_cp
 )
@@ -10,7 +8,7 @@ from d2.runtime.compute_metadata import from_planner_output
 from test_util import create_random_shard_info
 from test_fa2a_metadata import (
     simulate_fa2a_copy_non_cp, simulate_fa2a_copy_cp,
-    simulate_fa2a, 
+    simulate_fa2a,
 )
 
 

@@ -175,6 +175,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
                            max_cp_degree: int, hidden_size_q_tp: int,
                            hidden_size_k_tp: int, element_size: int,
                            num_head_in_dtype: int, tp_size: int, dp_size: int,
+                           num_token_per_rank: int,
                            use_planner: bool=False):
     tick_per_rank_doc_lens = None
     bwd_metadata = []
@@ -200,6 +201,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
             add_dummy=add_dummy_forward,
             tp_size=tp_size,
             dp_size=dp_size,
+            num_token_per_rank=num_token_per_rank,
             use_planner=use_planner
         )
         this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
@@ -237,6 +239,7 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
     pp_rank = as_rank // dp_size
     dp_rank = as_rank % dp_size
 
+
     # put bwd metadata to the corresponding side
     for i, microbatch in enumerate(microbatches):
         # When mb_i is computed on pp_rank at forward tick t, assume the backward right after this forward is at tick t'.
@@ -259,10 +262,11 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
 def test(args):
     seed = args.seed
     # test scale
-    num_tokens = args.num_tokens
+    num_tokens = args.num_tokens   
     max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
-    total_seq_len = args.num_tokens
+    total_seq_len = args.num_tokens 
+    num_token_per_rank = num_tokens      # num_token_per_rank = num_tokens in DP case. CP case, num_token_per_rank need to be deduced.
     # parallelization
     tp_size = args.tp_size
     pp_size = args.pp_size
@@ -312,13 +316,15 @@ def test(args):
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-        tp_size, dp_size, args.use_planner,
+        tp_size, dp_size, num_token_per_rank,
+        args.use_planner,
     )
     microbatches_1 = create_pp_microbatches(
         args.num_microbatch, pp_size, as_rank,
         as_world_size, total_seq_len, num_seqs, max_cp_degree,
         hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-        tp_size, dp_size, args.use_planner,
+        tp_size, dp_size, num_token_per_rank,
+        args.use_planner,
     )
     set_random_seed(seed, set_megatron=True)
     microbatches = []
