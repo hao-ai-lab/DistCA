@@ -57,8 +57,9 @@ for model_config in \
 
 #    s r b   tok  e N mode
 configs=(
+    "1 1 4  131072 2  8   wlbllm 8"
+    "1 1 4  131072 2  8   wlbllm 4"
     # "1 1 16  131072 2  32    d2"
-    "1 1 4  131072 2  8   wlbllm"
     # "1 1 8  262144 4  32    d2"
     # "1 1 8  262144 4  32   wlbllm"
     # "1 1 4  524288 8  32    d2"
@@ -86,7 +87,7 @@ export EXPERIMENT_PROFILE_RUN=0
 
 
 for config in "${configs[@]}"; do
-    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes mode <<< "$config"
+    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes mode cp_size <<< "$config"
     read -r sample_name change_long_doc_ratio <<< "$sample_config"
     read -r model_path attn_linear_breakpoint num_layers <<< "$model_config"
     
@@ -101,6 +102,7 @@ for config in "${configs[@]}"; do
     export CHANGE_LONG_DOC_RATIO=$change_long_doc_ratio
     export ATTN_LINEAR_BREAKPOINT=$attn_linear_breakpoint
     export NUM_LAYERS=$num_layers
+    export CP_SIZE=$CP_SIZE
 
     
     if [ "$mode" == "d2" ]; then
@@ -118,33 +120,16 @@ for config in "${configs[@]}"; do
     fi
     
     
-    
-    # for CP_SIZE in 32 16 8 4 2 1; do
     if [ "$mode" == "wlbllm" ]; then
         # Run wlbllm mode with different CP sizes
-        counter=0
-        for CP_SIZE in 32; do
-            if [ $CP_SIZE -gt $NNODES ]; then
-                continue
-            fi
-            DP_SIZE=$((NNODES / CP_SIZE))
-            if [ $DP_SIZE -gt $(($BATCH_SIZE * 2)) ]; then
-                continue
-            fi
-
-            export MODE=wlbllm CP_SIZE=$CP_SIZE
-            export OUTPUT_DIR_SUFFIX_ADDON=""
-            echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-            if [ $DRY_RUN -eq 0 ]; then
-                bash test_e2e_combined.salloc.sh
-                echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-                echo "\a"
-            fi
-            counter=$((counter + 1))
-            if [ $counter -ge 2 ]; then
-                break
-            fi
-        done
+        export MODE=wlbllm CP_SIZE=$CP_SIZE
+        export OUTPUT_DIR_SUFFIX_ADDON=""
+        echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
+        if [ $DRY_RUN -eq 0 ]; then
+            bash test_e2e_combined.salloc.sh
+            echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
+            echo "\a"
+        fi    
     fi
 
 
