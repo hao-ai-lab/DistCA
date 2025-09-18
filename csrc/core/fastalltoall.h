@@ -40,7 +40,8 @@ int launch_alltoallv(
   int64_t my_rank_recv_offset,
   int64_t my_rank_send_sz,
   cudaStream_t stream,
-  int64_t buffer_size
+  int64_t buffer_size,
+  bool separate_send_recv
 );
 
 void launch_buffer_availability_kernel(
