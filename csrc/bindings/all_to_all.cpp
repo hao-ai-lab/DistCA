@@ -229,7 +229,8 @@ void fast_a2a(
     my_rank_send_offset,
     my_rank_recv_offset,
     my_rank_send_sz,
-    stream
+    stream,
+    dispatch_helper->_buffer_size
   );
 }
 

@@ -24,7 +24,8 @@ __global__ void spreadout_alltoallv_internode_kernel(
   const uint64_t * inter_sender_transfer_sz,
   const uint64_t * inter_sender_recv_disp,
   const uint64_t * inter_recver_transfer_sz,
-  const bool do_print
+  const bool do_print,
+  const int64_t buffer_size // in bytes
 ) {
   const uint32_t warp_id = threadIdx.x / THREAD_N_PER_WARP;
   const uint32_t lane_id = threadIdx.x % THREAD_N_PER_WARP;
@@ -55,14 +56,13 @@ __global__ void spreadout_alltoallv_internode_kernel(
           send_rank_id
         );
         if (do_print && lane_id == 0 &&
-            ((uint64_t)(recv_buffer + recv_offset + send_sz) > (uint64_t)(sync_signal))) {
+            (recv_offset + send_sz) > (buffer_size)
+          ) {
           printf(
             "Overflow!!! sending %lu bytes from %d to %d, "
-            "signal address %p, recv address start %p, recv address end %p, "
-            "send size %lu, recv offset %lu, recv buffer start %p\n",
+            "recv offset %lu, send size %ld, buffer size %ld. \n",
             send_sz, this_rank, send_rank_id,
-            &sync_signal[this_rank], recv_buffer + recv_offset, recv_buffer + recv_offset + send_sz,
-            send_sz, recv_offset, recv_buffer);
+            recv_offset, send_sz, buffer_size);
         }
       }
     }
@@ -149,7 +149,8 @@ int launch_alltoallv(
   int64_t my_rank_send_offset,
   int64_t my_rank_recv_offset,
   int64_t my_rank_send_sz,
-  cudaStream_t stream
+  cudaStream_t stream,
+  int64_t buffer_size
 ) {
   int device_id = -1;
   CUDACHECK(cudaGetDevice(&device_id));
@@ -167,6 +168,7 @@ int launch_alltoallv(
     &inter_params->sender_recv_disp,
     &inter_params->recver_transfer_sz,
     &do_print,
+    &buffer_size
   };
   dim3 inter_grid(1, 1, 1), inter_block(THREAD_N_PER_2WARP, 1, 1);
   CUDACHECK(cudaLaunchKernel(
@@ -178,6 +180,13 @@ int launch_alltoallv(
       stream
     ));
   // The local communication
+  // Print the arguments
+  printf(
+    "Calling cudaMemcpyAsync with arguments: %ld, %ld, %ld\n",
+    my_rank_recv_offset,
+    my_rank_send_offset,
+    my_rank_send_sz
+  );
   CUDACHECK(cudaMemcpyAsync(
     buf->recv_buffer + my_rank_recv_offset,
     buf->send_buffer + my_rank_send_offset,
