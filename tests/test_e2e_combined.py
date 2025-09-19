@@ -523,6 +523,7 @@ try:
     import wlbllm.registry
     import wlbllm.megatron_patch.dot_product_attention
     import wlbllm.megatron_patch.backends
+    from wlbllm.fastmemcpy.fast_memcpy import prepare_metadata as wlb_memcpy_prepare_metadata
 except ImportError:
     print("""⚠️ WLBLLM is not installed. This only affects if you're testing WLBLLM tests. To install:
 
@@ -793,6 +794,9 @@ def test(args):
             doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
                 doc_lens, context_length, cp_size
             )
+            chunk_size = context_length // (2 * cp_size)
+            with torch.no_grad():
+                wlb_memcpy_args = wlb_memcpy_prepare_metadata(doc_shards, device, cp_size, chunk_size)
             # debug_print(f"doc_shards", doc_shards)
             (
                 cu_seqlens_q_list, cu_seqlens_k_list, 
@@ -862,6 +866,7 @@ def test(args):
             wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
             wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
             wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
+            wlbllm.registry.set("memcpy_args", wlb_memcpy_args)
 
         
         elif mode == "d2":
