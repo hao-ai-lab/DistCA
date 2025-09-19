@@ -24,12 +24,12 @@ def prepare_metadata(doc_shards: list[list[doc_shard]], device: torch.device,
     chunk_shard_lens = torch.tensor([
         [ds.shard_len if ds is not None else 0 for ds in cds]
         for cds in doc_shards
-    ], dtype=torch.uint64, device=device)
+    ], dtype=torch.int64, device=device)
 
     # compute the current shard's offset at dst layout
     intra_chunk_offset = _exclusive_cumsum(chunk_shard_lens, dim=1)
     # here we use chunk_size instead of sum(shard_lens_on_rank) because there are padding values.
-    chunk_offset = chunk_size * torch.arange(0, cp_size * 2, device=device, dtype=torch.uint64)
+    chunk_offset = chunk_size * torch.arange(0, cp_size * 2, device=device, dtype=torch.int64)
     shard_src_offset = intra_chunk_offset + chunk_offset.unsqueeze(1)
 
     # return value is in the (docs, chunks) layout
@@ -67,14 +67,14 @@ def _shuffle_per_doc_cp(context_length: int, tensor_list, cp_size: int,
                         shard_src_offset: torch.Tensor, num_tokens: int):
     gathered_tensor = prepare_tensor(tensor_list, context_length, cp_size)
     out_shape = (num_tokens,) + gathered_tensor.shape[2:]
-    gathered_tensor = gathered_tensor.flatten(start_dim=2)
+    gathered_tensor = gathered_tensor.flatten(start_dim=2).contiguous()
     shuffled_tensor = torch.empty(out_shape, dtype=gathered_tensor.dtype, device=gathered_tensor.device)
-    shuffled_tensor = shuffled_tensor.flatten(start_dim=1)
+    shuffled_tensor = shuffled_tensor.flatten(start_dim=1).contiguous()
 
     gathered_shuffled_switch(gathered_tensor, shuffled_tensor, chunk_shard_lens, shard_src_offset,
                              is_from_gathered=True)
     shuffled_tensor = shuffled_tensor.reshape(out_shape)
-    return shuffled_tensor
+    return shuffled_tensor.contiguous()
 
 
 def kv_shuffle_for_per_doc_cp_fast(
@@ -94,8 +94,8 @@ def _unshuffle_per_doc_cp(context_length: int, grad_shuffled: torch.Tensor, cp_s
     chunk_size = context_length // (2 * cp_size)
     gathered_tensor_shape = (cp_size * 2, chunk_size) + grad_shuffled.shape[1:]
     gathered_tensor = torch.empty(gathered_tensor_shape, dtype=grad_shuffled.dtype, device=grad_shuffled.device)
-    grad_shuffled = grad_shuffled.flatten(start_dim=1)
-    gathered_tensor = gathered_tensor.flatten(start_dim=1)
+    grad_shuffled = grad_shuffled.flatten(start_dim=1).contiguous()
+    gathered_tensor = gathered_tensor.flatten(start_dim=2).contiguous()
     gathered_shuffled_switch(
         gathered_tensor, grad_shuffled, chunk_shard_lens, shard_src_offset,
         is_from_gathered=False
@@ -103,9 +103,9 @@ def _unshuffle_per_doc_cp(context_length: int, grad_shuffled: torch.Tensor, cp_s
     gathered_tensor = gathered_tensor.reshape(gathered_tensor_shape)
     per_rank_tensor = [
         torch.concat((gathered_tensor[rank], gathered_tensor[2 * cp_size - 1 - rank])).contiguous()
-        for rank in cp_size
+        for rank in range(cp_size)
     ]
-    return per_rank_tensor
+    return torch.concat(per_rank_tensor, dim=0).contiguous()
 
 
 def kv_unshuffle_for_per_doc_cp_fast(

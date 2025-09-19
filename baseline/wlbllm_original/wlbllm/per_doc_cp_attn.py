@@ -26,6 +26,7 @@ from wlbllm.utils import (
     kv_unshuffle_for_per_doc_cp,
     compute_per_doc_cp_shard_doc_len,
 )
+from wlbllm.fastmemcpy.fast_memcpy import kv_shuffle_for_per_doc_cp_fast, kv_unshuffle_for_per_doc_cp_fast
 
 import wlbllm.registry
 
@@ -150,7 +151,13 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
                 if ENABLE_SHUFFLE:
                     start_time__shuffle = time.time()
-                    k_global, v_global = kv_shuffle_for_per_doc_cp(context_length, gather_k_list, gather_v_list, doc_lens, doc_shards, cp_size)
+
+                    chunk_shard_lens, shard_src_offset, num_tokens = wlbllm.registry.get("memcpy_args")
+                    k_global, v_global = kv_shuffle_for_per_doc_cp_fast(
+                        context_length, gather_k_list, gather_v_list, cp_size,
+                        chunk_shard_lens, shard_src_offset, num_tokens
+                    )
+
                     end_time__shuffle = time.time()
                     duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
                     debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
@@ -311,7 +318,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
         """
         log_memory_usage("PerDocumentCPAttention.backward(init)")
 
-        ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "1") == "1"
+        ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "0") == "1"
 
         nvtx_range_push("wlbllm.PerDocumentCPAttention.bwd")
 
@@ -386,7 +393,13 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         if ENABLE_SHUFFLE:
             start_time__unshuffle = time.time()
-            dk_global, dv_global = kv_unshuffle_for_per_doc_cp(context_length, dk_global, dv_global, doc_lens, doc_shards, cp_size)
+
+            chunk_shard_lens, shard_src_offset, num_tokens = wlbllm.registry.get("memcpy_args")
+            dk_global, dv_global = kv_unshuffle_for_per_doc_cp_fast(
+                context_length, dk_global, dv_global, cp_size,
+                chunk_shard_lens, shard_src_offset
+            )
+            # dk_global, dv_global = kv_unshuffle_for_per_doc_cp(context_length, dk_global, dv_global, doc_lens, doc_shards, cp_size)
             end_time__unshuffle = time.time()
             duration_ms__unshuffle = (end_time__unshuffle - start_time__unshuffle) * 1000
             # debug_print(f"🟡 PerDocumentCPAttention kv_unshuffle_for_per_doc_cp time: {duration_ms__unshuffle} ms")

@@ -21,8 +21,8 @@ template <bool IS_FORWARD>
 __global__ void wlb_shuffle_memcpy_kernel(
   uint8_t *gathered,
   uint8_t *shuffled,
-  const uint64_t *shard_lens,
-  const uint64_t *shard_gathered_offsets,
+  const int64_t *shard_lens,
+  const int64_t *shard_gathered_offsets,
   const size_t num_docs,
   const size_t num_total_tokens,
   const size_t hidden_bytes
@@ -83,8 +83,8 @@ __global__ void wlb_shuffle_memcpy_kernel(
 void launch_wlb_shuffle_memcpy(
   uint8_t *gathered,
   uint8_t *shuffled,
-  const uint64_t *shard_lens,
-  const uint64_t *shard_gathered_offsets,
+  const int64_t *shard_lens,
+  const int64_t *shard_gathered_offsets,
   const size_t num_docs,
   const size_t num_total_tokens,
   const size_t hidden_bytes,
@@ -111,8 +111,8 @@ void launch_wlb_shuffle_memcpy(
   void *args[] = {
     &gathered,
     &shuffled,
-    const_cast<uint64_t **>(&shard_lens),
-    const_cast<uint64_t **>(&shard_gathered_offsets),
+    const_cast<int64_t **>(&shard_lens),
+    const_cast<int64_t **>(&shard_gathered_offsets),
     const_cast<size_t *>(&num_docs),
     const_cast<size_t *>(&num_total_tokens),
     const_cast<size_t *>(&hidden_bytes)

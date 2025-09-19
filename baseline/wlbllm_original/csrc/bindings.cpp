@@ -35,8 +35,9 @@ void wlb_shuffle_memcpy(
   _CHECK_TENSOR(2, shard_lens)
   _CHECK_TENSOR(2, shard_gathered_offsets)
 
-  const size_t hidden_bytes = gathered_tensor.stride(2);
-  TORCH_CHECK(hidden_bytes == shuffled_tensor.stride(1));
+  const size_t hidden_sizes = gathered_tensor.size(2);
+  TORCH_CHECK(hidden_sizes == shuffled_tensor.size(1));
+  const size_t hidden_bytes = hidden_sizes * gathered_tensor.element_size();
 
   const size_t num_docs = shard_lens.size(0);
   const size_t num_shards = shard_lens.size(1);
@@ -48,8 +49,8 @@ void wlb_shuffle_memcpy(
   launch_wlb_shuffle_memcpy(
     (uint8_t *)gathered_tensor.data_ptr(),
     (uint8_t *)shuffled_tensor.data_ptr(),
-    shard_lens.const_data_ptr<uint64_t>(),
-    shard_gathered_offsets.const_data_ptr<uint64_t>(),
+    shard_lens.data_ptr<int64_t>(),
+    shard_gathered_offsets.data_ptr<int64_t>(),
     num_docs,
     num_total_tokens,
     hidden_bytes,
