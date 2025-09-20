@@ -260,7 +260,7 @@ def test(args):
         args_dict = vars(args)
         json.dump(args_dict, f, indent=2)
     
-    memory_usage_dir = os.path.join(output_dir, "memory_usage")
+    memory_usage_dir = os.path.join(output_dir, "mem-log")
     os.makedirs(memory_usage_dir, exist_ok=True)
     os.environ["WLBLLM_MODE"] = "1"
     seed = args.seed
@@ -336,14 +336,30 @@ def test(args):
         MegatronE2eWorker,
     )
     worker.set_config(dtype=dtype)
+
+    enable_gradient_checkpointing = False
+    gradient_checkpointing_kwargs = {}
+    if os.environ.get("EXPERIMENT_ADD_SELECTIVE_CKPT", "0") == "1":
+        enable_gradient_checkpointing = True
+        gradient_checkpointing_kwargs = dict(
+                activations_checkpoint_method="mlp",
+                activations_checkpoint_granularity="selective",
+                activations_checkpoint_num_layers=None, # num-layers
+                activations_checkpoint_recompute_modules = ["mlp"],
+            )
+        # print(f"🟡 [Rank {worker.rank}] Adding selective checkpoint: {gradient_checkpointing_kwargs}")
+    worker.set_config(
+        dtype=dtype,
+        enable_gradient_checkpointing=enable_gradient_checkpointing,
+        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+    )
     worker.init(model_path, seed=seed)
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
+
     enable_memory_usage_logging(memory_usage_dir)
-
-
-    log_memory_usage("init worker done")
+    log_memory_usage("init worker done", force=True)
 
     # Check rank correctness
     dp_rank = mpu.get_data_parallel_rank()

@@ -629,7 +629,8 @@ def test(args):
                 wlbllm.registry.set("cu_seqlens_kv_list", cu_seqlens_k_list)
                 wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
                 wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
-                wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
+                # wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
+                wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size))
             wlbllm_metadatas.append(register_wlbllm_variables)
             pass
 

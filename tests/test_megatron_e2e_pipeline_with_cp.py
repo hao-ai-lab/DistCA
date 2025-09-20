@@ -388,7 +388,7 @@ def test(args):
     model_path = args.model_path
 
     should_log_memory_during_warmup = (
-        os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP", "0") == "1"
+        os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP", "1") == "1"
     )
 
     setup_global_batch(

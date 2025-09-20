@@ -1,5 +1,14 @@
+# 
+# Usage
+#   export JOBID=<JOBID>
+#   export NNODES=<NNODES>
+#   bash salloc_srun.sh
+# 
+# set -e
+
 export NNODES=${NNODES:-32}
 export TP_SIZE=8
+# export JOBID=
 
 JOBID=${JOBID:-${SLURM_JOB_ID}}
 if [ -z "$JOBID" ]; then
@@ -15,12 +24,13 @@ sleep 1
 
 
 TS=$(TZ=America/Los_Angeles date +%m%d_%H%M%S)_PST
-
+export OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250919_allgather_percentage/logs.v1-allgather_percentage"
+export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2
 export TP_SIZE=8
 # export EXPERIMENT_LOG_MEMORY_USAGE=1
 export EXPERIMENT_LOG_MEMORY_USAGE=0
 export EXPERIMENT_REPEAT_TIMES=1
-export EXPERIMENT_WARMUP_TIMES=3
+export EXPERIMENT_WARMUP_TIMES=0
 export EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND=1 # default 1
 export SHOULD_ADD_DEBUG_CASES=0
 export EXPERIMENT_SKIP_OPTIMIZER_STEP=1
@@ -29,20 +39,37 @@ export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=0
 # export EXPERIMENT_FA2A_BARRIER=1
 # export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=0 # default 0
 
-# torch: avoid recording streams 
-export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 
 DRY_RUN=${DRY_RUN:-0}
+
+# export MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+# export MODEL_PATH=codellama/CodeLlama-34b-hf
+# export MODEL_PATH=codellama/CodeLlama-34b-hf
+
+export EXPERIMENT_D2_BALANCE_PING_PONG=0
 
 # ------------------------------------
 # Check and skip success runs
 # ------------------------------------
 
-export ENABLE_NSYS=1
-export MAX_SAMPLE_ID=7
+# check the success_eids.txt file
+# SUCCESS_EIDS=""
+# if [ -f $eid_file ]; then
+#     SUCCESS_EIDS=$(cat $eid_file)
+#     echo "🟡 SUCCESS_EIDS=$SUCCESS_EIDS"
+# else
+#     echo "🟡 $eid_file file does not exist"
+# fi
 
-export OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250918_remove_wlb_memcpy/logs.v1-debug-pretrain-8b"
-echo "Output will go to directory: $OUTPUT_DIR_PREFIX"
+# Distribution Name
+# CHANGE_LONG_DOC_RATIO  
+# ATTN_LINEAR_BREAKPOINT
+
+export EXPERIMENT_FA2A_SPLIT_SENDRECV=1
+
+export ENABLE_NSYS=1
+export MAX_SAMPLE_ID=1
+export SHOULD_ADD_DEBUG_CASES=1
 
 # Run one d2 + one wlbllm-cpMax to justify the result.
 for sample_config in \
@@ -52,42 +79,18 @@ for sample_config in \
 # "astronomer/Llama-3-70B-Special-Tokens-Adjusted 170000 80" \
 # "codellama/CodeLlama-34b-hf 131072 48" \
 for model_config in \
-"deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
+"deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 4" \
 ; do
 
-#    s r b   tok  e N mode
-configs=(
-    "1 1 4  131072 2  8   wlbllm 8"
-    "1 1 4  131072 2  8   wlbllm 4"
-    # "1 1 16  131072 2  32    d2"
-    # "1 1 8  262144 4  32    d2"
-    # "1 1 8  262144 4  32   wlbllm"
-    # "1 1 4  524288 8  32    d2"
-    # "1 1 4  524288 8  32   wlbllm"
-
-    # "1 1 8  131072 2  16    d2"
-    # "1 1 8  131072 2  16   wlbllm"
-    # "1 1 4  262144 4  16    d2"
-    # "1 1 4 262144 4  16   wlbllm"
-    # "1 1 2 524288 8  16    d2"
-    # "1 1 2 524288 8  16   wlbllm"
-    
-    # "1 1 4  131072 2   8    d2"
-    # "1 1 4  131072 2   8   wlbllm"
-    # "1 1 2  262144 4   8    d2" 
-    # "1 1 2 262144 4   8   wlbllm"
-    # "1 1 1 524288 8   8    d2"
-    # "1 1 1 524288 8   8   wlbllm"
-)
+#    s r b   tok  e n
+for config in \
+    "1 1 8 131072 2 8" \
+    "1 1 4 262144 4 8" \
+    "1 1 2 524288 8 8" \
+    ; do
 
 
-# export EXPERIMENT_D2_BALANCE_PING_PONG=1
-export EXPERIMENT_PROFILE_RUN=0
-
-
-
-for config in "${configs[@]}"; do
-    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes mode cp_size <<< "$config"
+    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes <<< "$config"
     read -r sample_name change_long_doc_ratio <<< "$sample_config"
     read -r model_path attn_linear_breakpoint num_layers <<< "$model_config"
     
@@ -102,26 +105,19 @@ for config in "${configs[@]}"; do
     export CHANGE_LONG_DOC_RATIO=$change_long_doc_ratio
     export ATTN_LINEAR_BREAKPOINT=$attn_linear_breakpoint
     export NUM_LAYERS=$num_layers
-    export CP_SIZE=$cp_size
-
     
-    if [ "$mode" == "d2" ]; then
-        # Run d2 mode with all on
-        export MODE=d2
-        export OUTPUT_DIR_SUFFIX_ADDON="-normal"
-        export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2
-        # export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=$buffer_size
-        echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-        if [ $DRY_RUN -eq 0 ]; then
-            bash test_e2e_combined.salloc.sh
-            echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-            echo "\a"
+    # Run wlbllm mode with different CP sizes
+    counter=0
+    # for CP_SIZE in 32 16 8 4 2 1; do
+    for CP_SIZE in 4 2 1; do
+        if [ $CP_SIZE -gt $NNODES ]; then
+            continue
         fi
-    fi
-    
-    
-    if [ "$mode" == "wlbllm" ]; then
-        # Run wlbllm mode with different CP sizes
+        DP_SIZE=$((NNODES / CP_SIZE))
+        if [ $DP_SIZE -gt $(($BATCH_SIZE * 2)) ]; then
+            continue
+        fi
+
         export MODE=wlbllm CP_SIZE=$CP_SIZE
         export OUTPUT_DIR_SUFFIX_ADDON=""
         echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
@@ -129,9 +125,12 @@ for config in "${configs[@]}"; do
             bash test_e2e_combined.salloc.sh
             echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
             echo "\a"
-        fi    
-    fi
-
+        fi
+        counter=$((counter + 1))
+        # if [ $counter -ge 3 ]; then
+        #     break
+        # fi
+    done
 
 done
 done

@@ -107,6 +107,8 @@ class PerDocumentCPAttention(torch.autograd.Function):
         rank = get_rank(cp_group)
         world_rank = torch.distributed.get_rank()
         context_length = local_q.shape[0] * cp_size
+        nkvheads = local_k.shape[1]
+        d_head = local_k.shape[2]
         
         # allgather kv, then shuffle back to global order
         if allgather_events is not None:
@@ -161,21 +163,28 @@ class PerDocumentCPAttention(torch.autograd.Function):
                     end_time__shuffle = time.time()
                     duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
                     debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
-                    # print("k_global.shape =", k_global.shape)
-                    # print("v_global.shape =", v_global.shape)
+                    print("(shuffle) k_global.shape =", k_global.shape)
+                    print("(shuffle) v_global.shape =", v_global.shape)
                     # context_length = max(max(i) for i in cu_seqlens_kv_list)
                     # print("🟡 kv_idx_list =", kv_idx_list)
+                    # global_tensor_length = wlbllm.registry.get("global_tensor_length")
+                    # print(f"global_tensor_length =", global_tensor_length)
                 else:
                     # Simply using a random global tensor for testing. This avoids a significant performance issue introduced by the shuffle logic.
-                    context_length = wlbllm.registry.get("global_tensor_length")
-                    # print("🟡 context_length =", context_length)
-                    nkvheads = local_k.shape[1]
-                    # print("🟡 nkvheads =", nkvheads)
-                    d_head = local_k.shape[2]
-                    # print("🟡 d_head =", d_head)
                     k_global = torch.randn(context_length, nkvheads, d_head, device=local_k.device, dtype=local_k.dtype)
                     v_global = torch.randn(context_length, nkvheads, d_head, device=local_v.device, dtype=local_v.dtype)
+                    print(f"(no shuffle) k_global.shape =", k_global.shape)
+                    print(f"(no shuffle) v_global.shape =", v_global.shape)
+
+                print(f"(no shuffle) k_global.shape =", (context_length, nkvheads, d_head))
+                print(f"(no shuffle) v_global.shape =", (context_length, nkvheads, d_head))
+
+                if ENABLE_SHUFFLE:
+                    assert k_global.shape[0] == context_length, f"k_global.shape[0] = {k_global.shape[0]} must equals context length {context_length}."
             
+            # exit(0)
+
+
             end_time__shuffle = time.time()
             duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
             # debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")

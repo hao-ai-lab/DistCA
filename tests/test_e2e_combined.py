@@ -85,7 +85,7 @@ def debug_print(*args, **kwargs):
     if os.getenv("D2_DEBUG_PRINT", "0") == "1":
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
-            rich.print(f"[Rank {rank}]", *args, **kwargs)
+            print(f"[Rank {rank}]", *args, **kwargs)
     return
 
 def set_random_seed(seed, set_megatron: bool=True):
@@ -141,6 +141,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
             # attention is in FA so no masked_softmax fusion
             # bias-drop_out-add fusion
             "bias_dropout_fusion": True,
+            "tp_comm_overlap": False,
 
         })
         # A default optim config
@@ -385,11 +386,29 @@ def init_megatron_e2e_test(
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=tp_size
     )
-    log_memory_usage("init_worker_torch_distributed")
+    log_memory_usage("init_worker_torch_distributed", force=True)
     worker = init_worker_torch_distributed(
         world_size, buffer_size, worker_cls, parallel_config
     )
     print("Communication groups initialized")
+
+    log_memory_usage("comm group initialized", force=True)
+
+    
+    # # FIXME: We don't have to do the hack like that...
+    # # # If the buffer size is < 2GB, 
+    # # update the real buffer size to 2GB,
+    # # but keep the nominal buffer size to the original value.
+    # if buffer_size < 2 * 1024 ** 3:
+    #     FastDispatcherWrapper.update_buffer_size(2 * 1024 ** 3)
+    #     # now the real buffer size is 2GB, but the nominal buffer size is the original value.
+    #     FastDispatcherWrapper.update_buffer_size(buffer_size)
+    #     print(f"🟡 [Rank {worker.rank}] Updated real buffer size to 2GB, but keep the nominal buffer size to {buffer_size / 1024**3} GB")
+    #     # now the nominal buffer size remains the original value.
+    #     # this will help us do replanning with the original buffer size.
+
+    log_memory_usage("buffer initialized", force=True)
+    # exit(0)
     return worker
 
 def init_wlbllm_e2e_test(
@@ -424,6 +443,7 @@ def init_wlbllm_e2e_test(
     # worker.init_comm(buffer_size, parallel_config, local_rank)
     # -- if use the original one, it will hit the nvshmem init logic, 
     # which needs to assert that other group initialization is not called.
+    log_memory_usage("init_worker_torch_distributed", force=True)
     worker.init_torch_distributed()
     mpu.initialize_model_parallel(
         tensor_model_parallel_size=parallel_config.tensor_model_parallel_size,
@@ -439,7 +459,7 @@ def init_wlbllm_e2e_test(
     )
     print("Communication groups initialized")
 
-    log_memory_usage("init_worker_torch_distributed")
+    log_memory_usage("comm_group_init finished", force=True)
     return worker
 
 
@@ -490,12 +510,20 @@ def setup_global_batch(
         ), max_ctx_length=total_seq_len
     )
     
+    # if should_add_debug_cases:
+    #     GLOBAL_BATCH = list(GLOBAL_BATCH)
+    #     manual_case = [
+    #         [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
+    #     ] * 16
+    #     GLOBAL_BATCH = manual_case + GLOBAL_BATCH
+    #     GLOBAL_BATCH = iter(GLOBAL_BATCH)
+
     if should_add_debug_cases:
         GLOBAL_BATCH = list(GLOBAL_BATCH)
         manual_case = [
-            [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
-            [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
-        ]
+            [total_seq_len],
+            # [total_seq_len // 32] * 32
+        ] * 16
         GLOBAL_BATCH = manual_case + GLOBAL_BATCH
         GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
@@ -656,13 +684,16 @@ def test(args):
         gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
     )
     worker.init(model_path, seed=seed)
-    rich.print(f"🟡 [Rank {worker.rank}] init done")
+    print(f"🟡 [Rank {worker.rank}] init done")
     log_memory_usage("init done")
     write_status_log(f"Finish worker.init()")
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
     # parallel_config = worker.parallel_config
+
+    # torch.cuda.memory.set_per_process_memory_fraction(0.85)
+    # print("🟡 [Rank {worker.rank}] torch.cuda.memory.set_per_process_memory_fraction to 0.85")
 
     if mode == "wlbllm":
         rank = torch.distributed.get_rank()
@@ -690,7 +721,7 @@ def test(args):
         sample_name=args.sample_name,
     )
 
-    max_sample_id = max_sample_id
+
     sample_times = []
     for sample_id in range(sample_start_idx, max_sample_id):
         if mode == "baseline":
@@ -865,7 +896,8 @@ def test(args):
             wlbllm.registry.set("cu_seqlens_kv_list", cu_seqlens_k_list)
             wlbllm.registry.set("max_seqlen_q_list", max_seqlen_q_list)
             wlbllm.registry.set("max_seqlen_kv_list", max_seqlen_k_list)
-            wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
+            wlbllm.registry.set("global_tensor_length", context_length)
+            # wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
             wlbllm.registry.set("memcpy_args", wlb_memcpy_args)
 
         
@@ -894,6 +926,7 @@ def test(args):
             
             # Rebalance Ping pong
             def balance_ping_pong(seq_lens: list[list[int]]) -> list[list[int]]:
+                # [1k x 4 ], [2k x 2 ], [4k] ...
                 # taking a list of batch, and interleave them by sorted workload.
                 sorted_attn_workload = sorted(seq_lens, key=lambda x: sum(y ** 2 for y in x))
                 ping = []
@@ -945,10 +978,17 @@ def test(args):
                 MIN_TOLERANCE_FACTOR = float(MIN_TOLERANCE_FACTOR)
             except ValueError:
                 pass
+            print(f"🟡 [Rank {rank}] MIN_TOLERANCE_FACTOR = {MIN_TOLERANCE_FACTOR}")
 
-            for tolerance_factor in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+            candidate_tolerance_factors = [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+            # FIXME: (Only for ablation) Tune the candidate tolerance factor.
+
+            for tolerance_factor in candidate_tolerance_factors:
                 if tolerance_factor < MIN_TOLERANCE_FACTOR:
                     continue
+
+                print(f"[Rank {rank}] =========== Tolerance factor = {tolerance_factor} ============ ")
                 
                 planner = Planner(world_size, parallel_config, model_config=model_config, tolerance_factor=tolerance_factor)
                 
@@ -957,61 +997,96 @@ def test(args):
 
 
                 if verbose:
-                    qkv_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[0].fa2a_metadata[1] // 1024 // 1024
-                    qkv_fwd_fa2a_metadata__recv_transfer_sz_mb = fa2a_metadata_0[0].fa2a_metadata[3] // 1024 // 1024
-                    attn_out_fwd_fa2a_metadata__send_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[1] // 1024 // 1024
-                    attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb = fa2a_metadata_0[1].fa2a_metadata[3] // 1024 // 1024
-                            
                     def print_2d_tensor(name: str, tensor):
-                        rich.print(f"🟡 [Rank {rank}] {name} = ")
+                        print(f"🟡 [Rank {rank}] {name} = ")
                         for row in tensor.tolist():
-                            rich.print(f"    {row}")
-
-                    # Print qkv_fwd_fa2a_metadata
-                    print_2d_tensor("qkv_fwd_fa2a_metadata.send_transfer_sz_mb", qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
-                    print_2d_tensor("qkv_fwd_fa2a_metadata.recv_transfer_sz_mb", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
+                            print(f"    {row}")
                     
-                    # Print attn_out_fwd_fa2a_metadata  
-                    print_2d_tensor("attn_out_fwd_fa2a_metadata.send_transfer_sz_mb", attn_out_fwd_fa2a_metadata__send_transfer_sz_mb)
-                    print_2d_tensor("attn_out_fwd_fa2a_metadata.recv_transfer_sz_mb", attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb)
-
                     def exclude_self_and_sum(t):
                         for i in range(len(t)):
                             t[i][i] = 0
                         return t.sum(dim=1)
+                        
+                    def inspect_network_metadata(metadata, is_ping, sample_id, tolerance_factor, output_dir, rank):
+                        qkv_fwd_metadata__send_transfer_sz_mb = metadata[0].fa2a_metadata[1] // 1024 // 1024
+                        qkv_fwd_metadata__recv_transfer_sz_mb = metadata[0].fa2a_metadata[3] // 1024 // 1024
+                        attn_out_fwd_metadata__send_transfer_sz_mb = metadata[1].fa2a_metadata[1] // 1024 // 1024
+                        attn_out_fwd_metadata__recv_transfer_sz_mb = metadata[1].fa2a_metadata[3] // 1024 // 1024
+                                
+                        # Print qkv_fwd_metadata
+                        print_2d_tensor("qkv_fwd_metadata.send_transfer_sz_mb", qkv_fwd_metadata__send_transfer_sz_mb)
+                        print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz_mb", qkv_fwd_metadata__recv_transfer_sz_mb)
+                        
+                        # Print attn_out_fwd_metadata  
+                        print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz_mb", attn_out_fwd_metadata__send_transfer_sz_mb)
+                        print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz_mb", attn_out_fwd_metadata__recv_transfer_sz_mb)
 
-                    # Calculate send size from me to others by subtracting diagonal (self-send) from total send
-                    qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_fa2a_metadata__send_transfer_sz_mb)
-                    qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_fa2a_metadata__recv_transfer_sz_mb)
-                    
-                    print_2d_tensor("qkv_fwd_fa2a_metadata.send_transfer_sz_mb_to_others", qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others)
-                    print_2d_tensor("qkv_fwd_fa2a_metadata.recv_transfer_sz_mb_to_others", qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others)
-                    
-                    # Expected send-recv time
-                    bandwidth_mb = 40 # MB/ms
-                    send_time_ms = qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others / bandwidth_mb
-                    recv_time_ms = qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others / bandwidth_mb
-                    print_2d_tensor("send_time_ms", send_time_ms)
-                    print_2d_tensor("recv_time_ms", recv_time_ms)
 
-                    if rank == 0:
-                        network_inspect_file = os.path.join(output_dir, "network_inspect.jsonl")
-                        with open(network_inspect_file, "a") as f:
-                            f.write(json.dumps({
-                                "sample_id": sample_id,
-                                "tolerance_factor": tolerance_factor,
-                                "qkv_fwd_fa2a_metadata__send_transfer_sz_mb": qkv_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
-                                "qkv_fwd_fa2a_metadata__recv_transfer_sz_mb": qkv_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
-                                "attn_out_fwd_fa2a_metadata__send_transfer_sz_mb": attn_out_fwd_fa2a_metadata__send_transfer_sz_mb.tolist(),
-                                "attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb": attn_out_fwd_fa2a_metadata__recv_transfer_sz_mb.tolist(),
+                        # Calculate send size from me to others by subtracting diagonal (self-send) from total send
+                        qkv_fwd_metadata__send_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_metadata__send_transfer_sz_mb)
+                        qkv_fwd_metadata__recv_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_metadata__recv_transfer_sz_mb)
+                        
+                        print_2d_tensor("qkv_fwd_metadata.send_transfer_sz_mb_to_others", qkv_fwd_metadata__send_transfer_sz_mb_to_others)
+                        print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz_mb_to_others", qkv_fwd_metadata__recv_transfer_sz_mb_to_others)
 
-                                "qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others": qkv_fwd_fa2a_metadata__send_transfer_sz_mb_to_others.tolist(),
-                                "qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_from_others": qkv_fwd_fa2a_metadata__recv_transfer_sz_mb_to_others.tolist(),
-                                "bandwidth_mb": bandwidth_mb,
-                                "send_time_ms": send_time_ms.tolist(),
-                                "recv_time_ms": recv_time_ms.tolist(),
-                            }) + "\n")
-                            pass
+                        attn_out_fwd_metadata__send_transfer_sz_mb_to_others = exclude_self_and_sum(attn_out_fwd_metadata__send_transfer_sz_mb)
+                        attn_out_fwd_metadata__recv_transfer_sz_mb_to_others = exclude_self_and_sum(attn_out_fwd_metadata__recv_transfer_sz_mb)
+
+                        print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz_mb_to_others", attn_out_fwd_metadata__send_transfer_sz_mb_to_others)
+                        print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz_mb_to_others", attn_out_fwd_metadata__recv_transfer_sz_mb_to_others)
+                        
+                        # Expected send-recv time
+                        bandwidth_mb = 40 # MB/ms
+                        send_time_ms = qkv_fwd_metadata__send_transfer_sz_mb_to_others / bandwidth_mb
+                        recv_time_ms = qkv_fwd_metadata__recv_transfer_sz_mb_to_others / bandwidth_mb
+                        print_2d_tensor("send_time_ms", send_time_ms)
+                        print_2d_tensor("recv_time_ms", recv_time_ms)
+
+                        max_comm_budget_all_rank = (
+                              qkv_fwd_metadata__send_transfer_sz_mb_to_others 
+                            + qkv_fwd_metadata__recv_transfer_sz_mb_to_others 
+                            + attn_out_fwd_metadata__send_transfer_sz_mb_to_others 
+                            + attn_out_fwd_metadata__recv_transfer_sz_mb_to_others
+                        ).max().item()
+
+                        if rank == 0:
+                            network_inspect_file = os.path.join(output_dir, "network_inspect.jsonl")
+                            with open(network_inspect_file, "a") as f:
+                                f.write(json.dumps({
+                                    "sample_id": sample_id,
+                                    "is_ping": is_ping,
+                                    "tolerance_factor": tolerance_factor,
+                                    "qkv_fwd_metadata__send_transfer_sz_mb": qkv_fwd_metadata__send_transfer_sz_mb.tolist(),
+                                    "qkv_fwd_metadata__recv_transfer_sz_mb": qkv_fwd_metadata__recv_transfer_sz_mb.tolist(),
+                                    "attn_out_fwd_metadata__send_transfer_sz_mb": attn_out_fwd_metadata__send_transfer_sz_mb.tolist(),
+                                    "attn_out_fwd_metadata__recv_transfer_sz_mb": attn_out_fwd_metadata__recv_transfer_sz_mb.tolist(),
+
+                                    "qkv_fwd_metadata__send_transfer_sz_mb_to_others": qkv_fwd_metadata__send_transfer_sz_mb_to_others.tolist(),
+                                    "qkv_fwd_metadata__recv_transfer_sz_mb_from_others": qkv_fwd_metadata__recv_transfer_sz_mb_to_others.tolist(),
+
+                                    "max_comm_budget_all_rank": max_comm_budget_all_rank,
+                                    "bandwidth_mb": bandwidth_mb,
+                                    "send_time_ms": send_time_ms.tolist(),
+                                    "recv_time_ms": recv_time_ms.tolist(),
+                                }) + "\n")
+
+                            network_inspect_summary_file = os.path.join(output_dir, "network_inspect.summary.jsonl")
+                            with open(network_inspect_summary_file, "a") as f:
+                                f.write(json.dumps({
+                                    "sample_id": sample_id,
+                                    "is_ping": is_ping,
+                                    "tolerance_factor": tolerance_factor,
+                                    "qkv_fwd_send_mb": qkv_fwd_metadata__send_transfer_sz_mb_to_others.tolist(),
+                                    "qkv_fwd_recv_mb": qkv_fwd_metadata__recv_transfer_sz_mb_to_others.tolist(),
+
+                                    "max_comm_budget_all_rank_mb": max_comm_budget_all_rank,
+                                    "send_time_ms": send_time_ms.tolist(),
+                                    "recv_time_ms": recv_time_ms.tolist(),
+                                }) + "\n")
+
+                    # Inspect both metadata sets
+                    inspect_network_metadata(fa2a_metadata_0, True, sample_id, tolerance_factor, output_dir, rank)
+                    inspect_network_metadata(fa2a_metadata_1, False, sample_id, tolerance_factor, output_dir, rank)
                     
                     
 
@@ -1019,23 +1094,29 @@ def test(args):
                 buffer_size = FastDispatcherWrapper.instance[0].buffer_size
                 
                 def _check_self_overflow(fa2a_metadata, as_rank_):
+                    """Return the self-overflow status and the maximum size provisioned."""
                     send_sz = [torch.sum(m.fa2a_metadata[1][as_rank_]).item() for m in fa2a_metadata]
-                    send_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank_] for m in fa2a_metadata]
+                    dst_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank_] for m in fa2a_metadata]
                     recv_sz = [torch.sum(m.fa2a_metadata[3][as_rank_]).item() for m in fa2a_metadata]
+                    src_last_offset = [(m.fa2a_metadata[0] + m.fa2a_metadata[1])[as_rank_] for m in fa2a_metadata]
                     max_send_sz = max(send_sz)
                     max_recv_sz = max(recv_sz)
+                    max_dst_last_offset = max(torch.max(o).item() for o in dst_last_offset)
+                    max_src_last_offset = max(torch.max(o).item() for o in src_last_offset)
                     
                     if rank % 8 == 0:
-                        rich.print(
+                        print(
                             f"🟡 [Rank {rank}]  Overflow check of as_rank_ = {as_rank_}: "
                             f"{max_send_sz / 1024**3:.2f} GB send size, "
                             f"{max_recv_sz / 1024**3:.2f} GB recv size, "
-                            f"{max(torch.max(o).item() for o in send_last_offset) / 1024**3:.2f} GB send last offset, "
+                            f"{max_dst_last_offset / 1024**3:.2f} GB dst last offset, "
+                            f"{max_src_last_offset / 1024**3:.2f} GB src last offset, "
                             f"{buffer_size / 1024**3:.2f} GB buffer size"
                         )
 
                     max_size_provisioned = max(
-                        max_send_sz, max_recv_sz, max(torch.max(o).item() for o in send_last_offset)
+                        max_send_sz, max_recv_sz, 
+                        max_dst_last_offset, max_src_last_offset,
                     )
                     if not (buffer_size >= max_size_provisioned):
                         return False, max_size_provisioned
@@ -1051,7 +1132,6 @@ def test(args):
                     all_state = all(states)
                     return all_state, all_max_size_provisioned
                     
-
                 check_0, max_size_provisioned_0 = _check_all_overflow(fa2a_metadata_0, as_world_size)
                 check_1, max_size_provisioned_1 = _check_all_overflow(fa2a_metadata_1, as_world_size)
                 max_size_provisioned = max(max_size_provisioned_0, max_size_provisioned_1) / 1024**3
@@ -1060,7 +1140,7 @@ def test(args):
                 
                 can_pass_tolerance_factor.append(check_0 and check_1)
                 if not (check_0 and check_1):
-                    rich.print(f"⚠️ [Rank {rank}] Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB. Retry...")
+                    print(f"⚠️ [Rank {rank}] Tolerance factor = {tolerance_factor}: Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB. Retry...")
                 else:
                     did_pass_overflow_check = True
                     break
@@ -1068,18 +1148,18 @@ def test(args):
                     
             
             if not did_pass_overflow_check:
-                rich.print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
-                rich.print(f"🔴 [Rank {rank}] Specified buffer_size = {buffer_size / 1024**3} GB")
-                recommended_buffer_size = math.ceil(max_size_provisioned)
-                rich.print(f"🔴 [Rank {rank}] Force update buffer_size to = {recommended_buffer_size} GB")
-                buffer_size = recommended_buffer_size * 1024**3 # bytes
+                print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
+                print(f"🔴 [Rank {rank}] Specified buffer_size = {buffer_size / 1024**3} GB")
+                recommended_buffer_size = math.ceil(max_size_provisioned) + 0.5
+                print(f"🔴 [Rank {rank}] Force update buffer_size to = {recommended_buffer_size} GB")
+                buffer_size = int(recommended_buffer_size * 1024**3) # bytes
 
                 FastDispatcherWrapper.update_buffer_size(buffer_size)
 
-                rich.print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
+                print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
                 buffer_size = FastDispatcherWrapper.instance[0].buffer_size
                             
-            rich.print(f"🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0 and fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB")
+            print(f"🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0 and fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB")
 
 
             # params for ping-pong batch0

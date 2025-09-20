@@ -72,9 +72,6 @@ sleep 1
 # ------------------------------------------------------
 TS=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)
 
-# Get the current directory of the script
-cd $HOME/jd/d2/tests
-
 # TOOD: Fix this hardcode output dir.
 OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
 OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${JOBID}.${MODE}-cp${CP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}"}

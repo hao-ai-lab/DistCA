@@ -45,8 +45,9 @@ def log_memory_usage(message: str, force: bool = False):
     EXPERIMENT_LOG_MEMORY_USAGE = os.getenv("EXPERIMENT_LOG_MEMORY_USAGE", "0")
     # print(f"Ⓜ️", EXPERIMENT_LOG_MEMORY_USAGE)
     # return
-    if EXPERIMENT_LOG_MEMORY_USAGE != "1":
-        return
+    if not force:
+        if EXPERIMENT_LOG_MEMORY_USAGE != "1":
+            return
     
     global memory_usage
     
@@ -56,10 +57,10 @@ def log_memory_usage(message: str, force: bool = False):
             print("⚠️ Warning: CUDA_LAUNCH_BLOCKING=0 may affect memory logging accuracy")
             log_memory_usage._warned_cuda_launch_blocking = True
     
-    if not torch.distributed.is_initialized():
-        return
+    if not force:
+        if not torch.distributed.is_initialized():
+            return
     
-    rank = torch.distributed.get_rank()
     # if rank % 8 != 0:
     #     return
 
@@ -98,8 +99,10 @@ from contextlib import contextmanager
 def log_memory_usage_context():
     old_env_var = os.environ.get("EXPERIMENT_LOG_MEMORY_USAGE", "0")
     os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = "1"
+    print(f"🟡 Setting EXPERIMENT_LOG_MEMORY_USAGE to 1 temporarily")
     yield
     os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = old_env_var
+    print(f"🟡 Setting EXPERIMENT_LOG_MEMORY_USAGE back to {old_env_var}")
 
 
 def enable_memory_usage_logging(memory_usage_dir: str):
