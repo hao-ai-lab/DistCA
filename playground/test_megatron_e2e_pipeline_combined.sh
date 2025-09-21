@@ -28,7 +28,7 @@ TP_SIZE=${TP_SIZE:-$GPUS_PER_NODE}   # Tensor Parallelism size, defaults to GPUs
 TP_SIZE=${TP_SIZE:-8}
 PP_SIZE=${PP_SIZE:-1}                # Pipeline Parallelism size
 CP_SIZE=${CP_SIZE:-1}                # Only useful in WLBLLM (D2 will have DPCP anyways)
-NUM_MICROBATCH=${NUM_MICROBATCH:-${PP_SIZE}}            # Number of microbatches per pipeline stage, has to be >= PP_SIZE - 1
+NUM_MICROBATCH=${PP_SIZE}            # Number of microbatches per pipeline stage, has to be >= PP_SIZE - 1
 
 # Experiment settings
 MODE=${MODE:-d2}               # Experiment mode (baseline, dynamic, etc.)
@@ -70,11 +70,13 @@ sleep 1
 # Setup loggings and artifact directories
 # ------------------------------------------------------
 TS=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)
-SHORT_TS=$(TZ=America/Los_Angeles date +%d_%H%M%S)
+
+# Get the current directory of the script
+cd $HOME/jd/d2/tests
 
 # TOOD: Fix this hardcode output dir.
 OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
-OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}"}
+OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${JOBID}.${MODE}-cp${CP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}"}
 OUTPUT_DIR_SUFFIX_ADDON=${OUTPUT_DIR_SUFFIX_ADDON:-""}
 OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX$OUTPUT_DIR_SUFFIX_ADDON"
 mkdir -p "$OUTPUT_DIR"
@@ -193,6 +195,7 @@ SRUN_BASE=(
   srun --kill-on-bad-exit=1 
   -N ${NNODES}
   -G ${WORLD_SIZE}
+  -vv
   --ntasks-per-node=1
   # --gpus-per-task=${GPUS_PER_NODE}     # <= crucial
   --cpus-per-task=128
@@ -202,8 +205,6 @@ SRUN_BASE=(
   -w "$head_node"
   --mem=0 # inherit the memory from the salloc
 )
-
-# -vv
 
 
 if [ ${JOBID} -ne 0 ]; then
@@ -222,38 +223,34 @@ TORCHRUN_CMD=(
   --rdzv_id=${RZV_ID}
   --max_restarts=0
   --no-python bash ./bind_and_exec.sh 
-    python test_megatron_e2e_pipeline_with_cp.py
+    # python test_megatron_e2e_pipeline_with_cp.py
+    python test_megatron_e2e_pipeline_combined.py
     --num-tokens ${NUM_TOKENS}
     --num-batches ${BATCH_SIZE}
     --num-nodes ${NNODES}
     --num-gpus-per-node ${NPROC_PER_NODE}
-    --cp-size ${CP_SIZE}
+    --cp-degree ${CP_SIZE}
     --tp-size ${TP_SIZE}
     --pp-size ${PP_SIZE}
     --num-microbatch ${NUM_MICROBATCH}
-    --use-planner
     
+    --mode ${MODE}
     --model-path ${MODEL_PATH}
     --num-layers ${NUM_LAYERS}
 
     # TODO: 
-    --max-sample-id ${MAX_SAMPLE_ID}
+    # --max-sample-id ${MAX_SAMPLE_ID}
 
-    --up-sample-factor ${UP_SAMPLE_FACTOR}
-    --elongate-factor ${ELONGATE_FACTOR}
-    --filter-threshold ${FILTER_THRESHOLD}
-    --filter-ratio ${FILTER_RATIO}
+    # --up-sample-factor ${UP_SAMPLE_FACTOR}
+    # --elongate-factor ${ELONGATE_FACTOR}
+    # --filter-threshold ${FILTER_THRESHOLD}
+    # --filter-ratio ${FILTER_RATIO}
     --output-dir ${OUTPUT_DIR}
 )
 
-# if [ ${USE_PLANNER} -eq 1 ]; then
-#     TORCHRUN_CMD+=(--use-planner)
-# fi
-
-if [ ${SHOULD_ADD_DEBUG_CASES} -eq 1 ]; then
-    TORCHRUN_CMD+=(--should-add-debug-cases)
+if [ ${USE_PLANNER} -eq 1 ]; then
+    TORCHRUN_CMD+=(--use-planner)
 fi
-
 
 # Serialize TORCHRUN_CMD array so we can pass it through bash -lc cleanly
 TORCHRUN_STR=$(printf " %q" "${TORCHRUN_CMD[@]}")
@@ -290,37 +287,37 @@ echo_and_tee "$EXP_README" "- NUM_MICROBATCH: $NUM_MICROBATCH"
 echo_and_tee "$EXP_README" "- BATCH_SIZE: $BATCH_SIZE"
 echo_and_tee "$EXP_README" "- NUM_TOKENS: $NUM_TOKENS"
 echo_and_tee "$EXP_README" "- MAX_SAMPLE_ID: $MAX_SAMPLE_ID"
-echo_and_tee "$EXP_README" "- UP_SAMPLE_FACTOR: $UP_SAMPLE_FACTOR"
-echo_and_tee "$EXP_README" "- ELONGATE_FACTOR: $ELONGATE_FACTOR"
-echo_and_tee "$EXP_README" "- FILTER_THRESHOLD: $FILTER_THRESHOLD"
-echo_and_tee "$EXP_README" "- FILTER_RATIO: $FILTER_RATIO"
-echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
-echo_and_tee "$EXP_README" "- SAMPLE_START_IDX: $SAMPLE_START_IDX"
+# echo_and_tee "$EXP_README" "- UP_SAMPLE_FACTOR: $UP_SAMPLE_FACTOR"
+# echo_and_tee "$EXP_README" "- ELONGATE_FACTOR: $ELONGATE_FACTOR"
+# echo_and_tee "$EXP_README" "- FILTER_THRESHOLD: $FILTER_THRESHOLD"
+# echo_and_tee "$EXP_README" "- FILTER_RATIO: $FILTER_RATIO"
+# echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
+# echo_and_tee "$EXP_README" "- SAMPLE_START_IDX: $SAMPLE_START_IDX"
 
 echo_and_tee "$EXP_README" "## Experiment Flags"
 echo_and_tee "$EXP_README" "- ENABLE_NSYS: $ENABLE_NSYS"
-echo_and_tee "$EXP_README" "- WLBLLM_SYNC_TIME_AG: $WLBLLM_SYNC_TIME_AG"
+# echo_and_tee "$EXP_README" "- WLBLLM_SYNC_TIME_AG: $WLBLLM_SYNC_TIME_AG"
 echo_and_tee "$EXP_README" "- EXPERIMENT_REPEAT_TIMES: $EXPERIMENT_REPEAT_TIMES"
 echo_and_tee "$EXP_README" "- EXPERIMENT_WARMUP_TIMES: $EXPERIMENT_WARMUP_TIMES"
-echo_and_tee "$EXP_README" "- EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB: $EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_FORCE_EXIT: $EXPERIMENT_SHOULD_FORCE_EXIT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_EMIT_BACKWARD_NVTX: $EXPERIMENT_EMIT_BACKWARD_NVTX"
-echo_and_tee "$EXP_README" "- EXPERIMENT_WARMUP_TIMEOUT_SEC: $EXPERIMENT_WARMUP_TIMEOUT_SEC"
-echo_and_tee "$EXP_README" "- D2_SHOULD_REPLAN: $D2_SHOULD_REPLAN"
-echo_and_tee "$EXP_README" "- SHOULD_PROFILE_MEMORY: $SHOULD_PROFILE_MEMORY"
-echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
-echo_and_tee "$EXP_README" "- EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0: $EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0"
-echo_and_tee "$EXP_README" "- EXPERIMENT_LOG_MEMORY_USAGE: $EXPERIMENT_LOG_MEMORY_USAGE"
-echo_and_tee "$EXP_README" "- EXPERIMENT_ADD_SELECTIVE_CKPT: $EXPERIMENT_ADD_SELECTIVE_CKPT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_RESEND_QKV: $EXPERIMENT_SHOULD_RESEND_QKV"
-echo_and_tee "$EXP_README" "- D2_SKIP_FLOAT_CONVERSION: $D2_SKIP_FLOAT_CONVERSION"
-echo_and_tee "$EXP_README" "- EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND: $EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SKIP_OPTIMIZER_STEP: $EXPERIMENT_SKIP_OPTIMIZER_STEP"
-echo_and_tee "$EXP_README" "- EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP: $EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"
-echo_and_tee "$EXP_README" "- EXPERIMENT_D2_BALANCE_PING_PONG: $EXPERIMENT_D2_BALANCE_PING_PONG"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_DUMP_TRACEBACK: $EXPERIMENT_SHOULD_DUMP_TRACEBACK"
-echo_and_tee "$EXP_README" "- EXPERIMENT_TORCH_DIST_TIMEOUT: $EXPERIMENT_TORCH_DIST_TIMEOUT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_ENABLE_BENCHMARK_SAVING: $EXPERIMENT_ENABLE_BENCHMARK_SAVING"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB: $EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_FORCE_EXIT: $EXPERIMENT_SHOULD_FORCE_EXIT"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_EMIT_BACKWARD_NVTX: $EXPERIMENT_EMIT_BACKWARD_NVTX"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_WARMUP_TIMEOUT_SEC: $EXPERIMENT_WARMUP_TIMEOUT_SEC"
+# echo_and_tee "$EXP_README" "- D2_SHOULD_REPLAN: $D2_SHOULD_REPLAN"
+# echo_and_tee "$EXP_README" "- SHOULD_PROFILE_MEMORY: $SHOULD_PROFILE_MEMORY"
+# echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0: $EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_LOG_MEMORY_USAGE: $EXPERIMENT_LOG_MEMORY_USAGE"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_ADD_SELECTIVE_CKPT: $EXPERIMENT_ADD_SELECTIVE_CKPT"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_RESEND_QKV: $EXPERIMENT_SHOULD_RESEND_QKV"
+# echo_and_tee "$EXP_README" "- D2_SKIP_FLOAT_CONVERSION: $D2_SKIP_FLOAT_CONVERSION"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND: $EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_SKIP_OPTIMIZER_STEP: $EXPERIMENT_SKIP_OPTIMIZER_STEP"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP: $EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_D2_BALANCE_PING_PONG: $EXPERIMENT_D2_BALANCE_PING_PONG"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_DUMP_TRACEBACK: $EXPERIMENT_SHOULD_DUMP_TRACEBACK"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_TORCH_DIST_TIMEOUT: $EXPERIMENT_TORCH_DIST_TIMEOUT"
+# echo_and_tee "$EXP_README" "- EXPERIMENT_ENABLE_BENCHMARK_SAVING: $EXPERIMENT_ENABLE_BENCHMARK_SAVING"
 
 
 echo_and_tee "$EXP_README" "## Other Variables"
@@ -344,20 +341,13 @@ echo "Start running sbatch at $(TZ='America/Los_Angeles' date)"
 NSYS_PATH="${OUTPUT_DIR}/nsys-reps"
 mkdir -p ${NSYS_PATH}
 
-
-
-# nsys_str="nsys profile --show-output=true --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true -o ${NSYS_PATH}/%h.nsys-rep --sample=none -t cuda,nvtx"
-# WARNING: CUDA backtraces will not be collected because CPU sampling is disabled.
-# WARNING: CPU IP/backtrace sampling not supported, disabling.
-# Try the 'nsys status --environment' command to learn more.
 nsys_str=""
 if [ ${ENABLE_NSYS} -eq 1 ]; then
-  nsys_str="nsys profile --show-output=true --force-overwrite=true -o ${NSYS_PATH}/%h.nsys-rep -t cuda,nvtx"
+  nsys_str="nsys profile --show-output=true --force-overwrite=true -o ${NSYS_PATH}/%h.nsys-rep --sample=none -t cuda,nvtx"
 fi
 
 start_time=$(TZ='America/Los_Angeles' date +%s)
 
-set -x
 "${SRUN_BASE[@]}" \
     bash -lc '
         '"$nsys_str"' torchrun '"$TORCHRUN_STR"'

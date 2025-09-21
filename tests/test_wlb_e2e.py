@@ -2,6 +2,7 @@
 Debug example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 """
+
 import argparse
 from functools import partial
 import os
@@ -16,8 +17,8 @@ import torch
 from transformers import AutoConfig
 
 from d2.runtime.compute_metadata import get_attn_metadata
-from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
-from d2.runtime.megatron_patch.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
+from d2.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
+from d2.runtime.megatron.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
 
 from test_util import ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch_pipeline_tick
 from test_megatron_e2e import MegatronE2eWorker as BaseMegatronE2eWorker, set_random_seed
@@ -313,7 +314,7 @@ def test(args):
         elongate_factor=args.elongate_factor,
         filter_threshold=args.filter_threshold,
         filter_ratio=args.filter_ratio,
-        should_add_debug_cases=True,
+        should_add_debug_cases=args.should_add_debug_cases,
     )
 
     # for _ in range(20):
@@ -518,7 +519,23 @@ def test(args):
         rank = torch.distributed.get_rank()
         
         max_warmup_cnt = 1
+        try:
+            if sample_idx == 0:
+                max_warmup_cnt = int(os.environ.get("EXPERIMENT_0TH_SAMPLE_WARMUP_TIMES", 1))
+            else:
+                max_warmup_cnt = int(os.environ.get("EXPERIMENT_WARMUP_TIMES", 0))
+                pass
+        except:
+            pass
+
+        
         max_repeat_cnt = 1
+        try:
+            max_repeat_cnt = int(os.environ.get("EXPERIMENT_REPEAT_TIMES", 1))
+        except:
+            pass
+
+
         durations_ms = []
         for repeat_idx in range(max_repeat_cnt + max_warmup_cnt):
             wlbllm.registry.set("forward_cnt", 0)
@@ -622,6 +639,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="./logs/")
 
     parser.add_argument("--max-sample-id", type=int, default=3)
+    parser.add_argument("--should-add-debug-cases", action="store_true")
 
     parser.add_argument("--up-sample-factor", type=int, default=4)
     parser.add_argument("--elongate-factor", type=int, default=1)

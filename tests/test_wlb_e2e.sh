@@ -74,8 +74,7 @@ SHORT_TS=$(TZ=America/Los_Angeles date +%d_%H%M%S)
 
 # TOOD: Fix this hardcode output dir.
 OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
-# OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${JOBID}.${MODE}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}-mb${NUM_MICROBATCH}"}
-OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}-mb${NUM_MICROBATCH}"}
+OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}"}
 OUTPUT_DIR_SUFFIX_ADDON=${OUTPUT_DIR_SUFFIX_ADDON:-""}
 OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX$OUTPUT_DIR_SUFFIX_ADDON"
 mkdir -p "$OUTPUT_DIR"
@@ -247,6 +246,11 @@ TORCHRUN_CMD=(
 # if [ ${USE_PLANNER} -eq 1 ]; then
 #     TORCHRUN_CMD+=(--use-planner)
 # fi
+
+if [ ${SHOULD_ADD_DEBUG_CASES} -eq 1 ]; then
+    TORCHRUN_CMD+=(--should-add-debug-cases)
+fi
+
 
 # Serialize TORCHRUN_CMD array so we can pass it through bash -lc cleanly
 TORCHRUN_STR=$(printf " %q" "${TORCHRUN_CMD[@]}")

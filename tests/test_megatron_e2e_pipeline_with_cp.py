@@ -49,6 +49,23 @@ from d2.utils.traceback import enable_clickable_excepthook, enable_trace_calls
 enable_clickable_excepthook()
 
 
+import time
+start_time__ = time.time()
+
+import psutil, os
+rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID","0")))
+local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID","0")))
+p = psutil.Process(os.getpid())
+p.cpu_affinity([local * 16, (local + 1) * 16])  # pin to core based on local rank
+print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
+
+# ----------------
+# Taskset confirm
+# ----------------
+import check_cpu_binding
+aff, mems = check_cpu_binding.check_cpu_binding()
+print(f"CPUS={aff} MEMS={mems}")
+
 
 class MegatronE2eWorker(BaseMegatronE2eWorker):
     def __init__(self, rank: int, world_size: int):
@@ -341,7 +358,7 @@ def test(args):
     seed = args.seed
     # test scale
     num_tokens = args.num_tokens
-    cp_size = args.cp_size
+    dpcp_size = args.cp_size
     num_seqs = args.num_seqs
     num_batches = args.num_batches
     num_layers = args.num_layers
@@ -371,14 +388,15 @@ def test(args):
     pp_size = args.pp_size
     world_size = args.num_nodes * args.num_gpus_per_node
     assert world_size % (tp_size * pp_size) == 0
-    dp_size = world_size // (tp_size * pp_size)
+    _dp_size = world_size // (tp_size * pp_size)
+    assert dpcp_size == _dp_size, f"dpcp_size: {dpcp_size} != _dp_size: {_dp_size}"
 
     assert args.num_microbatch >= pp_size, f"num_microbatch need bigger than pp_size. Current num_microbatch: {args.num_microbatch}, pp size: {pp_size}"
 
     # Set num_batches. 
     # If None, we use MLP-DP. will get DP number of new batches per tick.
     # If set, num_batches < dp_size && dp_size % num_batches == 0, Will get num_batches number of List per tick.
-    num_token_per_rank = num_tokens * num_batches // dp_size
+    num_token_per_rank = num_tokens * num_batches // dpcp_size
     total_seq_len = num_tokens 
 
     dtype = torch.bfloat16
@@ -391,13 +409,15 @@ def test(args):
         os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP", "1") == "1"
     )
 
+    print(f"tp_size: {tp_size}, pp_size: {pp_size}, dpcp_size: {dpcp_size}, world_size: {world_size}, num_tokens_per_rank: {num_token_per_rank}, total_seq_len: {total_seq_len}, num_batches: {num_batches}")
+
     setup_global_batch(
         total_seq_len=num_tokens,
         up_sample_factor=args.up_sample_factor,
         elongate_factor=args.elongate_factor,
         filter_threshold=args.filter_threshold,
         filter_ratio=args.filter_ratio,
-        should_add_debug_cases=True,
+        should_add_debug_cases=args.should_add_debug_cases,
     )
     
 
@@ -411,7 +431,7 @@ def test(args):
 
     worker: MegatronE2eWorker = init_megatron_e2e_test(
         hidden_size_q, hidden_size_kv, hf_config.num_attention_heads, num_tokens,
-        world_size, cp_size, tp_size, pp_size,
+        world_size, dpcp_size, tp_size, pp_size,
         dtype, MegatronE2eWorker
     )
     worker.set_config(dtype=dtype)
@@ -426,7 +446,7 @@ def test(args):
     # Check rank correctness
     dp_rank = mpu.get_data_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
-    assert as_rank == dp_rank + pp_rank * dp_size
+    assert as_rank == dp_rank + pp_rank * dpcp_size
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
@@ -449,17 +469,17 @@ def test(args):
         
         microbatches_0, tick_per_rank_doc_lens_0 = create_pp_microbatches(
             args.num_microbatch, pp_size, as_rank,
-            as_world_size, total_seq_len, num_seqs, cp_size,
+            as_world_size, total_seq_len, num_seqs, dpcp_size,
             hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-            tp_size, dp_size, 
+            tp_size, dpcp_size, 
             num_token_per_rank, num_batches, args.use_planner,  
             return_seq_lens=True,
         )
         microbatches_1, tick_per_rank_doc_lens_1 = create_pp_microbatches(
             args.num_microbatch, pp_size, as_rank,
-            as_world_size, total_seq_len, num_seqs, cp_size,
+            as_world_size, total_seq_len, num_seqs, dpcp_size,
             hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-            tp_size, dp_size, 
+            tp_size, dpcp_size, 
             num_token_per_rank, num_batches, args.use_planner,
             return_seq_lens=True,
         )
@@ -522,7 +542,19 @@ def test(args):
         should_run_d2 = True
 
         n_warmup = 1
+        try:
+            if sample_idx == 0:
+                n_warmup = int(os.environ.get("EXPERIMENT_0TH_SAMPLE_WARMUP_TIMES", 1))
+            else:
+                n_warmup = int(os.environ.get("EXPERIMENT_WARMUP_TIMES", 0))
+                pass
+        except:
+            pass
         n_repeats = 1
+        try:
+            n_repeats = int(os.environ.get("EXPERIMENT_REPEAT_TIMES", 1))
+        except:
+            pass
 
         rank = torch.distributed.get_rank()
         d2.mem.enable_memory_usage_logging(memory_usage_dir)
@@ -537,17 +569,18 @@ def test(args):
                     mem_ctx = d2.mem.log_memory_usage_context()
                     pass
 
-
                 print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start baseline dummy {_}")
                 with torch.cuda.nvtx.range(f"baseline_dummy[sample={sample_idx}][repeat={_}]"):
                     with mem_ctx:
                         torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                         loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
                             microbatches=orig_impl_microbatches,
+
                             forward_only=False,
                             mode="orig_reimpl",
                             with_dummy=True,
                         )
+
                         torch.cuda.synchronize(); torch.distributed.barrier(); end_time = time.time()
                         duration_ms = (end_time - start_time) * 1000
                         durations.append(duration_ms)
@@ -668,6 +701,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
     parser.add_argument("--num-layers", type=int, default=8)
     parser.add_argument("--max-sample-id", type=int, default=3)
+    parser.add_argument("--should-add-debug-cases", action="store_true")
 
     parser.add_argument("--output-dir", type=str, default="./logs/")
 
