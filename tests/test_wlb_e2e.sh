@@ -45,6 +45,8 @@ FILTER_THRESHOLD=${FILTER_THRESHOLD:-65536}
 FILTER_RATIO=${FILTER_RATIO:-0.50}
 SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-0}
 PROFILE_MEMORY_PATH=${PROFILE_MEMORY_PATH:"${OUTPUT_DIR}/"}
+SAMPLE_NAME=${SAMPLE_NAME:-"wlbllm"}
+CHANGE_LONG_DOC_RATIO=${CHANGE_LONG_DOC_RATIO:-0.0}
 
 JOBID=${JOBID:-${SLURM_JOB_ID}}
 if [ -z "$JOBID" ]; then
@@ -236,6 +238,8 @@ TORCHRUN_CMD=(
     --num-layers ${NUM_LAYERS}
 
     --max-sample-id ${MAX_SAMPLE_ID}
+    --sample-name ${SAMPLE_NAME}
+    --change-long-doc-ratio ${CHANGE_LONG_DOC_RATIO}
 
     --up-sample-factor ${UP_SAMPLE_FACTOR}
     --elongate-factor ${ELONGATE_FACTOR}
@@ -247,6 +251,10 @@ TORCHRUN_CMD=(
 # if [ ${USE_PLANNER} -eq 1 ]; then
 #     TORCHRUN_CMD+=(--use-planner)
 # fi
+
+if [ ${SHOULD_ADD_DEBUG_CASES} -eq 1 ]; then
+    TORCHRUN_CMD+=(--should-add-debug-cases)
+fi
 
 # Serialize TORCHRUN_CMD array so we can pass it through bash -lc cleanly
 TORCHRUN_STR=$(printf " %q" "${TORCHRUN_CMD[@]}")

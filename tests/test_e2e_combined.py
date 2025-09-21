@@ -11,6 +11,8 @@ Usage:
 bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
 """
+
+
 import time
 start_time__ = time.time()
 
@@ -130,6 +132,14 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
 
     def init(self, model_path, seed=42):
+        """
+        tp_comm_overlap_cfg:
+        tp_comm_overlap_ag: true
+        tp_comm_overlap_rs: true
+        tp_comm_bulk_wgrad: true
+        tp_comm_bulk_dgrad: true
+        ub_tp_comm_overlap: true
+        """
         set_random_seed(seed)
         self.model_path = model_path
         override_model_config = OmegaConf.create()
@@ -545,20 +555,24 @@ def get_next_batch(dp_size) -> Iterable[List[List[int]]]:
 # ========== D2 Specific Functions ==========
 
 # from transformer_engine.pytorch.attention.dot_product_attention.backends import get_attention_duration
+import traceback
 try:
     import wlbllm
     import wlbllm.utils
     import wlbllm.registry
     import wlbllm.megatron_patch.dot_product_attention
     import wlbllm.megatron_patch.backends
+    import wlbllm.fastmemcpy.fast_memcpy
     from wlbllm.fastmemcpy.fast_memcpy import prepare_metadata as wlb_memcpy_prepare_metadata
-except ImportError:
+except ImportError as e:
+    traceback.print_exc()
+    print(f"🟡 ImportError: {e}")
     print("""⚠️ WLBLLM is not installed. This only affects if you're testing WLBLLM tests. To install:
 
     cd d2/baseline/wlbllm_original
     pip install -e .
     """)
-    pass
+    exit(1)
 
 
 

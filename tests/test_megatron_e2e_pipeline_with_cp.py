@@ -50,6 +50,25 @@ enable_clickable_excepthook()
 
 
 
+import time
+start_time__ = time.time()
+
+import psutil, os
+rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID","0")))
+local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID","0")))
+p = psutil.Process(os.getpid())
+p.cpu_affinity([local * 16, local * 16 + 1])  # pin to core based on local rank
+print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
+
+# ----------------
+# Taskset confirm
+# ----------------
+import check_cpu_binding
+aff, mems = check_cpu_binding.check_cpu_binding()
+print(f"CPUS={aff} MEMS={mems}")
+
+
+
 class MegatronE2eWorker(BaseMegatronE2eWorker):
     def __init__(self, rank: int, world_size: int):
         super().__init__(rank, world_size)
@@ -324,6 +343,8 @@ def create_pp_microbatches(
     return ret
 
 
+# torch.cuda.empty_cache
+
 from contextlib import contextmanager
 @contextmanager
 def time_me(msg):
@@ -397,7 +418,9 @@ def test(args):
         elongate_factor=args.elongate_factor,
         filter_threshold=args.filter_threshold,
         filter_ratio=args.filter_ratio,
-        should_add_debug_cases=True,
+        should_add_debug_cases=args.should_add_debug_cases,
+        change_long_doc_ratio=args.change_long_doc_ratio,
+        sample_name=args.sample_name,
     )
     
 
@@ -414,7 +437,24 @@ def test(args):
         world_size, cp_size, tp_size, pp_size,
         dtype, MegatronE2eWorker
     )
-    worker.set_config(dtype=dtype)
+
+    enable_gradient_checkpointing = False
+    gradient_checkpointing_kwargs = {}
+    if os.environ.get("EXPERIMENT_ADD_SELECTIVE_CKPT", "0") == "1":
+        enable_gradient_checkpointing = True
+        gradient_checkpointing_kwargs = dict(
+                activations_checkpoint_method="mlp",
+                activations_checkpoint_granularity="selective",
+                activations_checkpoint_num_layers=None, # num-layers
+                activations_checkpoint_recompute_modules = ["mlp"],
+            )
+        print(f"🟡 [Rank {worker.rank}] Adding selective checkpoint: {gradient_checkpointing_kwargs}")
+    worker.set_config(
+        dtype=dtype,
+        enable_gradient_checkpointing=enable_gradient_checkpointing,
+        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+    )
+
     worker.init(model_path, seed=seed)
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
@@ -521,116 +561,89 @@ def test(args):
         should_run_baseline = False
         should_run_d2 = True
 
-        n_warmup = 1
-        n_repeats = 1
+        n_warmup = 1 if sample_idx == 0 else 0 # Per-sample warm up count
+        try:
+            if sample_idx == 0:
+                n_warmup = int(os.environ.get("EXPERIMENT_0TH_SAMPLE_WARMUP_TIMES", 1))
+            else:
+                n_warmup = int(os.environ.get("EXPERIMENT_WARMUP_TIMES", 0))
+            pass
+        except:
+            pass
+        
+        n_repeats = 2
+        try:
+            n_repeats = int(os.environ.get("EXPERIMENT_REPEAT_TIMES", 2))
+        except:
+            pass
 
         rank = torch.distributed.get_rank()
         d2.mem.enable_memory_usage_logging(memory_usage_dir)
 
-        if should_run_baseline_with_dummy:
-
+        def run_benchmark(mode, microbatches_to_use, with_dummy=False, log_path=None):
             durations = []
             for _ in range(n_repeats + n_warmup):
-
                 mem_ctx = nullcontext()
                 if _ < n_warmup and should_log_memory_during_warmup:
                     mem_ctx = d2.mem.log_memory_usage_context()
-                    pass
 
-
-                print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start baseline dummy {_}")
-                with torch.cuda.nvtx.range(f"baseline_dummy[sample={sample_idx}][repeat={_}]"):
+                print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start {mode} {_}")
+                with torch.cuda.nvtx.range(f"{mode}(pp{pp_size}dpcp{dp_size*cp_size}tp{tp_size})[sample={sample_idx}][repeat={_}]"):
                     with mem_ctx:
-                        torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
-                        loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
-                            microbatches=orig_impl_microbatches,
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        start_time = time.time()
+                        
+                        loss, grad = worker.forward_backward_batch(
+                            microbatches=microbatches_to_use,
                             forward_only=False,
-                            mode="orig_reimpl",
-                            with_dummy=True,
+                            mode=mode,
+                            with_dummy=with_dummy,
                         )
-                        torch.cuda.synchronize(); torch.distributed.barrier(); end_time = time.time()
+                        
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        end_time = time.time()
                         duration_ms = (end_time - start_time) * 1000
                         durations.append(duration_ms)
-                        print(f"⚪ [Rank {rank}] [sample {sample_idx}] baseline dummy {_}: {duration_ms} ms")
+                        print(f"⚪ [Rank {rank}] [sample {sample_idx}] {mode} {_}: {duration_ms} ms")
                 time.sleep(1)
-            
-            if rank == 0:
-                with open(benchmark_log_path__baseline_with_dummy, "a") as f:
+
+            if rank == 0 and log_path:
+                with open(log_path, "a") as f:
                     f.write(json.dumps({
                         "sample_id": sample_idx,
                         "duration_ms": duration_ms,
                         "duration_list": durations,
                         "seq_lens": seq_lens,
                     }) + "\n")
+            
+            torch.cuda.empty_cache()
+            return loss, grad
+
+        if should_run_baseline_with_dummy:
+            loss_orig_reimpl, grad_orig_reimpl = run_benchmark(
+                "orig_reimpl", 
+                orig_impl_microbatches,
+                with_dummy=True,
+                log_path=benchmark_log_path__baseline_with_dummy
+            )
 
         if should_run_baseline:
-            durations = []
-            for _ in range(n_repeats + n_warmup):
-                mem_ctx = nullcontext()
-                if _ < n_warmup and should_log_memory_during_warmup:
-                    mem_ctx = d2.mem.log_memory_usage_context()
-                    pass
-
-                print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start baseline {_}")
-                with torch.cuda.nvtx.range(f"baseline[sample={sample_idx}][repeat={_}]"):
-                    with mem_ctx:
-                        torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
-                        loss_orig, grad_orig = worker.forward_backward_batch(
-                            microbatches=orig_impl_microbatches,
-                            forward_only=False,
-                            mode="orig_reimpl",
-                            with_dummy=False,
-                        )
-                        torch.cuda.synchronize(); torch.distributed.barrier(); end_time = time.time()
-                        duration_ms = (end_time - start_time) * 1000
-                        durations.append(duration_ms)
-                        print(f"⚪ [Rank {rank}] [sample {sample_idx}] baseline {_}: {duration_ms} ms")
-                time.sleep(1)
-            
-            if rank == 0:
-                with open(benchmark_log_path__baseline, "a") as f:
-                    f.write(json.dumps({
-                        "sample_id": sample_idx,
-                        "duration_ms": duration_ms,
-                        "duration_list": durations,
-                        "seq_lens": seq_lens,
-                    }) + "\n")
-
-        
-        
+            loss_orig, grad_orig = run_benchmark(
+                "orig_reimpl",
+                orig_impl_microbatches, 
+                with_dummy=False,
+                log_path=benchmark_log_path__baseline
+            )
 
         if should_run_d2:
-            durations = []
-            for _ in range(n_repeats + n_warmup):
-                mem_ctx = nullcontext()
-                if _ < n_warmup and should_log_memory_during_warmup:
-                    mem_ctx = d2.mem.log_memory_usage_context()
-                    pass
-
-                print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start pingpong dummy {_}")
-                with torch.cuda.nvtx.range(f"d2[sample={sample_idx}][repeat={_}]"):
-                    with mem_ctx:
-                        torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
-                        loss_reduced, grad_sample = worker.forward_backward_batch(
-                            microbatches=microbatches,
-                            forward_only=False,
-                            mode="ping_pong",
-                            with_dummy=True,
-                        )
-                        torch.cuda.synchronize(); torch.distributed.barrier(); end_time = time.time()
-                        duration_ms = (end_time - start_time) * 1000
-                        durations.append(duration_ms)
-                        print(f"⚪ [Rank {rank}] [sample {sample_idx}] pingpong with dummy {_}: {duration_ms} ms")
-                time.sleep(1)
-                
-            if rank == 0:
-                with open(benchmark_log_path, "a") as f:
-                    f.write(json.dumps({
-                        "sample_id": sample_idx,
-                        "duration_ms": duration_ms,
-                        "duration_list": durations,
-                        "seq_lens": seq_lens,
-                    }) + "\n")
+            loss_reduced, grad_sample = run_benchmark(
+                "ping_pong",
+                microbatches,
+                with_dummy=True, 
+                log_path=benchmark_log_path
+            )
         
             
             # print(f"{loss_reduced=}, {loss_orig_reimpl=}, {loss_orig=}")
@@ -664,6 +677,9 @@ if __name__ == "__main__":
     parser.add_argument("--elongate-factor", type=int, default=1)
     parser.add_argument("--filter-threshold", type=int, default=65536)
     parser.add_argument("--filter-ratio", type=float, default=0.50)
+    parser.add_argument("--should-add-debug-cases", action="store_true")
+    parser.add_argument("--sample-name", type=str, default="wlbllm", choices=["wlbllm", "prolong"])
+    parser.add_argument("--change-long-doc-ratio", type=float, default=0.0)
 
     parser.add_argument("--model-path", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
     parser.add_argument("--num-layers", type=int, default=8)

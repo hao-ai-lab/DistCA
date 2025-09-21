@@ -2,12 +2,33 @@
 Debug example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 """
+
+import time
+start_time__ = time.time()
+
+import psutil, os
+rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID","0")))
+local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID","0")))
+p = psutil.Process(os.getpid())
+p.cpu_affinity([local * 16, local * 16 + 1])  # pin to core based on local rank
+print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
+
+# ----------------
+# Taskset confirm
+# ----------------
+import check_cpu_binding
+aff, mems = check_cpu_binding.check_cpu_binding()
+print(f"CPUS={aff} MEMS={mems}")
+
+
+
 import argparse
 from functools import partial
 import os
 import time
 import json
 import traceback
+from contextlib import nullcontext
 
 import megatron.core.parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -16,8 +37,9 @@ import torch
 from transformers import AutoConfig
 
 from d2.runtime.compute_metadata import get_attn_metadata
-from d2.runtime.megatron_patch.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
-from d2.runtime.megatron_patch.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
+from d2.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams
+from d2.runtime.megatron.packed_seq_params import arg_to_cuda
+from d2.runtime.megatron.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
 
 from test_util import ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch_pipeline_tick
 from test_megatron_e2e import MegatronE2eWorker as BaseMegatronE2eWorker, set_random_seed
@@ -313,7 +335,9 @@ def test(args):
         elongate_factor=args.elongate_factor,
         filter_threshold=args.filter_threshold,
         filter_ratio=args.filter_ratio,
-        should_add_debug_cases=True,
+        should_add_debug_cases=args.should_add_debug_cases,
+        change_long_doc_ratio=args.change_long_doc_ratio,
+        sample_name=args.sample_name,
     )
 
     # for _ in range(20):
@@ -392,10 +416,13 @@ def test(args):
 
         ENABLE_BALANCED_FLOS_NO_DEFER = True
 
+        unbalanced_micro_batches = get_next_batch(batch_size * 2 * num_microbatch)
+        print(f"🟡 unbalanced_micro_batches: {unbalanced_micro_batches}")
+        
+        all_seq_lens.append(unbalanced_micro_batches)
+        my_batch_ranks = list(range(dp_rank, dp_size * num_microbatch, dp_size))
+
         if ENABLE_BALANCED_FLOS_NO_DEFER:
-            unbalanced_micro_batches = get_next_batch(batch_size * 2 * num_microbatch)
-            print(f"🟡 unbalanced_micro_batches: {unbalanced_micro_batches}")
-            my_batch_ranks = list(range(dp_rank, dp_size * num_microbatch, dp_size))
             print(f"🟡 my_batch_ranks: {my_batch_ranks}")
             balanced_seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
                 dp_size * num_microbatch, my_batch_ranks, total_seq_len, batch_size, 
@@ -405,24 +432,14 @@ def test(args):
                 model_config=hf_config, 
             )
         else:
-            unbalanced_micro_batches = []
-            for i in range(num_microbatch):
-                a = get_next_batch(batch_size * 2 * num_microbatch)
-                all_seq_lens.append(a)
-                b = a[
-                    dp_rank * (batch_size * 2):
-                    (dp_rank + 1) * (batch_size * 2)
-                ]
-                unbalanced_micro_batches.append(b)
-                pass
-            balanced_seq_lens = [unbalanced_micro_batches[dp_rank]]
-            new_batch = unbalanced_micro_batches
-
+            balanced_seq_lens = [unbalanced_micro_batches[r] for r in my_batch_ranks]
             pass
+
         print(f"🟡 {dp_size =} * {pp_size =}, {dp_rank =}, {my_batch_ranks =}")
         print(f"🟡 balanced_seq_lens: {balanced_seq_lens}, {len(balanced_seq_lens) = }")
         assert len(balanced_seq_lens) == num_microbatch, f"len(balanced_seq_lens) == num_microbatch, {len(balanced_seq_lens)} != {num_microbatch}"
         print(f"🟡 new_batch: {new_batch}")
+        all_seq_lens.append(new_batch)
         
         microbatches = []
         all_seq_lens.append(balanced_seq_lens)
@@ -517,9 +534,24 @@ def test(args):
         
         rank = torch.distributed.get_rank()
         
-        max_warmup_cnt = 1
-        max_repeat_cnt = 1
-        durations_ms = []
+        max_warmup_cnt = 1 if sample_idx == 0 else 0 # Per-sample warm up count
+        try:
+            if sample_idx == 0:
+                max_warmup_cnt = int(os.environ.get("EXPERIMENT_0TH_SAMPLE_WARMUP_TIMES", 1))
+                pass
+            else:
+                max_warmup_cnt = int(os.environ.get("EXPERIMENT_WARMUP_TIMES", 0))
+                pass
+        except:
+            pass
+
+        max_repeat_cnt = 2
+        try:
+            max_repeat_cnt = int(os.environ.get("EXPERIMENT_REPEAT_TIMES", 2))
+        except:
+            pass
+
+        durations_ms = []        
         for repeat_idx in range(max_repeat_cnt + max_warmup_cnt):
             wlbllm.registry.set("forward_cnt", 0)
             wlbllm.registry.set("backward_cnt", 0)
@@ -531,13 +563,12 @@ def test(args):
                 os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP", "0") == "1"
             )
 
-            from contextlib import nullcontext
             memory_logging_ctx = nullcontext()
             if is_warmup and should_log_memory_during_warmup:
                 memory_logging_ctx = log_memory_usage_context()
                 pass
             
-            with torch.cuda.nvtx.range(f"wlbllm[sample={sample_idx}][repeat={repeat_idx}]"):
+            with torch.cuda.nvtx.range(f"wlbllm(pp{pp_size}cp{cp_size}dp{dp_size}tp{tp_size})[sample={sample_idx}][repeat={repeat_idx}]"):
                 with memory_logging_ctx:
                     torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                     loss, grad = worker.forward_backward_batch(
@@ -622,6 +653,9 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="./logs/")
 
     parser.add_argument("--max-sample-id", type=int, default=3)
+    parser.add_argument("--should-add-debug-cases", action="store_true")
+    parser.add_argument("--sample-name", type=str, default="wlbllm", choices=["wlbllm", "prolong"])
+    parser.add_argument("--change-long-doc-ratio", type=float, default=0.0)
 
     parser.add_argument("--up-sample-factor", type=int, default=4)
     parser.add_argument("--elongate-factor", type=int, default=1)
