@@ -460,7 +460,7 @@ def from_planner_output(
     import rich
     # qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
     #  out_grad_linear_to_attn, attn_metadata
-    rank = torch.distributed.get_rank()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     if rank % 8 == 1:
         rich.print(f"from_planner_output: qkv_linear_to_attn=", qkv_linear_to_attn)
         rich.print(f"from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear)
@@ -516,7 +516,7 @@ def backward_from_planner_output(
     )
     # FIXME(junda): print only when environment variable is set
     import rich
-    rank = torch.distributed.get_rank()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     if rank % 8 == 1:
         rich.print(f"backward_from_planner_output: qkv_resend_and_out_grad_linear_to_attn=", qkv_resend_and_out_grad_linear_to_attn.__better_print__())
         rich.print(f"backward_from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear.__better_print__())
