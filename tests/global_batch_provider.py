@@ -11,9 +11,48 @@ def balance_ping_pong_with_mb(
     seq_lens: list[list[int]],
     mb: int, batch_size: int,
 ) -> list[list[int]]:
+    """
+    Co-design with the `create_pp_microbatches` and `create_qkv_dispatch_pipeline_tick`.
+    
+    In flie `test_megatron_e2e_pipeline_with_cp.py`, the outer loop logic is roughly:
+    
+    ```python
+    for sample_idx in range(max_sample_id):
+        microbatches_0, tick_per_rank_doc_lens_0 = create_pp_microbatches(mb, batch_size)
+        microbatches_1, tick_per_rank_doc_lens_1 = create_pp_microbatches(mb, batch_size)
+        pass
+    ```
+
+    We first take the ping batch (of mb * batch_size number of batches), then the pong batch.
+    Sometimes, ping and pong are not balanced.
+    This function aims to balance the two batches in terms of attention flops. 
+    
+    The procedure of this function looks like this:
+    1. Take the `mb * batch_size * 2` number of batches.
+    2. Reorganize is such that we have
+    -------------------------------------------------------------------------------------------
+      ping_b[0] | ping_b[1] | ... | ping_b[bs-1] | pong_b[0] | pong_b[1] | ... | pong_b[bs-1]
+    -------------------------------------------------------------------------------------------
+
+
+    """
     
     def batch_flops(batch):
         return sum(y ** 2 // 2 for y in batch)
+
+    def zigzag(batches: list[list[int]]) -> list[list[int]]:
+        """
+        Convert each inner list into a zigzag pattern.
+        Example (single inner list shown):
+        8 7 6 5 4 3 2 1 -> 8 6 4 2 1 3 5 7
+        Rule: take elements at even indices in order, then odd indices in reverse.
+        """
+        out: list[list[int]] = []
+        for batch in batches:
+            left = batch[0::2]            # even indices
+            right = batch[1::2][::-1]     # odd indices, reversed
+            out.append(left + right)
+        return out
 
     assert len(seq_lens) % 2 == 0, f"ping pong should have even number of batches, but got {len(seq_lens)} batches, seq_lens={seq_lens}"
     assert len(seq_lens) == (mb * batch_size * 2), f"seq_lens should be divisible by {mb * batch_size * 2}, but got {len(seq_lens)}"
@@ -21,8 +60,7 @@ def balance_ping_pong_with_mb(
     sorted_batches_deque = deque(sorted_batches)
     
     # Now sorted_batches_deque is sorted by flops >
-    print(f"sorted_batches_deque: {sorted_batches_deque}")
-    microbatch_results: 'list[list[list[int]]]' = []
+    microbatch_results: 'list[list[int]]' = []
 
     for _ in range(mb):
         batches = []
@@ -43,31 +81,11 @@ def balance_ping_pong_with_mb(
                 pong_flops += batch_flops(batch)
         
         # Feed the ping and pong back to the results
-        microbatch_results.append(
-            (ping, pong)
-        )
+        ping = zigzag(ping)
+        pong = zigzag(pong)
+        microbatch_results.extend(ping + pong)
 
-    print(f"microbatch_results: {microbatch_results}")
-    results: deque[list[int]] = deque()
-    flip = False
-    while microbatch_results:
-        # Pop the smallest flop items.
-        ping, pong = microbatch_results.pop()
-        if flip:
-            for b in ping:
-                results.appendleft(b)
-            for b in pong:
-                results.appendleft(b)
-        else:
-            for b in ping:
-                results.append(b)
-            for b in pong:
-                results.append(b)
-        flip = not flip
-
-    assert len(results) == len(seq_lens), f"results should have the same length as seq_lens, but got {len(results)} != {len(seq_lens)}"
-    print(f"results: {results}")
-    return list(results)
+    return microbatch_results
 
 
 ITERATION_ID = 0

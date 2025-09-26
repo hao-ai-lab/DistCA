@@ -618,7 +618,8 @@ def test(args):
                 memory_logging_ctx = log_memory_usage_context()
                 pass
             
-            with torch.cuda.nvtx.range(f"wlbllm[sample={sample_idx}][repeat={repeat_idx}]"):
+            config_name = f"n{args.num_nodes}t{args.num_tokens}b{args.num_batches}mb{args.num_microbatch}-cp{args.cp_size}pp{args.pp_size}tp{args.tp_size}"
+            with torch.cuda.nvtx.range(f"wlbllm({config_name})[sample={sample_idx}][repeat={repeat_idx}]"):
                 with memory_logging_ctx:
                     torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                     loss, grad = worker.forward_backward_batch(

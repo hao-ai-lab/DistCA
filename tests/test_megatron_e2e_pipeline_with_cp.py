@@ -361,6 +361,7 @@ def time_me(msg):
 def test(args):
     seed = args.seed
     # test scale
+    num_nodes = args.num_nodes
     num_tokens = args.num_tokens
     dpcp_size = args.cp_size
     num_seqs = args.num_seqs
@@ -435,7 +436,14 @@ def test(args):
     )
     
 
-    hf_config = AutoConfig.from_pretrained(model_path)
+    # Use local cache to avoid HuggingFace rate limiting
+    try:
+        # First try with local_files_only to use cached version
+        hf_config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    except Exception as e:
+        print(f"Local cache not found for {model_path}, downloading... Error: {e}")
+        # Fallback to downloading with cache_dir specified
+        hf_config = AutoConfig.from_pretrained(model_path, cache_dir="./models/")
     hidden_size_q = hf_config.hidden_size
 
     hidden_size_kv = hidden_size_q
@@ -670,8 +678,9 @@ def test(args):
                     mem_ctx = d2.mem.log_memory_usage_context()
                     pass
 
+                config_name = f"n{num_nodes}t{num_tokens}b{num_batches}mb{num_microbatch}-cp{dpcp_size}pp{pp_size}tp{tp_size}"
                 print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start pingpong dummy {_}")
-                with torch.cuda.nvtx.range(f"d2[sample={sample_idx}][repeat={_}]"):
+                with torch.cuda.nvtx.range(f"d2({config_name})[sample={sample_idx}][repeat={_}]"):
                     with mem_ctx:
                         torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                         loss_reduced, grad_sample = worker.forward_backward_batch(
@@ -730,7 +739,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample-name", type=str, default="wlbllm")
     parser.add_argument("--change-long-doc-ratio", type=float, default=0.0)
 
-    parser.add_argument("--model-path", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
+    parser.add_argument("--model-path", type=str, default="./models/codellama/CodeLlama-34b-hf")
     parser.add_argument("--num-layers", type=int, default=8)
     parser.add_argument("--max-sample-id", type=int, default=3)
     parser.add_argument("--should-add-debug-cases", action="store_true")

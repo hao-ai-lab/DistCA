@@ -6,6 +6,7 @@ import json
 # root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v1-sweep-pp-34b"
 # root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v2-sweep-pp-34b"
 root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v3-sweep-pp-34b"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v4-sweep-pp-34b"
 a = os.listdir(root_path)
 a = sorted(a)
 
@@ -102,6 +103,7 @@ for folder in a:
     # print(f"{name}: {average_duration:.2f}ms")
 
 
+    # only_focus_on_sample_id = {0}
     only_focus_on_sample_id = {}
     sample_durations = {}
     for i, d in enumerate(durations):

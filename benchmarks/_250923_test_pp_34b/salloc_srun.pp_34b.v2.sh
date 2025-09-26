@@ -10,7 +10,9 @@ DRY_RUN=0
 SKIP_PARTIAL=0
 SKIP_STARTED=0
 SKIP_COMPLETED=0
+SKIP_OOM=1  # Skip OOM cases by default
 MONITOR_STUCK=0
+DEBUG_ONLY=0
 
 # Filter variables
 FILTER_MODEL_PATH=""
@@ -55,8 +57,16 @@ while [[ $# -gt 0 ]]; do
             SKIP_COMPLETED=1
             shift
             ;;
+        --no-skip-oom)
+            SKIP_OOM=0
+            shift
+            ;;
         --monitor-stuck)
             MONITOR_STUCK=1
+            shift
+            ;;
+        --debug-only)
+            DEBUG_ONLY=1
             shift
             ;;
         --filter-model_path)
@@ -105,7 +115,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--ls] [--ls-runs] [--ls-runs-full] [--dry-run] [--skip-partial] [--skip-started] [--skip-completed] [--monitor-stuck] [FILTER_OPTIONS]"
+            echo "Usage: $0 [--ls] [--ls-runs] [--ls-runs-full] [--dry-run] [--skip-partial] [--skip-started] [--skip-completed] [--no-skip-oom] [--monitor-stuck] [--debug-only] [FILTER_OPTIONS]"
             echo "  --ls            List configs that would be run and exit"
             echo "  --ls-runs       List configs and show existing run folders, then exit"
             echo "  --ls-runs-full  List ALL configs (including completed) and show existing run folders, then exit"
@@ -113,7 +123,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-partial  Skip configs that already have partial results (benchmark.raw.jsonl)"
             echo "  --skip-started  Skip configs that have already been started (have README.md)"
             echo "  --skip-completed Skip configs that have been completed with sufficient samples (>= MAX_SAMPLE_ID)"
+            echo "  --no-skip-oom   Don't skip configs that have OOM errors (by default OOM cases are skipped)"
             echo "  --monitor-stuck Enable job monitoring to detect stuck processes (disabled by default)"
+            echo "  --debug-only    Only run configs with EXPERIMENT__DEBUG=1 (by default debug configs are filtered out)"
             echo ""
             echo "Filter Options (comma-separated values for OR condition):"
             echo "  --filter-model_path VALUE   Filter by model path"
@@ -226,7 +238,7 @@ case_matches_filters() {
     return 0
 }
 
-export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v3-sweep-pp-34b
+export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v4-sweep-pp-34b
 
 export STATUS_FILE_PATH=${OUTPUT_DIR_PREFIX}/job-status.txt
 mkdir -p ${OUTPUT_DIR_PREFIX}
@@ -481,6 +493,38 @@ config_is_completed_with_sufficient_samples() {
     return 1  # No completed runs with sufficient samples found
 }
 
+# Function to check if a config has OOM errors
+# Returns 0 (true) if there's any run with OOM status
+config_has_oom() {
+    local mode=$1
+    local nnodes=$2
+    local num_tokens=$3
+    local batch_size=$4
+    local microbatch_size=$5
+    local cp_size=$6
+    local tp_size=$7
+    local pp_size=$8
+    local model_path_normalized=$9
+    
+    local existing_runs=$(find_existing_runs "$mode" "$nnodes" "$num_tokens" "$batch_size" "$microbatch_size" "$cp_size" "$tp_size" "$pp_size" "$model_path_normalized")
+    
+    if [ -z "$existing_runs" ]; then
+        return 1  # No existing runs, so no OOM
+    fi
+    
+    # Check if any run has OOM status
+    while IFS= read -r run_dir; do
+        if [ -z "$run_dir" ]; then continue; fi
+        
+        local status=$(analyze_run_status "$run_dir")
+        if [[ "$status" == "OOM" ]]; then
+            return 0  # Found OOM run
+        fi
+    done <<< "$existing_runs"
+    
+    return 1  # No OOM runs found
+}
+
 # -----------------------------
 # TorchRun Final Logging Flag (for cleaner console)
 # -----------------------------
@@ -536,6 +580,30 @@ param_configs_cases=()
 config_sweep_memory=()
 # Get current directory of this script
 CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+
+
+# Function to check if env_var contains EXPERIMENT__DEBUG=1
+has_debug_flag() {
+    local env_var="$1"
+    
+    if [ -z "$env_var" ]; then
+        return 1  # No env_var, so no debug flag
+    fi
+    
+    # Remove surrounding quotes if present
+    env_var_clean="${env_var//\'/}"  # Remove single quotes
+    env_var_clean="${env_var_clean//\"/}"  # Remove double quotes
+    
+    # Look for EXPERIMENT__DEBUG=1 in the env_var string
+    if [[ "$env_var_clean" =~ EXPERIMENT__DEBUG=1 ]]; then
+        return 0  # Found debug flag
+    fi
+    
+    return 1  # No debug flag found
+}
+
+
 
 # Read config file line by line and append to array
 line_number=0
@@ -611,6 +679,37 @@ while IFS= read -r line; do
         fi
     fi
     
+    # Skip lines that have OOM errors if SKIP_OOM flag is set (default behavior)
+    if [[ "$SKIP_OOM" == "1" ]] && [[ "$LIST_RUNS_FULL" != "1" ]]; then
+        # Parse the config line to check for OOM jobs
+        if read -r nnodes batch_size microbatch_size num_tokens mode cp_size pp_size tp_size comment env_var <<< "$line"; then
+            # Create model_path_normalized (assuming codellama/CodeLlama-34b-hf)
+            model_path_normalized="codellama_CodeLlama-34b-hf"
+            
+            if config_has_oom "$mode" "$nnodes" "$num_tokens" "$batch_size" "$microbatch_size" "$cp_size" "$tp_size" "$pp_size" "$model_path_normalized"; then
+                echo "🔴 Skipping config line $line_number due to OOM errors (use --no-skip-oom to include): $original_line"
+                continue
+            fi
+        fi
+    fi
+    
+    # Handle debug-only filtering
+    if read -r nnodes batch_size microbatch_size num_tokens mode cp_size pp_size tp_size comment env_var <<< "$line"; then
+        if [[ "$DEBUG_ONLY" == "1" ]]; then
+            # If --debug-only is set, only include configs with EXPERIMENT__DEBUG=1
+            if ! has_debug_flag "$env_var"; then
+                echo "🔍 Skipping config line $line_number (--debug-only set, but no EXPERIMENT__DEBUG=1): $original_line"
+                continue
+            fi
+        else
+            # If --debug-only is NOT set, filter OUT configs with EXPERIMENT__DEBUG=1
+            if has_debug_flag "$env_var"; then
+                echo "🔍 Skipping config line $line_number (debug config filtered out, use --debug-only to include): $original_line"
+                continue
+            fi
+        fi
+    fi
+    
     # Store line number with the config line
     config_sweep_memory+=("$line_number:$line")
 done < "$CURDIR/config_sweep_memory.config.v2.sh"
@@ -681,8 +780,8 @@ sort_cases_by_priority
 
 
 dists=(
-    "wlbllm 0.0"
-    # "prolong 0.3"
+    # "wlbllm 0.0"
+    "prolong 0.3"
 )
 
 function write_status_log() {
@@ -809,7 +908,7 @@ for case in "${cases[@]}"; do
     if [ "$mode" == "wlbllm" ]; then
         wlbllm_cases+=("$case")
         
-        # Check if this config would be skipped due to partial results, started status, or completion
+        # Check if this config would be skipped due to partial results, started status, completion, or OOM
         skip_indicator=""
         if [[ "$SKIP_PARTIAL" == "1" ]] && config_has_partial_results "$mode" "$nnodes" "$num_tokens" "$batch_size" "$microbatch_size" "$cp_size" "$tp_size" "$pp_size" "$model_path_normalized"; then
             skip_indicator=" [SKIP-PARTIAL]"
@@ -817,6 +916,8 @@ for case in "${cases[@]}"; do
             skip_indicator=" [SKIP-STARTED]"
         elif [[ "$SKIP_COMPLETED" == "1" ]] && config_is_completed_with_sufficient_samples "$mode" "$nnodes" "$num_tokens" "$batch_size" "$microbatch_size" "$cp_size" "$tp_size" "$pp_size" "$model_path_normalized"; then
             skip_indicator=" [SKIP-COMPLETED]"
+        elif [[ "$SKIP_OOM" == "1" ]] && config_has_oom "$mode" "$nnodes" "$num_tokens" "$batch_size" "$microbatch_size" "$cp_size" "$tp_size" "$pp_size" "$model_path_normalized"; then
+            skip_indicator=" [SKIP-OOM]"
         fi
         
         printf "$format_str" \
@@ -842,7 +943,7 @@ for case in "${cases[@]}"; do
     if [ "$mode" == "d2" ]; then
         d2_cases+=("$case")
         
-        # Check if this config would be skipped due to partial results, started status, or completion
+        # Check if this config would be skipped due to partial results, started status, completion, or OOM
         skip_indicator=""
         if [[ "$SKIP_PARTIAL" == "1" ]] && config_has_partial_results "$mode" "$nnodes" "$num_tokens" "$batch_size" "$microbatch_size" "$cp_size" "$tp_size" "$pp_size" "$model_path_normalized"; then
             skip_indicator=" [SKIP-PARTIAL]"
@@ -850,6 +951,8 @@ for case in "${cases[@]}"; do
             skip_indicator=" [SKIP-STARTED]"
         elif [[ "$SKIP_COMPLETED" == "1" ]] && config_is_completed_with_sufficient_samples "$mode" "$nnodes" "$num_tokens" "$batch_size" "$microbatch_size" "$cp_size" "$tp_size" "$pp_size" "$model_path_normalized"; then
             skip_indicator=" [SKIP-COMPLETED]"
+        elif [[ "$SKIP_OOM" == "1" ]] && config_has_oom "$mode" "$nnodes" "$num_tokens" "$batch_size" "$microbatch_size" "$cp_size" "$tp_size" "$pp_size" "$model_path_normalized"; then
+            skip_indicator=" [SKIP-OOM]"
         fi
         
         printf "$format_str" \
@@ -886,10 +989,20 @@ fi
 if [[ "$SKIP_COMPLETED" == "1" ]]; then
     echo "✅ --skip-completed flag is enabled (MAX_SAMPLE_ID: $MAX_SAMPLE_ID)"
 fi
+if [[ "$SKIP_OOM" == "1" ]]; then
+    echo "🔴 Skipping OOM cases by default (use --no-skip-oom to include them)"
+else
+    echo "🔴 --no-skip-oom flag is enabled (including OOM cases)"
+fi
 if [[ "$MONITOR_STUCK" == "1" ]]; then
     echo "🔍 --monitor-stuck flag is enabled (job monitoring active)"
 else
     echo "🏃 Job monitoring is disabled (use --monitor-stuck to enable)"
+fi
+if [[ "$DEBUG_ONLY" == "1" ]]; then
+    echo "🔍 --debug-only flag is enabled (only running configs with EXPERIMENT__DEBUG=1)"
+else
+    echo "🔍 Debug configs are filtered out by default (use --debug-only to include only debug configs)"
 fi
 
 echo ""
