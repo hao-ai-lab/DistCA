@@ -27,7 +27,7 @@ def test(args):
     lse_size = 0    # we do not test pp here so it can be 0
     scheduler_output, _ = create_random_shard_info(args.seed, world_size, num_doc, max_cp_degree,
                                                    min_shard_len=8, tot_num_token=total_seq_len)
-    qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata, _, _ = from_planner_output(
+    qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata, _, _, _ = from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
         is_pipeline_tick=False,
     )
@@ -62,6 +62,7 @@ def test(args):
         src_shard = src_buffer[rank]
         src_shard_cor = src_shard.clone()
         send_mask = metadata_slice.kv_replica_mask
+        max_cp = metadata_slice.kv_replica_mask.shape[1]
         # Q shard
         src_shard_cor = simulate_fa2a_copy_non_cp(
             q_shard.flatten(), src_shard_cor, q_src_offsets, q_src_seqlen,
@@ -78,7 +79,7 @@ def test(args):
         # K shard
         src_shard_cor = simulate_fa2a_copy_cp(
             k_shard.flatten(), src_shard_cor, k_src_offsets,
-            kv_src_seqlen, hidden_size_k, element_size, max_cp_degree,
+            kv_src_seqlen, hidden_size_k, element_size, max_cp,
             send_mask, is_send=True,
         )
         do_shard = send_mask.to(torch.int8).cuda()
@@ -92,7 +93,7 @@ def test(args):
         print(f"copying rank {rank} k shard to src buffer done.")
         src_shard_cor = simulate_fa2a_copy_cp(
             v_shard.flatten(), src_shard_cor, v_src_offsets,
-            kv_src_seqlen, hidden_size_k, element_size, max_cp_degree,
+            kv_src_seqlen, hidden_size_k, element_size, max_cp,
             send_mask, is_send=True,
         )
         src_buffer[rank] = src_shard_cor
@@ -176,6 +177,7 @@ def test(args):
         grad_v_shard = grad_v[rank]
         # assume grad equals the original value
         grad_shard = src_buffer[rank]
+        max_cp = metadata_slice.kv_replica_mask.shape[1]
         # K
         grad_send_mask = metadata_slice.kv_replica_mask
         grad_do_shard = grad_send_mask.to(torch.int8).cuda()
@@ -183,7 +185,7 @@ def test(args):
         grad_k_shard_cor = grad_k_shard.flatten(start_dim=1).clone()
         grad_k_shard_cor = simulate_fa2a_copy_cp(
             grad_k_shard_cor, grad_shard, grad_k_recv_offsets, grad_seqlen_kv,
-            hidden_size_k, element_size, max_cp_degree, grad_send_mask, is_send=False,
+            hidden_size_k, element_size, max_cp, grad_send_mask, is_send=False,
         )
         grad_k_shard_cor = grad_k_shard_cor.reshape_as(grad_k_shard)
         torch.testing.assert_close(
