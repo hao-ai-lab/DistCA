@@ -45,19 +45,6 @@ _PerPairShardInfo = list[list[list[_ShardCommInfo]]]
 _PerPairCommInfo = list[list[_PairCommInfo]]
 
 
-def send_bytes_to_fa2a_metadata(send_bytes: torch.Tensor):
-    # TODO: remove the local communication, which is the major part.
-    # This allows a much smaller nsys buffer.
-    sender_send_disp = exclusive_cumsum(send_bytes, dim=1)
-    sender_transfer_sz = send_bytes
-    # (i,j) -> on i, send_bytes received from j
-    recver_transfer_sz = send_bytes.transpose(0, 1).contiguous()
-    # (i,j) -> on i, offset for buffer from j
-    recver_recv_disp = exclusive_cumsum(recver_transfer_sz, dim=1)
-    sender_recv_disp = recver_recv_disp.transpose(0, 1).contiguous()
-    return (sender_send_disp, sender_transfer_sz, sender_recv_disp, recver_transfer_sz)
-
-
 def get_per_token_bytes(
     hidden_size_q: int,
     hidden_size_kv: int,
@@ -66,6 +53,7 @@ def get_per_token_bytes(
     is_resend_qkv_in_bwd: bool,
     is_send_lse_in_fwd: bool,
 ):
+    """Get the number of bytes per token."""
     assert not (is_send_lse_in_fwd and is_resend_qkv_in_bwd), "cannot be both fwd(send lse) and bwd(resend qkv)"
     # compute per token hidden size
     q_bytes = element_size * (
@@ -86,38 +74,21 @@ def get_per_token_bytes(
     return q_bytes_pad, k_bytes, attn_out_bytes_pad
 
 
-def _get_logical_shape(
-    num_token_per_rank: torch.Tensor,
-    world_size: int,
-    hidden: int,
-    is_kv_linear: bool = False,
-    kv_max_cp: Optional[list[int]] = None,
-):
-    assert num_token_per_rank.shape == (world_size,)
-    num_total_tokens: list[int] = [
-        num_token_per_rank[rank].item() for rank in range(world_size)
-    ]
-    return [
-        (kv_max_cp[rank], nt, hidden) if is_kv_linear else (nt, hidden)
-        for rank, nt in enumerate(num_total_tokens)
-    ]
+def get_fa2a_metadata(send_bytes: torch.Tensor):
+    """Get the fa2a metadata from the send_bytes matrix (index (i,j) means bytes from i to j)."""
+    # TODO: remove the local communication, which is the major part.
+    # This allows a much smaller nsys buffer.
+    sender_send_disp = exclusive_cumsum(send_bytes, dim=1)
+    sender_transfer_sz = send_bytes
+    # (i,j) -> on i, send_bytes received from j
+    recver_transfer_sz = send_bytes.transpose(0, 1).contiguous()
+    # (i,j) -> on i, offset for buffer from j
+    recver_recv_disp = exclusive_cumsum(recver_transfer_sz, dim=1)
+    sender_recv_disp = recver_recv_disp.transpose(0, 1).contiguous()
+    return (sender_send_disp, sender_transfer_sz, sender_recv_disp, recver_transfer_sz)
 
 
-def _get_seqlens(
-    doc_info: _AllDocInfo,
-    on_rank_shard_id: list[list[_ShardID]],
-):
-    world_size = len(on_rank_shard_id)
-    seqlens = []
-    for rank in range(world_size):
-        rank_seqlens = []
-        for shard_id in on_rank_shard_id[rank]:
-            shard_info = doc_info[shard_id.doc_id][shard_id.logical_id]
-            rank_seqlens.append(shard_info.shard_len)
-        seqlens.append(torch.tensor(rank_seqlens, dtype=torch.int32))
-    return seqlens
-
-
+#### Tensor shape.
 def _total_tokens(comm_infos: list[_ShardCommInfo], doc_info: _AllDocInfo):
     """Sum the number of tokens."""
     num_tokens = 0
@@ -126,6 +97,24 @@ def _total_tokens(comm_infos: list[_ShardCommInfo], doc_info: _AllDocInfo):
         shard_len = doc_info[shard_id.doc_id][shard_id.logical_id].shard_len
         num_tokens += shard_len
     return num_tokens
+
+
+def _get_logical_shape(
+    num_token_per_rank: torch.Tensor,
+    world_size: int,
+    hidden: int,
+    is_kv_linear: bool = False,
+    kv_max_cp: Optional[list[int]] = None,
+):
+    """Get the logical shape of the tensor on each rank."""
+    assert num_token_per_rank.shape == (world_size,)
+    num_total_tokens: list[int] = [
+        num_token_per_rank[rank].item() for rank in range(world_size)
+    ]
+    return [
+        (kv_max_cp[rank], nt, hidden) if is_kv_linear else (nt, hidden)
+        for rank, nt in enumerate(num_total_tokens)
+    ]
 
 
 def _get_input_output_shape(linear_to_attn_q: _PerPairShardInfo,
@@ -174,6 +163,40 @@ def _get_input_output_shape(linear_to_attn_q: _PerPairShardInfo,
     return q_shape, k_shape, pair_comm_tokens_q, pair_comm_tokens_k
 
 
+#### Seqlens
+def _collect_per_rank_shard_lens(
+    doc_info: _AllDocInfo,
+    on_rank_shard_id: _PerRankShards,
+):
+    """Get the seqlens of each shard on each rank."""
+    world_size = len(on_rank_shard_id)
+    seqlens = []
+    for rank in range(world_size):
+        rank_seqlens = []
+        for shard_id in on_rank_shard_id[rank]:
+            shard_info = doc_info[shard_id.doc_id][shard_id.logical_id]
+            rank_seqlens.append(shard_info.shard_len)
+        seqlens.append(torch.tensor(rank_seqlens, dtype=torch.int32))
+    return seqlens
+
+
+def _compute_seqlens(doc_info: _AllDocInfo,
+                     linear_shards_on_rank: _PerRankShards,
+                     attn_q_shards_on_rank: _PerRankShards,
+                     attn_k_shards_on_rank: _PerRankShards):
+    """
+    Compute the seqlens for a2a metadata.
+    NOTE: this should only be used for k shards not deduped.
+    """
+    linear_seqlens = _collect_per_rank_shard_lens(doc_info, linear_shards_on_rank)
+    attn_q_seqlens = _collect_per_rank_shard_lens(doc_info, attn_q_shards_on_rank)
+    attn_k_seqlens = _collect_per_rank_shard_lens(doc_info, attn_k_shards_on_rank)
+    linear_to_attn_seqlens_q = SeqLens(linear_seqlens, attn_q_seqlens)
+    linear_to_attn_seqlens_k = SeqLens(linear_seqlens, attn_k_seqlens)
+    return linear_to_attn_seqlens_q, linear_to_attn_seqlens_k
+####
+
+
 def _dedup_k_shard(comm_infos: list[_ShardCommInfo]):
     """See _dedup_k_shard_world."""
     seen = set()
@@ -206,8 +229,7 @@ def _assign_offsets(
     shards: _PairCommInfo | list[_ShardCommInfo],
     is_kv_linear: bool = False,
 ):
-    # TODO: pass a dedup mask. Then, the deduplicated shards will skip its offset assignment.
-    # Instead, it will reuses the offset assigned to the main copy.
+    """Assign the offsets for each shard in the send and recv buffer."""
     if is_kv_linear:
         assert isinstance(shards, _PairCommInfo)
         comm_infos = shards.shards
@@ -242,22 +264,6 @@ def _assign_offsets(
         cur_offset_send += shard_len * token_bytes
         cur_offset_recv += shard_len * token_bytes
     return cur_offset_send, cur_offset_recv
-
-
-def _compute_seqlens(doc_info: _AllDocInfo,
-                     linear_shards_on_rank,
-                     attn_q_shards_on_rank,
-                     attn_k_shards_on_rank):
-    """
-    Compute the seqlens for a2a metadata.
-    NOTE: this should only be used for k shards not deduped.
-    """
-    linear_seqlens = _get_seqlens(doc_info, linear_shards_on_rank)
-    attn_q_seqlens = _get_seqlens(doc_info, attn_q_shards_on_rank)
-    attn_k_seqlens = _get_seqlens(doc_info, attn_k_shards_on_rank)
-    linear_to_attn_seqlens_q = SeqLens(linear_seqlens, attn_q_seqlens)
-    linear_to_attn_seqlens_k = SeqLens(linear_seqlens, attn_k_seqlens)
-    return linear_to_attn_seqlens_q, linear_to_attn_seqlens_k
 
 
 def get_attn_metadata(
@@ -408,7 +414,7 @@ def _from_planner_output(
         pair_comm_tokens_q * q_bytes + pair_comm_tokens_k * k_bytes * 2
     )
     # fast a2a metadata
-    linear_to_attn_qkv_fa2a_metadata = send_bytes_to_fa2a_metadata(
+    linear_to_attn_qkv_fa2a_metadata = get_fa2a_metadata(
         linear_to_attn_qkv_bytes
     )
 
@@ -512,7 +518,7 @@ def _from_planner_output(
         out_grad_linear_to_attn_bytes = (
             pair_comm_tokens_q * attn_out_bytes
         )
-        linear_to_attn_out_grad_fa2a_metadata = send_bytes_to_fa2a_metadata(
+        linear_to_attn_out_grad_fa2a_metadata = get_fa2a_metadata(
             out_grad_linear_to_attn_bytes
         )
         # my rank fa2a metadata
