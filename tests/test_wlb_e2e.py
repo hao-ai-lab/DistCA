@@ -3,6 +3,26 @@ Debug example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 """
 
+
+import time
+start_time__ = time.time()
+
+import psutil, os
+rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID","0")))
+local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID","0")))
+p = psutil.Process(os.getpid())
+p.cpu_affinity([local * 16, local * 16 + 1])  # pin to core based on local rank
+print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
+
+# ----------------
+# Taskset confirm
+# ----------------
+import check_cpu_binding
+aff, mems = check_cpu_binding.check_cpu_binding()
+print(f"CPUS={aff} MEMS={mems}")
+
+
+
 import argparse
 from functools import partial
 import os
@@ -12,6 +32,9 @@ import traceback
 from typing import Any
 
 from transformers import AutoTokenizer, AutoProcessor
+
+
+from contextlib import nullcontext
 
 
 import megatron.core.parallel_state as mpu
@@ -452,6 +475,12 @@ def test(args):
 
         ENABLE_BALANCED_FLOS_NO_DEFER = True
 
+        unbalanced_micro_batches = get_next_batch(batch_size * 2 * num_microbatch)
+        print(f"🟡 unbalanced_micro_batches: {unbalanced_micro_batches}")
+        
+        all_seq_lens.append(unbalanced_micro_batches)
+        my_batch_ranks = list(range(dp_rank, dp_size * num_microbatch, dp_size))
+
         if ENABLE_BALANCED_FLOS_NO_DEFER:
             batch_size_x2 = int(batch_size * 2)
             assert isinstance(batch_size_x2, int) and batch_size_x2 > 0
@@ -488,6 +517,7 @@ def test(args):
         print(f"🟡 balanced_seq_lens: {balanced_seq_lens}, {len(balanced_seq_lens) = }")
         assert len(balanced_seq_lens) == num_microbatch, f"len(balanced_seq_lens) == num_microbatch, {len(balanced_seq_lens)} != {num_microbatch}"
         print(f"🟡 new_batch: {new_batch}")
+        all_seq_lens.append(new_batch)
         
         microbatches = []
         all_seq_lens.append(balanced_seq_lens)
@@ -612,7 +642,6 @@ def test(args):
                 os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP", "0") == "1"
             )
 
-            from contextlib import nullcontext
             memory_logging_ctx = nullcontext()
             if is_warmup and should_log_memory_during_warmup:
                 memory_logging_ctx = log_memory_usage_context()
@@ -706,6 +735,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-sample-id", type=int, default=3)
     parser.add_argument("--should-add-debug-cases", action="store_true")
     parser.add_argument("--sample-name", type=str, default="wlbllm")
+    parser.add_argument("--sample-name", type=str, default="wlbllm", choices=["wlbllm", "prolong"])
     parser.add_argument("--change-long-doc-ratio", type=float, default=0.0)
 
     parser.add_argument("--up-sample-factor", type=int, default=4)
