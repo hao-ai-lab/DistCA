@@ -170,7 +170,7 @@ def test(args):
     )
 
     tik = time.time()
-    fwd_qkv_metadata, bwd_qkv_metadata, fwd_attn_out_metadata, bwd_attn_out_metadata = from_planner_output(
+    fwd_qkv_metadata, bwd_qkv_metadata, fwd_attn_out_metadata, bwd_attn_out_metadata, _ = from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
         is_pipeline_tick=False
     )

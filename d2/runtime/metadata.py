@@ -34,6 +34,7 @@ class LogicalShape:
     Logical shape for input and output tensors. By logical,
     KV send shape is (cp_degree, num_tokens, hidden_size);
     Other tensors have the same shape as physical shape.
+    This shape is used to construct empty buffers for recv.
     """
     send_shape: Union[torch.Size, Sequence[torch.Size]]
     recv_shape: Union[torch.Size, Sequence[torch.Size]]
