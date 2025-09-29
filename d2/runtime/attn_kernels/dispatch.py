@@ -84,46 +84,6 @@ def post_a2a_qkv(
     return recv_q, recv_k, recv_v
 
 
-def fast_a2a_qkv(
-    q: Tensor, k: Tensor, v: Tensor, kv_dispatch_mask: Tensor,
-    recv_q: Tensor, recv_k: Tensor, recv_v: Tensor,
-    q_seq_tokens: Tensor, k_seq_tokens: Tensor,
-    q_recv_seq_tokens: Tensor, k_recv_seq_tokens: Tensor,
-    q_send_buffer_offset: Tensor, k_send_buffer_offset: Tensor, v_send_buffer_offset: Tensor,
-    q_recv_buffer_offset: Tensor, k_recv_buffer_offset: Tensor, v_recv_buffer_offset: Tensor,
-    sender_send_disp: Tensor, sender_transfer_sz: Tensor,
-    sender_recv_disp: Tensor, recver_transfer_sz: Tensor,
-    my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
-    is_fwd: bool,
-    switch_buffer: bool = True,
-    instance_id: int=None,
-    # TODO: reorder args to make it more logical
-    kv_grad_copy_seq_mask: Tensor=None,
-):
-    # copy in advance
-    q, k, v = pre_a2a_qkv(
-        q, k, v, kv_dispatch_mask, q_seq_tokens, k_seq_tokens,
-        q_send_buffer_offset, k_send_buffer_offset, v_send_buffer_offset,
-        is_fwd=is_fwd, instance_id=instance_id,
-        kv_grad_copy_seq_mask=kv_grad_copy_seq_mask,
-    )
-    # all2all
-    fast_a2a(
-        sender_send_disp, sender_transfer_sz,
-        sender_recv_disp, recver_transfer_sz,
-        my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz,
-        instance_id=instance_id,
-    )
-    # copy back
-    recv_q, recv_k, recv_v = post_a2a_qkv(
-        recv_q, recv_k, recv_v, kv_dispatch_mask,
-        q_recv_seq_tokens, k_recv_seq_tokens,
-        q_recv_buffer_offset, k_recv_buffer_offset, v_recv_buffer_offset,
-        is_fwd=is_fwd, switch_buffer=switch_buffer, instance_id=instance_id,
-    )
-    return recv_q, recv_k, recv_v
-
-
 def pre_a2a_attn_out(
     q: Tensor, q_seq_tokens: Tensor, q_send_buffer_offset: Tensor,
     instance_id: int=None,
