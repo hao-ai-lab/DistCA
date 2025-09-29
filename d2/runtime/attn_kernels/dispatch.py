@@ -4,7 +4,8 @@ import torch.nn.functional as F
 
 from d2.runtime.attn_kernels.ops import (
     DispatcherWrapper, a2a_memcpy_non_cp,
-    a2a_memcpy_cp, fast_a2a,
+    a2a_memcpy_cp, pre_a2a_grad_acc
+
 )
 from d2.runtime.utils import size_pad_by_int4
 
@@ -15,8 +16,11 @@ def pre_a2a_qkv(
     q_send_buffer_offset: Tensor, k_send_buffer_offset: Tensor, v_send_buffer_offset: Tensor,
     is_fwd: bool, instance_id: int=None,
     # TODO: reorder args to make it more logical
-    kv_grad_copy_seq_mask: Tensor=None,
+    kv_grad_copy_shard_mask: Tensor=None,
+    # this includes (num_copies, copy_start_id, shard_tokens)
+    pre_a2a_grad_acc_args = None,
 ):
+    """pre_a2a_grad_acc_args is effective only when it's a backward."""
     # copy in advance
     to_nvshmem = True
     a2a_memcpy_non_cp(
@@ -33,15 +37,21 @@ def pre_a2a_qkv(
             instance_id=instance_id,
         )
     else:
-        assert kv_grad_copy_seq_mask is not None, "kv grad copy requires a dedup mask."
+        assert kv_grad_copy_shard_mask is not None, "kv grad copy requires a dedup mask."
+        k = k.contiguous()
+        v = v.contiguous()
+        if pre_a2a_grad_acc_args is not None:
+            pre_a2a_grad_acc(k, *pre_a2a_grad_acc_args)
+            pre_a2a_grad_acc(k, *pre_a2a_grad_acc_args)
+
         a2a_memcpy_non_cp(
-            k.contiguous(), k_send_buffer_offset, k_seq_tokens, to_nvshmem,
-            copy_seq_mask=kv_grad_copy_seq_mask,
+            k, k_send_buffer_offset, k_seq_tokens, to_nvshmem,
+            shard_do_copy_mask=kv_grad_copy_shard_mask,
             instance_id=instance_id,
         )
         a2a_memcpy_non_cp(
-            v.contiguous(), v_send_buffer_offset, k_seq_tokens, to_nvshmem,
-            copy_seq_mask=kv_grad_copy_seq_mask,
+            v, v_send_buffer_offset, k_seq_tokens, to_nvshmem,
+            shard_do_copy_mask=kv_grad_copy_shard_mask,
             instance_id=instance_id,
         )
     return q, k, v
@@ -203,6 +213,6 @@ def pre_a2a_attn_out_with_lse(
     assert softmax_lse.shape[0] == attn_out.shape[0]
     merged_attn_out = _concat_with_uint8_and_pad([attn_out, softmax_lse], dim=1)
     return pre_a2a_attn_out(
-        merged_attn_out, send_seqlens, send_memcpy_metadata[0],
+        merged_attn_out, send_seqlens, send_memcpy_metadata,
         instance_id=dispatcher_id,
     )

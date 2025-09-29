@@ -261,7 +261,7 @@ def _get_dedup_grad_sum_metadata(
     num_copies = torch.tensor(
         [len(cis) for cis in copy_indices], dtype=torch.int32, device=attn_shard_lens.device
     )
-    max_num_copies = num_copies.max().item()
+    max_num_copies = max(1, num_copies.max().item())
     # start token id of each copy
     copy_start_id = torch.zeros(
         (num_seq, max_num_copies), dtype=torch.int64, device=attn_shard_lens.device

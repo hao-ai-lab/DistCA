@@ -16,8 +16,9 @@ from d2.runtime.attn_kernels.ops import (
 )
 # TODO: test fast_a2a_attn_out and its metadata by sending q_attn_layout back to q_mlp_layout via attn_out metadata.
 from d2.runtime.attn_kernels.dispatch import (
-    pre_a2a_qkv, post_a2a_qkv, fast_a2a
+    pre_a2a_qkv, post_a2a_qkv
 )
+from d2.runtime.attn_kernels.ops import fast_a2a
 from d2.runtime.compute_metadata import from_planner_output
 from d2.runtime.metadata import AlltoAllMetadata
 
@@ -40,16 +41,17 @@ def _fast_a2a_qkv(
     my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
     is_fwd: bool,
     # TODO: reorder args to make it more logical
-    kv_grad_copy_seq_mask: torch.Tensor=None,
+    kv_grad_copy_shard_mask: torch.Tensor=None,
 ):
     switch_buffer = True
     instance_id = None
     # copy in advance
+    # NOTE: in this test, kv grads = kv values, so we don't accumulate them due to the ease of value checking.
     q, k, v = pre_a2a_qkv(
         q, k, v, kv_dispatch_mask, q_seq_tokens, k_seq_tokens,
         q_send_buffer_offset, k_send_buffer_offset, v_send_buffer_offset,
         is_fwd=is_fwd, instance_id=instance_id,
-        kv_grad_copy_seq_mask=kv_grad_copy_seq_mask,
+        kv_grad_copy_shard_mask=kv_grad_copy_shard_mask,
     )
     # all2all
     fast_a2a(
@@ -145,7 +147,7 @@ class Worker(BaseWorker):
             fa2a_metadata_rev.my_rank_recv_offset,
             fa2a_metadata_rev.my_rank_send_sz,
             is_fwd=False,
-            kv_grad_copy_seq_mask=copy_seq_mask,
+            kv_grad_copy_shard_mask=copy_seq_mask,
         )
         nvshmem_barrier_all()
         torch.cuda.synchronize()

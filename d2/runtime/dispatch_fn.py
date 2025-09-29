@@ -178,6 +178,13 @@ class post_all2all_layout_transfer(torch.autograd.Function):
             *(sl.send_seqlens for sl in bwd_metadata.seq_lens),
             *bwd_metadata.send_memcpy_metadata,
         ])
+        if is_qkv:
+            assert bwd_metadata.kv_grad_send_dedup is not None
+            saved_tensors.extend([
+                bwd_metadata.kv_grad_send_dedup.main_copy_mask,
+                bwd_metadata.kv_grad_send_dedup.num_copies,
+                bwd_metadata.kv_grad_send_dedup.copy_start_id,
+            ])
         ctx.save_for_backward(*saved_tensors)
 
         if is_qkv:
@@ -188,14 +195,22 @@ class post_all2all_layout_transfer(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         if ctx.is_qkv:
+            (kv_replica_mask, q_shard_lens, kv_shard_lens,
+             q_memcpy, k_memcpy, v_memcpy,
+             main_copy_mask, num_copies, copy_start_id) = ctx.saved_tensors
             grad_q, grad_k, grad_v = grads
+            memcpy_dedup_args = (num_copies, copy_start_id, kv_shard_lens)
             pre_a2a_qkv(
-                grad_q, grad_k, grad_v, *ctx.saved_tensors,
+                grad_q, grad_k, grad_v, kv_replica_mask,
+                q_shard_lens, kv_shard_lens,
+                q_memcpy, k_memcpy, v_memcpy,
                 is_fwd=False, instance_id=ctx.dispatcher_id,
+                kv_grad_copy_shard_mask=main_copy_mask,
+                pre_a2a_grad_acc_args=memcpy_dedup_args
             )
         else:
             grad_q, = grads
             pre_a2a_attn_out(grad_q, *ctx.saved_tensors,
-                                  instance_id=ctx.dispatcher_id,)
+                             instance_id=ctx.dispatcher_id,)
         signal_grad = torch.empty((1,), dtype=grad_q.dtype, device=grad_q.device)
         return (signal_grad,) + (None,) * 4
