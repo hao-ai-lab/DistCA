@@ -16,9 +16,80 @@ import json
 # root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v7-small-scale-pp-34b-384k-wlbllm-0.0"
 # root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v7-small-scale-pp-34b-16node-128k-256k-384k--pretrain"
 # root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v7-small-scale-pp-34b-16node-128k-256k-384k--prolong-0.3"
-root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v9-large-scale-pp-34b-16node-128k-256k-384k-pretrain"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v8-small-scale-pp-34b-16node-128k-256k-384k-pretrain-sample5"
+
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v8-small-scale-pp-34b-16node-128k-256k-384k-pretrain-sample5"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v8-small-scale-pp-34b-16node-128k-256k-384k-prolong-0.3-sample5"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v8-small-scale-pp-34b-16node-128k-256k-384k-prolong-sample5"
+
+# ----------------------
+# Production Ready Runs
+# ----------------------
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v9-large-scale-pp-34b-16node-128k-256k-384k-pretrain"
 
 # root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v10-large-scale-pp-34b-16node-128k-256k-384k--prolong-0.3"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v11-large-scale-pp-34b-32node-128k-256k-384k-pretrain"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v12-large-scale-pp-34b-32node-128k-256k-384k-prolong-0.3"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v40-large-scale-pp-34b-64node-128k-256k-384k-pretrain"
+
+# ----------------------
+# Runnings
+# ----------------------
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v8-small-scale-pp-34b-16node-128k-256k-384k-pretrain-sample5"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v12-large-scale-pp-34b-32node-128k-256k-384k-prolong-0.3"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v20-small-scale-pp-34b-16node-384k-prolong-0.3-sample5"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v21-small-scale-pp-34b-16node-384k-pretrain-sample5"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v31-small-scale-pp-34b-16node-384k-prolong-0.3-sample5"
+
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v8-small-scale-pp-34b-16node-128k-256k-384k-pretrain-sample5"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v30-small-scale-pp-34b-16node-384k-pretrain-sample5"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v32-small-scale-pp-34b-16node-384k-prolong-0.8-sample5"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v50-small-scale-pp-34b-64node-384k-pretrain"
+
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v50-small-scale-pp-34b-64node-384k"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v60-large-scale-pp-34b-64node-128k-256k-384k-pretrain"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v60-large-scale-pp-34b-64node-128k-256k-384k-pretrain"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v60-large-scale-pp-34b-64node-128k-256k-384k-prolong-0.3"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v60-large-scale-pp-34b-64node-128k-256k-384k-pretrain"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v60-small-scale-pp-34b-64node-256k-prolong-0.3"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v12-large-scale-pp-34b-32node-128k-256k-384k-prolong-0.3"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v62-small-scale-pp-34b-64node-128k-prolong-0.3"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v70-small-scale-pp-34b-16node-128k"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v62-small-scale-pp-34b-64node-128k-prolong-0.3"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v71-small-scale-pp-34b-16node-384k"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v70-small-scale-pp-34b-16node-384k"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v62-small-scale-pp-34b-64node-128k-prolong-0.3"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v60-small-scale-pp-34b-64node-256k-prolong-0.3"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v62-small-scale-pp-34b-64node-128k-prolong-0.3"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v62-small-scale-pp-34b-64node-128k-prolong-0.3"
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v60-small-scale-pp-34b-64node-256k-prolong-0.3"
+
+# root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v60-large-scale-pp-34b-64node-128k-256k-384k-prolong-0.3"
+root_path = "/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v80-large-scale-pp-34b-32node-256k-pretrain"
+only_focus_on_sample_id = {}
+# only_focus_on_sample_id = {0,1,2,3,4}
+# only_focus_on_sample_id = {0,1,2,3,4,5,6,7,8}
+# only_focus_on_sample_id = {0,1,2,3}
 
 a = os.listdir(root_path)
 a = sorted(a)
@@ -29,8 +100,8 @@ for folder in a:
 
     if not os.path.isdir(os.path.join(root_path, folder)):
         continue
-    if 'old' in folder:
-        continue
+    # if 'old' in folder:
+    #     continue
     
     # Read the config file to check the configurations
     readme_config = os.path.join(root_path, folder, "README.md")
@@ -78,6 +149,7 @@ for folder in a:
     # Read the benchmark file
     file = os.path.join(root_path, folder, "benchmark.raw.jsonl")
     if not os.path.exists(file):
+        print(f"Skip {folder} because file {file} does not exist")
         continue
 
 
@@ -122,8 +194,8 @@ for folder in a:
 
 
     # only_focus_on_sample_id = {0}
-    only_focus_on_sample_id = {0,1,2,3}
-    # only_focus_on_sample_id = {}
+    # only_focus_on_sample_id = {0,1,2,3}
+    
     sample_durations = {}
     for i, d in enumerate(durations):
         if (only_focus_on_sample_id and i in only_focus_on_sample_id) or not only_focus_on_sample_id:
@@ -163,8 +235,8 @@ df_to_save.rename(columns={
     'batch_size': 'bs',
     'total_batch_size': 'tbs',
 }, inplace=True)
-df_to_save
 df_to_save.to_csv("table.tsv", index=True, sep="\t")
+df_to_save
 
 # %%
 wlb_groups_best = df[
@@ -282,7 +354,25 @@ print(
 )
 
 # %%
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', None)
 
+# %%
+# best config 
+print("pretrain best config:")
+merged_wlb_vs_d2_display__wlbllm[[
+    'best_config_d2', 'best_config_wlb', 'speedup', 
+    'num_tokens', 'model_size', 'nodes', 'total_batch_size',
+]]
+
+# %%
+print("prolong best config")
+merged_wlb_vs_d2_display__prolong[[
+    'best_config_d2', 'best_config_wlb', 'speedup',
+    'num_tokens', 'model_size', 'nodes', 'total_batch_size',
+]]
+# %%
+print(root_path)
 
 # %%
 # # Plot speedup vs nodes for each num_tokens/batch_size combination

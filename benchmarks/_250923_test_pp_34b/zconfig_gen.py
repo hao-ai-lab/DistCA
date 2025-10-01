@@ -6,16 +6,22 @@ tp_size = 8
 print("N bs mb   tok   M cp pp tp comment")
 rows = []
 # for seq_len in [128 * K, 256 * K, 384 * K, 512 * K]:
-# for seq_len in [256 * K]:
-for seq_len in [384 * K, ]:
-    for nnodes in [16]:
+# for seq_len in [128 * K, ]:
+for seq_len in [256 * K]:
+# for seq_len in [384 * K, ]:
+    # for nnodes in [64]:
+    for nnodes in [32]:
         _ratios = {
             # 128 * K: [16],
             # 128 * K: [8],
-            # 256 * K: [4],
+            # 128 * K: [4],
+            # 128 * K: [2],
             # 256 * K: [2],
+            # 256 * K: [4],
+            256 * K: [8],
             # 384 * K: [1],
-            384 * K: [2],
+            # 384 * K: [2],
+            384 * K: [4],
             # 512 * K: [1, 2],
         }[seq_len]
         for ratio in _ratios:
@@ -108,6 +114,8 @@ pd.set_option('display.max_colwidth', None)
 
 # Now display the DataFrame
 df['tb'] = df['batch_size'] * df['microbatch_size']
+# sort df by mode
+df = df.sort_values(by=["mode", "pp_size"])
 df
 # %%
 # Print in desired format

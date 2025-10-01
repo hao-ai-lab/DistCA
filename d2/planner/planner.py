@@ -2,7 +2,7 @@ from collections import defaultdict
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-
+import time
 import rich
 import torch
 from d2.runtime.compute_metadata import from_planner_output
@@ -676,8 +676,11 @@ class Planner:
     
 
     def items_to_shardinfo(self, items_: list[Item], verbose=False) -> list[list[ShardInfo]]:
+        start_time = time.time()
         planned_items = self.plan_items(items_, verbose)
         planned_items = self.postprocess_items(planned_items)
+        end_time = time.time()
+        print(f"Planner.items_to_shardinfo duration: {(end_time - start_time):.2f} sec")
         shard_infos = self.items_into_shardinfos(planned_items)
         return shard_infos
     
