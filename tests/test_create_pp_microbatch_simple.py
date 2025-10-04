@@ -11,7 +11,7 @@ setup_global_batch(
     up_sample_factor=4,
     elongate_factor=1,
     filter_threshold=64 * 1024,
-    filter_ratio=0.1,
+    filter_ratio=0.,
     should_add_debug_cases=False,
     change_long_doc_ratio=0.0,
     sample_name='wlbllm',
@@ -24,6 +24,26 @@ import importlib
 import test_megatron_e2e_pipeline_with_cp
 importlib.reload(test_megatron_e2e_pipeline_with_cp)
 from test_megatron_e2e_pipeline_with_cp import create_pp_microbatches
+
+
+import d2.runtime.attn_kernels.ops
+DispatcherWrapper = d2.runtime.attn_kernels.ops.DispatcherWrapper
+
+class MockDispatcher:
+    def __init__(self):
+        self.buffer_size = 1024 * 1024 * 1024 # 1GB default buffer size
+
+class MockDispatcherWrapper:
+    instance = [MockDispatcher()]
+
+DispatcherWrapper.instance = MockDispatcherWrapper.instance
+DispatcherWrapper.instance[0].buffer_size
+
+import os
+# Set minimum tolerance factor for batch balancing via environment variable
+os.environ["MIN_TOLERANCE_FACTOR"] = "0.15"
+
+
 
 import time
 start_time = time.time()
