@@ -61,6 +61,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 from d2.runtime.attn_kernels.ops import DispatcherWrapper
 from d2.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
 from d2.runtime.compute_metadata import get_attn_metadata
+from d2.runtime.megatron.ops.stream_sync_fn import TickSync
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
 from test_pingpong_layer import get_single_step_packed_seq_params
@@ -635,6 +636,18 @@ def test(args):
         setup_unified_a2a_timing_patch()
         print(f"🟡 Unified all-to-all timing collection setup. This may impact the performance, but recording the all-to-all timing.")
     
+    # Setup tick operations timing collection
+    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+        from d2.runtime.megatron.ping_pong.tick_ops import setup_tick_timing
+        setup_tick_timing()
+        print(f"🟡 Unified tick operations timing collection setup. This may impact the performance, but recording the tick operations timing.")
+    
+    # Setup TickSync blocking detection
+    if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
+        threshold_ms = float(os.getenv("D2_TICKSYNC_THRESHOLD_MS", "1.0"))
+        TickSync.enable_blocking_detection(enabled=True, threshold_ms=threshold_ms)
+        print(f"🟡 TickSync blocking detection enabled with threshold {threshold_ms}ms")
+    
     memory_log_output_dir = os.path.join(output_dir, "mem-log")
     enable_memory_usage_logging(memory_log_output_dir)
 
@@ -766,6 +779,9 @@ def test(args):
             set_unified_current_sample_id(sample_id)
         if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
             set_unified_current_a2a_sample_id(sample_id)
+        if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+            from d2.runtime.megatron.ping_pong.tick_ops import set_current_tick_sample_id
+            set_current_tick_sample_id(sample_id)
         if mode == "baseline":
             try:
                 # TOOD: This should be batch_size * 2
@@ -1561,6 +1577,79 @@ def test(args):
             if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
                 rich.print(f"🕒 [Sample {sample_id}] {mode.upper()} All-to-All timing - Median: {a2a_median:.2f} ms ({len(a2a_times)} measurements)")
 
+        # Log TickSync blocking events for this iteration if enabled
+        if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
+            # Create ticksync_blocking directory structure    
+            ticksync_blocking_dir = os.path.join(output_dir, "ticksync_blocking")
+            os.makedirs(ticksync_blocking_dir, exist_ok=True)
+            ticksync_blocking_file = os.path.join(ticksync_blocking_dir, f"ticksync_blocking.rank{rank}.jsonl")
+
+            # Process pending CUDA events to measure actual GPU timing
+            TickSync.process_pending_events()
+            blocking_events = TickSync.get_blocking_events()
+            
+            # Log each blocking event separately to per-rank JSONL file
+            for event in blocking_events:
+                iteration_data = {
+                    "sample_id": sample_id,
+                    "mode": mode,
+                    "blocking_event": event
+                }
+                with open(ticksync_blocking_file, 'a') as f:
+                    f.write(json.dumps(iteration_data) + '\n')
+            
+            # Print blocking events for this iteration
+            # if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
+            #     rich.print(f"⚠️  [Sample {sample_id}] {mode.upper()} TickSync Blocking - {len(blocking_events)} events detected")
+            #     for event in blocking_events[-3:]:  # Show last 3 events
+            #         rich.print(f"    {event['layer_info']} {event['operation_info']} ({event['phase']}): {event['wait_time_ms']:.2f}ms > {event['threshold_ms']}ms")
+            
+            # Clear events after logging
+            TickSync.clear_blocking_events()
+
+        # Log tick operations timing data for this iteration if enabled
+        if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+            # Synchronize and collect timing data from CUDA events
+            from d2.runtime.megatron.ping_pong.tick_ops import sync_and_collect_tick_timing, get_tick_times
+            sync_and_collect_tick_timing()
+            
+            timing_data = get_tick_times().get(sample_id, {
+                "forward_pre_core_attn": [], 
+                "forward_post_core_attn": [],
+            })
+            pre_attn_times = timing_data["forward_pre_core_attn"]
+            post_attn_times = timing_data["forward_post_core_attn"]
+            
+            # Calculate medians
+            pre_attn_median = np.median([t["duration_ms"] for t in pre_attn_times]) if pre_attn_times else 0.0
+            post_attn_median = np.median([t["duration_ms"] for t in post_attn_times]) if post_attn_times else 0.0
+            
+            # Create tick_time directory structure
+            tick_time_dir = os.path.join(output_dir, "tick_time")
+            os.makedirs(tick_time_dir, exist_ok=True)
+            
+            # Log to per-rank JSONL file
+            tick_time_file = os.path.join(tick_time_dir, f"tick_time.rank{rank}.jsonl")
+            iteration_data = {
+                "sample_id": sample_id,
+                "mode": mode,
+                "forward_pre_core_attn_times": pre_attn_times,
+                "forward_post_core_attn_times": post_attn_times,
+                "forward_pre_core_attn_median_ms": pre_attn_median,
+                "forward_post_core_attn_median_ms": post_attn_median,
+                "forward_pre_core_attn_count": len(pre_attn_times),
+                "forward_post_core_attn_count": len(post_attn_times)
+            }
+            
+            
+            with open(tick_time_file, 'a') as f:
+                f.write(json.dumps(iteration_data) + '\n')
+            
+            # Print median times for this iteration
+            if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
+                timing_msg = f"🕒 [Sample {sample_id}] {mode.upper()} Tick Operations timing - Forward Pre-attn median: {pre_attn_median:.2f} ms ({len(pre_attn_times)} measurements), Forward Post-attn median: {post_attn_median:.2f} ms ({len(post_attn_times)} measurements)"
+                rich.print(timing_msg)
+
         # Write to the benchmark jsonl log
         if rank == 0:
             # benchmark_data
@@ -1708,8 +1797,79 @@ def test(args):
                     rich.print(f"Sample {sample_id}: All-to-All Forward - Avg: {avg_a2a:.2f} ms, Median: {median_a2a:.2f} ms ({len(a2a_times)} measurements)")
             rich.print(f"🟢 Individual rank all-to-all timing logs saved to: {os.path.join(output_dir, 'a2a_time')}")
     
+    # Save tick operations timing data if enabled
+    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+        # Final synchronization to collect any remaining timing data
+        from d2.runtime.megatron.ping_pong.tick_ops import sync_and_collect_tick_timing, get_tick_times
+        sync_and_collect_tick_timing()
+        
+        if rank == 0:
+            all_tick_times = get_tick_times()
+            tick_timing_file = os.path.join(output_dir, "tick_timing.json")
+            with open(tick_timing_file, 'w') as f:
+                json.dump(all_tick_times, f, indent=2)
+            rich.print(f"🟢 {mode.upper()} Tick operations timing data saved to: {tick_timing_file}")
+            
+            # Also print summary with medians
+            rich.print(f"🟢 ===== {mode.upper()} Tick Operations Timing Summary =====")
+            for sample_id, timing_data in all_tick_times.items():
+                pre_attn_times = timing_data["forward_pre_core_attn"]
+                post_attn_times = timing_data["forward_post_core_attn"]
+                
+                if pre_attn_times:
+                    avg_pre = sum(t["duration_ms"] for t in pre_attn_times) / len(pre_attn_times)
+                    median_pre = np.median([t["duration_ms"] for t in pre_attn_times])
+                    rich.print(f"Sample {sample_id}: Forward Pre-Core Attn - Avg: {avg_pre:.2f} ms, Median: {median_pre:.2f} ms ({len(pre_attn_times)} measurements)")
+                if post_attn_times:
+                    avg_post = sum(t["duration_ms"] for t in post_attn_times) / len(post_attn_times)
+                    median_post = np.median([t["duration_ms"] for t in post_attn_times])
+                    rich.print(f"Sample {sample_id}: Forward Post-Core Attn - Avg: {avg_post:.2f} ms, Median: {median_post:.2f} ms ({len(post_attn_times)} measurements)")
+                
+                        
+            rich.print(f"🟢 Individual rank tick operations timing logs saved to: {os.path.join(output_dir, 'tick_time')}")
     
-
+    # Save TickSync blocking data if enabled
+    if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
+        # Process any remaining pending events
+        TickSync.process_pending_events()
+        # Final collection of any remaining blocking events
+        final_blocking_events = TickSync.get_blocking_events()
+        
+        if rank == 0:
+            # Create summary of all blocking events
+            ticksync_summary_file = os.path.join(output_dir, "ticksync_blocking_summary.json")
+            summary_data = {
+                "total_blocking_events": len(final_blocking_events),
+                "blocking_events": final_blocking_events,
+                "threshold_ms": float(os.getenv("D2_TICKSYNC_THRESHOLD_MS", "1.0"))
+            }
+            
+            with open(ticksync_summary_file, 'w') as f:
+                json.dump(summary_data, f, indent=2)
+            rich.print(f"🟢 {mode.upper()} TickSync blocking summary saved to: {ticksync_summary_file}")
+            
+            # Print summary
+            if final_blocking_events:
+                rich.print(f"🟢 ===== {mode.upper()} TickSync Blocking Summary =====")
+                rich.print(f"Total blocking events: {len(final_blocking_events)}")
+                
+                # Group by layer and operation
+                layer_ops = {}
+                for event in final_blocking_events:
+                    key = f"{event['layer_info']} {event['operation_info']}"
+                    if key not in layer_ops:
+                        layer_ops[key] = []
+                    layer_ops[key].append(event['wait_time_ms'])
+                
+                for key, times in layer_ops.items():
+                    avg_time = sum(times) / len(times)
+                    max_time = max(times)
+                    rich.print(f"{key}: {len(times)} events, avg: {avg_time:.2f}ms, max: {max_time:.2f}ms")
+            else:
+                rich.print(f"✅ No TickSync blocking events detected")
+            
+            rich.print(f"🟢 Individual rank TickSync blocking logs saved to: {os.path.join(output_dir, 'ticksync_blocking')}")
+    
     # Cleanup and exit
     rich.print(f"❄️ [Rank {rank}] Finished test and exit.")        
     write_status_log(f"Finish test and exit.")

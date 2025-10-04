@@ -253,6 +253,7 @@ def create_pp_microbatches(
 
     start_time = time.time()
     all_original_seq_lens = []
+    loop_start_time = time.time()
     for i in range(num_microbatch + pp_degree - 1):
         # For the last few ticks (drain-out ticks)
         # add a dummy forward microbatch at PP rank 0.
@@ -276,11 +277,11 @@ def create_pp_microbatches(
             use_planner=use_planner,
             return_original_doclen=return_seq_lens,
         )
-        end_time = time.time()
-        print(f"🟡 create_qkv_dispatch_pipeline_tick duration: {end_time - start_time} seconds")
         if rank == 1:
             print(f"🟡 fa_fwd_params: {fa_fwd_params}")
         all_original_seq_lens.append(original_tick_per_rank_doc_lens)
+        end_time = time.time()
+        print(f"🟡 create_qkv_dispatch_pipeline_tick duration: {end_time - start_time} seconds")
         
         # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, so each rank knows its number of tokens.
         #   Example1 DP case:
@@ -289,11 +290,8 @@ def create_pp_microbatches(
         #   Example2 CP case:
         # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 768],[512, 10, 502] ]
         # tick_per_rank_doc_lens mlp list: [[8], [8], [8], [8], [256, 128, 128], [256, 256], [512], [10, 502]]
-
         start_time = time.time()
         tick_per_rank_doc_lens_after_cp_transfer = cp_list_to_mlp_list(tick_per_rank_doc_lens, as_world_size, num_token_per_rank)
-        end_time = time.time()
-        print(f"🟡 cp_list_to_mlp_list duration: {end_time - start_time} seconds")
         
         this_rank_num_tokens = sum(tick_per_rank_doc_lens_after_cp_transfer[as_rank])
         bwd_packed_seq_params = PackedSeqParams(
@@ -301,8 +299,11 @@ def create_pp_microbatches(
         )
         tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens_after_cp_transfer[as_rank], dtype=torch.int32)
         mlp_packed_seq_params = get_attn_metadata(tensor_doc_lens, get_packed_seq_params=True)
+        end_time = time.time()
+        print(f"🟡 get_attn_metadata duration: {end_time - start_time} seconds")
 
         # Create packed_params. Note that we do not add backward params here.
+        start_time = time.time()
         ping_pang_params = PingPangSingleStepPackedSeqParams(
             qkv_format="thd",
             **fa_fwd_params[as_rank],
@@ -326,12 +327,19 @@ def create_pp_microbatches(
         bwd_metadata.append(
             (qkv_bwd_fa2a_metadata.get_slice(as_rank), attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank), bwd_packed_seq_params)
         )
-    end_time = time.time()
-    print(f"🟡 create_pp_microbatches - first for loop duration: {end_time - start_time} seconds")
+        end_time = time.time()
+        print(f"🟡 create_pp_microbatches - append microbatch duration: {end_time - start_time} seconds")
+
+
+
+    loop_end_time = time.time()
+    print(f"🟡 create_pp_microbatches - first for loop duration: {loop_end_time - loop_start_time} seconds")
+
 
     pp_rank = as_rank // dp_size
     dp_rank = as_rank % dp_size
 
+    start_time = time.time()
     # put bwd metadata to the corresponding side
     for i, microbatch in enumerate(microbatches):
         # When mb_i is computed on pp_rank at forward tick t, assume the backward right after this forward is at tick t'.
@@ -348,7 +356,8 @@ def create_pp_microbatches(
         packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
         packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
         packed_seq_params.bwd_packed_seq_params = bwd_packed_seq_params
-    
+    end_time = time.time()
+    print(f"🟡 create_pp_microbatches - second for loop duration: {end_time - start_time} seconds")
     ret = microbatches
     if return_seq_lens:
         ret = (microbatches, all_original_seq_lens)
@@ -526,6 +535,7 @@ def test(args):
         #   This is the parameter controlling the number of batches per tick.
         # 
         start_time = time.time()
+
         microbatches_0, tick_per_rank_doc_lens_0 = create_pp_microbatches(
             num_microbatch, pp_size, as_rank,
             as_world_size, total_seq_len, num_seqs, dpcp_size,
@@ -543,11 +553,13 @@ def test(args):
             return_seq_lens=True,
         )
         end_time = time.time()
-        duration_ms = (end_time - start_time) * 1000
-        print(f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches: {duration_ms} ms")
+        duration = (end_time - start_time)
+        print(f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches: {duration} seconds")
 
         seq_lens = [tick_per_rank_doc_lens_0, tick_per_rank_doc_lens_1]
         # print(f"🟡 [sample_idx = {sample_idx}] seq_lens is: {seq_lens}")
+
+        loop_start_time = time.time()
         set_random_seed(seed, set_megatron=True)
         microbatches = []
         orig_impl_microbatches = []
@@ -602,6 +614,8 @@ def test(args):
                 "packed_seq_params": packed_seq_params,
             }
             orig_impl_microbatches.append(orig_mb)
+        loop_end_time = time.time()
+        print(f"⚪ create_pp_microbatches - constructing PingPangPackedSeqParams: {loop_end_time - loop_start_time} seconds")
 
 
 
@@ -699,10 +713,9 @@ def test(args):
 
         
         
-
         if should_run_d2:
-            durations = []
             print(f"Prepare to run d2 with total runs: {n_repeats = } + {n_warmup = } = {n_repeats + n_warmup = }")
+            durations = []
             for _ in range(n_repeats + n_warmup):
                 mem_ctx = nullcontext()
                 if _ < n_warmup and should_log_memory_during_warmup:
