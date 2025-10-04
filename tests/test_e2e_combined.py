@@ -77,6 +77,10 @@ from d2.planner.planner import (
 )
 
 
+from d2.utils.traceback import enable_clickable_excepthook, enable_trace_calls
+enable_clickable_excepthook()
+
+
 def timeout_handler(signum, frame):
     raise TimeoutError("forward_backward_batch operation timed out after 5 minutes")
 
@@ -530,10 +534,17 @@ def setup_global_batch(
 
     if should_add_debug_cases:
         GLOBAL_BATCH = list(GLOBAL_BATCH)
+        # manual_case = [
+        #     [total_seq_len],
+        #     # [total_seq_len // 32] * 32
+        # ] * 128
         manual_case = [
-            [total_seq_len],
-            # [total_seq_len // 32] * 32
-        ] * 16
+            [total_seq_len // 2, ] + [total_seq_len // 32] * 16,
+        ] + [
+            # [total_seq_len // 2] * 2,
+            # [total_seq_len // 4] * 4,
+            [total_seq_len // 32] * 32,
+        ] * 128
         GLOBAL_BATCH = manual_case + GLOBAL_BATCH
         GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
@@ -599,6 +610,7 @@ def test(args):
     should_add_debug_cases = args.should_add_debug_cases
     resend_qkv = args.should_resend_qkv
     sample_start_idx = args.sample_start_idx
+    alpha_factor = args.alpha_factor
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
@@ -612,8 +624,10 @@ def test(args):
     normal_forward_fn = (mode in ["baseline", "wlbllm"])
     # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
     os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
+    memory_log_output_dir = os.path.join(output_dir, "mem-log")
+    enable_memory_usage_logging(memory_log_output_dir)
 
-
+    log_memory_usage("enter test", force=True)
     
     def write_status_log(message):
         # get the caller's file and line number
@@ -677,9 +691,7 @@ def test(args):
         )
 
     write_status_log(f"Finish init worker")
-
-    memory_log_output_dir = os.path.join(output_dir, "mem-log")
-    enable_memory_usage_logging(memory_log_output_dir)
+    log_memory_usage("init worker object done", force=True)
 
     enable_gradient_checkpointing = False
     gradient_checkpointing_kwargs = {}
@@ -699,7 +711,7 @@ def test(args):
     )
     worker.init(model_path, seed=seed)
     print(f"🟡 [Rank {worker.rank}] init done")
-    log_memory_usage("init done")
+    log_memory_usage("init done", force=True)
     write_status_log(f"Finish worker.init()")
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
@@ -798,14 +810,29 @@ def test(args):
                 return [y for x in a for y in x]
 
             
+            alpha_factor = args.alpha_factor # at max tolerate 2x memory imbalance. This number can go infinite...
             seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
                 dp_size, dp_rank, total_seq_len, batch_size, _seq_lens, 
                 ENABLE_BALANCED_FLOS_NO_DEFER=True,
                 model_config=hf_config, # TODO: (Refactor) This is a hack to pass the model config to the WLBLLM planner.
+                Lmax=int(total_seq_len * 2 * batch_size // dp_size * alpha_factor),
             )
             
             # TODO: Estimate and calculate flops imbalance and print it here...
             print(f"🟡 [Rank {rank}] WLBLLM Reordered Batch: new_batch={new_batch}")
+            # also calculate the flops 
+            def calc_relative_flops(batches: list[list[int]]):
+                flops_per_batch = [0] * len(batches)
+                for batch_idx, batch in enumerate(batches):
+                    for seq_len in batch:
+                        flops_per_batch[batch_idx] += seq_len ** 2
+                # Now find the min flops per gpu, and everyone divide the min flops per gpu
+                min_flops_per_gpu = min(flops_per_batch)
+                flops_per_batch = [flops / min_flops_per_gpu for flops in flops_per_batch]
+                return flops_per_batch
+            
+            relative_flops_per_batch = calc_relative_flops(new_batch)
+            print(f"🟡 [Rank {rank}] Relative Flops per batch: {relative_flops_per_batch}")
             print(f"🟡 [Rank {rank}] Taking seq_lens={seq_lens}")
 
 
@@ -1383,6 +1410,15 @@ def test(args):
         start_time = time.time()
         torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
         
+        
+        should_log_memory_during_real_experiment = (
+            os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_REAL_EXPERIMENT", "0") == "1"
+        )
+        if should_log_memory_during_real_experiment:
+            log_memory_usage_ctx = log_memory_usage_context()
+            log_memory_usage_ctx.__enter__()
+            pass
+        
         for repeat_idx in range(N):
             # start_event = torch.cuda.Event(enable_timing=True)
             # end_event = torch.cuda.Event(enable_timing=True)pr:
@@ -1559,7 +1595,7 @@ def save_memory_usage_to_file(memory_usage_dir: str):
 
 def enable_memory_usage_logging(memory_usage_dir: str):
     os.makedirs(memory_usage_dir, exist_ok=True)
-    rank = torch.distributed.get_rank()
+    rank = os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0"))
     memory_usage_log_file = os.path.join(memory_usage_dir, f"mem.rank{rank}.log.jsonl")
     with open(memory_usage_log_file, 'w') as f:
         pass
@@ -1593,6 +1629,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample-start-idx", type=int, default=0, help="Start index of the sample ids to sample") 
     parser.add_argument("--change-long-doc-ratio", type=float, default=0.0, help="Ratio of long docs to change")
     parser.add_argument("--sample-name", type=str, default="wlbllm", help="Name of the sample to use", choices=["wlbllm", "prolong"])
+    parser.add_argument("--alpha-factor", type=float, default=1.0, help="Alpha factor for memory imbalance")
     
     args = parser.parse_args()
     print(f"🟡 Args: {args}")
@@ -1668,7 +1705,8 @@ if __name__ == "__main__":
         memory_timeline_output_raw = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.json.gz")
         print(f"🟡 Will save mem snapshot to: {mem_snapshot_output_path}")
         print(f"🟡 Will save mem timeline to: {memory_timeline_output_path}")
-        if rank % 8 == 0:
+        # if rank % 8 == 0:
+        if rank == 0:
             print("Dumping memory snapshot")
             torch.cuda.memory._dump_snapshot(mem_snapshot_output_path)
             prof.export_memory_timeline(memory_timeline_output_path, device=torch.cuda.current_device())
