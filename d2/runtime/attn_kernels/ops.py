@@ -206,6 +206,9 @@ def a2a_memcpy_cp(
     )
 
 
+def _ops_fast_a2a_wrapper(*args):
+    return _ops.fast_a2a(*args)
+
 def fast_a2a(
     sender_send_disp: torch.Tensor, sender_transfer_sz: torch.Tensor,
     sender_recv_disp: torch.Tensor, recver_transfer_sz: torch.Tensor,
@@ -237,7 +240,7 @@ def fast_a2a(
             fast_a2a._printed_skip_message = True
         return
 
-    ret = _ops.fast_a2a(
+    ret = _ops_fast_a2a_wrapper(
         DispatcherWrapper.get_instance(instance_id).handle,
         sender_send_disp, sender_transfer_sz,
         sender_recv_disp, recver_transfer_sz,
