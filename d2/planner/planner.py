@@ -598,7 +598,8 @@ class Planner:
                 parallel_config,
                 tolerance_factor: float = 0.1,
                 model_config = None,
-                dtype: torch.dtype = torch.bfloat16) -> None:
+                dtype: torch.dtype = torch.bfloat16,
+                planner_type: str = "greedy") -> None:
         self.model_config = model_config
         self.world_size = world_size
         self.parallel_config = parallel_config
@@ -671,7 +672,7 @@ class Planner:
         if return_items:
             return ret, items
         return ret
-    
+
     def plan_items(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
         if self.planner_type == "greedy":
             return self.plan_items_greedy(items_, verbose, plot)
