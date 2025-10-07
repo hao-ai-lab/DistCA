@@ -306,8 +306,6 @@ def cp_list_to_mlp_list(cp_rank_doc_lens: List[List[int]], as_world_size: int, n
 
 
 
-
-
 # Represent a part of sequence.
 # This class can handle DP/CP MLP layout. 
 # For DP layout, whole document will be put on one GPU.
@@ -607,10 +605,9 @@ class Planner:
         self.data_parallel = world_size // (parallel_config.pipeline_model_parallel_size * parallel_config.tensor_model_parallel_size)
         self.attention_server_world_size = self.data_parallel * parallel_config.pipeline_model_parallel_size
         self.dtype = dtype
-        rich.print(f"[bold green] world_size: {self.world_size}, DP: {self.data_parallel}[/bold green], PP: {parallel_config.pipeline_model_parallel_size}, TP: {parallel_config.tensor_model_parallel_size}, attention_server_world_size: {self.attention_server_world_size}")
-        
+        self.planner_type = planner_type
         self.tolerance_factor = tolerance_factor
-
+        rich.print(f"[bold green] world_size: {self.world_size}, DP: {self.data_parallel}[/bold green], PP: {parallel_config.pipeline_model_parallel_size}, TP: {parallel_config.tensor_model_parallel_size}, attention_server_world_size: {self.attention_server_world_size}")
     # from item to metadata.
     def plan(self, items_: list[Item], verbose=False, plot=False, device="cuda", is_resend_qkv:bool=False):
         mlp_shard_len = self.items_to_mlp_doc_len(items_, device)
@@ -683,6 +680,10 @@ class Planner:
         else:
             raise ValueError(f"Unknown planner_type: '{self.planner_type}'")
 
+    # This is FlexSP ILP planner.
+    # MLP layout is not changed. Only Attention in CP.
+    # Documents' MLP GPU id is specified by Item's src_gpuid.
+    # Documents' Attention GPU id is specified by Item's gpuid.
     # This is FlexSP ILP planner.
     # MLP layout is not changed. Only Attention in CP.
     # Documents' MLP GPU id is specified by Item's src_gpuid.
