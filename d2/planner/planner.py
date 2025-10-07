@@ -597,6 +597,43 @@ class Planner:
             raise ValueError(f"Unknown planner_type: '{self.planner_type}'")
 
     def plan_items_ilp(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
+        import pulp
+        group_sizes = [1, 2, 4, 8, 16]
+        max_group_sizes = {k: self.world_size // k for k in group_sizes}
+        prob = pulp.LpProblem("DocAssignment", pulp.LpMinimize)
+        C_max = pulp.LpVariable("C_max", lowBound=0, cat='Continuous')
+        x = pulp.LpVariable.dicts(
+            "AssignDoc",
+            ((i.seqid, j, k) for i in items_ for k in group_sizes for j in range(max_group_sizes[k])),
+            cat='Binary',
+        )
+        y = pulp.LpVariable.dicts(
+            "GroupUsed",
+            ((j, k) for k in group_sizes for j in range(max_group_sizes[k])),
+            cat='Binary',
+        )
+        prob += C_max
+        prob += pulp.lpSum(k * y[j, k] for k in group_sizes for j in range(max_group_sizes[k])) <= self.world_size
+        for i in items_:
+            prob += pulp.lpSum(x[i.seqid, j, k] for k in group_sizes for j in range(max_group_sizes[k])) == 1
+        for k in group_sizes:
+            for j in range(max_group_sizes[k]):
+                prob += pulp.lpSum((i.seq_len + 1) * i.seq_len / k * x[i.seqid, j, k] for i in items_) <= C_max * y[j, k]
+        prob.solve(solver=pulp.CPLEX_CMD(msg=False, timeLimit=300))
+
+        group_sizes = []
+        group_items = []
+        for k in group_sizes:
+            for j in range(max_group_sizes[k]):
+                if pulp.value(y[j, k]) > 0.5:
+                    group_sizes.append(k)
+                    group_items.append([])
+                for i in items_:
+                    if pulp.value(x[i.seqid, j, k]) > 0.5:
+                        group_items[-1].append(i)
+
+        return group_sizes, group_items
+
         items = deepcopy(items_)
         return items
     
