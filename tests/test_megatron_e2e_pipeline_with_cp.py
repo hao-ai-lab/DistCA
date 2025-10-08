@@ -222,10 +222,12 @@ def init_megatron_e2e_test(
         pipeline_model_parallel_size=pp_size,
     )
 
+    log_memory_usage("before init_worker_torch_distributed", force=True)
     worker = init_worker_torch_distributed(
         world_size, buffer_size,
         worker_cls, parallel_config
     )
+    log_memory_usage("after init_worker_torch_distributed (also init_nvshmem)", force=True)
     print("Communication groups initialized")
     return worker
 
@@ -377,6 +379,12 @@ def time_me(msg):
     duration_ms = ((end_time - start_time) * 1000)
     print(f"⚪ [Rank {rank}] finish {msg}, duration: {duration_ms} ms")
 
+
+import d2.mem
+def log_memory_usage(message: str, force:bool = False):
+    d2.mem.log_memory_usage(message, force=force)
+
+
 def test(args):
     seed = args.seed
     # test scale
@@ -403,7 +411,6 @@ def test(args):
     microbatch_log_path = os.path.join(output_dir, "microbatch.log")
     os.environ["EXPERIMENT_OUTPUT_DIR"] = output_dir
 
-
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, "w") as f:
         # Namespace to dict
@@ -412,6 +419,9 @@ def test(args):
 
     memory_usage_dir = os.path.join(output_dir, "memory_usage")
     d2.mem.set_memory_usage_log_file(memory_usage_dir)
+    d2.mem.enable_memory_usage_logging(memory_usage_dir)
+
+    log_memory_usage("enter test", force=True)
 
     # parallelization
     tp_size = args.tp_size
@@ -481,11 +491,15 @@ def test(args):
         hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
                           hf_config.num_attention_heads)
 
+    log_memory_usage("before init_megatron_e2e_test", force=True)
+
     worker: MegatronE2eWorker = init_megatron_e2e_test(
         hidden_size_q, hidden_size_kv, hf_config.num_attention_heads, num_tokens,
         world_size, dpcp_size, tp_size, pp_size,
         dtype, MegatronE2eWorker
     )
+    log_memory_usage("after init_megatron_e2e_test", force=True)
+
     enable_gradient_checkpointing = False
     gradient_checkpointing_kwargs = {}
     if os.environ.get("EXPERIMENT_ADD_SELECTIVE_CKPT", "0") == "1":
@@ -502,7 +516,11 @@ def test(args):
         enable_gradient_checkpointing=enable_gradient_checkpointing,
         gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
     )
+    log_memory_usage("before worker.init", force=True)
     worker.init(model_path, seed=seed)
+    log_memory_usage("after worker.init", force=True)
+    rank = torch.distributed.get_rank()
+    
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
@@ -536,6 +554,7 @@ def test(args):
         # 
         start_time = time.time()
 
+        print(f"""create_pp_microbatches(num_microbatch={num_microbatch}, pp_degree={pp_size}, as_rank={as_rank}, as_world_size={as_world_size}, total_seq_len={total_seq_len}, num_seqs={num_seqs}, max_cp_degree={dpcp_size}, hidden_size_q_tp={hidden_size_q_tp}, hidden_size_k_tp={hidden_size_k_tp}, element_size={element_size}, num_head_in_dtype={num_head_in_dtype}, tp_size={tp_size}, dp_size={dpcp_size}, num_token_per_rank={num_token_per_rank}, num_batches={num_batches}, use_planner={args.use_planner}, return_seq_lens=True)""")
         microbatches_0, tick_per_rank_doc_lens_0 = create_pp_microbatches(
             num_microbatch, pp_size, as_rank,
             as_world_size, total_seq_len, num_seqs, dpcp_size,
@@ -544,6 +563,11 @@ def test(args):
             num_token_per_rank, num_batches, args.use_planner,  
             return_seq_lens=True,
         )
+        end_time = time.time()
+        duration = (end_time - start_time)
+        print(f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches(0): {duration} seconds")
+
+        start_time = time.time()
         microbatches_1, tick_per_rank_doc_lens_1 = create_pp_microbatches(
             num_microbatch, pp_size, as_rank,
             as_world_size, total_seq_len, num_seqs, dpcp_size,
@@ -554,7 +578,7 @@ def test(args):
         )
         end_time = time.time()
         duration = (end_time - start_time)
-        print(f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches: {duration} seconds")
+        print(f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches(1): {duration} seconds")
 
         seq_lens = [tick_per_rank_doc_lens_0, tick_per_rank_doc_lens_1]
         # print(f"🟡 [sample_idx = {sample_idx}] seq_lens is: {seq_lens}")
@@ -617,7 +641,7 @@ def test(args):
         loop_end_time = time.time()
         print(f"⚪ create_pp_microbatches - constructing PingPangPackedSeqParams: {loop_end_time - loop_start_time} seconds")
 
-
+        log_memory_usage("complete microbatches construction", force=True)
 
         should_run_baseline_with_dummy = False
         should_run_baseline = False
@@ -638,8 +662,7 @@ def test(args):
         except:
             pass
 
-        rank = torch.distributed.get_rank()
-        d2.mem.enable_memory_usage_logging(memory_usage_dir)
+        
 
         if should_run_baseline_with_dummy:
 
