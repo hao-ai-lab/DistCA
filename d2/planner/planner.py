@@ -48,6 +48,7 @@ def batch_to_items_class(batches: list[list[int]], model_config=None):
             seqid += 1
     return items
 
+# Can handle MLP DPCP and dummy doc.
 def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int, as_world_size: int, model_config: dict):
 
     items = []
@@ -119,7 +120,7 @@ def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int
 """
 Partition and place a batch of variable-length documents onto GPU ranks under a
 hybrid Data-Parallel (DP) and Context-Parallel (CP) policy, returning a list of
-Item objects.
+Item objects.(Can handle MLP DPCP. Can't handle dummy docs.)
 
 Steps
 1. Schedule each document to the next available rank in original order (DP).
@@ -460,7 +461,10 @@ class Item:
             assert newly_split_item.total_flops == moved_flops_actual, "Total moved flops should be equal"
             return newly_split_item, moved_flops_actual
 
-    def to_dicts(self):
+    # Transfer Item to List of dict(s).
+    # Complete Item -> List[one dict]
+    # Split Item -> List[two dicts]
+    def to_dicts(self) -> List[Dict[str, Any]]:
         output_dicts = []
         for item_chunk in self.items:
             if item_chunk['q'] <= 0:
@@ -531,7 +535,7 @@ class Planner:
     def plan(self, items_: list[Item], verbose=False, plot=False, is_resend_qkv:bool=False):
         mlp_shard_len = self.items_to_mlp_doc_len(items_)
         planned_items: list[Item] = self.plan_items(items_, verbose, plot)
-        planned_items: list[Item] = self.postprocess_items(planned_items)
+        planned_items: list[dict] = self.postprocess_items(planned_items)
         planner_output: list[list[ShardInfo]] = self.items_into_shardinfos(planned_items)
         tp_size = self.parallel_config.tensor_model_parallel_size
         if self.parallel_config.pipeline_model_parallel_size == 1:
@@ -682,7 +686,7 @@ class Planner:
         return shard_infos
     
 
-    def postprocess_items(self, items: list[Item]) -> list[Item]:
+    def postprocess_items(self, items: list[Item]) -> list[dict]:
         dict_items = []
         for item in items:
             dict_items.extend(item.to_dicts())
