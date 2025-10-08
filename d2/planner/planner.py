@@ -49,6 +49,7 @@ def batch_to_items_class(batches: list[list[int]], model_config=None):
     return items
 
 # Can handle MLP DPCP and dummy doc.
+# Can handle MLP DPCP and dummy doc.
 def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int, as_world_size: int, model_config: dict):
 
     items = []
@@ -120,6 +121,7 @@ def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int
 """
 Partition and place a batch of variable-length documents onto GPU ranks under a
 hybrid Data-Parallel (DP) and Context-Parallel (CP) policy, returning a list of
+Item objects.(Can handle MLP DPCP. Can't handle dummy docs.)
 Item objects.(Can handle MLP DPCP. Can't handle dummy docs.)
 
 Steps
@@ -467,6 +469,10 @@ class Item:
             assert newly_split_item.total_flops == moved_flops_actual, "Total moved flops should be equal"
             return newly_split_item, moved_flops_actual
 
+    # Transfer Item to List of dict(s).
+    # Complete Item -> List[one dict]
+    # Split Item -> List[two dicts]
+    def to_dicts(self) -> List[Dict[str, Any]]:
     # Transfer Item to List of dict(s).
     # Complete Item -> List[one dict]
     # Split Item -> List[two dicts]
@@ -826,6 +832,7 @@ class Planner:
         return shard_infos
     
 
+    def postprocess_items(self, items: list[Item]) -> list[dict]:
     def postprocess_items(self, items: list[Item]) -> list[dict]:
         dict_items = []
         for item in items:
