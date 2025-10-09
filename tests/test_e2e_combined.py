@@ -1003,19 +1003,27 @@ def test(args):
                 break
             
             # Rebalance Ping pong
-            def balance_ping_pong(seq_lens: list[list[int]]) -> list[list[int]]:
-                # [1k x 4 ], [2k x 2 ], [4k] ...
-                # taking a list of batch, and interleave them by sorted workload.
-                sorted_attn_workload = sorted(seq_lens, key=lambda x: sum(y ** 2 for y in x))
-                ping = []
-                pong = []
-                for batch in sorted_attn_workload:
-                    if len(ping) < len(pong):
+            def balance_ping_pong(seq_lens: list[list[int]]) -> tuple[list[list[int]], list[list[int]]]:
+                def batch_flops(batch):
+                    return sum(y ** 2 // 2 for y in batch)
+
+                assert len(seq_lens) % 2 == 0, f"ping pong should have even number of batches, but got {len(seq_lens)} batches, seq_lens={seq_lens}"
+                sorted_batches = sorted(seq_lens, key=batch_flops, reverse=True)
+                ping, pong = [], []
+                ping_flops, pong_flops = 0, 0
+                avg_num_batches = len(seq_lens) // 2
+
+                for batch in sorted_batches:
+                    if (ping_flops <= pong_flops and len(ping) < avg_num_batches) or len(pong) >= avg_num_batches:
                         ping.append(batch)
+                        ping_flops += batch_flops(batch)
                     else:
                         pong.append(batch)
-                assert len(ping) == len(pong)
+                        pong_flops += batch_flops(batch)
+
+                assert len(ping) == len(pong) == avg_num_batches, f"ping batches={ping}, pong batches={pong}"
                 return ping, pong
+
                 
             rich.print(f"🟡 [Rank {rank}] _seq_lens = {_seq_lens}")
 
