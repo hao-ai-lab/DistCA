@@ -159,6 +159,8 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
                 labels=None, 
                 # labels=input_ids.unsqueeze(0),
             )
+            # print(f"🟡 output = {output}")
+            # print(f"🟡 output.shape = {output.shape if output is not None else None}")
             torch.cuda.nvtx.range_pop()
             return output, loss_func
 
@@ -204,6 +206,12 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         if with_dummy:
             raise NotImplementedError("Dummy backward is not implemented for WLBLLM")
             
+        # Set the sequence lengths for all microbatches
+        seq_lengths = [mb['input_ids'].shape[0] for mb in microbatches]
+        print(f"🟡 Setting microbatch sequence lengths: {seq_lengths}")
+        from wlbllm.megatron_patch.pp_schedules import set_microbatch_seq_lengths
+        set_microbatch_seq_lengths(seq_lengths)
+        
         # orig_fwd_backward_func = get_forward_backward_func()
         import wlbllm.megatron_patch.pp_schedules
         orig_fwd_backward_func = wlbllm.megatron_patch.pp_schedules.forward_backward_pipelining_without_interleaving
@@ -330,6 +338,14 @@ def test(args):
     output_dir = args.output_dir
     benchmark_log_path = os.path.join(output_dir, "benchmark.raw.jsonl")
     benchmark_final_path = os.path.join(output_dir, "benchmark.json")
+
+    should_profile_memory_history = False
+    if should_profile_memory_history:
+        torch.cuda.memory._record_memory_history()
+        mem_snapshots_dir = os.path.join(output_dir, "mem_snapshots")
+        os.makedirs(mem_snapshots_dir, exist_ok=True)
+        print(f"🟡 Will save mem snapshots to: {mem_snapshots_dir}")
+        pass
     
     log_memory_usage("test start")
 
@@ -341,6 +357,8 @@ def test(args):
     
     memory_usage_dir = os.path.join(output_dir, "mem-log")
     os.makedirs(memory_usage_dir, exist_ok=True)
+    enable_memory_usage_logging(memory_usage_dir)
+
     os.environ["WLBLLM_MODE"] = "1"
     seed = args.seed
 
@@ -400,10 +418,17 @@ def test(args):
     )
 
     # for _ in range(20):
-    #     print(f"🟡 get_next_batch: {get_next_batch(batch_size * 2)}")
+    #     print(f"🟡 get_next_batch: {get_next_batch(int(num_microbatch * batch_size * 2))}")
+    # exit(0)
 
     # Setup the model and configuration
-    hf_config = AutoConfig.from_pretrained(model_path)
+    try:
+        # First try with local_files_only to use cached version
+        hf_config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    except Exception as e:
+        print(f"Local cache not found for {model_path}, downloading... Error: {e}")
+        # Fallback to downloading with cache_dir specified
+        hf_config = AutoConfig.from_pretrained(model_path, cache_dir="./models/")
     hidden_size_q = hf_config.hidden_size
 
     hidden_size_kv = hidden_size_q
@@ -414,10 +439,12 @@ def test(args):
     wlbllm.megatron_patch.dot_product_attention.monkey_patch()
     wlbllm.megatron_patch.backends.monkey_patch()
 
+    log_memory_usage("before init_megatron_e2e_test", force=True)
     worker: MegatronE2eWorker = init_megatron_e2e_test(
         world_size, cp_size, tp_size, pp_size, dp_size, 
         MegatronE2eWorker,
     )
+    log_memory_usage("after init_megatron_e2e_test", force=True)
     worker.set_config(dtype=dtype)
 
     enable_gradient_checkpointing = False
@@ -441,7 +468,6 @@ def test(args):
     set_random_seed(seed, set_megatron=False)
 
 
-    enable_memory_usage_logging(memory_usage_dir)
     log_memory_usage("init worker done", force=True)
 
     # Check rank correctness
@@ -459,7 +485,7 @@ def test(args):
     def swap_metadata_fn(counter: int):
         wlb_metadata = wlbllm.registry.get(counter)
         for key, value in wlb_metadata.items():
-            print(f"🟡 swap_metadata_fn[{counter}]: swapping {key}")
+            # print(f"🟡 swap_metadata_fn[{counter}]: swapping {key}")
             wlbllm.registry.set(key, value)
         return wlb_metadata
 
@@ -472,19 +498,19 @@ def test(args):
     for sample_idx in range(max_sample_id):
 
         # Get the unbalanced microbatches from the data loader
-
         ENABLE_BALANCED_FLOS_NO_DEFER = True
 
-        unbalanced_micro_batches = get_next_batch(batch_size * 2 * num_microbatch)
-        print(f"🟡 unbalanced_micro_batches: {unbalanced_micro_batches}")
-        
-        all_seq_lens.append(unbalanced_micro_batches)
-        my_batch_ranks = list(range(dp_rank, dp_size * num_microbatch, dp_size))
+        batch_size_x2 = int(batch_size * 2)
 
         if ENABLE_BALANCED_FLOS_NO_DEFER:
-            batch_size_x2 = int(batch_size * 2)
-            assert isinstance(batch_size_x2, int) and batch_size_x2 > 0
+            
             unbalanced_micro_batches = get_next_batch(batch_size_x2 * num_microbatch)
+            print(f"🟡 unbalanced_micro_batches: {unbalanced_micro_batches}")
+            
+            all_seq_lens.append(unbalanced_micro_batches)
+            my_batch_ranks = list(range(dp_rank, dp_size * num_microbatch, dp_size))
+
+            assert isinstance(batch_size_x2, int) and batch_size_x2 > 0
             print(f"🟡 unbalanced_micro_batches: {unbalanced_micro_batches}")
             my_batch_ranks = list(range(dp_rank, dp_size * num_microbatch, dp_size))
             print(f"🟡 my_batch_ranks: {my_batch_ranks}")
@@ -499,7 +525,6 @@ def test(args):
             unbalanced_micro_batches = []
             for i in range(num_microbatch):
                 a = get_next_batch(batch_size_x2 * num_microbatch)
-                all_seq_lens.append(a)
                 b = a[
                     dp_rank * (batch_size_x2):
                     (dp_rank + 1) * (batch_size_x2)
@@ -517,10 +542,10 @@ def test(args):
         print(f"🟡 balanced_seq_lens: {balanced_seq_lens}, {len(balanced_seq_lens) = }")
         assert len(balanced_seq_lens) == num_microbatch, f"len(balanced_seq_lens) == num_microbatch, {len(balanced_seq_lens)} != {num_microbatch}"
         print(f"🟡 new_batch: {new_batch}")
-        all_seq_lens.append(new_batch)
+        # all_seq_lens.append(new_batch)
         
         microbatches = []
-        all_seq_lens.append(balanced_seq_lens)
+        # all_seq_lens.append(balanced_seq_lens)
         for mb_idx, seq_lens in enumerate(balanced_seq_lens):
             # doc_lens = flatten(seq_lens)
             # TODO: (Refactor) doc lens must satisfies the TP requirement
@@ -630,6 +655,7 @@ def test(args):
             pass
 
 
+        log_memory_usage("complete sample setup")
         durations_ms = []
         for repeat_idx in range(max_repeat_cnt + max_warmup_cnt):
             wlbllm.registry.set("forward_cnt", 0)
@@ -647,9 +673,40 @@ def test(args):
                 memory_logging_ctx = log_memory_usage_context()
                 pass
             
+            log_memory_usage("before forward_backward_batch")
             config_name = f"n{args.num_nodes}t{args.num_tokens}b{args.num_batches}mb{args.num_microbatch}-cp{args.cp_size}pp{args.pp_size}tp{args.tp_size}"
             with torch.cuda.nvtx.range(f"wlbllm({config_name})[sample={sample_idx}][repeat={repeat_idx}]"):
-                with memory_logging_ctx:
+                # with memory_logging_ctx:
+                #     torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
+                #     if True:
+
+                #         with torch.profiler.profile(
+                #             activities=[
+                #                 torch.profiler.ProfilerActivity.CPU,
+                #                 torch.profiler.ProfilerActivity.CUDA,
+                #             ],
+                #             profile_memory=True,
+                #             record_shapes=True,
+                #             with_stack=True,
+                #         ) as prof:
+                #             loss, grad = worker.forward_backward_batch(
+                #                 microbatches=microbatches,
+                #                 forward_only=False,
+                #                 mode="orig_reimpl", # actually wlbllm
+                #                 with_dummy=False,
+                #             )
+                        
+                #     if rank == 0:
+                #         print("Dumping memory snapshot")
+                #         mem_snapshot_output_path = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.pickle")
+                #         memory_timeline_output_path = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.html")
+                #         memory_timeline_output_raw = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.json.gz")
+                #         torch.cuda.memory._dump_snapshot(mem_snapshot_output_path)
+                #         prof.export_memory_timeline(memory_timeline_output_path, device=torch.cuda.current_device())
+                #         prof.export_memory_timeline(memory_timeline_output_raw, device=torch.cuda.current_device())
+                #         print("Memory snapshot dumped")
+                #     exit(0)
+
                     torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
                     loss, grad = worker.forward_backward_batch(
                         microbatches=microbatches,
@@ -678,7 +735,7 @@ def test(args):
                     "sample_id": sample_idx,
                     "duration_ms": average_duration_ms,
                     "duration_list": durations_ms,
-                    "samples": balanced_seq_lens,
+                    "samples": unbalanced_micro_batches,
                 }) + "\n")
 
             print(f"🟡 Write benchmark log to {benchmark_log_path}")
@@ -734,7 +791,6 @@ if __name__ == "__main__":
 
     parser.add_argument("--max-sample-id", type=int, default=3)
     parser.add_argument("--should-add-debug-cases", action="store_true")
-    parser.add_argument("--sample-name", type=str, default="wlbllm")
     parser.add_argument("--sample-name", type=str, default="wlbllm", choices=["wlbllm", "prolong"])
     parser.add_argument("--change-long-doc-ratio", type=float, default=0.0)
 

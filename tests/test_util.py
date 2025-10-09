@@ -10,6 +10,7 @@ from datetime import timedelta
 from megatron.core import parallel_state as mpu
 import ray
 import torch
+import time
 
 from d2.runtime.attn_kernels.ops import (
     nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper
@@ -509,6 +510,7 @@ def create_pipeline_doclens(
     print(f"In util.py, finally tick_per_rank_doc_len is: {tick_per_rank_doc_len}")
 
     if return_original_doclen:
+        print("In util.py, return_original_doclen is True, returning (tick_per_rank_doc_len, pp_head_new_doc_len)")
         return (tick_per_rank_doc_len, pp_head_new_doc_len)
     # exit(0)
     return tick_per_rank_doc_len
@@ -582,12 +584,18 @@ def create_qkv_dispatch_pipeline_tick(
     except ValueError:
         pass
     print(f"🟡 MIN_TOLERANCE_FACTOR = {MIN_TOLERANCE_FACTOR}")
+
+    tolerance_factors_to_try.append(MIN_TOLERANCE_FACTOR)
+    tolerance_factors_to_try = set(tolerance_factors_to_try)
+    tolerance_factors_to_try = list(tolerance_factors_to_try)
+    tolerance_factors_to_try.sort()
     
     for tolerance_factor in tolerance_factors_to_try:
         if tolerance_factor < MIN_TOLERANCE_FACTOR:
             continue
         print(f"🟡 Trying tolerance_factor: {tolerance_factor}")
         
+        start_time = time.time()
         if use_planner:
             # TODO: This pp_size should really come from mpu or some module that handles the world size...
             pp_size = world_size // dp_size        # in this function, world size is actual as_world_size. pp = world_size // dp_size
@@ -625,9 +633,12 @@ def create_qkv_dispatch_pipeline_tick(
             softmax_lse_size, element_size, is_pipeline_tick=True
         )
         (qkv_linear_to_attn_fa2a, _, out_attn_to_linear_fa2a, _, fwd_attn_metadata) = fa2a_metadata
+        end_time = time.time()
+        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - fwd_planner_out duration: {(end_time - start_time):.2f} sec", flush=True)
 
         
         # CP flip logic.
+        start_time = time.time()
         print(f"🟡 fwd_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
         if len(cur_tick_per_rank_doc_lens) < world_size:
             print("🟡 CP flip logic.")
@@ -665,8 +676,11 @@ def create_qkv_dispatch_pipeline_tick(
         if return_original_doclen:
             ret += (original_cur_tick_per_rank_doc_lens,)
 
+        end_time = time.time()
+        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - cp flip duration: {(end_time - start_time):.2f} sec")
 
         # FIXME: Properly pass the output dir down here.
+        start_time = time.time()
         from d2.utils.network_inspect import inspect_network_metadata
         output_dir = os.environ.get("EXPERIMENT_OUTPUT_DIR")
         if torch.distributed.is_initialized():
@@ -690,7 +704,8 @@ def create_qkv_dispatch_pipeline_tick(
             output_dir=output_dir, rank=rank,
             seq_len=cur_tick_per_rank_doc_lens,
         )
-
+        end_time = time.time()
+        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - network_inspect duration: {(end_time - start_time):.2f} sec")
 
         def debug_set_metadata_transfer_size_to_0(
             qkv_fwd_metadata,

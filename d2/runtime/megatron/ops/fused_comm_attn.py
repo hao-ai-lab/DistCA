@@ -3,9 +3,7 @@ import math
 import os
 from typing import Tuple
 
-from flash_attn.flash_attn_interface import (
-    _wrapped_flash_attn_varlen_forward, _wrapped_flash_attn_varlen_backward
-)
+import flash_attn.flash_attn_interface
 from d2.runtime.attn_kernels.ops import DispatcherWrapper, fast_a2a
 from d2.runtime.megatron.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -93,7 +91,7 @@ def _qkv_to_attn_out_fwd(q: Tensor, k: Tensor, v: Tensor,
         print("🟡 _qkv_to_attn_out_fwd: return_attn_probs = ", fa_args.return_attn_probs)
         print("🟡 _qkv_to_attn_out_fwd: block_table.shape = ", fa_args.block_table.shape if fa_args.block_table is not None else None)
     
-    out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+    out_padded, softmax_lse, S_dmask, rng_state = flash_attn.flash_attn_interface._wrapped_flash_attn_varlen_forward(
         q, k, v,
         fa_params.cu_seqlens_q,
         fa_params.cu_seqlens_kv,
@@ -168,7 +166,7 @@ def _qkv_to_attn_out_bwd(
         print("🟡 _qkv_to_attn_out_bwd: alibi_slopes.shape = ", fa_args.alibi_slopes.shape if fa_args.alibi_slopes is not None else None)
         print("🟡 _qkv_to_attn_out_bwd: deterministic = ", fa_args.deterministic)
 
-    _wrapped_flash_attn_varlen_backward(
+    flash_attn.flash_attn_interface._wrapped_flash_attn_varlen_backward(
         dout_padded, q, k, v, out_padded.contiguous(), softmax_lse, dq, dk, dv,
         cu_seqlen_q, cu_seqlen_kv, max_seqlen_q, max_seqlen_kv,
         fa_args.dropout_p, softmax_scale, fa_args.causal,

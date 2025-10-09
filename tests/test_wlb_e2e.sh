@@ -21,6 +21,7 @@
 # Model configuration
 # MODEL_PATH=${MODEL_PATH:-codellama/CodeLlama-34b-hf}
 MODEL_PATH=${MODEL_PATH:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}
+MODEL_PATH_normalized=$(echo $MODEL_PATH | sed 's/\//_/g')
 NUM_LAYERS=${NUM_LAYERS:-8}
 
 # Parallelism settings
@@ -78,7 +79,7 @@ SHORT_TS=$(TZ=America/Los_Angeles date +%d_%H%M%S)
 
 # TOOD: Fix this hardcode output dir.
 OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
-OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}"}
+OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-${MODEL_PATH_normalized}-L${NUM_LAYERS}-${SAMPLE_NAME}_${CHANGE_LONG_DOC_RATIO}"}
 OUTPUT_DIR_SUFFIX_ADDON=${OUTPUT_DIR_SUFFIX_ADDON:-""}
 OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX$OUTPUT_DIR_SUFFIX_ADDON"
 mkdir -p "$OUTPUT_DIR"

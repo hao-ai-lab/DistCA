@@ -691,7 +691,14 @@ for config in "${cases[@]}"; do
     
     # Construct the expected output directory for this run
     run_timestamp="${TS}"
-    run_output_dir="${OUTPUT_DIR_PREFIX}/${run_timestamp}.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}${OUTPUT_DIR_SUFFIX_ADDON}"
+    
+    # Check if FOLDER_SEPARATOR flag is enabled for simplified directory naming
+    if [ "${FOLDER_SEPARATOR:-0}" == "1" ]; then
+        run_output_dir="${OUTPUT_DIR_PREFIX}/${run_timestamp}.-----"
+        echo "🔧 FOLDER_SEPARATOR=1: Using simplified directory name: ${run_timestamp}.-----"
+    else
+        run_output_dir="${OUTPUT_DIR_PREFIX}/${run_timestamp}.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}${OUTPUT_DIR_SUFFIX_ADDON}"
+    fi
     
     if [ $MODE == "d2" ]; then
         if [ "$MONITOR_STUCK" == "1" ]; then

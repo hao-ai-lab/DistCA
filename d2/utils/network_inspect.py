@@ -53,12 +53,12 @@ def inspect_network_metadata(metadata: 'FastAllToAllMetadata_Tuple', is_ping, sa
     attn_out_fwd_metadata__recv_transfer_sz = metadata[1].fa2a_metadata[3]
             
     # Print qkv_fwd_metadata
-    print_2d_tensor("qkv_fwd_metadata.send_transfer_sz", qkv_fwd_metadata__send_transfer_sz, unit="MB")
-    print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz", qkv_fwd_metadata__recv_transfer_sz, unit="MB")
+    # print_2d_tensor("qkv_fwd_metadata.send_transfer_sz", qkv_fwd_metadata__send_transfer_sz, unit="MB")
+    # print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz", qkv_fwd_metadata__recv_transfer_sz, unit="MB")
     
     # Print attn_out_fwd_metadata  
-    print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz", attn_out_fwd_metadata__send_transfer_sz, unit="MB")
-    print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz", attn_out_fwd_metadata__recv_transfer_sz, unit="MB")
+    # print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz", attn_out_fwd_metadata__send_transfer_sz, unit="MB")
+    # print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz", attn_out_fwd_metadata__recv_transfer_sz, unit="MB")
 
     # Calculate the demand for the DispatcherWrapper.buffer (including comm and local kv)
     max_buffer_budget_all_rank = (
@@ -72,22 +72,25 @@ def inspect_network_metadata(metadata: 'FastAllToAllMetadata_Tuple', is_ping, sa
     qkv_fwd_metadata__send_transfer_sz_to_others = exclude_self_and_sum(qkv_fwd_metadata__send_transfer_sz)
     qkv_fwd_metadata__recv_transfer_sz_to_others = exclude_self_and_sum(qkv_fwd_metadata__recv_transfer_sz)
     
-    print_2d_tensor("qkv_fwd_metadata.send_transfer_sz_to_others", qkv_fwd_metadata__send_transfer_sz_to_others, unit="MB")
-    print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz_to_others", qkv_fwd_metadata__recv_transfer_sz_to_others, unit="MB")
+    # print_2d_tensor("qkv_fwd_metadata.send_transfer_sz_to_others", qkv_fwd_metadata__send_transfer_sz_to_others, unit="MB")
+    # print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz_to_others", qkv_fwd_metadata__recv_transfer_sz_to_others, unit="MB")
 
     attn_out_fwd_metadata__send_transfer_sz_to_others = exclude_self_and_sum(attn_out_fwd_metadata__send_transfer_sz)
     attn_out_fwd_metadata__recv_transfer_sz_to_others = exclude_self_and_sum(attn_out_fwd_metadata__recv_transfer_sz)
 
-    print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz_to_others", attn_out_fwd_metadata__send_transfer_sz_to_others, unit="MB")
-    print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz_to_others", attn_out_fwd_metadata__recv_transfer_sz_to_others, unit="MB")
+    # print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz_to_others", attn_out_fwd_metadata__send_transfer_sz_to_others, unit="MB")
+    # print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz_to_others", attn_out_fwd_metadata__recv_transfer_sz_to_others, unit="MB")
     
     # Expected send-recv time
     bandwidth_mb = 40 # MB/ms
     bandwidth = bandwidth_mb * 1024 * 1024  # Convert to bytes/ms
     send_time_ms = qkv_fwd_metadata__send_transfer_sz_to_others / bandwidth
     recv_time_ms = qkv_fwd_metadata__recv_transfer_sz_to_others / bandwidth
-    print_2d_tensor("send_time_ms", send_time_ms)
-    print_2d_tensor("recv_time_ms", recv_time_ms)
+    # print_2d_tensor("send_time_ms", send_time_ms)
+    # print_2d_tensor("recv_time_ms", recv_time_ms)
+
+    max_send_time_ms = (send_time_ms.max().item())
+    max_recv_time_ms = (recv_time_ms.max().item())
 
     max_comm_budget_all_rank = (
           qkv_fwd_metadata__send_transfer_sz_to_others 
@@ -116,6 +119,8 @@ def inspect_network_metadata(metadata: 'FastAllToAllMetadata_Tuple', is_ping, sa
                 "bandwidth_mb": bandwidth_mb,
                 "send_time_ms": send_time_ms.tolist(),
                 "recv_time_ms": recv_time_ms.tolist(),
+                "max_send_time_ms": max_send_time_ms,
+                "max_recv_time_ms": max_recv_time_ms,
                 "seq_len": seq_len if seq_len is not None else None,
             }) + "\n")
 
@@ -132,6 +137,8 @@ def inspect_network_metadata(metadata: 'FastAllToAllMetadata_Tuple', is_ping, sa
                 "max_buffer_budget_all_rank_mb": max_buffer_budget_all_rank // (1024 * 1024),
                 "send_time_ms": send_time_ms.tolist(),
                 "recv_time_ms": recv_time_ms.tolist(),
+                "max_send_time_ms": max_send_time_ms,
+                "max_recv_time_ms": max_recv_time_ms,
                 "seq_len": seq_len if seq_len is not None else None,
             }) + "\n")
 

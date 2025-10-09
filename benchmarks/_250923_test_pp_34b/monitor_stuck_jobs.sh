@@ -6,28 +6,27 @@
 set -e
 
 # Configuration
-DEFAULT_OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250923_test_pp_34b/logs.v3-sweep-pp-34b"
 CHECK_INTERVAL_SECONDS=15
 STUCK_THRESHOLD_MINUTES=3
 
 # Command line argument parsing
-OUTPUT_DIR_PREFIX="$DEFAULT_OUTPUT_DIR_PREFIX"
+OUTPUT_DIR_PREFIX=""
 VERBOSE=0
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --help|-h)
-            echo "Usage: $0 [OUTPUT_DIR_PREFIX] [--verbose]"
+            echo "Usage: $0 <OUTPUT_DIR_PREFIX> [--verbose]"
             echo ""
             echo "Monitor the latest job for stuck conditions"
             echo ""
             echo "Arguments:"
-            echo "  OUTPUT_DIR_PREFIX  Directory containing job folders (default: $DEFAULT_OUTPUT_DIR_PREFIX)"
+            echo "  OUTPUT_DIR_PREFIX  Directory containing job folders (required)"
             echo "  --verbose          Enable verbose logging"
             echo ""
             echo "Example:"
-            echo "  $0"
+            echo "  $0 /path/to/logs"
             echo "  $0 /path/to/logs --verbose"
             echo ""
             echo "The script will:"
@@ -53,6 +52,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validate required arguments
+if [ -z "$OUTPUT_DIR_PREFIX" ]; then
+    echo "Error: OUTPUT_DIR_PREFIX is required"
+    echo "Use --help for usage information"
+    exit 1
+fi
 
 # Function to log with timestamp
 log() {

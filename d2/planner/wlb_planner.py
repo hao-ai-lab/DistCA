@@ -38,17 +38,18 @@ def balance_data_for_wlbllm(
     _seq_lens, 
     ENABLE_BALANCED_FLOS_NO_DEFER = True,
     model_config: dict | None = None,
+    Lmax: int | None = None,
 ):
     """Balance data across DP ranks for WLBLLM planner.
     
     Args:
         dp_size: Number of data parallel ranks
-        dp_rank: Current data parallel rank(s)
+        dp_rank: Current data parallel rank(s). Note that this can be generalized to dp * pp rank(s).
         total_seq_len: Maximum sequence length
         batch_size: Global batch size
         rank: Global rank
         _seq_lens: Original sequence lengths
-        
+        Lmax: Maximum sequence length that fits into a dp rank. Default None, which means use the `total_seq_len * 2 * batch_size // dp_size`.
     Returns:
         seq_lens: Balanced sequence lengths for current rank
     """
@@ -69,7 +70,7 @@ def balance_data_for_wlbllm(
         #   (or DP*PP, depending on the outer function calls - if you don't understand, see WLBLLM paper 
         #   and understand how it works by taking DP * PP batches each time). 
         # TODO: Sorting / swapping batches may have perforamnce regression. Be careful of what you wish for.
-        Lmax = total_seq_len * 2 * batch_size // dp_size
+        Lmax = int(total_seq_len * 2 * batch_size) // dp_size if Lmax is None else Lmax
         rich.print(f"🟡 Lmax = total_seq_len({total_seq_len}) * 2 * batch_size({batch_size}) // dp_size({dp_size}) = Lmax({Lmax})")
 
         all_docs = flatten(_seq_lens)

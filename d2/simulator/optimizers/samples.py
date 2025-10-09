@@ -218,7 +218,7 @@ def sample_prolong_docs(
     ctx_length = 64 * 1024 * elongate_factor
     print("ctx_length", ctx_length)
     # short_doc_dist = []
-    docpath = data_folder / "textbook.json"
+    docpath = data_folder / "dist_prolong.json"
     with open(docpath, "r") as f:
         docs = json.load(f)
 
