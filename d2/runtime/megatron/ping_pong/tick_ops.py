@@ -181,7 +181,7 @@ def tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, key
     tensors_0 = [arg_group_0[key] for key in keys_0]
     tensors_1 = [arg_group_1[key] for key in keys_1]
     tensors = tensors_0 + tensors_1
-    out_tensors = tick_sync_with_info(compute_stream, comm_stream, layer_info, operation_info, *tensors, )
+    out_tensors = tick_sync_with_info(compute_stream, comm_stream, *tensors, layer_info=layer_info, operation_info=operation_info)
     out_tensors_0 = out_tensors[:len(tensors_0)]
     out_tensors_1 = out_tensors[len(tensors_0):]
     for key, out_tensor in zip(keys_0, out_tensors_0):

@@ -141,4 +141,4 @@ def tick_sync_with_info(compute_stream: torch.cuda.Stream, comm_stream: torch.cu
     """
     Wrapper around TickSync that includes layer and operation information for blocking detection.
     """
-    return TickSync.apply(compute_stream, comm_stream, *tensors, layer_info, operation_info)
+    return TickSync.apply(compute_stream, comm_stream, layer_info, operation_info, *tensors)
