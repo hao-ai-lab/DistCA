@@ -1,5 +1,7 @@
 from collections import defaultdict
 from copy import deepcopy
+import math
+import random
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -520,6 +522,60 @@ def group_items_by_seqid(items: list[Item]) -> dict:
     return doc_info
 
 
+# {doc_id: {'items': [Item], 'doc_len':4096 , 'cp_group_index': 0}}
+def flex_sp(doc_info: dict, total_cp_degree: int) -> tuple[list[list[int]], dict]:
+    cp_groups = []
+    import pulp
+    group_sizes = [1]
+    while group_sizes[-1] * 2 <= total_cp_degree:
+        group_sizes.append(group_sizes[-1] * 2)
+    max_group_sizes = {k: total_cp_degree // k for k in group_sizes}
+    prob = pulp.LpProblem("DocAssignment", pulp.LpMinimize)
+    C_max = pulp.LpVariable("C_max", lowBound=0, cat='Continuous')
+    x = pulp.LpVariable.dicts(
+        "AssignDoc",
+        ((i, j, k) for i in doc_info for k in group_sizes for j in range(max_group_sizes[k])),
+        cat='Binary',
+    )
+    y = pulp.LpVariable.dicts(
+        "GroupUsed",
+        ((j, k) for k in group_sizes for j in range(max_group_sizes[k])),
+        cat='Binary',
+    )
+    prob += C_max
+    prob += pulp.lpSum(k * y[j, k] for k in group_sizes for j in range(max_group_sizes[k])) == total_cp_degree
+    for i in doc_info:
+        prob += pulp.lpSum(x[i, j, k] for k in group_sizes for j in range(max_group_sizes[k])) == 1
+    for k in group_sizes:
+        for j in range(max_group_sizes[k]):
+            prob += pulp.lpSum((doc_info[i]['doc_len'] + 1) * doc_info[i]['doc_len'] / k * x[i, j, k] for i in doc_info) <= C_max
+            for i in doc_info:
+                prob += x[i, j, k] <= y[j, k]
+    prob.solve(solver=pulp.PULP_CBC_CMD(msg=False, timeLimit=60))
+
+    cp_groups = []
+    current = 0
+    for k in reversed(group_sizes):
+        for j in range(max_group_sizes[k]):
+            if pulp.value(y[j, k]) > 0.5:
+                cp_groups.append(list(range(current, current + k)))
+                current += k
+            for i in doc_info:
+                if pulp.value(x[i, j, k]) > 0.5:
+                    doc_info[i]['cp_group_index'] = len(cp_groups) - 1
+
+    return cp_groups, doc_info
+
+
+if __name__ == "__main__":
+    docs = {}
+    for i in range(36):
+        docs[str(i)] = {'doc_len': int(math.floor(random.expovariate() % 10 / 10 * 65536)) + 1}
+    cp_groups, doc_info = flex_sp(docs, 20)
+    for i, group in enumerate(cp_groups):
+        print(f"Group {i} (size {len(group)}): {[doc_info[d]['doc_len'] for d in doc_info if doc_info[d]['cp_group_index'] == i]}")
+
+
 class Planner:
     def __init__(self,
                 world_size: int,
@@ -611,14 +667,7 @@ class Planner:
     # Documents' Attention GPU id is specified by Item's gpuid.
     def plan_items_ilp(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
         items = deepcopy(items_)
-        # {doc_id: {'items': [Item], 'doc_len':4096 , 'cp_group_index': 0}}
         doc_info = group_items_by_seqid(items)
-        
-        def flex_sp(doc_info: dict, total_cp_degree: int) -> tuple[list[list[int]], dict]:
-            cp_groups = []
-            # TODO: Implement flex_sp ILP solver.
-            return cp_groups, doc_info
-
 
         # For ILP planner, total_cp_degree can be treated as attention_server_world_size.
         # Aftr calling flex_sp functione
