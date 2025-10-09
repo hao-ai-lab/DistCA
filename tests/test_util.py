@@ -107,21 +107,15 @@ class BaseWorker:
                 pass
 
     def init_nvshmem(self, buffer_size: int, local_rank: int = None):
-        print("====== init_nvshmem ======")
         if self.rank == 0:
             uid = nvshmem_get_unique_id()
-            print(f"Init uid = {uid}")
         else:
             uid = nvshmem_alloc_empty_unique_id()
-        print(f"Broadcast uid: {uid}")
         torch.distributed.broadcast(uid, src=0)
-        print(f"Rank {self.rank} uid = {uid}")
-        
-        print("DispatcherWrapper.init")
+
         DispatcherWrapper.init(
             self.rank, local_rank, self.world_size, buffer_size, uid
         )
-        print("====== init_nvshmem done ======")
 
     def init_comm(self, buffer_size: int, local_rank: int = None):
         if local_rank is None:

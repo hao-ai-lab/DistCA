@@ -16,8 +16,9 @@ from d2.runtime.attn_kernels.ops import (
 )
 # TODO: test fast_a2a_attn_out and its metadata by sending q_attn_layout back to q_mlp_layout via attn_out metadata.
 from d2.runtime.attn_kernels.dispatch import (
-    fast_a2a_qkv
+    pre_a2a_qkv, post_a2a_qkv
 )
+from d2.runtime.attn_kernels.ops import fast_a2a
 from d2.runtime.compute_metadata import from_planner_output
 from d2.runtime.metadata import AlltoAllMetadata
 
@@ -26,6 +27,47 @@ from test_util import (
     random_shard_info_linear_layout_dp
 )
 from test_shard_info_to_fa2a import simulate_all2all
+
+
+def _fast_a2a_qkv(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_dispatch_mask: torch.Tensor,
+    recv_q: torch.Tensor, recv_k: torch.Tensor, recv_v: torch.Tensor,
+    q_seq_tokens: torch.Tensor, k_seq_tokens: torch.Tensor,
+    q_recv_seq_tokens: torch.Tensor, k_recv_seq_tokens: torch.Tensor,
+    q_send_buffer_offset: torch.Tensor, k_send_buffer_offset: torch.Tensor, v_send_buffer_offset: torch.Tensor,
+    q_recv_buffer_offset: torch.Tensor, k_recv_buffer_offset: torch.Tensor, v_recv_buffer_offset: torch.Tensor,
+    sender_send_disp: torch.Tensor, sender_transfer_sz: torch.Tensor,
+    sender_recv_disp: torch.Tensor, recver_transfer_sz: torch.Tensor,
+    my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
+    is_fwd: bool,
+    # TODO: reorder args to make it more logical
+    kv_grad_copy_shard_mask: torch.Tensor=None,
+):
+    switch_buffer = True
+    instance_id = None
+    # copy in advance
+    # NOTE: in this test, kv grads = kv values, so we don't accumulate them due to the ease of value checking.
+    q, k, v = pre_a2a_qkv(
+        q, k, v, kv_dispatch_mask, q_seq_tokens, k_seq_tokens,
+        q_send_buffer_offset, k_send_buffer_offset, v_send_buffer_offset,
+        is_fwd=is_fwd, instance_id=instance_id,
+        kv_grad_copy_shard_mask=kv_grad_copy_shard_mask,
+    )
+    # all2all
+    fast_a2a(
+        sender_send_disp, sender_transfer_sz,
+        sender_recv_disp, recver_transfer_sz,
+        my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz,
+        instance_id=instance_id,
+    )
+    # copy back
+    recv_q, recv_k, recv_v = post_a2a_qkv(
+        recv_q, recv_k, recv_v, kv_dispatch_mask,
+        q_recv_seq_tokens, k_recv_seq_tokens,
+        q_recv_buffer_offset, k_recv_buffer_offset, v_recv_buffer_offset,
+        is_fwd=is_fwd, switch_buffer=switch_buffer, instance_id=instance_id,
+    )
+    return recv_q, recv_k, recv_v
 
 
 class Worker(BaseWorker):
@@ -55,7 +97,7 @@ class Worker(BaseWorker):
             dtype=dtype, device=device
         )
         dst_tensor_v = dst_tensor_k.clone()
-        fast_a2a_qkv(
+        _fast_a2a_qkv(
             tensor_q, tensor_k, tensor_v,
             fa2a_metadata_fwd.kv_replica_mask,
             dst_tensor_q, dst_tensor_k, dst_tensor_v,
@@ -89,7 +131,8 @@ class Worker(BaseWorker):
 
         nvshmem_barrier_all()
 
-        fast_a2a_qkv(
+        copy_seq_mask = fa2a_metadata_rev.kv_grad_send_dedup.main_copy_mask
+        _fast_a2a_qkv(
             dst_tensor_q, dst_tensor_k, dst_tensor_v,
             fa2a_metadata_rev.kv_replica_mask,
             back_tensor_q, back_tensor_k, back_tensor_v,
@@ -103,7 +146,8 @@ class Worker(BaseWorker):
             fa2a_metadata_rev.my_rank_send_offset,
             fa2a_metadata_rev.my_rank_recv_offset,
             fa2a_metadata_rev.my_rank_send_sz,
-            is_fwd=False
+            is_fwd=False,
+            kv_grad_copy_shard_mask=copy_seq_mask,
         )
         nvshmem_barrier_all()
         torch.cuda.synchronize()
@@ -151,7 +195,7 @@ def create_answer(
     )
     rev_qs, rev_ks, rev_vs = simulate_all2all(
         dst_qs, dst_ks, dst_vs, bwd_qkv_metadata, element_size, hidden_size_q, hidden_size_k,
-        is_from_linear_layout=False,
+        is_from_linear_layout=False, zero_mask_kv_grad=True,
     )
     kv_mask = fwd_qkv_metadata.kv_replica_mask
     src_kvs = [
@@ -257,7 +301,7 @@ def test(args):
         stride_kv * max_tokens_key_value * max_cp_degree * 2
     )
     worker = init_worker_torch_distributed(
-        world_size, buffer_size, Worker
+        world_size, buffer_size, Worker, None,
     )
     print("init done.")
     test_qkv(
