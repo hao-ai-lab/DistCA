@@ -2,12 +2,7 @@
 
 from typing import Sequence
 
-import torch
 from torch import Tensor
-
-from d2.runtime.metadata import (
-    AlltoAllMetadata
-)
 
 
 def simulate_fa2a_copy_non_cp(

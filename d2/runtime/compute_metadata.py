@@ -1,11 +1,12 @@
 from dataclasses import dataclass
+import os
 from typing import Optional, Sequence
 
 from megatron.core.packed_seq_params import PackedSeqParams
 import torch
 
 from d2.runtime.metadata import (
-    AlltoAllMetadata, LogicalShape, SeqLens,
+    AlltoAllMetadata, LogicalShape, SeqLens, DedupGradSumMetadata,
     compute_reverse_a2a_layout_metadata, _get_my_rank_from_metadata,
 )
 from d2.runtime.shard_info import ShardInfo
@@ -23,8 +24,8 @@ class _ShardPos:
     id_on_rank: int
 @dataclass(frozen=True, eq=True)
 class _ShardCommInfo:
-    linear_rank_id: int
-    attn_rank_id: int
+    id_on_linear_rank: int
+    id_on_attn_rank: int
     shard_glob_id: _ShardID
     replica_id: Optional[int]  # None for q, replica id for k/v
 
@@ -45,19 +46,6 @@ _PerPairShardInfo = list[list[list[_ShardCommInfo]]]
 _PerPairCommInfo = list[list[_PairCommInfo]]
 
 
-def send_bytes_to_fa2a_metadata(send_bytes: torch.Tensor):
-    # TODO: remove the local communication, which is the major part.
-    # This allows a much smaller nsys buffer.
-    sender_send_disp = exclusive_cumsum(send_bytes, dim=1)
-    sender_transfer_sz = send_bytes
-    # (i,j) -> on i, send_bytes received from j
-    recver_transfer_sz = send_bytes.transpose(0, 1).contiguous()
-    # (i,j) -> on i, offset for buffer from j
-    recver_recv_disp = exclusive_cumsum(recver_transfer_sz, dim=1)
-    sender_recv_disp = recver_recv_disp.transpose(0, 1).contiguous()
-    return (sender_send_disp, sender_transfer_sz, sender_recv_disp, recver_transfer_sz)
-
-
 def get_per_token_bytes(
     hidden_size_q: int,
     hidden_size_kv: int,
@@ -66,6 +54,7 @@ def get_per_token_bytes(
     is_resend_qkv_in_bwd: bool,
     is_send_lse_in_fwd: bool,
 ):
+    """Get the number of bytes per token."""
     assert not (is_send_lse_in_fwd and is_resend_qkv_in_bwd), "cannot be both fwd(send lse) and bwd(resend qkv)"
     # compute per token hidden size
     q_bytes = element_size * (
@@ -86,38 +75,21 @@ def get_per_token_bytes(
     return q_bytes_pad, k_bytes, attn_out_bytes_pad
 
 
-def _get_logical_shape(
-    num_token_per_rank: torch.Tensor,
-    world_size: int,
-    hidden: int,
-    is_kv_linear: bool = False,
-    kv_max_cp: Optional[list[int]] = None,
-):
-    assert num_token_per_rank.shape == (world_size,)
-    num_total_tokens: list[int] = [
-        num_token_per_rank[rank].item() for rank in range(world_size)
-    ]
-    return [
-        (kv_max_cp[rank], nt, hidden) if is_kv_linear else (nt, hidden)
-        for rank, nt in enumerate(num_total_tokens)
-    ]
+def get_fa2a_metadata(send_bytes: torch.Tensor):
+    """Get the fa2a metadata from the send_bytes matrix (index (i,j) means bytes from i to j)."""
+    # TODO: remove the local communication, which is the major part.
+    # This allows a much smaller nsys buffer.
+    sender_send_disp = exclusive_cumsum(send_bytes, dim=1)
+    sender_transfer_sz = send_bytes
+    # (i,j) -> on i, send_bytes received from j
+    recver_transfer_sz = send_bytes.transpose(0, 1).contiguous()
+    # (i,j) -> on i, offset for buffer from j
+    recver_recv_disp = exclusive_cumsum(recver_transfer_sz, dim=1)
+    sender_recv_disp = recver_recv_disp.transpose(0, 1).contiguous()
+    return (sender_send_disp, sender_transfer_sz, sender_recv_disp, recver_transfer_sz)
 
 
-def _get_seqlens(
-    doc_info: _AllDocInfo,
-    on_rank_shard_id: list[list[_ShardID]],
-):
-    world_size = len(on_rank_shard_id)
-    seqlens = []
-    for rank in range(world_size):
-        rank_seqlens = []
-        for shard_id in on_rank_shard_id[rank]:
-            shard_info = doc_info[shard_id.doc_id][shard_id.logical_id]
-            rank_seqlens.append(shard_info.shard_len)
-        seqlens.append(torch.tensor(rank_seqlens, dtype=torch.int32))
-    return seqlens
-
-
+#### Tensor shape.
 def _total_tokens(comm_infos: list[_ShardCommInfo], doc_info: _AllDocInfo):
     """Sum the number of tokens."""
     num_tokens = 0
@@ -126,6 +98,24 @@ def _total_tokens(comm_infos: list[_ShardCommInfo], doc_info: _AllDocInfo):
         shard_len = doc_info[shard_id.doc_id][shard_id.logical_id].shard_len
         num_tokens += shard_len
     return num_tokens
+
+
+def _get_logical_shape(
+    num_token_per_rank: torch.Tensor,
+    world_size: int,
+    hidden: int,
+    is_kv_linear: bool = False,
+    kv_max_cp: Optional[list[int]] = None,
+):
+    """Get the logical shape of the tensor on each rank."""
+    assert num_token_per_rank.shape == (world_size,)
+    num_total_tokens: list[int] = [
+        num_token_per_rank[rank].item() for rank in range(world_size)
+    ]
+    return [
+        (kv_max_cp[rank], nt, hidden) if is_kv_linear else (nt, hidden)
+        for rank, nt in enumerate(num_total_tokens)
+    ]
 
 
 def _get_input_output_shape(linear_to_attn_q: _PerPairShardInfo,
@@ -174,6 +164,41 @@ def _get_input_output_shape(linear_to_attn_q: _PerPairShardInfo,
     return q_shape, k_shape, pair_comm_tokens_q, pair_comm_tokens_k
 
 
+#### Seqlens
+def _collect_per_rank_shard_lens(
+    doc_info: _AllDocInfo,
+    on_rank_shard_id: _PerRankShards,
+):
+    """Get the seqlens of each shard on each rank."""
+    world_size = len(on_rank_shard_id)
+    seqlens = []
+    for rank in range(world_size):
+        rank_seqlens = []
+        for shard_id in on_rank_shard_id[rank]:
+            shard_info = doc_info[shard_id.doc_id][shard_id.logical_id]
+            rank_seqlens.append(shard_info.shard_len)
+        seqlens.append(torch.tensor(rank_seqlens, dtype=torch.int32))
+    return seqlens
+
+
+def _get_seqlens(doc_info: _AllDocInfo,
+                 linear_shards_on_rank: _PerRankShards,
+                 attn_q_shards_on_rank: _PerRankShards,
+                 attn_k_shards_on_rank: _PerRankShards):
+    """
+    Compute the seqlens for a2a metadata.
+    NOTE: this should only be used for k shards not deduped.
+    """
+    linear_seqlens = _collect_per_rank_shard_lens(doc_info, linear_shards_on_rank)
+    attn_q_seqlens = _collect_per_rank_shard_lens(doc_info, attn_q_shards_on_rank)
+    attn_k_seqlens = _collect_per_rank_shard_lens(doc_info, attn_k_shards_on_rank)
+    linear_to_attn_seqlens_q = SeqLens(linear_seqlens, attn_q_seqlens)
+    linear_to_attn_seqlens_k = SeqLens(linear_seqlens, attn_k_seqlens)
+    return linear_to_attn_seqlens_q, linear_to_attn_seqlens_k
+####
+
+
+### Dedup items
 def _dedup_k_shard(comm_infos: list[_ShardCommInfo]):
     """See _dedup_k_shard_world."""
     seen = set()
@@ -194,6 +219,61 @@ def _dedup_k_shard(comm_infos: list[_ShardCommInfo]):
     return _PairCommInfo(comm_infos, dedup_shards, is_main_copy, id_to_main_copy_id)
 
 
+def _get_dedup_grad_sum_metadata(
+    attn_shard_lens: torch.Tensor,
+    attn_shard_comm_info: list[_PairCommInfo],
+):
+    """
+    Compute the grad sum metadata for dedup k/v shards on one rank.
+    """
+    assert attn_shard_lens.ndim == 1
+    num_seq = attn_shard_lens.shape[0]
+
+    # assert len(attn_shard_ids) == num_seq
+    # max_num_copies = 
+
+    copy_indices = [[] for _ in range(num_seq)]
+    main_copy_mask = torch.zeros((num_seq,), dtype=torch.bool, device=attn_shard_lens.device)
+    # Record the copy relations
+    # NOTE: this might be confusing. We have two indices:
+    # 1. the index of this shard on the attn layout. This is used for
+    # `attn_shard_lens`, `copy_indices`, etc. This is obtained by
+    # `id_on_attn_rank` of each shard.
+    # 2. the index within elements of _PairCommInfo. This is obtained
+    # by `_PairCommInfo.main_copy_id` or enumerating _PairCommInfo's
+    # `is_main_copy` and `shards`.
+    for pair_comm_info in attn_shard_comm_info:
+        shards = pair_comm_info.shards
+        for sid, shard in enumerate(pair_comm_info.shards):
+            seq_idx = shard.id_on_attn_rank
+            is_main_copy = pair_comm_info.is_main_copy[sid]
+            if not is_main_copy:
+                main_copy_id = pair_comm_info.main_copy_id[sid]
+                main_copy = shards[main_copy_id]
+                # check they are the same copy
+                assert main_copy.shard_glob_id == shard.shard_glob_id
+                assert main_copy.replica_id == shard.replica_id
+                assert main_copy.id_on_linear_rank == shard.id_on_linear_rank
+                # record this idx
+                copy_indices[main_copy.id_on_attn_rank].append(seq_idx)
+            main_copy_mask[seq_idx] = is_main_copy
+    # transform to tensors
+    num_copies = torch.tensor(
+        [len(cis) for cis in copy_indices], dtype=torch.int32, device=attn_shard_lens.device
+    )
+    max_num_copies = max(1, num_copies.max().item())
+    # start token id of each copy
+    copy_start_id = torch.zeros(
+        (num_seq, max_num_copies), dtype=torch.int64, device=attn_shard_lens.device
+    )
+    start_token_idx = exclusive_cumsum(attn_shard_lens, dim=0)
+    for seq_idx, cis in enumerate(copy_indices):
+        for cid, copy_idx in enumerate(cis):
+            copy_start_id[seq_idx, cid] = start_token_idx[copy_idx]
+    return DedupGradSumMetadata(num_copies, copy_start_id, main_copy_mask)
+
+
+#### Offset
 def _assign_offsets(
     cur_offset_send: int,
     cur_offset_recv: int,
@@ -206,8 +286,7 @@ def _assign_offsets(
     shards: _PairCommInfo | list[_ShardCommInfo],
     is_kv_linear: bool = False,
 ):
-    # TODO: pass a dedup mask. Then, the deduplicated shards will skip its offset assignment.
-    # Instead, it will reuses the offset assigned to the main copy.
+    """Assign the offsets for each shard in the send and recv buffer."""
     if is_kv_linear:
         assert isinstance(shards, _PairCommInfo)
         comm_infos = shards.shards
@@ -216,8 +295,8 @@ def _assign_offsets(
         comm_infos = shards
 
     for idx, comm_info in enumerate(comm_infos):
-        linear_rank_id = comm_info.linear_rank_id
-        attn_rank_id = comm_info.attn_rank_id
+        id_on_linear_rank = comm_info.id_on_linear_rank
+        id_on_attn_rank = comm_info.id_on_attn_rank
         shard_id = comm_info.shard_glob_id
         replica_id = comm_info.replica_id
 
@@ -229,35 +308,19 @@ def _assign_offsets(
                 assert main_copy.shard_glob_id == shard_id
                 assert main_copy.replica_id == replica_id
 
-                recv_offset[attn_rank][attn_rank_id] = recv_offset[attn_rank][main_copy.attn_rank_id]
+                recv_offset[attn_rank][id_on_attn_rank] = recv_offset[attn_rank][main_copy.id_on_attn_rank]
                 continue
 
         if is_kv_linear:
-            send_offset[linear_rank][replica_id, linear_rank_id] = cur_offset_send
+            send_offset[linear_rank][replica_id, id_on_linear_rank] = cur_offset_send
         else:
-            send_offset[linear_rank][linear_rank_id] = cur_offset_send
-        recv_offset[attn_rank][attn_rank_id] = cur_offset_recv
+            send_offset[linear_rank][id_on_linear_rank] = cur_offset_send
+        recv_offset[attn_rank][id_on_attn_rank] = cur_offset_recv
 
         shard_len = doc_info[shard_id.doc_id][shard_id.logical_id].shard_len
         cur_offset_send += shard_len * token_bytes
         cur_offset_recv += shard_len * token_bytes
     return cur_offset_send, cur_offset_recv
-
-
-def _compute_seqlens(doc_info: _AllDocInfo,
-                     linear_shards_on_rank,
-                     attn_q_shards_on_rank,
-                     attn_k_shards_on_rank):
-    """
-    Compute the seqlens for a2a metadata.
-    NOTE: this should only be used for k shards not deduped.
-    """
-    linear_seqlens = _get_seqlens(doc_info, linear_shards_on_rank)
-    attn_q_seqlens = _get_seqlens(doc_info, attn_q_shards_on_rank)
-    attn_k_seqlens = _get_seqlens(doc_info, attn_k_shards_on_rank)
-    linear_to_attn_seqlens_q = SeqLens(linear_seqlens, attn_q_seqlens)
-    linear_to_attn_seqlens_k = SeqLens(linear_seqlens, attn_k_seqlens)
-    return linear_to_attn_seqlens_q, linear_to_attn_seqlens_k
 
 
 def get_attn_metadata(
@@ -408,7 +471,7 @@ def _from_planner_output(
         pair_comm_tokens_q * q_bytes + pair_comm_tokens_k * k_bytes * 2
     )
     # fast a2a metadata
-    linear_to_attn_qkv_fa2a_metadata = send_bytes_to_fa2a_metadata(
+    linear_to_attn_qkv_fa2a_metadata = get_fa2a_metadata(
         linear_to_attn_qkv_bytes
     )
 
@@ -468,7 +531,7 @@ def _from_planner_output(
 
     # seqlens
     (linear_to_attn_seqlens_q,
-     linear_to_attn_seqlens_k) = _compute_seqlens(
+     linear_to_attn_seqlens_k) = _get_seqlens(
         scheduler_output,
         linear_shards_on_rank,
         attn_q_shards_on_rank,
@@ -491,13 +554,8 @@ def _from_planner_output(
         tensor_shape=(q_shape, k_shape),
         kv_replica_mask=tuple(kv_replica_masks)
     )
-    # FIXME: simply reversing it will make the to_send_buffer memcpy in the reverse
-    # side wrong: multiple shards writing to the same place.
-    # TODO: introduce a new metadata to add it to the main copy first.
-    qkv_grad_attn_to_linear = compute_reverse_a2a_layout_metadata(
-        qkv_linear_to_attn
-    )
 
+    ## Flash Attn metadata
     attn_q_seqlens_on_rank = [
         torch.tensor(v, dtype=torch.int32) for v in attn_q_seqlens_on_rank
     ]
@@ -507,12 +565,28 @@ def _from_planner_output(
     attn_metadata = get_attn_metadata(
         attn_q_seqlens_on_rank, attn_k_seqlens_on_rank
     )
+
+    ## Bwd metadata
+    qkv_grad_attn_to_linear = compute_reverse_a2a_layout_metadata(
+        qkv_linear_to_attn
+    )
+    dedup_metadata = []
+    for a_rank in range(world_size):
+        attn_k_shard_lens = linear_to_attn_seqlens_k.recv_seqlens[a_rank]
+        rank_dedup = _get_dedup_grad_sum_metadata(
+            attn_k_shard_lens,
+            [linear_to_attn_k[l_rank][a_rank] for l_rank in range(world_size)]
+        )
+        dedup_metadata.append(rank_dedup)
+    qkv_grad_attn_to_linear.kv_grad_send_dedup = dedup_metadata
+
+    ## Attn out metadata
     if compute_attn_out_metadata:
         # fa2a metadata
         out_grad_linear_to_attn_bytes = (
             pair_comm_tokens_q * attn_out_bytes
         )
-        linear_to_attn_out_grad_fa2a_metadata = send_bytes_to_fa2a_metadata(
+        linear_to_attn_out_grad_fa2a_metadata = get_fa2a_metadata(
             out_grad_linear_to_attn_bytes
         )
         # my rank fa2a metadata
@@ -589,18 +663,18 @@ def from_planner_output(
         world_size, scheduler_output, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=True, attn_out_bytes=out_bytes,
     )
-    # FIXME(junda): print only when environment variable is set
-    import rich
-    # qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
-    #  out_grad_linear_to_attn, attn_metadata
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    if rank % 8 == 1:
-        rich.print(f"from_planner_output: qkv_linear_to_attn=", qkv_linear_to_attn)
-        rich.print(f"from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear)
-        rich.print(f"from_planner_output: out_attn_to_linear=", out_attn_to_linear)
-        rich.print(f"from_planner_output: out_grad_linear_to_attn=", out_grad_linear_to_attn)
-        rich.print(f"from_planner_output: attn_metadata=", attn_metadata)
-        pass
+
+    if os.getenv("D2_DEBUG_PRINT_METADATA", "0") == "1":
+        import rich
+        # qkv_linear_to_attn, qkv_grad_attn_to_linear, out_attn_to_linear,
+        #  out_grad_linear_to_attn, attn_metadata
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank % 8 == 1:
+            rich.print(f"from_planner_output: qkv_linear_to_attn=", qkv_linear_to_attn)
+            rich.print(f"from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear)
+            rich.print(f"from_planner_output: out_attn_to_linear=", out_attn_to_linear)
+            rich.print(f"from_planner_output: out_grad_linear_to_attn=", out_grad_linear_to_attn)
+            rich.print(f"from_planner_output: attn_metadata=", attn_metadata)
 
     if is_pipeline_tick:
         # Force them to None to avoid being misused.
@@ -647,13 +721,14 @@ def backward_from_planner_output(
         world_size, scheduler_output_bwd, q_bytes, k_bytes, element_size,
         compute_attn_out_metadata=False, attn_out_bytes=None
     )
-    # FIXME(junda): print only when environment variable is set
-    import rich
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    if rank % 8 == 1:
-        rich.print(f"backward_from_planner_output: qkv_resend_and_out_grad_linear_to_attn=", qkv_resend_and_out_grad_linear_to_attn.__better_print__())
-        rich.print(f"backward_from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear.__better_print__())
-        for i, metadata in enumerate(bwd_attn_metadata):
-            rich.print(f"backward_from_planner_output: bwd_attn_metadata[{i}]=", metadata)
-        pass
+
+    if os.getenv("D2_DEBUG_PRINT_METADATA", "0") == "1":
+        import rich
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank % 8 == 1:
+            rich.print(f"backward_from_planner_output: qkv_resend_and_out_grad_linear_to_attn=", qkv_resend_and_out_grad_linear_to_attn.__better_print__())
+            rich.print(f"backward_from_planner_output: qkv_grad_attn_to_linear=", qkv_grad_attn_to_linear.__better_print__())
+            for i, metadata in enumerate(bwd_attn_metadata):
+                rich.print(f"backward_from_planner_output: bwd_attn_metadata[{i}]=", metadata)
+
     return qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear, bwd_attn_metadata

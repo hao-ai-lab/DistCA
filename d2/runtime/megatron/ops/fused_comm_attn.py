@@ -252,6 +252,9 @@ class FusedCommAttn(torch.autograd.Function):
             bwd_attn_out_qkv_metadata.seq_lens[0].recv_seqlens,
             bwd_attn_out_qkv_metadata.seq_lens[1].recv_seqlens,
             *bwd_attn_out_qkv_metadata.recv_memcpy_metadata,
+            bwd_qkv_metadata.kv_grad_send_dedup.main_copy_mask,
+            bwd_qkv_metadata.kv_grad_send_dedup.num_copies,
+            bwd_qkv_metadata.kv_grad_send_dedup.copy_start_id,
         ])
         recv_seqlens_q_total = bwd_attn_out_qkv_metadata.tensor_shape[0].recv_shape[0]
         ctx.bwd_q_shape = ctx.attn_out_shape = recv_seqlens_q_total, recv_q_shape[1]
@@ -270,7 +273,8 @@ class FusedCommAttn(torch.autograd.Function):
          bwd_attn_cu_seqlens_q, bwd_attn_cu_seqlens_kv,
          bwd_attn_out_qkv_recv_seqlens_q, bwd_attn_out_qkv_recv_seqlens_k,
          bwd_attn_out_qkv_recv_q_offset, bwd_attn_out_qkv_recv_k_offset,
-         bwd_attn_out_qkv_recv_v_offset
+         bwd_attn_out_qkv_recv_v_offset,
+         main_copy_mask, num_copies, copy_start_id
          ) = ctx.saved_tensors
 
         # Step 1: post-dispatch merged_q, k, v
@@ -308,7 +312,9 @@ class FusedCommAttn(torch.autograd.Function):
         dq, dk, dv = pre_a2a_qkv(
             dq, dk, dv, None, bwd_qkv_grad_send_seqlens_q, bwd_qkv_grad_send_seqlens_k,
             bwd_q_grad_send_offset, bwd_k_grad_send_offset, bwd_v_grad_send_offset,
-            is_fwd=False, instance_id=dispatcher_id
+            is_fwd=False, instance_id=dispatcher_id,
+            kv_grad_copy_shard_mask=main_copy_mask,
+            pre_a2a_grad_acc_args=(num_copies, copy_start_id, bwd_qkv_grad_send_seqlens_k),
         )
         torch.cuda.nvtx.range_pop()
         signal_grad = torch.empty((1,), device=recv_q.device, dtype=recv_q.dtype)
@@ -466,6 +472,12 @@ def dummy_backward_single_sided(
         *bwd_qkv_metadata.send_memcpy_metadata,
         is_fwd=False,
         instance_id=dispatcher_id,
+        kv_grad_copy_shard_mask=bwd_qkv_metadata.kv_grad_send_dedup.main_copy_mask,
+        pre_a2a_grad_acc_args=(
+            bwd_qkv_metadata.kv_grad_send_dedup.num_copies,
+            bwd_qkv_metadata.kv_grad_send_dedup.copy_start_id,
+            bwd_qkv_metadata.seq_lens[1].send_seqlens,
+        ),
     )
     torch.cuda.nvtx.range_pop()
 

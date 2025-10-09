@@ -1,3 +1,5 @@
+from typing import Sequence
+
 import torch
 
 _CUDA_INT4_BYTES = 16
@@ -30,3 +32,9 @@ def exclusive_cumsum(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
     cumsum = tensor.cumsum(dim=dim)
     zero = torch.zeros_like(tensor.select(dim, 0))
     return torch.cat([zero.unsqueeze(dim), cumsum.narrow(dim, 0, cumsum.size(dim) - 1)], dim=dim)
+
+
+def slice_or_none(seq: Sequence | None, idx: int):
+    if seq is None:
+        return None
+    return seq[idx]

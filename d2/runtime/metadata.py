@@ -3,6 +3,9 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
+from d2.runtime.utils import slice_or_none
+
+
 _Tensor_Or_Tensor_List = Union[torch.Tensor, Sequence[torch.Tensor]]
 
 
@@ -45,6 +48,26 @@ class LogicalShape:
 
 
 @dataclass
+class DedupGradSumMetadata:
+    """
+    A KV shard may be used by many Q shards on a rank.
+    It then has multiple copies on the rank.
+    We send a single copy on forward, and sum the gradients
+    of all copies to only send the summed gradient back.
+    """
+    num_copies: torch.Tensor
+    copy_start_id: torch.Tensor
+    main_copy_mask: torch.Tensor
+
+    def normalize(self):
+        return DedupGradSumMetadata(
+            self.num_copies.cuda().to(torch.int32).contiguous(),
+            self.copy_start_id.cuda().to(torch.int64).contiguous(),
+            self.main_copy_mask.cuda().to(torch.int8).contiguous()
+        )
+
+
+@dataclass
 class AlltoAllMetadata:
     # sender_send_offset, sender_transfer_sz, sender_recv_offset, recver_transfer_sz
     fa2a_metadata: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -67,6 +90,7 @@ class AlltoAllMetadata:
     # List of kv replica mask for each rank. (or this rank)
     # shape is (num_local_seqs, cp_degree).
     kv_replica_mask: Optional[_Tensor_Or_Tensor_List] = None
+    kv_grad_send_dedup: Optional[DedupGradSumMetadata | Sequence[DedupGradSumMetadata]] = None
     # Debug setting
     single_stream: bool = False
     # For cuda graph, the number of sequences and max cp degree are padded.
@@ -168,9 +192,8 @@ class AlltoAllMetadata:
             self.my_rank_send_sz[rank],
             seq_lens,
             tensor_shape,
-            kv_replica_mask=(
-                self.kv_replica_mask[rank] if self.kv_replica_mask is not None else None
-            ),
+            kv_replica_mask=slice_or_none(self.kv_replica_mask, rank),
+            kv_grad_send_dedup=slice_or_none(self.kv_grad_send_dedup, rank),
             single_stream=self.single_stream,
         )
 
@@ -188,6 +211,10 @@ class AlltoAllMetadata:
             kv_replica_mask=(
                 self.kv_replica_mask.cuda().to(torch.int8).contiguous()
                 if self.kv_replica_mask is not None else None
+            ),
+            kv_grad_send_dedup=(
+                self.kv_grad_send_dedup.normalize()
+                if self.kv_grad_send_dedup is not None else None
             ),
             single_stream=self.single_stream,
         )
