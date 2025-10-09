@@ -21,6 +21,7 @@
 # Model configuration
 # MODEL_PATH=${MODEL_PATH:-codellama/CodeLlama-34b-hf}
 MODEL_PATH=${MODEL_PATH:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}
+MODEL_PATH_normalized=$(echo $MODEL_PATH | sed 's/\//_/g')
 NUM_LAYERS=${NUM_LAYERS:-8}
 
 # Parallelism settings
@@ -37,6 +38,8 @@ BATCH_SIZE=${BATCH_SIZE:-1}          # Batch size for training
 NUM_TOKENS=${NUM_TOKENS:-16384}     # Number of tokens to process
 MAX_SAMPLE_ID=${MAX_SAMPLE_ID:-3}   # Maximum sample ID
 # SAMPLE_EXPR=${SAMPLE_EXPR:-""}   # Sample expression
+SAMPLE_NAME=${SAMPLE_NAME:-"wlbllm"}
+CHANGE_LONG_DOC_RATIO=${CHANGE_LONG_DOC_RATIO:-0.0}
 
 # Dataset sampling settings
 UP_SAMPLE_FACTOR=${UP_SAMPLE_FACTOR:-4}
@@ -76,8 +79,7 @@ SHORT_TS=$(TZ=America/Los_Angeles date +%d_%H%M%S)
 
 # TOOD: Fix this hardcode output dir.
 OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
-# OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${JOBID}.${MODE}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}-mb${NUM_MICROBATCH}"}
-OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}-mb${NUM_MICROBATCH}"}
+OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-${MODEL_PATH_normalized}-L${NUM_LAYERS}-${SAMPLE_NAME}_${CHANGE_LONG_DOC_RATIO}"}
 OUTPUT_DIR_SUFFIX_ADDON=${OUTPUT_DIR_SUFFIX_ADDON:-""}
 OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX$OUTPUT_DIR_SUFFIX_ADDON"
 mkdir -p "$OUTPUT_DIR"
@@ -236,7 +238,8 @@ TORCHRUN_CMD=(
     --num-microbatch ${NUM_MICROBATCH}
     --model-path ${MODEL_PATH}
     --num-layers ${NUM_LAYERS}
-
+    --sample-name ${SAMPLE_NAME}
+    --change-long-doc-ratio ${CHANGE_LONG_DOC_RATIO}
     --max-sample-id ${MAX_SAMPLE_ID}
     --sample-name ${SAMPLE_NAME}
     --change-long-doc-ratio ${CHANGE_LONG_DOC_RATIO}
@@ -297,6 +300,8 @@ echo_and_tee "$EXP_README" "- FILTER_THRESHOLD: $FILTER_THRESHOLD"
 echo_and_tee "$EXP_README" "- FILTER_RATIO: $FILTER_RATIO"
 echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
 echo_and_tee "$EXP_README" "- SAMPLE_START_IDX: $SAMPLE_START_IDX"
+echo_and_tee "$EXP_README" "- SAMPLE_NAME: $SAMPLE_NAME"
+echo_and_tee "$EXP_README" "- CHANGE_LONG_DOC_RATIO: $CHANGE_LONG_DOC_RATIO"
 
 echo_and_tee "$EXP_README" "## Experiment Flags"
 echo_and_tee "$EXP_README" "- ENABLE_NSYS: $ENABLE_NSYS"
@@ -371,12 +376,18 @@ elapsed_time=$((end_time - start_time))
 echo "Finished running sbatch at $(TZ='America/Los_Angeles' date)."
 echo_and_tee "$EXP_README" "- Elapsed time: $elapsed_time seconds"
 
-
 # Check if the experiment finished successfully
 if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
     echo "Experiment failed. The benchmark.json file does not exist."
 else 
     echo "Experiment success. See the $OUTPUT_DIR/benchmark.json file."
+    echo_and_tee "$EXP_README" "Experiment success. See the $OUTPUT_DIR/benchmark.json file."
+fi
+
+
+# Check if OOM happened by checking all log files.
+if grep -H -C 20 'OutOfMemoryError' "$LOG_DIR"/logs/*.log > /dev/null 2>&1; then
+    grep -H -C 20 'OutOfMemoryError' "$LOG_DIR"/logs/*.log > "$OUTPUT_DIR/exit_status.oom.txt"
 fi
 
 

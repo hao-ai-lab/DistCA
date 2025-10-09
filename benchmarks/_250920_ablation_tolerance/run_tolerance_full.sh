@@ -76,45 +76,46 @@ for sample_config in \
 # "codellama/CodeLlama-34b-hf 131072 48" \
 
 
-#                                                   L  s r b   tok   e  n tolerance_factor
-for config in \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.0" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.01" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.05" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.1" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  1.0" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  16 0.0" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.01" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.05" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.1" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 1.0" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.0" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.01" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.05" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.1" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.5" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  1.0" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.0" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.01" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.05" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.1" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.5" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 1.0" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.5" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.005" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.02" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.2" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.005" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.02" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.2" \
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.5" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.005" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.02" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.2" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.005" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.02" \
-    "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.2" \
-    ; do
+configs=(
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.0"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.01"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.05"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.1"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  1.0"
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.0"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.01"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.05"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.1"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 1.0"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.0"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.01"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.05"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.1"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.5"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  1.0"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.0"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.01"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.05"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.1"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.5"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 1.0"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.5"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.005"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.02"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 4 131072  2  8  0.2"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.005"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.02"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.2"
+    # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32 1 1 8 131072  2  16 0.5"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.005"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.02"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 2 131072  2  8  0.2"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.005"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.02"
+    # "codellama/CodeLlama-34b-hf 131072              48 1 1 4 131072  2  16 0.2"
+)
+
+for config in "${configs[@]}"; do
 
     read -r model_path attn_linear_breakpoint num_layers selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes tolerance_factor <<< "$config"
     read -r sample_name change_long_doc_ratio <<< "$sample_config"

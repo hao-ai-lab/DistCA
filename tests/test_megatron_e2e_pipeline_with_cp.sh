@@ -21,6 +21,7 @@
 # Model configuration
 # MODEL_PATH=${MODEL_PATH:-codellama/CodeLlama-34b-hf}
 MODEL_PATH=${MODEL_PATH:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}
+MODEL_PATH_normalized=$(echo $MODEL_PATH | sed 's/\//_/g')
 NUM_LAYERS=${NUM_LAYERS:-8}
 
 # Parallelism settings
@@ -37,6 +38,8 @@ BATCH_SIZE=${BATCH_SIZE:-1}          # Batch size for training
 NUM_TOKENS=${NUM_TOKENS:-16384}     # Number of tokens to process
 MAX_SAMPLE_ID=${MAX_SAMPLE_ID:-3}   # Maximum sample ID
 # SAMPLE_EXPR=${SAMPLE_EXPR:-""}   # Sample expression
+SAMPLE_NAME=${SAMPLE_NAME:-"wlbllm"}
+CHANGE_LONG_DOC_RATIO=${CHANGE_LONG_DOC_RATIO:-0.0}
 
 # Dataset sampling settings
 UP_SAMPLE_FACTOR=${UP_SAMPLE_FACTOR:-4}
@@ -45,8 +48,6 @@ FILTER_THRESHOLD=${FILTER_THRESHOLD:-65536}
 FILTER_RATIO=${FILTER_RATIO:-0.50}
 SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-0}
 PROFILE_MEMORY_PATH=${PROFILE_MEMORY_PATH:"${OUTPUT_DIR}/"}
-SAMPLE_NAME=${SAMPLE_NAME:-"wlbllm"}
-CHANGE_LONG_DOC_RATIO=${CHANGE_LONG_DOC_RATIO:-0.0}
 
 JOBID=${JOBID:-${SLURM_JOB_ID}}
 if [ -z "$JOBID" ]; then
@@ -76,8 +77,7 @@ SHORT_TS=$(TZ=America/Los_Angeles date +%d_%H%M%S)
 
 # TOOD: Fix this hardcode output dir.
 OUTPUT_DIR_PREFIX=${OUTPUT_DIR_PREFIX:-"$HOME/jd/d2/tests/logs"}
-# OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$TS.job$SLURM_JOB_NAME-${JOBID}.${MODE}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}-mb${NUM_MICROBATCH}"}
-OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}-mb${NUM_MICROBATCH}"}
+OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-${MODEL_PATH_normalized}-L${NUM_LAYERS}-${SAMPLE_NAME}_${CHANGE_LONG_DOC_RATIO}"}
 OUTPUT_DIR_SUFFIX_ADDON=${OUTPUT_DIR_SUFFIX_ADDON:-""}
 OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX$OUTPUT_DIR_SUFFIX_ADDON"
 mkdir -p "$OUTPUT_DIR"
@@ -150,10 +150,6 @@ export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
 DRY_RUN=${DRY_RUN:-0}
 
 ENABLE_NSYS=${ENABLE_NSYS:-0}
-EXPERIMENT_REPEAT_TIMES=${EXPERIMENT_REPEAT_TIMES:-3}
-EXPERIMENT_WARMUP_TIMES=${EXPERIMENT_WARMUP_TIMES:-5}
-EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=${EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB:--1}
-
 
 # ---------------------------
 # Setup distributed args
@@ -243,6 +239,7 @@ TORCHRUN_CMD=(
     --model-path ${MODEL_PATH}
     --num-layers ${NUM_LAYERS}
 
+    # TODO: 
     --max-sample-id ${MAX_SAMPLE_ID}
     --sample-name ${SAMPLE_NAME}
     --change-long-doc-ratio ${CHANGE_LONG_DOC_RATIO}
@@ -258,10 +255,10 @@ TORCHRUN_CMD=(
 #     TORCHRUN_CMD+=(--use-planner)
 # fi
 
-
 if [ ${SHOULD_ADD_DEBUG_CASES} -eq 1 ]; then
     TORCHRUN_CMD+=(--should-add-debug-cases)
 fi
+
 
 # Serialize TORCHRUN_CMD array so we can pass it through bash -lc cleanly
 TORCHRUN_STR=$(printf " %q" "${TORCHRUN_CMD[@]}")
@@ -304,6 +301,7 @@ echo_and_tee "$EXP_README" "- FILTER_THRESHOLD: $FILTER_THRESHOLD"
 echo_and_tee "$EXP_README" "- FILTER_RATIO: $FILTER_RATIO"
 echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
 echo_and_tee "$EXP_README" "- SAMPLE_START_IDX: $SAMPLE_START_IDX"
+echo_and_tee "$EXP_README" "- SAMPLE_NAME: $SAMPLE_NAME"
 
 echo_and_tee "$EXP_README" "## Experiment Flags"
 echo_and_tee "$EXP_README" "- ENABLE_NSYS: $ENABLE_NSYS"
@@ -361,7 +359,6 @@ mkdir -p ${NSYS_PATH}
 nsys_str=""
 if [ ${ENABLE_NSYS} -eq 1 ]; then
   nsys_str="nsys profile --show-output=true --force-overwrite=true -o ${NSYS_PATH}/%h.nsys-rep -t cuda,nvtx"
-  # nsys_str="nsys profile --show-output=true --force-overwrite=true -o ${NSYS_PATH}/%h.nsys-rep -t cuda,nvtx,osrt --cudabacktrace=true --backtrace=auto "
 fi
 
 start_time=$(TZ='America/Los_Angeles' date +%s)
@@ -384,8 +381,14 @@ if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
     echo "Experiment failed. The benchmark.json file does not exist."
 else 
     echo "Experiment success. See the $OUTPUT_DIR/benchmark.json file."
+    echo_and_tee "$EXP_README" "Experiment success. See the $OUTPUT_DIR/benchmark.json file."
 fi
 
+
+# Check if OOM happened by checking all log files.
+if grep -H -C 20 'OutOfMemoryError' "$LOG_DIR"/logs/*.log > /dev/null 2>&1; then
+    grep -H -C 20 'OutOfMemoryError' "$LOG_DIR"/logs/*.log > "$OUTPUT_DIR/exit_status.oom.txt"
+fi
 
 echo '\a'
 echo '\a'

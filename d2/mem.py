@@ -41,7 +41,7 @@ def get_torch_cuda_memory_usage(device):
     return allocated_cur, allocated_peak, total_alloc
 
 
-def log_memory_usage(message: str, force: bool = False):
+def log_memory_usage(message: str, force: bool = False, comment: str = None):
     EXPERIMENT_LOG_MEMORY_USAGE = os.getenv("EXPERIMENT_LOG_MEMORY_USAGE", "0")
     # print(f"Ⓜ️", EXPERIMENT_LOG_MEMORY_USAGE)
     # return
@@ -77,7 +77,8 @@ def log_memory_usage(message: str, force: bool = False):
     print(f"Ⓜ️ [{message}] Allocated: {(allocated_cur/ 1024):.2f} GB | "
           f"Peak: {(allocated_peak/ 1024):.2f} GB | "
           f"Total alloc (approx): {(total_alloc/ 1024):.2f} GB | "
-          f"nvidia-smi reported usage: {(pynvml_gpu_memory_usage/1024):.2f} GB")
+          f"nvidia-smi reported usage: {(pynvml_gpu_memory_usage/1024):.2f} GB | "
+          f"comment: {comment}")
     
     new_entry = {
         "message": message,
@@ -85,6 +86,7 @@ def log_memory_usage(message: str, force: bool = False):
         "allocated_peak": allocated_peak,
         "total_alloc": total_alloc,
         "pynvml_gpu_memory_usage": pynvml_gpu_memory_usage,
+        "comment": comment,
     }
     memory_usage.append(new_entry)
     
@@ -107,7 +109,7 @@ def log_memory_usage_context():
 
 def enable_memory_usage_logging(memory_usage_dir: str):
     os.makedirs(memory_usage_dir, exist_ok=True)
-    rank = torch.distributed.get_rank()
+    rank = os.environ.get("RANK", "0")
     memory_usage_log_file = os.path.join(memory_usage_dir, f"mem.rank{rank}.log.jsonl")
     with open(memory_usage_log_file, 'w') as f:
         pass

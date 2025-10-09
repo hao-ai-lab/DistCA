@@ -3,10 +3,13 @@ torchrun --nproc_per_node=1 --nnodes=8 --rdzv_backend=c10d --rdzv_endpoint=fs-mb
 
 
 torchrun --nproc_per_node=1 --nnodes=2 --rdzv_backend=c10d --rdzv_endpoint=fs-mbz-gpu-172:29600 --rdzv_id=fjfjjfjfjfj --max_restarts=0 /mnt/weka/home/hao.zhang/jd/d2/benchmarks/_250821_calc_bw/test_all2all.py
+
+
+torchrun --nproc_per_node=8 --nnodes=1 test_all2all.py
 """
 
 from d2.runtime.attn_kernels.ops import (
-    nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, FastDispatcherWrapper,
+    nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper as FastDispatcherWrapper,
     fast_a2a, nvshmem_barrier_all,
     nvshmem_barrier_all_on_current_stream,
 
@@ -43,6 +46,7 @@ FastDispatcherWrapper.init(
     # buffer_size=1024**3 * 32,
     uid=uid,
 )
+FastDispatcherWrapper.comm_stream = torch.cuda.current_stream()
 
 torch.cuda.synchronize()
 torch.distributed.barrier()

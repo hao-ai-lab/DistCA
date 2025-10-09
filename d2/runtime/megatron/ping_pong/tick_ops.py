@@ -1,7 +1,9 @@
-import os
 from typing import Any, Dict, Optional
+import os
+import torch
 
-from d2.runtime.megatron.ops import FusedCommAttn, TickSync, post_a2a_attn_out_with_lse
+from d2.runtime.megatron.ops import FusedCommAttn, post_a2a_attn_out_with_lse
+from d2.runtime.megatron.ops.stream_sync_fn import tick_sync_with_info
 from d2.runtime.megatron.ops.fused_comm_attn import FlashAttnArgs
 from d2.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams
 from d2.runtime.megatron.ping_pong.transformer_layer import TransformerLayer
@@ -15,6 +17,15 @@ def log_memory_usage(message: str):
 
 def forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(start)")
+    
+    # Setup timing if enabled
+    start_event = None
+    end_event = None
+    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1" and _current_tick_sample_id is not None:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+    
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(before pre core attn)")
     hidden_states = args.pop("hidden_states")
     query, key, value, residual, attn_mask_type = layer._forward_pre_core_attn(
@@ -37,6 +48,13 @@ def forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
     args["residual"] = residual
     args["attn_mask_type"] = attn_mask_type
     args["signal"] = signal
+    
+    
+    # Record timing if enabled
+    if start_event is not None and end_event is not None:
+        end_event.record()
+        _record_tick_timing("forward_pre_core_attn", layer.layer_number, start_event, end_event)
+    
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(return)")
     return args
 
@@ -110,6 +128,15 @@ def layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
 
 def forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
     log_memory_usage(f"(L{layer.layer_number}) forward_post_core_attn:(start)")
+    
+    # Setup timing if enabled
+    start_event = None
+    end_event = None
+    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1" and _current_tick_sample_id is not None:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+    
     signal = args.pop("signal")
     packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
     bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
@@ -133,11 +160,19 @@ def forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
     )
     args["hidden_states"] = mlp_output
     args["context"] = context
+    
+    
+    # Record timing if enabled
+    if start_event is not None and end_event is not None:
+        end_event.record()
+        _record_tick_timing("forward_post_core_attn", layer.layer_number, start_event, end_event)
+    
     log_memory_usage(f"(L{layer.layer_number}) forward_post_core_attn:(end)")
     return args
 
 
-def tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, keys_1):
+def tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, keys_1, 
+              layer_info="unknown", operation_info="unknown"):
     log_memory_usage(f"(L?) tick_sync:(start)")
     if isinstance(keys_0, str):
         keys_0 = [keys_0]
@@ -146,7 +181,7 @@ def tick_sync(compute_stream, comm_stream, arg_group_0, keys_0, arg_group_1, key
     tensors_0 = [arg_group_0[key] for key in keys_0]
     tensors_1 = [arg_group_1[key] for key in keys_1]
     tensors = tensors_0 + tensors_1
-    out_tensors = TickSync.apply(compute_stream, comm_stream, *tensors)
+    out_tensors = tick_sync_with_info(compute_stream, comm_stream, layer_info, operation_info, *tensors, )
     out_tensors_0 = out_tensors[:len(tensors_0)]
     out_tensors_1 = out_tensors[len(tensors_0):]
     for key, out_tensor in zip(keys_0, out_tensors_0):
@@ -173,3 +208,82 @@ def tick_nonca_compute(
         arg_group = forward_post_core_attn(prev_layer, arg_group)
     arg_group = forward_pre_core_attn(layer, arg_group)
     return arg_group
+
+
+# ========== Tick Operations Timing Collection ==========
+# TODO: (Refactor) Move this to somewhere else for sole measurement purpose only.
+
+# Global variables for timing collection
+_tick_times = {}
+_current_tick_sample_id = None
+_pending_tick_events = []  # List of (sample_id, operation, layer_number, start_event, end_event) tuples
+
+
+def setup_tick_timing():
+    """Setup timing collection for tick operations."""
+    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+        print("🟢 Tick operations timing collection enabled")
+        return True
+    return False
+
+
+def set_current_tick_sample_id(sample_id):
+    """Set the current sample ID for tick timing."""
+    global _current_tick_sample_id
+    _current_tick_sample_id = sample_id
+
+
+def _record_tick_timing(operation: str, layer_number: int, start_event: torch.cuda.Event, end_event: torch.cuda.Event):
+    """Record timing for a tick operation."""
+    if _current_tick_sample_id is not None:
+        _pending_tick_events.append((_current_tick_sample_id, operation, layer_number, start_event, end_event))
+
+
+
+
+
+
+def sync_and_collect_tick_timing():
+    """Synchronize all pending tick events and collect timing data."""
+    global _pending_tick_events, _tick_times
+    
+    if not _pending_tick_events:
+        return {}
+    
+    # Synchronize all events
+    torch.cuda.synchronize()
+    
+    # Process all pending events
+    for sample_id, operation, layer_number, start_event, end_event in _pending_tick_events:
+        # Calculate duration in milliseconds
+        duration_ms = start_event.elapsed_time(end_event)
+        
+        # Initialize sample data if needed
+        if sample_id not in _tick_times:
+            _tick_times[sample_id] = {
+                "forward_pre_core_attn": [], 
+                "forward_post_core_attn": []
+            }
+        
+        # Store timing data
+        if operation in _tick_times[sample_id]:
+            _tick_times[sample_id][operation].append({
+                "layer_number": layer_number,
+                "duration_ms": duration_ms
+            })
+    
+    # Clear pending events
+    _pending_tick_events.clear()
+    return _tick_times.copy()
+
+
+def get_tick_times():
+    """Get all tick timing data."""
+    return _tick_times.copy()
+
+
+def clear_tick_times():
+    """Clear tick timing data."""
+    global _tick_times, _pending_tick_events
+    _tick_times.clear()
+    _pending_tick_events.clear()
