@@ -42,7 +42,7 @@ def pre_a2a_qkv(
         v = v.contiguous()
         if pre_a2a_grad_acc_args is not None:
             pre_a2a_grad_acc(k, *pre_a2a_grad_acc_args)
-            pre_a2a_grad_acc(k, *pre_a2a_grad_acc_args)
+            pre_a2a_grad_acc(v, *pre_a2a_grad_acc_args)
 
         a2a_memcpy_non_cp(
             k, k_send_buffer_offset, k_seq_tokens, to_nvshmem,
