@@ -485,10 +485,17 @@ fi
 
 # --output="${LOG_DIR}/%N.%j.%s.out" \
 # --error="${LOG_DIR}/%N.%j.%s.out" \
-"${SRUN_BASE[@]}" \
-    bash -lc '
-        '"$nsys_str"' torchrun '"$TORCHRUN_STR"'
-    '
+
+# if the global variable EXPERIMENT_NO_SRUN=1 is set, then don't use srun
+
+if [ ${EXPERIMENT_NO_SRUN} -eq 1 ]; then
+  torchrun $TORCHRUN_STR
+else
+  "${SRUN_BASE[@]}" \
+      bash -lc '
+          '"$nsys_str"' torchrun '"$TORCHRUN_STR"'
+      '
+fi
 set +x
 
 end_time=$(TZ='America/Los_Angeles' date +%s)
