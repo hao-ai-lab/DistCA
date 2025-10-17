@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.table import Table
 from test_util import ParallelConfig
 
+
 from d2.planner.planner import (Item, Planner, batch_to_items_general,
                                 batch_to_items_with_dummy, cp_list_to_mlp_list,
                                 get_flops)
@@ -663,7 +664,45 @@ def test_batch_to_items_with_dummy_pp_fwd_bwd():
     rich.print(reversed_items)
     return
 
+def test_ilp_planner():
+    model_config = MockConfig()
+    parallel_config = ParallelConfig(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    world_size = 20
+    planner = Planner(world_size=world_size, parallel_config=parallel_config, model_config=model_config, planner_type = "ilp")
+    total_seq_len = 2048
+    batch_size = 4
+    from global_batch_provider import setup_global_batch, get_next_batch
+    setup_global_batch(total_seq_len)
+    _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
+
+    seq_lens_0, seq_lens_1 = _seq_lens[:batch_size], _seq_lens[batch_size:]
+    seq_lens_0 = [seq for seqlist in seq_lens_0 for seq in seqlist]
+    seq_lens_1 = [seq for seqlist in seq_lens_1 for seq in seqlist]
+    # Origin Item for ILP.
+    _items_0 = [Item(model_config, seq_lens_0[i], i, -1, -1, {'q': seq_lens_0[i], 'kv': seq_lens_0[i]}) for i in range(len(seq_lens_0))]
+    _items_1 = [Item(model_config, seq_lens_1[i], i, -1, -1, {'q': seq_lens_1[i], 'kv': seq_lens_1[i]}) for i in range(len(seq_lens_1))]
+
+                
+    planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
+    resend_qkv = True
+    verbose = True
+
+    fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose, device="cpu")
+    fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose, device="cpu")
+    
+    #rich.print(f"🟡 fa2a_metadata_0 = {fa2a_metadata_0}")
+    #rich.print(f"🟡 fa2a_metadata_1 = {fa2a_metadata_1}")
+    rich.print(f"🟡 mlp_shard_len_0 = {mlp_shard_len_0}")
+    rich.print(f"🟡 mlp_shard_len_1 = {mlp_shard_len_1}")
+    return
+
 if __name__ == "__main__":
+    test_ilp_planner()
+    
+    exit(0)
     test_batch_to_items_with_dummy_pp_fwd_bwd()
     test_cp_list_to_mlp_list()
     test_batch_to_items_with_dummy()

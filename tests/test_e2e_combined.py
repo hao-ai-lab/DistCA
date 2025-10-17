@@ -1322,6 +1322,321 @@ def test(args):
             }
             pass
 
+        elif mode == "ilp":
+            # D2 will get 2 batch each time, one for ping, the other for pong.
+            # Suppose we have 
+            #   as_world_size = 4
+            # Then that means we implicitly have dpcp = 4
+            # 1. We get 2 batch, each batch has `total_seq_len`` number of tokens
+            # 2. Each GPU should get total_seq_len // as_world_size number of tokens. 
+            
+            print(f"🟡 [Rank {rank}] hidden_size_q_tp = {hidden_size_q_tp}, hidden_size_k_tp = {hidden_size_k_tp}, element_size = {element_size}")
+
+            dp_size = as_world_size     # this should be total cp size.
+
+            model_config = hf_config
+            parallel_config = ParallelConfig(
+                tensor_model_parallel_size=tp_size,
+                pipeline_model_parallel_size=1,
+            )
+
+            try:
+                _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
+            except StopIteration:
+                break
+            
+            # Rebalance Ping pong
+            def balance_ping_pong(seq_lens: list[list[int]]) -> tuple[list[list[int]], list[list[int]]]:
+                def batch_flops(batch):
+                    return sum(y ** 2 // 2 for y in batch)
+
+                assert len(seq_lens) % 2 == 0, f"ping pong should have even number of batches, but got {len(seq_lens)} batches, seq_lens={seq_lens}"
+                sorted_batches = sorted(seq_lens, key=batch_flops, reverse=True)
+                ping, pong = [], []
+                ping_flops, pong_flops = 0, 0
+                avg_num_batches = len(seq_lens) // 2
+
+                for batch in sorted_batches:
+                    if (ping_flops <= pong_flops and len(ping) < avg_num_batches) or len(pong) >= avg_num_batches:
+                        ping.append(batch)
+                        ping_flops += batch_flops(batch)
+                    else:
+                        pong.append(batch)
+                        pong_flops += batch_flops(batch)
+
+                assert len(ping) == len(pong) == avg_num_batches, f"ping batches={ping}, pong batches={pong}"
+                return ping, pong
+   
+            rich.print(f"🟡 [Rank {rank}] _seq_lens = {_seq_lens}")
+
+            should_d2_balance_ping_pong = os.environ.get("EXPERIMENT_D2_BALANCE_PING_PONG", "0") == "1"
+            if should_d2_balance_ping_pong:
+                print(f"🟢 [Rank {rank}] Balancing ping pong")
+                seq_lens_0, seq_lens_1 = balance_ping_pong(_seq_lens)
+            else:
+                print(f"🟡 [Rank {rank}] Not Balancing ping pong")
+                seq_lens_0, seq_lens_1 = _seq_lens[:batch_size], _seq_lens[batch_size:]
+            
+            rich.print(f"🟡 [Rank {rank}] seq_lens_0 = {seq_lens_0}")
+            rich.print(f"🟡 [Rank {rank}] seq_lens_1 = {seq_lens_1}")
+
+            # This is for MLP layout in D2 case. For ILP, we should first identify the cp group and cp group index for each doc.
+            # We don't need tolerance factor for ILP for now.
+            planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
+            
+            # Origin Item for ILP.
+            _items_0 = [Item(model_config, seq_lens_0[i], i, -1, -1, {'q': seq_lens_0[i], 'kv': seq_lens_0[i]}) for i in range(len(seq_lens_0))]
+            _items_1 = [Item(model_config, seq_lens_1[i], i, -1, -1, {'q': seq_lens_1[i], 'kv': seq_lens_1[i]}) for i in range(len(seq_lens_1))]
+
+            if rank % 8 == 0:
+                rich.print(f"🟡 [Rank {rank}] original _items_0 = {_items_0}")
+                rich.print(f"🟡 [Rank {rank}] original _items_1 = {_items_1}")
+            
+            planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
+            
+            fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose)
+            fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose)
+
+
+            if verbose:
+                def print_2d_tensor(name: str, tensor):
+                    print(f"🟡 [Rank {rank}] {name} = ")
+                    for row in tensor.tolist():
+                        print(f"    {row}")
+                
+                def exclude_self_and_sum(t):
+                    for i in range(len(t)):
+                        t[i][i] = 0
+                    return t.sum(dim=1)
+                    
+                def inspect_network_metadata(metadata, is_ping, sample_id, tolerance_factor, output_dir, rank):
+                    qkv_fwd_metadata__send_transfer_sz_mb = metadata[0].fa2a_metadata[1] // 1024 // 1024
+                    qkv_fwd_metadata__recv_transfer_sz_mb = metadata[0].fa2a_metadata[3] // 1024 // 1024
+                    attn_out_fwd_metadata__send_transfer_sz_mb = metadata[1].fa2a_metadata[1] // 1024 // 1024
+                    attn_out_fwd_metadata__recv_transfer_sz_mb = metadata[1].fa2a_metadata[3] // 1024 // 1024
+                            
+                    # Print qkv_fwd_metadata
+                    print_2d_tensor("qkv_fwd_metadata.send_transfer_sz_mb", qkv_fwd_metadata__send_transfer_sz_mb)
+                    print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz_mb", qkv_fwd_metadata__recv_transfer_sz_mb)
+                    
+                    # Print attn_out_fwd_metadata  
+                    print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz_mb", attn_out_fwd_metadata__send_transfer_sz_mb)
+                    print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz_mb", attn_out_fwd_metadata__recv_transfer_sz_mb)
+
+
+                    # Calculate send size from me to others by subtracting diagonal (self-send) from total send
+                    qkv_fwd_metadata__send_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_metadata__send_transfer_sz_mb)
+                    qkv_fwd_metadata__recv_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_metadata__recv_transfer_sz_mb)
+                    
+                    print_2d_tensor("qkv_fwd_metadata.send_transfer_sz_mb_to_others", qkv_fwd_metadata__send_transfer_sz_mb_to_others)
+                    print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz_mb_to_others", qkv_fwd_metadata__recv_transfer_sz_mb_to_others)
+
+                    attn_out_fwd_metadata__send_transfer_sz_mb_to_others = exclude_self_and_sum(attn_out_fwd_metadata__send_transfer_sz_mb)
+                    attn_out_fwd_metadata__recv_transfer_sz_mb_to_others = exclude_self_and_sum(attn_out_fwd_metadata__recv_transfer_sz_mb)
+
+                    print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz_mb_to_others", attn_out_fwd_metadata__send_transfer_sz_mb_to_others)
+                    print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz_mb_to_others", attn_out_fwd_metadata__recv_transfer_sz_mb_to_others)
+                    
+                    # Expected send-recv time
+                    bandwidth_mb = 40 # MB/ms
+                    send_time_ms = qkv_fwd_metadata__send_transfer_sz_mb_to_others / bandwidth_mb
+                    recv_time_ms = qkv_fwd_metadata__recv_transfer_sz_mb_to_others / bandwidth_mb
+                    print_2d_tensor("send_time_ms", send_time_ms)
+                    print_2d_tensor("recv_time_ms", recv_time_ms)
+
+                    max_comm_budget_all_rank = (
+                            qkv_fwd_metadata__send_transfer_sz_mb_to_others 
+                        + qkv_fwd_metadata__recv_transfer_sz_mb_to_others 
+                        + attn_out_fwd_metadata__send_transfer_sz_mb_to_others 
+                        + attn_out_fwd_metadata__recv_transfer_sz_mb_to_others
+                    ).max().item()
+
+                    if rank == 0:
+                        network_inspect_file = os.path.join(output_dir, "network_inspect.jsonl")
+                        with open(network_inspect_file, "a") as f:
+                            f.write(json.dumps({
+                                "sample_id": sample_id,
+                                "is_ping": is_ping,
+                                "tolerance_factor": tolerance_factor,
+                                "qkv_fwd_metadata__send_transfer_sz_mb": qkv_fwd_metadata__send_transfer_sz_mb.tolist(),
+                                "qkv_fwd_metadata__recv_transfer_sz_mb": qkv_fwd_metadata__recv_transfer_sz_mb.tolist(),
+                                "attn_out_fwd_metadata__send_transfer_sz_mb": attn_out_fwd_metadata__send_transfer_sz_mb.tolist(),
+                                "attn_out_fwd_metadata__recv_transfer_sz_mb": attn_out_fwd_metadata__recv_transfer_sz_mb.tolist(),
+
+                                "qkv_fwd_metadata__send_transfer_sz_mb_to_others": qkv_fwd_metadata__send_transfer_sz_mb_to_others.tolist(),
+                                "qkv_fwd_metadata__recv_transfer_sz_mb_from_others": qkv_fwd_metadata__recv_transfer_sz_mb_to_others.tolist(),
+
+                                "max_comm_budget_all_rank": max_comm_budget_all_rank,
+                                "bandwidth_mb": bandwidth_mb,
+                                "send_time_ms": send_time_ms.tolist(),
+                                "recv_time_ms": recv_time_ms.tolist(),
+                            }) + "\n")
+
+                        network_inspect_summary_file = os.path.join(output_dir, "network_inspect.summary.jsonl")
+                        with open(network_inspect_summary_file, "a") as f:
+                            f.write(json.dumps({
+                                "sample_id": sample_id,
+                                "is_ping": is_ping,
+                                "tolerance_factor": tolerance_factor,
+                                "qkv_fwd_send_mb": qkv_fwd_metadata__send_transfer_sz_mb_to_others.tolist(),
+                                "qkv_fwd_recv_mb": qkv_fwd_metadata__recv_transfer_sz_mb_to_others.tolist(),
+
+                                "max_comm_budget_all_rank_mb": max_comm_budget_all_rank,
+                                "send_time_ms": send_time_ms.tolist(),
+                                "recv_time_ms": recv_time_ms.tolist(),
+                            }) + "\n")
+
+                # Inspect both metadata sets
+                inspect_network_metadata(fa2a_metadata_0, True, sample_id, tolerance_factor, output_dir, rank)
+                inspect_network_metadata(fa2a_metadata_1, False, sample_id, tolerance_factor, output_dir, rank)
+                
+                
+
+            # Check size:
+            buffer_size = DispatcherWrapper.instance[0].buffer_size
+            
+            def _check_self_overflow(fa2a_metadata, as_rank_):
+                """Return the self-overflow status and the maximum size provisioned."""
+                send_sz = [torch.sum(m.fa2a_metadata[1][as_rank_]).item() for m in fa2a_metadata]
+                dst_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank_] for m in fa2a_metadata]
+                recv_sz = [torch.sum(m.fa2a_metadata[3][as_rank_]).item() for m in fa2a_metadata]
+                src_last_offset = [(m.fa2a_metadata[0] + m.fa2a_metadata[1])[as_rank_] for m in fa2a_metadata]
+                max_send_sz = max(send_sz)
+                max_recv_sz = max(recv_sz)
+                max_dst_last_offset = max(torch.max(o).item() for o in dst_last_offset)
+                max_src_last_offset = max(torch.max(o).item() for o in src_last_offset)
+                
+                if rank % 8 == 0:
+                    print(
+                        f"🟡 [Rank {rank}]  Overflow check of as_rank_ = {as_rank_}: "
+                        f"{max_send_sz / 1024**3:.2f} GB send size, "
+                        f"{max_recv_sz / 1024**3:.2f} GB recv size, "
+                        f"{max_dst_last_offset / 1024**3:.2f} GB dst last offset, "
+                        f"{max_src_last_offset / 1024**3:.2f} GB src last offset, "
+                        f"{buffer_size / 1024**3:.2f} GB buffer size"
+                    )
+
+                max_size_provisioned = max(
+                    max_send_sz, max_recv_sz, 
+                    max_dst_last_offset, max_src_last_offset,
+                )
+                if not (buffer_size >= max_size_provisioned):
+                    return False, max_size_provisioned
+                return True, max_size_provisioned
+
+            def _check_all_overflow(fa2a_metadata, as_world_size_):
+                all_max_size_provisioned = 0
+                states = []
+                for as_rank_ in range(as_world_size_):
+                    state, max_size_provisioned = _check_self_overflow(fa2a_metadata, as_rank_)
+                    all_max_size_provisioned = max(all_max_size_provisioned, max_size_provisioned)
+                    states.append(state)
+                all_state = all(states)
+                return all_state, all_max_size_provisioned
+                
+            check_0, max_size_provisioned_0 = _check_all_overflow(fa2a_metadata_0, as_world_size)
+            check_1, max_size_provisioned_1 = _check_all_overflow(fa2a_metadata_1, as_world_size)
+            max_size_provisioned = max(max_size_provisioned_0, max_size_provisioned_1) / 1024**3
+            required_buffer_size.append(max_size_provisioned)
+            
+            
+            can_pass_tolerance_factor.append(check_0 and check_1)
+            if not (check_0 and check_1):
+                print(f"⚠️ [Rank {rank}] Tolerance factor = {tolerance_factor}: Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB. Retry...")
+            else:
+                did_pass_overflow_check = True
+                break
+
+                
+        
+            if not did_pass_overflow_check:
+                print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
+                print(f"🔴 [Rank {rank}] Specified buffer_size = {buffer_size / 1024**3} GB")
+                recommended_buffer_size = math.ceil(max_size_provisioned) + 0.5
+                print(f"🔴 [Rank {rank}] Force update buffer_size to = {recommended_buffer_size} GB")
+                buffer_size = int(recommended_buffer_size * 1024**3) # bytes
+
+
+                DispatcherWrapper.update_buffer_size(buffer_size)
+
+
+                rich.print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
+                buffer_size = DispatcherWrapper.instance[0].buffer_size
+
+            rich.print(f"🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0 and fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB")
+
+            # params for ping-pong batch0
+            ping_pang_params_0 = get_single_step_packed_seq_params(
+                fa2a_metadata_0, as_attn_metadata_0, as_rank, resend_qkv=resend_qkv
+            )
+            # params for ping-pong batch1
+            ping_pang_params_1 = get_single_step_packed_seq_params(
+                fa2a_metadata_1, as_attn_metadata_1, as_rank, resend_qkv=resend_qkv
+            )
+
+            mlp_seq_params_0 = get_attn_metadata(mlp_shard_len_0[as_rank], get_packed_seq_params=True)
+            mlp_seq_params_1 = get_attn_metadata(mlp_shard_len_1[as_rank], get_packed_seq_params=True)
+
+            # if rank % 8 == 0:
+            #     rich.print(f"🟡 [Rank {rank}] all_metadata[0] -> qkv_fwd_fa2a_metadata =", fa2a_metadata_0[0].fa2a_metadata.__better_print__())
+            #     rich.print(f"🟡 [Rank {rank}] all_metadata[0] -> qkv_rev_fa2a_metadata =", fa2a_metadata_0[1].fa2a_metadata.__better_print__())
+            #     rich.print(f"🟡 [Rank {rank}] all_metadata[1] -> qkv_fwd_fa2a_metadata =", fa2a_metadata_1[0].fa2a_metadata.__better_print__())
+            #     rich.print(f"🟡 [Rank {rank}] all_metadata[1] -> qkv_rev_fa2a_metadata =", fa2a_metadata_1[1].fa2a_metadata.__better_print__())
+
+            def debug_set_metadata_transfer_size_to_0(ping_pang_params: 'PingPangSingleStepPackedSeqParams'):
+                for param in [
+                    ping_pang_params.qkv_fwd_metadata,
+                    ping_pang_params.qkv_bwd_metadata,
+                    ping_pang_params.attn_out_fwd_metadata,
+                    ping_pang_params.attn_out_bwd_metadata,
+                ]:
+                    param.fa2a_metadata[1][:] = 1
+                    param.fa2a_metadata[3][:] = 1
+                    param.my_rank_send_sz = 1
+                return
+            
+            
+            if os.environ.get("EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0", "0") == "1":
+                print(f"🟡 [Rank {rank}] Debug set metadata transfer size to 0")
+                debug_set_metadata_transfer_size_to_0(ping_pang_params_0)
+                debug_set_metadata_transfer_size_to_0(ping_pang_params_1)
+
+
+            if rank % 8 == 0:
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_fwd_metadata =", ping_pang_params_0.qkv_fwd_metadata.__better_print__())
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_fwd_metadata =", ping_pang_params_1.qkv_fwd_metadata.__better_print__())
+                rich.print(f"🟡 [Rank {rank}] mlp_seq_params_0 =", mlp_seq_params_0)
+                rich.print(f"🟡 [Rank {rank}] mlp_seq_params_1 =", mlp_seq_params_1)
+
+                # Adding backward metadata
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_bwd_metadata =", ping_pang_params_0.qkv_bwd_metadata.__better_print__())
+                rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_bwd_metadata =", ping_pang_params_1.qkv_bwd_metadata.__better_print__())
+
+            packed_seq_params = PingPangPackedSeqParams(
+                seq_params=[ping_pang_params_0, ping_pang_params_1],
+                mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
+                # max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+                # max_seqlen_kv=torch.tensor([total_seq_len_including_cp * 2], dtype=torch.int32)[0],
+                
+                # TODO:(Question) Not sure if the values are correct here??
+                max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+                max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+                qkv_format="thd",
+            )
+            # Althrough, each rank has different number of tokens, but sum token number is still num_batched_token_per_as_rank * 2.
+            input_ids_local = torch.randint(0, 100, (1, num_batched_token_per_as_rank * 2))[0]
+            position_ids_local = torch.arange(num_batched_token_per_as_rank, dtype=torch.int64).repeat(1, 2)[0]
+
+            if rank % 8 == 0:
+                rich.print(f"🟡 [Rank {rank}] [{sample_id = }] input_ids_local.shape =", input_ids_local.shape)
+                rich.print(f"🟡 [Rank {rank}] [{sample_id = }] position_ids_local.shape =", position_ids_local.shape)
+
+            microbatch = {
+                "input_ids": input_ids_local,
+                "position_ids": position_ids_local,
+                "packed_seq_params": packed_seq_params,
+            }
+            pass
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
