@@ -47,23 +47,24 @@ CHANGE_LONG_DOC_RATIO=${CHANGE_LONG_DOC_RATIO:-0.0}
 ALPHA_FACTOR=${ALPHA_FACTOR:-1.0}
 
 JOBID=${JOBID:-${SLURM_JOB_ID}}
-if [ -z "$JOBID" ]; then
-  echo -e "\033[31mJOBID is not set. Must set JOBID environment variable.\033[0m"
-  exit 1
-fi
+if [ ${EXPERIMENT_NO_SRUN} -eq 0 ]; then
+  if [ -z "$JOBID" ]; then
+      echo -e "\033[31mJOBID is not set. Must set JOBID environment variable.\033[0m"
+      exit 1
+  fi
 
-# Check if job is still running
-if ! squeue -j "$JOBID" &>/dev/null; then
-  echo -e "\033[31mError: Job $JOBID is no longer running in SLURM queue\033[0m"
-  exit 1
+  # Check if job is still running
+  if ! squeue -j "$JOBID" &>/dev/null; then
+    echo -e "\033[31mError: Job $JOBID is no longer running in SLURM queue\033[0m"
+    exit 1
+  fi
+  NNODES=${NNODES:-$SLURM_NNODES}
+  if [ -z "$NNODES" ]; then
+      NNODES=$(squeue -j $JOBID -h -o %D)
+  fi
+  echo -e "\033[33mRecognized JOBID=$JOBID, NNODES=$NNODES\033[0m"
+  sleep 1
 fi
-
-NNODES=${NNODES:-$SLURM_NNODES}
-if [ -z "$NNODES" ]; then
-    NNODES=$(squeue -j $JOBID -h -o %D)
-fi
-echo -e "\033[33mRecognized JOBID=$JOBID, NNODES=$NNODES\033[0m"
-sleep 1
 
 # cmd="MODE=$MODE MODEL_PATH=$MODEL_PATH BATCH_SIZE=$BATCH_SIZE NUM_TOKENS=$NUM_TOKENS MAX_SAMPLE_ID=$MAX_SAMPLE_ID TP_SIZE=$TP_SIZE CP_SIZE=$CP_SIZE NUM_LAYERS=$NUM_LAYERS sbatch --nodes $NNODES test_e2e_combined.slurm.sh"
 

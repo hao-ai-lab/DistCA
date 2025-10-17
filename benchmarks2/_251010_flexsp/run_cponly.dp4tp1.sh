@@ -5,7 +5,7 @@ TS=$(TZ=America/Los_Angeles date +%m%d_%H%M%S)_PST
 
 export EXPERIMENT_LOG_MEMORY_USAGE=0
 export EXPERIMENT_REPEAT_TIMES=1
-export EXPERIMENT_WARMUP_TIMES=2
+export EXPERIMENT_WARMUP_TIMES=1
 export EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND=1 # default 1
 export SHOULD_ADD_DEBUG_CASES=0
 export EXPERIMENT_SKIP_OPTIMIZER_STEP=1
@@ -21,7 +21,7 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 # Control how many GPUs per node we should use.
 export GPUS_PER_NODE=4
 # Control if we should use srun.
-export EXPERIMENT_NO_SRUN=1
+export EXPERIMENT_NO_SRUN=0
 
 DRY_RUN=${DRY_RUN:-0}
 
@@ -39,16 +39,19 @@ for sample_config in \
 "wlbllm 0.0" \
 ; do
 
+# "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
 # "astronomer/Llama-3-70B-Special-Tokens-Adjusted 170000 80" \
 # "codellama/CodeLlama-34b-hf 131072 48" \
 for model_config in \
-"deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
+"deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 2" \
 ; do
 
-#    s r b   tok  e N mode
+#    s r b    tok  e  N  mode             cp  tp
 configs=(
-    "1 1 4  8192 1  1  d2"
+    # "1 1 4  16384  1  1  wlbllm            2  2"
+    "1 1 4  16384  1  1  wlbllm_perseq     2  2"
 )
+    # "1 1 4  8192 1  1  d2"
 
 
 # export EXPERIMENT_D2_BALANCE_PING_PONG=1
@@ -57,7 +60,7 @@ export WLBLLM_ENABLE_SHUFFLE=0
 
 
 for config in "${configs[@]}"; do
-    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes mode <<< "$config"
+    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes mode cp_size tp_size <<< "$config"
     read -r sample_name change_long_doc_ratio <<< "$sample_config"
     read -r model_path attn_linear_breakpoint num_layers <<< "$model_config"
     
@@ -72,7 +75,8 @@ for config in "${configs[@]}"; do
     export CHANGE_LONG_DOC_RATIO=$change_long_doc_ratio
     export ATTN_LINEAR_BREAKPOINT=$attn_linear_breakpoint
     export NUM_LAYERS=$num_layers
-
+    export CP_SIZE=$cp_size
+    export TP_SIZE=$tp_size
     
     if [ "$mode" == "d2" ]; then
         # Run d2 mode with all on
@@ -91,31 +95,21 @@ for config in "${configs[@]}"; do
     
     
     # for CP_SIZE in 32 16 8 4 2 1; do
-    if [ "$mode" == "wlbllm" ]; then
+    if [ "$mode" == "wlbllm" ] || [ "$mode" == "wlbllm_perseq" ]; then
         # Run wlbllm mode with different CP sizes
-        counter=0
-        for CP_SIZE in 16; do
-            if [ $CP_SIZE -gt $NNODES ]; then
-                continue
-            fi
-            DP_SIZE=$((NNODES / CP_SIZE))
-            if [ $DP_SIZE -gt $(($BATCH_SIZE * 2)) ]; then
-                continue
-            fi
+        DP_SIZE=$((NNODES / CP_SIZE))
+        if [ $DP_SIZE -gt $(($BATCH_SIZE * 2)) ]; then
+            continue
+        fi
 
-            export MODE=wlbllm CP_SIZE=$CP_SIZE
-            export OUTPUT_DIR_SUFFIX_ADDON=""
-            echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-            if [ $DRY_RUN -eq 0 ]; then
-                bash test_e2e_combined.salloc.sh
-                echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-                echo "\a"
-            fi
-            counter=$((counter + 1))
-            if [ $counter -ge 2 ]; then
-                break
-            fi
-        done
+        export MODE=$mode
+        export OUTPUT_DIR_SUFFIX_ADDON=""
+        echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
+        if [ $DRY_RUN -eq 0 ]; then
+            bash test_e2e_combined.salloc.sh
+            echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
+            echo "\a"
+        fi
     fi
 
 
