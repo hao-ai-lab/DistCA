@@ -670,37 +670,89 @@ def test_ilp_planner():
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
     )
-    world_size = 20
-    planner = Planner(world_size=world_size, parallel_config=parallel_config, model_config=model_config, planner_type = "ilp")
-    total_seq_len = 2048
-    batch_size = 4
-    from global_batch_provider import setup_global_batch, get_next_batch
-    setup_global_batch(total_seq_len)
-    _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
+    world_sizes = [8, 16, 32, 64, 128]
+    pp_size = 1
+    scale_factors = [1, 2, 4]
+    for world_size in world_sizes:
+        for scale_factor in scale_factors:
+            cp_total = world_size / pp_size     # total cp size. sum of all cp groups.
+            
+            total_seq_len = 2048
+            batch_size = int(cp_total // scale_factor) # each batch has batch_size * total_seq_len tokens.
+            
+            assert cp_total % scale_factor == 0, f"cp_total={cp_total} must be divisible by {scale_factor}"
+            # We don't have num token per rank concept in ILP planner.
+            
+            from global_batch_provider import setup_global_batch, get_next_batch
+            setup_global_batch(total_seq_len)
+            _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
 
-    seq_lens_0, seq_lens_1 = _seq_lens[:batch_size], _seq_lens[batch_size:]
-    seq_lens_0 = [seq for seqlist in seq_lens_0 for seq in seqlist]
-    seq_lens_1 = [seq for seqlist in seq_lens_1 for seq in seqlist]
-    # Origin Item for ILP.
-    _items_0 = [Item(model_config, seq_lens_0[i], i, -1, -1, {'q': seq_lens_0[i], 'kv': seq_lens_0[i]}) for i in range(len(seq_lens_0))]
-    _items_1 = [Item(model_config, seq_lens_1[i], i, -1, -1, {'q': seq_lens_1[i], 'kv': seq_lens_1[i]}) for i in range(len(seq_lens_1))]
+            # Post Process seq_lens, to divisible by largest cp_total.
+            max_cp_total = max(world_sizes) // pp_size
+            for docs in _seq_lens:
+                remain_doc_length = 0 
+                for i in range(len(docs)):
+                    doc_len = docs[i]
+                    new_doc_len = (doc_len // max_cp_total) * max_cp_total
+                    remain_doc_length += doc_len - new_doc_len
+                    docs[i] = new_doc_len 
 
-                
+                smallest_doc_idx = min(range(len(docs)), key=lambda x: docs[x])
+                docs[smallest_doc_idx] += remain_doc_length
+
+            seq_lens_0, seq_lens_1 = _seq_lens[:batch_size], _seq_lens[batch_size:]
+            seq_lens_0 = [seq for seqlist in seq_lens_0 for seq in seqlist]
+            seq_lens_1 = [seq for seqlist in seq_lens_1 for seq in seqlist]
+            # Origin Item for ILP.
+            _items_0 = [Item(model_config, seq_lens_0[i], i, -1, -1, {'q': seq_lens_0[i], 'kv': seq_lens_0[i]}) for i in range(len(seq_lens_0))]
+            _items_1 = [Item(model_config, seq_lens_1[i], i, -1, -1, {'q': seq_lens_1[i], 'kv': seq_lens_1[i]}) for i in range(len(seq_lens_1))]
+
+                        
+            planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
+            resend_qkv = True
+            verbose = False
+            start_time = time.time()
+            rich.print(f"🟡 Start Planning for items_0")
+            fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose, device="cpu")
+            end_time = time.time()
+            rich.print(f"🟡 Planning for items_0 time: {end_time - start_time:.4f} seconds")
+            start_time = time.time()
+            rich.print(f"🟡 Start Planning for items_1")
+            fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose, device="cpu")
+            end_time = time.time()
+            rich.print(f"🟡 Planning for items_1 time: {end_time - start_time:.4f} seconds")
+            #rich.print(f"🟡 fa2a_metadata_0 = {fa2a_metadata_0}")
+            #rich.print(f"🟡 fa2a_metadata_1 = {fa2a_metadata_1}")
+            rich.print(f"🟡 mlp_shard_len_0 = {mlp_shard_len_0}")
+            rich.print(f"🟡 mlp_shard_len_1 = {mlp_shard_len_1}")
+    return
+
+def test_ilp_special_case():
+    model_config = MockConfig()
+    parallel_config = ParallelConfig(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    world_size = 32
+    # token per batch: 1024, token per rank: 1024, cp total: 32
+    _seq_lens: list[list[int]] = [[1024, 1024], [2048], [1152, 896], [1408, 640], [2048], [2048], [1024, 1024], [128, 1920], [768, 896, 384], [1280, 768], [2048], [2048], [1024, 1024], [2048], [1664, 384], [2048]]
+    seq_lens = [seq for seqlist in _seq_lens for seq in seqlist]
+    # items for ILP planner.
+    _items_0 = [Item(model_config, seq_lens[i], i, -1, -1, {'q': seq_lens[i], 'kv': seq_lens[i]}) for i in range(len(seq_lens))]
     planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
     resend_qkv = True
     verbose = True
-
+    start_time = time.time()
+    rich.print(f"🟡 Start Planning for items_0")
     fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose, device="cpu")
-    fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose, device="cpu")
-    
-    #rich.print(f"🟡 fa2a_metadata_0 = {fa2a_metadata_0}")
-    #rich.print(f"🟡 fa2a_metadata_1 = {fa2a_metadata_1}")
-    rich.print(f"🟡 mlp_shard_len_0 = {mlp_shard_len_0}")
-    rich.print(f"🟡 mlp_shard_len_1 = {mlp_shard_len_1}")
-    return
+    end_time = time.time()
+    rich.print(f"🟡 Planning for items_0 time: {end_time - start_time:.4f} seconds")
 
 if __name__ == "__main__":
+    test_ilp_special_case()
+    exit()
     test_ilp_planner()
+    exit()
     test_batch_to_items_with_dummy_pp_fwd_bwd()
     test_cp_list_to_mlp_list()
     test_batch_to_items_with_dummy()

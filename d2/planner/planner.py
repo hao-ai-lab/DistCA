@@ -681,6 +681,9 @@ class Planner:
     # Documents' MLP GPU id is specified by Item's src_gpuid.
     # Documents' Attention GPU id is specified by Item's gpuid.
     def plan_items_ilp(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
+        def rlog(message):
+            if verbose:
+                rich.print(message)
         items = deepcopy(items_)
         doc_info = group_items_by_seqid(items)
 
@@ -689,7 +692,7 @@ class Planner:
         # cp_groups: [[0, 1], [2,3,4,5], [6, 7, 8, 9], [10, 11]]
         # doc_info: {doc_id: {'items': [Item], 'doc_len':4096 , 'cp_group_index': cp_group_index_in_cp_groups}}
         cp_groups, doc_info = flex_sp(doc_info, self.attention_server_world_size)
-        rich.print(f"🟡 cp_groups = {cp_groups}")
+        rlog(f"🟡 cp_groups = {cp_groups}")
 
         # Split items according to flexsp plan.
         # TODO:Support MLP CP Split...
@@ -699,7 +702,7 @@ class Planner:
             original_item = doc_info['items'][0]
             cp_index = doc_info['cp_group_index']
             cp_degree = len(cp_groups[cp_index])
-            rich.print(f"🟡 item: {original_item}, cp_index: {cp_index}, cp_degree: {cp_degree}")
+            rlog(f"🟡 item: {original_item}, cp_index: {cp_index}, cp_degree: {cp_degree}")
             total_flops = original_item.total_flops
             assert total_flops % cp_degree == 0, "Total flops should be divisible by cp_degree."
             flops_per_cp = total_flops / cp_degree
@@ -718,7 +721,6 @@ class Planner:
                 item.gpuid = cp_group[i]
                 item.src_gpuid = cp_group[i]    # in flex sp, mlp layout is similar to attention layout.
                 final_items.append(item)
-        rich.print(f"🟡 final_items = {final_items}")
         return final_items
     
     def plan_items_greedy(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
