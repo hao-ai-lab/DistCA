@@ -51,7 +51,6 @@ def batch_to_items_class(batches: list[list[int]], model_config=None):
     return items
 
 # Can handle MLP DPCP and dummy doc.
-# Can handle MLP DPCP and dummy doc.
 def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int, as_world_size: int, model_config: dict):
 
     items = []
@@ -123,7 +122,6 @@ def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int
 """
 Partition and place a batch of variable-length documents onto GPU ranks under a
 hybrid Data-Parallel (DP) and Context-Parallel (CP) policy, returning a list of
-Item objects.(Can handle MLP DPCP. Can't handle dummy docs.)
 Item objects.(Can handle MLP DPCP. Can't handle dummy docs.)
 
 Steps
@@ -473,10 +471,6 @@ class Item:
     # Complete Item -> List[one dict]
     # Split Item -> List[two dicts]
     def to_dicts(self) -> List[Dict[str, Any]]:
-    # Transfer Item to List of dict(s).
-    # Complete Item -> List[one dict]
-    # Split Item -> List[two dicts]
-    def to_dicts(self) -> List[Dict[str, Any]]:
         output_dicts = []
         for item_chunk in self.items:
             if item_chunk['q'] <= 0:
@@ -685,10 +679,6 @@ class Planner:
     # MLP layout is not changed. Only Attention in CP.
     # Documents' MLP GPU id is specified by Item's src_gpuid.
     # Documents' Attention GPU id is specified by Item's gpuid.
-    # This is FlexSP ILP planner.
-    # MLP layout is not changed. Only Attention in CP.
-    # Documents' MLP GPU id is specified by Item's src_gpuid.
-    # Documents' Attention GPU id is specified by Item's gpuid.
     def plan_items_ilp(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
         items = deepcopy(items_)
         doc_info = group_items_by_seqid(items)
@@ -843,8 +833,6 @@ class Planner:
         shard_infos = self.items_into_shardinfos(planned_items)
         return shard_infos
     
-
-    def postprocess_items(self, items: list[Item]) -> list[dict]:
     def postprocess_items(self, items: list[Item]) -> list[dict]:
         dict_items = []
         for item in items:

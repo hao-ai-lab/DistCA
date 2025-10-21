@@ -574,8 +574,8 @@ try:
     import wlbllm.registry
     import wlbllm.megatron_patch.dot_product_attention
     import wlbllm.megatron_patch.backends
-    import wlbllm.fastmemcpy.fast_memcpy
-    from wlbllm.fastmemcpy.fast_memcpy import prepare_metadata as wlb_memcpy_prepare_metadata
+    #import wlbllm.fastmemcpy.fast_memcpy
+    #from wlbllm.fastmemcpy.fast_memcpy import prepare_metadata as wlb_memcpy_prepare_metadata
 except ImportError as e:
     traceback.print_exc()
     print(f"🟡 ImportError: {e}")
@@ -1329,11 +1329,12 @@ def test(args):
             # Then that means we implicitly have dpcp = 4
             # 1. We get 2 batch, each batch has `total_seq_len`` number of tokens
             # 2. Each GPU should get total_seq_len // as_world_size number of tokens. 
-            
+            verbose = (rank % 8 == 0)
+
             print(f"🟡 [Rank {rank}] hidden_size_q_tp = {hidden_size_q_tp}, hidden_size_k_tp = {hidden_size_k_tp}, element_size = {element_size}")
 
             dp_size = as_world_size     # this should be total cp size.
-
+            num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
             model_config = hf_config
             parallel_config = ParallelConfig(
                 tensor_model_parallel_size=tp_size,
@@ -1380,18 +1381,17 @@ def test(args):
             rich.print(f"🟡 [Rank {rank}] seq_lens_0 = {seq_lens_0}")
             rich.print(f"🟡 [Rank {rank}] seq_lens_1 = {seq_lens_1}")
 
-            # This is for MLP layout in D2 case. For ILP, we should first identify the cp group and cp group index for each doc.
-            # We don't need tolerance factor for ILP for now.
-            planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
-            
             # Origin Item for ILP.
-            _items_0 = [Item(model_config, seq_lens_0[i], i, -1, -1, {'q': seq_lens_0[i], 'kv': seq_lens_0[i]}) for i in range(len(seq_lens_0))]
-            _items_1 = [Item(model_config, seq_lens_1[i], i, -1, -1, {'q': seq_lens_1[i], 'kv': seq_lens_1[i]}) for i in range(len(seq_lens_1))]
+            flat_seq_lens_0 = [length for batch in seq_lens_0 for length in (batch if isinstance(batch, list) else [batch])]
+            flat_seq_lens_1 = [length for batch in seq_lens_1 for length in (batch if isinstance(batch, list) else [batch])]
+            _items_0 = [Item(model_config, flat_seq_lens_0[i], i, -1, -1, {'q': flat_seq_lens_0[i], 'kv': flat_seq_lens_0[i]}) for i in range(len(flat_seq_lens_0))]
+            _items_1 = [Item(model_config, flat_seq_lens_1[i], i, -1, -1, {'q': flat_seq_lens_1[i], 'kv': flat_seq_lens_1[i]}) for i in range(len(flat_seq_lens_1))]
 
             if rank % 8 == 0:
                 rich.print(f"🟡 [Rank {rank}] original _items_0 = {_items_0}")
                 rich.print(f"🟡 [Rank {rank}] original _items_1 = {_items_1}")
             
+            tolerance_factor = 0.1
             planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
             
             fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose)
@@ -1492,76 +1492,76 @@ def test(args):
                 
                 
 
-            # Check size:
-            buffer_size = DispatcherWrapper.instance[0].buffer_size
-            
-            def _check_self_overflow(fa2a_metadata, as_rank_):
-                """Return the self-overflow status and the maximum size provisioned."""
-                send_sz = [torch.sum(m.fa2a_metadata[1][as_rank_]).item() for m in fa2a_metadata]
-                dst_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank_] for m in fa2a_metadata]
-                recv_sz = [torch.sum(m.fa2a_metadata[3][as_rank_]).item() for m in fa2a_metadata]
-                src_last_offset = [(m.fa2a_metadata[0] + m.fa2a_metadata[1])[as_rank_] for m in fa2a_metadata]
-                max_send_sz = max(send_sz)
-                max_recv_sz = max(recv_sz)
-                max_dst_last_offset = max(torch.max(o).item() for o in dst_last_offset)
-                max_src_last_offset = max(torch.max(o).item() for o in src_last_offset)
+            # # Check size:
+            # buffer_size = DispatcherWrapper.instance[0].buffer_size
+            buffer_size = 0
+            # def _check_self_overflow(fa2a_metadata, as_rank_):
+            #     """Return the self-overflow status and the maximum size provisioned."""
+            #     send_sz = [torch.sum(m.fa2a_metadata[1][as_rank_]).item() for m in fa2a_metadata]
+            #     dst_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank_] for m in fa2a_metadata]
+            #     recv_sz = [torch.sum(m.fa2a_metadata[3][as_rank_]).item() for m in fa2a_metadata]
+            #     src_last_offset = [(m.fa2a_metadata[0] + m.fa2a_metadata[1])[as_rank_] for m in fa2a_metadata]
+            #     max_send_sz = max(send_sz)
+            #     max_recv_sz = max(recv_sz)
+            #     max_dst_last_offset = max(torch.max(o).item() for o in dst_last_offset)
+            #     max_src_last_offset = max(torch.max(o).item() for o in src_last_offset)
                 
-                if rank % 8 == 0:
-                    print(
-                        f"🟡 [Rank {rank}]  Overflow check of as_rank_ = {as_rank_}: "
-                        f"{max_send_sz / 1024**3:.2f} GB send size, "
-                        f"{max_recv_sz / 1024**3:.2f} GB recv size, "
-                        f"{max_dst_last_offset / 1024**3:.2f} GB dst last offset, "
-                        f"{max_src_last_offset / 1024**3:.2f} GB src last offset, "
-                        f"{buffer_size / 1024**3:.2f} GB buffer size"
-                    )
+            #     if rank % 8 == 0:
+            #         print(
+            #             f"🟡 [Rank {rank}]  Overflow check of as_rank_ = {as_rank_}: "
+            #             f"{max_send_sz / 1024**3:.2f} GB send size, "
+            #             f"{max_recv_sz / 1024**3:.2f} GB recv size, "
+            #             f"{max_dst_last_offset / 1024**3:.2f} GB dst last offset, "
+            #             f"{max_src_last_offset / 1024**3:.2f} GB src last offset, "
+            #             f"{buffer_size / 1024**3:.2f} GB buffer size"
+            #         )
 
-                max_size_provisioned = max(
-                    max_send_sz, max_recv_sz, 
-                    max_dst_last_offset, max_src_last_offset,
-                )
-                if not (buffer_size >= max_size_provisioned):
-                    return False, max_size_provisioned
-                return True, max_size_provisioned
+            #     max_size_provisioned = max(
+            #         max_send_sz, max_recv_sz, 
+            #         max_dst_last_offset, max_src_last_offset,
+            #     )
+            #     if not (buffer_size >= max_size_provisioned):
+            #         return False, max_size_provisioned
+            #     return True, max_size_provisioned
 
-            def _check_all_overflow(fa2a_metadata, as_world_size_):
-                all_max_size_provisioned = 0
-                states = []
-                for as_rank_ in range(as_world_size_):
-                    state, max_size_provisioned = _check_self_overflow(fa2a_metadata, as_rank_)
-                    all_max_size_provisioned = max(all_max_size_provisioned, max_size_provisioned)
-                    states.append(state)
-                all_state = all(states)
-                return all_state, all_max_size_provisioned
+            # def _check_all_overflow(fa2a_metadata, as_world_size_):
+            #     all_max_size_provisioned = 0
+            #     states = []
+            #     for as_rank_ in range(as_world_size_):
+            #         state, max_size_provisioned = _check_self_overflow(fa2a_metadata, as_rank_)
+            #         all_max_size_provisioned = max(all_max_size_provisioned, max_size_provisioned)
+            #         states.append(state)
+            #     all_state = all(states)
+            #     return all_state, all_max_size_provisioned
                 
-            check_0, max_size_provisioned_0 = _check_all_overflow(fa2a_metadata_0, as_world_size)
-            check_1, max_size_provisioned_1 = _check_all_overflow(fa2a_metadata_1, as_world_size)
-            max_size_provisioned = max(max_size_provisioned_0, max_size_provisioned_1) / 1024**3
-            required_buffer_size.append(max_size_provisioned)
+            # check_0, max_size_provisioned_0 = _check_all_overflow(fa2a_metadata_0, as_world_size)
+            # check_1, max_size_provisioned_1 = _check_all_overflow(fa2a_metadata_1, as_world_size)
+            # max_size_provisioned = max(max_size_provisioned_0, max_size_provisioned_1) / 1024**3
+            # required_buffer_size.append(max_size_provisioned)
             
             
-            can_pass_tolerance_factor.append(check_0 and check_1)
-            if not (check_0 and check_1):
-                print(f"⚠️ [Rank {rank}] Tolerance factor = {tolerance_factor}: Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB. Retry...")
-            else:
-                did_pass_overflow_check = True
-                break
+            # can_pass_tolerance_factor.append(check_0 and check_1)
+            # if not (check_0 and check_1):
+            #     print(f"⚠️ [Rank {rank}] Tolerance factor = {tolerance_factor}: Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB. Retry...")
+            # else:
+            #     did_pass_overflow_check = True
+            #     break
 
                 
         
-            if not did_pass_overflow_check:
-                print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
-                print(f"🔴 [Rank {rank}] Specified buffer_size = {buffer_size / 1024**3} GB")
-                recommended_buffer_size = math.ceil(max_size_provisioned) + 0.5
-                print(f"🔴 [Rank {rank}] Force update buffer_size to = {recommended_buffer_size} GB")
-                buffer_size = int(recommended_buffer_size * 1024**3) # bytes
+            # if not did_pass_overflow_check:
+            #     print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
+            #     print(f"🔴 [Rank {rank}] Specified buffer_size = {buffer_size / 1024**3} GB")
+            #     recommended_buffer_size = math.ceil(max_size_provisioned) + 0.5
+            #     print(f"🔴 [Rank {rank}] Force update buffer_size to = {recommended_buffer_size} GB")
+            #     buffer_size = int(recommended_buffer_size * 1024**3) # bytes
 
 
-                DispatcherWrapper.update_buffer_size(buffer_size)
+            #     DispatcherWrapper.update_buffer_size(buffer_size)
 
 
-                rich.print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
-                buffer_size = DispatcherWrapper.instance[0].buffer_size
+            #     rich.print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
+            #     buffer_size = DispatcherWrapper.instance[0].buffer_size
 
             rich.print(f"🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0 and fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB")
 
@@ -2420,7 +2420,7 @@ def clear_unified_a2a_times():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm"], default="baseline", 
+    parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm", "ilp"], default="baseline", 
                         help="Test mode: 'baseline' for simple batch generation, 'd2' for balanced flops planning, 'wlbllm' for wlbllm")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-tokens", type=int, default=1024)

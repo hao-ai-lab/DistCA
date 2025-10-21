@@ -701,8 +701,6 @@ def test_ilp_planner():
 
 if __name__ == "__main__":
     test_ilp_planner()
-    
-    exit(0)
     test_batch_to_items_with_dummy_pp_fwd_bwd()
     test_cp_list_to_mlp_list()
     test_batch_to_items_with_dummy()
