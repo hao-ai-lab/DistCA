@@ -533,7 +533,8 @@ def group_items_by_seqid(items: list[Item]) -> dict:
 
 
 # {doc_id: {'items': [Item], 'doc_len':4096 , 'cp_group_index': 0}}
-def flex_sp(doc_info: dict, total_cp_degree: int) -> tuple[list[list[int]], dict]:
+# cost = alpha * l(l-1)/2 / k + beta * (k-1)/k * l, l is doc_len, k is cp_degree.
+def flex_sp(doc_info: dict, total_cp_degree: int, alpha: float = 1.0, beta: float = 1.0) -> tuple[list[list[int]], dict]:
     cp_groups = []
     import pulp
     group_sizes = [1]
@@ -558,7 +559,7 @@ def flex_sp(doc_info: dict, total_cp_degree: int) -> tuple[list[list[int]], dict
         prob += pulp.lpSum(x[i, j, k] for k in group_sizes for j in range(max_group_sizes[k])) == 1
     for k in group_sizes:
         for j in range(max_group_sizes[k]):
-            prob += pulp.lpSum((doc_info[i]['doc_len'] + 1) * doc_info[i]['doc_len'] / k * x[i, j, k] for i in doc_info) <= C_max
+            prob += pulp.lpSum(alpha / 2 * (doc_info[i]['doc_len'] + 1) * doc_info[i]['doc_len'] / k * x[i, j, k] + beta * (k - 1) / k * doc_info[i]['doc_len'] for i in doc_info) <= C_max
             for i in doc_info:
                 prob += x[i, j, k] <= y[j, k]
     prob.solve(solver=pulp.PULP_CBC_CMD(msg=False, timeLimit=60))
