@@ -690,17 +690,28 @@ def test_ilp_planner():
             _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
 
             # Post Process seq_lens, to divisible by largest cp_total.
-            max_cp_total = max(world_sizes) // pp_size
-            for docs in _seq_lens:
-                remain_doc_length = 0 
+            cp_total = world_size // pp_size
+            for docs in _seq_lens:                
+                total_remainder = 0
+                
                 for i in range(len(docs)):
                     doc_len = docs[i]
-                    new_doc_len = (doc_len // max_cp_total) * max_cp_total
-                    remain_doc_length += doc_len - new_doc_len
-                    docs[i] = new_doc_len 
+                    remainder = doc_len % cp_total
+                    docs[i] = doc_len - remainder
+                    total_remainder += remainder
+                
+                num_chunks_to_distribute = total_remainder // cp_total
+                # Distribute the remainder to all short docs.(Avoid 0 doc length.)
+                if num_chunks_to_distribute > 0:
+                    sorted_indices = sorted(range(len(docs)), key=lambda k: docs[k])
+                    for i in range(num_chunks_to_distribute):
+                        idx_to_add = sorted_indices[i] 
+                        docs[idx_to_add] += cp_total
 
-                smallest_doc_idx = min(range(len(docs)), key=lambda x: docs[x])
-                docs[smallest_doc_idx] += remain_doc_length
+            for doc in docs:
+                assert doc > 0, f"doc length={doc} must be greater than 0"
+                assert doc % cp_total == 0, f"doc length={doc} must be divisible by {cp_total}"
+
 
             seq_lens_0, seq_lens_1 = _seq_lens[:batch_size], _seq_lens[batch_size:]
             seq_lens_0 = [seq for seqlist in seq_lens_0 for seq in seqlist]
@@ -769,16 +780,168 @@ def test_flex_sp():
     
     rich.print(f"[bold green][PASS][/bold green] test_flex_sp completed successfully")
 
+
+def plan_ahead_for_ilp_planner(num_tokens: list[int], batch_sizes_list: list[list[int]], world_sizes_list: list[list[int]], num_sample: int=30, time_limits: list[int]=[60], sample_name: str="wlbllm", dump_data: bool=True):
+    import pickle
+    import os
+    import time
+    from global_batch_provider import setup_global_batch, get_next_batch
+
+    def post_process_seq_lens(seq_lens: list[list[int]], world_size: int):
+        # Post Process seq_lens, to divisible by largest cp_total.
+        pp_size = 1
+        tp_size = 8     # Fix tp_size=8.
+        cp_total = world_size // pp_size
+        for docs in seq_lens:                
+            total_remainder = 0
+            
+            for i in range(len(docs)):
+                doc_len = docs[i]
+                remainder = doc_len % cp_total
+                docs[i] = doc_len - remainder
+                total_remainder += remainder
+            
+            num_chunks_to_distribute = total_remainder // cp_total
+            # Distribute the remainder to all short docs.(Avoid 0 doc length.)
+            if num_chunks_to_distribute > 0:
+                sorted_indices = sorted(range(len(docs)), key=lambda k: docs[k])
+                for i in range(num_chunks_to_distribute):
+                    idx_to_add = sorted_indices[i] 
+                    docs[idx_to_add] += cp_total
+        return seq_lens
+        
+    parallel_config = ParallelConfig(
+        tensor_model_parallel_size=8,
+        pipeline_model_parallel_size=1,
+    )
+    model_config = MockConfig()
+    K = 1024
+    for time_limit in time_limits:
+        for _, (num_token, batch_sizes, world_sizes) in enumerate(zip(num_tokens, batch_sizes_list, world_sizes_list)):
+            elongate_factor = num_token // 64 // K
+            tp_size = 8
+            if sample_name == 'wlbllm':
+                setup_global_batch(total_seq_len=num_token, elongate_factor=int(elongate_factor), sample_name=sample_name)
+            elif sample_name == 'prolong':
+                setup_global_batch(total_seq_len=num_token, elongate_factor=int(elongate_factor), change_long_doc_ratio=0.3, sample_name=sample_name)
+            else:
+                raise ValueError(f"Invalid sample_name: {sample_name}")
+            
+            for batch_size,world_size in zip(batch_sizes, world_sizes):
+                total_cp_size = world_size // tp_size
+                # Run ILP planner.
+                planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
+                for sample_idx in range(num_sample):
+                    _seq_lens: list[list[int]] = get_next_batch(batch_size)
+                    seq_lens = post_process_seq_lens(_seq_lens, world_size)
+                    # for seq in seq_lens:
+                    #     assert sum(seq) == num_token, f"seq sum={sum(seq)} must be equal to num_token={num_token}"
+                    #     for j in range(len(seq)):
+                    #         if seq[j] % total_cp_size != 0:
+                    #             rich.print(f"🟡 seq[{j}]={seq[j]} is not divisible by total_cp_size={total_cp_size}")
+                    #             raise ValueError(f"seq[{j}]={seq[j]} is not divisible by total_cp_size={total_cp_size}")
+                    
+                    seq_lens_0, seq_lens_1 = seq_lens[:batch_size], seq_lens[batch_size:]
+                    seq_lens_0 = [seq for seqlist in seq_lens_0 for seq in seqlist]
+                    seq_lens_1 = [seq for seqlist in seq_lens_1 for seq in seqlist]
+                    # Origin Item for ILP.
+                    _items_0 = [Item(model_config, seq_lens_0[i], i, -1, -1, {'q': seq_lens_0[i], 'kv': seq_lens_0[i]}) for i in range(len(seq_lens_0))]
+                    _items_1 = [Item(model_config, seq_lens_1[i], i, -1, -1, {'q': seq_lens_1[i], 'kv': seq_lens_1[i]}) for i in range(len(seq_lens_1))]
+                
+
+                    # Plan items_0. 
+                    start_time = time.time()
+                    items_after_ilp_0 = planner.plan_items(_items_0, time_limit=time_limit)
+                    end_time = time.time()
+                    items0_time = end_time - start_time
+                    # Plan items_1.
+                    start_time = time.time()
+                    items_after_ilp_1 = planner.plan_items(_items_1, time_limit=time_limit)
+                    end_time = time.time()
+                    items1_time = end_time - start_time
+                    rich.print(f"🟡 ILP Planner time: items0_time={items0_time:.4f} seconds, items1_time={items1_time:.4f} seconds")
+
+                    if dump_data:
+                        data_to_save = {
+                            "seq_lens_0": seq_lens_0,
+                            "seq_lens_1": seq_lens_1,
+                            "items_0": _items_0,
+                            "items_1": _items_1,
+                            "items_after_ilp_0": items_after_ilp_0,
+                            "items_after_ilp_1": items_after_ilp_1,
+                            "time_limit": time_limit,
+                            "items0_time": items0_time,
+                            "items1_time": items1_time,
+                            "batch_size": batch_size,
+                            "world_size": world_size,
+                            "sample_idx": sample_idx,
+                            "sample_name": sample_name,
+                        }
+
+                        from pathlib import Path
+                        current_script_dir = Path(__file__).parent
+                        project_root = current_script_dir.parent
+                        base_dir = project_root / "tests" / "ilp_plan_ahead"
+                        curr_dir = os.path.join(base_dir, f"{sample_name}_num_token={num_token}_batch_size={batch_size}_world_size={world_size}_time_limit={time_limit}")
+                        os.makedirs(curr_dir, exist_ok=True)
+                        filepath = os.path.join(curr_dir, f"plan_ahead_sample_idx={sample_idx}.pkl")
+
+                        # use pickle to save data_to_save.
+                        with open(filepath, "wb") as f:
+                            pickle.dump(data_to_save, f)
+                        rich.print(f"Finish world_size={world_size}, batch_size={batch_size}, time_limit={time_limit}, sample_index={sample_idx}")
+
+def test_pre_plan_for_ilp_planner():
+    K = 1024
+    num_sample = 15
+    num_tokens = [
+        128*K, 
+        256*K, 
+        512*K,
+        128*K, 
+        256*K, 
+        512*K
+    ]
+    batch_sizes_list = [
+        [8, 16, 32],
+        [4, 8, 16],
+        [2, 4, 8],
+        [4, 8, 16],
+        [2, 4, 8],
+        [2, 4, 8]
+    ]
+    world_sizes_list = [
+        [64, 128, 256],
+        [64, 128, 256],
+        [64, 128, 256],
+        [64, 128, 256],
+        [64, 128, 256],
+        [64, 128, 256]
+    ]
+    time_limits = [
+        60, 
+        300
+    ]
+    dump_data = True
+    sample_name = 'wlbllm'
+    plan_ahead_for_ilp_planner(num_tokens, batch_sizes_list, world_sizes_list,num_sample, time_limits, sample_name, dump_data)
+    sample_name = 'prolong'
+    plan_ahead_for_ilp_planner(num_tokens, batch_sizes_list, world_sizes_list,num_sample, time_limits, sample_name, dump_data)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ilp", action="store_true", help="Run ILP tests")
+    parser.add_argument("--ilp-plan-ahead", action="store_true", help="Run ILP plan ahead tests")
     args = parser.parse_args()
-    
+    if args.ilp_plan_ahead:
+        test_pre_plan_for_ilp_planner()
+        exit()
+
     if args.ilp:
         test_flex_sp()
         test_ilp_special_case()
         test_ilp_planner()
-    
         
     test_batch_to_items_with_dummy_pp_fwd_bwd()
     test_cp_list_to_mlp_list()

@@ -691,12 +691,12 @@ class Planner:
         final_items = []
         
         for doc_id, doc_info in doc_info.items():
-            original_item = doc_info['items'][0]
+            original_item = doc_info['items'][0]    # Only one item per doc originally.
             cp_index = doc_info['cp_group_index']
             cp_degree = len(cp_groups[cp_index])
             rlog(f"🟡 item: {original_item}, cp_index: {cp_index}, cp_degree: {cp_degree}")
             total_flops = original_item.total_flops
-            assert total_flops % cp_degree == 0, "Total flops should be divisible by cp_degree."
+            assert total_flops % cp_degree == 0, "Total flops should be divisible by cp_degree. doc_len: {original_item.seq_len}, cp_degree: {cp_degree}"
             flops_per_cp = total_flops / cp_degree
 
             split_items = doc_info['items']
