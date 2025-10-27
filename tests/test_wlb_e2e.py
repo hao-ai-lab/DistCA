@@ -388,8 +388,10 @@ def test(args):
     assert world_size == int(os.environ.get("WORLD_SIZE")), f"world_size: {world_size} != WORLD_SIZE: {os.environ.get('WORLD_SIZE')}"
     dp_size = world_size // (tp_size * pp_size * cp_size)
 
+    mode = args.mode
+    
     config = dict(
-        mode="wlbllm", 
+        mode=mode, 
         nodes=args.num_nodes,
         num_gpus_per_node=args.num_gpus_per_node,
         tp_size=tp_size, dp_size=dp_size, cp_size=cp_size, 
@@ -514,12 +516,15 @@ def test(args):
             print(f"🟡 unbalanced_micro_batches: {unbalanced_micro_batches}")
             my_batch_ranks = list(range(dp_rank, dp_size * num_microbatch, dp_size))
             print(f"🟡 my_batch_ranks: {my_batch_ranks}")
+            alpha_factor = args.alpha_factor # at max tolerate 2x memory imbalance. This number can go infinite...
             balanced_seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
                 dp_size * num_microbatch, my_batch_ranks, total_seq_len, batch_size, 
                 unbalanced_micro_batches, 
                 ENABLE_BALANCED_FLOS_NO_DEFER=ENABLE_BALANCED_FLOS_NO_DEFER,
                 # TODO: (Refactor) This is a hack to pass the model config to the WLBLLM planner.
                 model_config=hf_config, 
+                Lmax=int(total_seq_len * 2 * batch_size // dp_size * alpha_factor), # TODO: (Refactor) This is a hack to pass the Lmax to the WLBLLM planner.
+
             )
         else:
             unbalanced_micro_batches = []
@@ -572,47 +577,87 @@ def test(args):
 
             num_tokens_this_rank = context_length // cp_size
             assert num_tokens_this_rank * cp_size == context_length, f"num_tokens_this_rank * cp_size == context_length, {num_tokens_this_rank * cp_size} != {context_length}"
-            doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
-                doc_lens, context_length, cp_size
-            )
-
-            if rank % 8 == 1:
-                print(f"🟡 doc_shards: {doc_shards}")
             
-            (
-                cu_seqlens_q_list, cu_seqlens_k_list, 
-                max_seqlen_q_list, max_seqlen_k_list, 
-                kv_idx_list,
-            ) = wlbllm.utils.compute_per_doc_metadate_combined__metadata_only(    
-                context_length, 
-                doc_lens, 
-                doc_shards,
-                cp_size, 
-                cp_rank, 
-                device=torch.cuda.current_device()
-            )
+            # Branch based on mode: per-doc vs per-seq
+            if mode == "wlbllm_perseq":
+                # Per-seq mode: uses k_offset_list instead of doc_shards and kv_idx_list
+                chunk_size = context_length // (2 * cp_size)
+                (
+                    cu_seqlens_q_list, cu_seqlens_k_list, 
+                    max_seqlen_q_list, max_seqlen_k_list, 
+                    k_offset_list,
+                ) = wlbllm.utils.compute_per_seq_metadate_combined__metadata_only(    
+                    context_length, 
+                    doc_lens, 
+                    cp_size, 
+                    cp_rank, 
+                    device=torch.cuda.current_device()
+                )
+                
+                if rank % 8 == 1:
+                    print(f"🟡 k_offset_list: {k_offset_list}")
+                
+                # Only take the number of tokens in this rank seq_lens 
+                # is already the dp_rank's doc_lens. 
+                # So here we only take the cp-shard of it.
+                input_ids = torch.randint(10, 1000, (num_tokens_this_rank,))
+                print(f"🟡 input_ids: {input_ids.shape}")
+                position_ids = torch.arange(num_tokens_this_rank)
+                print(f"🟡 position_ids: {position_ids.shape}")
+                
+                wlb_metadata = dict(
+                    mode="per-seq",
+                    doc_lens=doc_lens,
+                    kv_idx_list=k_offset_list,  # Using k_offset_list as equivalent
+                    k_offset_list=k_offset_list,
+                    cu_seqlens_q_list=cu_seqlens_q_list,
+                    cu_seqlens_kv_list=cu_seqlens_k_list,
+                    max_seqlen_q_list=max_seqlen_q_list,
+                    max_seqlen_kv_list=max_seqlen_k_list,
+                    global_tensor_length=(context_length),
+                )
+            else:
+                # Per-doc mode (original wlbllm)
+                doc_shards = wlbllm.utils.compute_per_doc_cp_shard_doc_len(
+                    doc_lens, context_length, cp_size
+                )
 
-            # Only take the number of tokens in this rank seq_lens 
-            # is already the dp_rank's doc_lens. 
-            # So here we only take the cp-shard of it.
-            input_ids = torch.randint(10, 1000, (num_tokens_this_rank,))
-            print(f"🟡 input_ids: {input_ids.shape}")
-            position_ids = torch.arange(num_tokens_this_rank)
-            print(f"🟡 position_ids: {position_ids.shape}")
-            wlb_metadata = dict(
-                doc_lens=doc_lens,
-                doc_shards=doc_shards,
-                kv_idx_list=kv_idx_list,
-                cu_seqlens_q_list=cu_seqlens_q_list,
-                cu_seqlens_kv_list=cu_seqlens_k_list,
-                max_seqlen_q_list=max_seqlen_q_list,
-                max_seqlen_kv_list=max_seqlen_k_list,
-                # global_tensor_length: 
-                # global_tensor_length=(num_tokens * cp_size * 2),
-                # TODO: What this value should be?
-                global_tensor_length=(context_length),
-                # context_length
-            )
+                if rank % 8 == 1:
+                    print(f"🟡 doc_shards: {doc_shards}")
+                
+                (
+                    cu_seqlens_q_list, cu_seqlens_k_list, 
+                    max_seqlen_q_list, max_seqlen_k_list, 
+                    kv_idx_list,
+                ) = wlbllm.utils.compute_per_doc_metadate_combined__metadata_only(    
+                    context_length, 
+                    doc_lens, 
+                    doc_shards,
+                    cp_size, 
+                    cp_rank, 
+                    device=torch.cuda.current_device()
+                )
+
+                # Only take the number of tokens in this rank seq_lens 
+                # is already the dp_rank's doc_lens. 
+                # So here we only take the cp-shard of it.
+                input_ids = torch.randint(10, 1000, (num_tokens_this_rank,))
+                print(f"🟡 input_ids: {input_ids.shape}")
+                position_ids = torch.arange(num_tokens_this_rank)
+                print(f"🟡 position_ids: {position_ids.shape}")
+                
+                wlb_metadata = dict(
+                    mode="per-doc",
+                    doc_lens=doc_lens,
+                    doc_shards=doc_shards,
+                    kv_idx_list=kv_idx_list,
+                    cu_seqlens_q_list=cu_seqlens_q_list,
+                    cu_seqlens_kv_list=cu_seqlens_k_list,
+                    max_seqlen_q_list=max_seqlen_q_list,
+                    max_seqlen_kv_list=max_seqlen_k_list,
+                    global_tensor_length=(context_length),
+                )
+            
             packed_seq_params = WLBPackedSeqParams(
                 qkv_format="thd",
                 cu_seqlens_q=cu_seqlens_q_list[-1],
@@ -798,6 +843,10 @@ if __name__ == "__main__":
     parser.add_argument("--elongate-factor", type=int, default=1)
     parser.add_argument("--filter-threshold", type=int, default=65536)
     parser.add_argument("--filter-ratio", type=float, default=0.50)
+    
+    parser.add_argument("--mode", type=str, default="wlbllm", choices=["wlbllm", "wlbllm_perseq"],
+                        help="WLBLLM mode: 'wlbllm' for per-doc mode, 'wlbllm_perseq' for per-seq mode")
+    parser.add_argument("--alpha-factor", type=float, default=1.0, help="Alpha factor for memory imbalance")
 
     args = parser.parse_args()
     print("args: ", args)
