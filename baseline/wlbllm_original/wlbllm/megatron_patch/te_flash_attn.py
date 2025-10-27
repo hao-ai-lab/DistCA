@@ -112,6 +112,7 @@ def wlbllm_func__per_doc(*args, **kwargs):
 
 def wlbllm_func(*args, **kwargs):
     mode = wlbllm.registry.get("mode")
+    print(f"🟡 wlbllm_func: mode={mode}")
     if mode not in ["per-doc", "per-seq"]:
         mode = "per-doc"
         print(f"🟡 Warning: Invalid mode: {mode}, using per-doc mode as default.")

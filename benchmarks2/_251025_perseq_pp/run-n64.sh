@@ -1,0 +1,2 @@
+bash /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251025_perseq_pp/salloc_srun.pp_34b.v2.sh --config /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251025_perseq_pp/perseq_pp-n8-pretrain-0.0-34B-n64.sh
+bash /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251025_perseq_pp/salloc_srun.pp_34b.v2.sh --config /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251025_perseq_pp/perseq_pp-n8-prolong-0.3-34B-n64.sh
