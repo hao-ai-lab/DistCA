@@ -845,9 +845,9 @@ def plan_ahead_for_ilp_planner(num_tokens: list[int], batch_sizes_list: list[lis
                     curr_dir = os.path.join(base_dir, f"{sample_name}_num_token={num_token}_batch_size={batch_size}_world_size={world_size}_time_limit={time_limit}")
                     os.makedirs(curr_dir, exist_ok=True)
                     filepath = os.path.join(curr_dir, f"sample_idx{sample_idx}.pkl")
-                    if os.path.exists(filepath):
-                        rich.print(f"🟡 File already exists: {filepath}")
-                        continue
+                    # if os.path.exists(filepath):
+                    #     rich.print(f"🟡 File already exists: {filepath}")
+                    #     continue
                     seq_lens = post_process_seq_lens(_seq_lens, world_size)
                     # for seq in seq_lens:
                     #     assert sum(seq) == num_token, f"seq sum={sum(seq)} must be equal to num_token={num_token}"
@@ -863,27 +863,28 @@ def plan_ahead_for_ilp_planner(num_tokens: list[int], batch_sizes_list: list[lis
                     seq_lens_1 = [seq for seqlist in original_seq_lens_1 for seq in seqlist]
                     # Origin Item for ILP.
                     _items_0 = [Item(model_config, seq_lens_0[i], i, -1, -1, {'q': seq_lens_0[i], 'kv': seq_lens_0[i]}) for i in range(len(seq_lens_0))]
-                    _items_1 = [Item(model_config, seq_lens_1[i], i, -1, -1, {'q': seq_lens_1[i], 'kv': seq_lens_1[i]}) for i in range(len(original_seq_lens_1))]
+                    _items_1 = [Item(model_config, seq_lens_1[i], i, -1, -1, {'q': seq_lens_1[i], 'kv': seq_lens_1[i]}) for i in range(len(seq_lens_1))]
                 
-
                     # Plan items_0. 
                     start_time = time.time()
-                    items_after_ilp_0 = planner.plan_items(_items_0, time_limit=time_limit)
+                    items_after_ilp_0, cp_groups_0 = planner.plan_items(_items_0, time_limit=time_limit)
                     end_time = time.time()
                     items0_time = end_time - start_time
                     # Plan items_1.
                     start_time = time.time()
-                    items_after_ilp_1 = planner.plan_items(_items_1, time_limit=time_limit)
+                    items_after_ilp_1, cp_groups_1 = planner.plan_items(_items_1, time_limit=time_limit)
                     end_time = time.time()
                     items1_time = end_time - start_time
                     rich.print(f"🟡 ILP Planner time: items0_time={items0_time:.4f} seconds, items1_time={items1_time:.4f} seconds")
-
+                    
                     if dump_data:
                         data_to_save = {
                             "seq_lens_0": original_seq_lens_0,
                             "seq_lens_1": original_seq_lens_1,
                             "items_0": _items_0,
                             "items_1": _items_1,
+                            "cp_groups_0": cp_groups_0,
+                            "cp_groups_1": cp_groups_1,
                             "items_after_ilp_0": items_after_ilp_0,
                             "items_after_ilp_1": items_after_ilp_1,
                             "time_limit": time_limit,
@@ -920,7 +921,7 @@ def load_plan_ahead_data(sample_name: str, num_token: int, batch_size: int, worl
 
 
 def test_pre_plan_for_ilp_planner():
-    rich.print("🟡 Testing all ILP plan ahead data...")
+    rich.print("🟡 Plan ahead for ILP planner...")
     K = 1024
     num_sample = 15
     num_tokens = [
@@ -959,7 +960,8 @@ def test_pre_plan_for_ilp_planner():
 
 def load_and_simulate_ilp_plan_ahead_data(num_tokens: list[int], batch_sizes_list: list[list[int]], world_sizes_list: list[list[int]], num_sample: int=30, time_limits: list[int]=[60], sample_name: str="wlbllm"):
     rich.print("🟡 Testing all ILP plan ahead data...")
-
+    import os
+    from pathlib import Path
     def check_ilp_items(items: list[Item], as_world_size: int):
         gpuid_set = set()
         for item in items:
@@ -994,14 +996,34 @@ def load_and_simulate_ilp_plan_ahead_data(num_tokens: list[int], batch_sizes_lis
                         continue
                     items_after_ilp_0 = data['items_after_ilp_0']
                     items_after_ilp_1 = data['items_after_ilp_1']
+                    seq_lens_0 = data['seq_lens_0']
+                    seq_lens_1 = data['seq_lens_1']
                     # post check for planned items. Each rank should have at least one doc.
                     as_world_size = world_size // tp_size
+
                     if not check_ilp_items(items_after_ilp_0, as_world_size) or not check_ilp_items(items_after_ilp_1, as_world_size):
+                        # delete the file
+                        # current_script_dir = Path(__file__).parent
+                        # project_root = current_script_dir.parent
+                        # base_dir = project_root / "tests" / "ilp_plan_ahead"
+                        # curr_dir = os.path.join(base_dir, f"{sample_name}_num_token={num_token}_batch_size={batch_size}_world_size={world_size}_time_limit={time_limit}")
+                        # filepath = os.path.join(curr_dir, f"sample_idx{sample_idx}.pkl")
+                        # os.remove(filepath)
+                        # rich.print(f"🟡 Deleted file: {filepath}")
                         continue
                     planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
                     resend_qkv = True
                     fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan_with_plan_ahead(items_after_ilp_0, is_resend_qkv=resend_qkv, device="cpu")
                     fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan_with_plan_ahead(items_after_ilp_1, is_resend_qkv=resend_qkv, device="cpu")
+                    # Sum along the last dimension for each tensor
+                    token_per_rank_0 = [0] * as_world_size
+                    token_per_rank_1 = [0] * as_world_size
+                    for i in range(len(mlp_shard_len_0)):
+                        token_per_rank_0[i] = mlp_shard_len_0[i].sum(dim=-1).item()
+                    for i in range(len(mlp_shard_len_1)):
+                        token_per_rank_1[i] = mlp_shard_len_1[i].sum(dim=-1).item()
+                    rich.print(f"🟡 token_per_rank_0={token_per_rank_0}")
+                    rich.print(f"🟡 token_per_rank_1={token_per_rank_1}")
                     rich.print(f"🟡 Passed sample_name={sample_name}, num_token={num_token}, batch_size={batch_size}, world_size={world_size}, time_limit={time_limit}, sample_index={sample_idx}")
     return
 
@@ -1052,7 +1074,6 @@ if __name__ == "__main__":
         test_pre_plan_for_ilp_planner()
         exit()
     if args.load_ilp:
-        test_load_plan_ahead_data()
         test_all_ilp_plan_ahead_data()
         exit()
     if args.ilp:

@@ -755,7 +755,7 @@ class Planner:
                 item.src_gpuid = cp_group[i]    # in flex sp, mlp layout is similar to attention layout.
                 final_items.append(item)
         
-        return final_items
+        return final_items, cp_groups
     
     def plan_items_greedy(self, items_: list[Item], verbose=False, plot=False) -> list[Item]:
         items = deepcopy(items_)
