@@ -841,14 +841,26 @@ def test(args):
             def flatten(a):
                 return [y for x in a for y in x]
 
+            def recursive_flatten(a):
+                if isinstance(a, list):
+                    return [y for x in a for y in recursive_flatten(x)]
+                else:
+                    return [a]
+
             
             alpha_factor = args.alpha_factor # at max tolerate 2x memory imbalance. This number can go infinite...
-            seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
-                dp_size, dp_rank, total_seq_len, batch_size, _seq_lens, 
-                ENABLE_BALANCED_FLOS_NO_DEFER=True,
-                model_config=hf_config, # TODO: (Refactor) This is a hack to pass the model config to the WLBLLM planner.
-                Lmax=int(total_seq_len * 2 * batch_size // dp_size * alpha_factor),
-            )
+
+            should_wlbllm_perseq_perform_balance = os.environ.get("EXPERIMENT_WLBLLM_PERSEQ_PERFORM_BALANCE", "1") == "1"
+            if should_wlbllm_perseq_perform_balance:
+                seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
+                    dp_size, dp_rank, total_seq_len, batch_size, _seq_lens, 
+                    ENABLE_BALANCED_FLOS_NO_DEFER=True,
+                    model_config=hf_config, # TODO: (Refactor) This is a hack to pass the model config to the WLBLLM planner.
+                    Lmax=int(total_seq_len * 2 * batch_size // dp_size * alpha_factor),
+                )
+            else:
+                seq_lens = new_batch = [recursive_flatten(_seq_lens[dp_rank::dp_size])]
+                pass
             
             # TODO: Estimate and calculate flops imbalance and print it here...
             print(f"🟡 [Rank {rank}] WLBLLM Reordered Batch: new_batch={new_batch}")

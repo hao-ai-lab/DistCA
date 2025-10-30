@@ -1,0 +1,1 @@
+model_size	nodes	num_tokens	ratio	total_batch_size	speedup	dataset	average_duration_d2	best_config_d2	average_duration_wlb_perseq	best_config_wlb_perseq	config_list_wlb_perseq	config_list_d2	linear_speedup	line_id
