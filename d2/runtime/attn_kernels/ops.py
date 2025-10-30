@@ -202,7 +202,8 @@ def sync_if_debug(msg: str):
         print(f"Start sync for {msg}")
         torch.cuda.synchronize()
     try:
-        yield
+        with torch.cuda.nvtx.range(msg):
+            yield
     finally:
         if os.environ.get("EXPERIMENT_SHOULD_SYNC_FAST_A2A_OPS", "0") == "1":
             torch.cuda.synchronize()
@@ -225,6 +226,10 @@ def _ops_fast_a2a_memcpy_non_cp(*args):
 def _ops_fast_a2a_wrapper(*args):
     with sync_if_debug("_ops_fast_a2a_wrapper"):
         return _ops.fast_a2a(*args)
+
+def _ops_fast_a2a_grad_acc(*args):
+    with sync_if_debug("_ops_fast_a2a_grad_acc"):
+        return _ops.fast_a2a_grad_acc(*args)
 
 def a2a_memcpy_cp(
     tensor: torch.Tensor, do_shard: torch.Tensor,
@@ -266,7 +271,7 @@ def pre_a2a_grad_acc(
     When kv has multiple copies, and we accumulates their gradients to the main copy,
     so that we only need to send one gradient back.
     """
-    _ops.fast_a2a_grad_acc(tensor, num_copies, copy_start_id, shard_tokens)
+    _ops_fast_a2a_grad_acc(tensor, num_copies, copy_start_id, shard_tokens)
     return tensor
 
 
@@ -396,7 +401,8 @@ def _fast_a2a_pytorch_mock(
         print(f"[Rank {rank}] 🔄 send_list[{i}] shape: {send_tensor.shape}")
     for i, recv_tensor in enumerate(recv_list):
         print(f"[Rank {rank}] 🔄 recv_list[{i}] shape: {recv_tensor.shape}")
-    torch.distributed.all_to_all(recv_list, send_list, group=group)
+    with torch.cuda.nvtx.range("torch.distributed.all_to_all"):
+        torch.distributed.all_to_all(recv_list, send_list, group=group)
     print(f"[Rank {rank}] 🔄 PyTorch mock A2A communication completed")
     # torch.cuda.synchronize()
     # torch.distributed.barrier()

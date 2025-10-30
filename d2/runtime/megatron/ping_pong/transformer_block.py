@@ -107,16 +107,23 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
 
         # ping_num_tokens = packed_seq_params_0.cu_seqlens_q.max().item()
         # pong_num_tokens = packed_seq_params_1.cu_seqlens_q.max().item()
-        ping_num_tokens, pong_num_tokens = packed_seq_params.ping_pong_num_tokens
+        
+        has_ping_pong_num_tokens = False
+        ping_num_tokens, pong_num_tokens = None, None
+        try:
+            ping_num_tokens, pong_num_tokens = packed_seq_params.ping_pong_num_tokens
+            has_ping_pong_num_tokens = True
+            print(f"🟡 Get {ping_num_tokens = }, {pong_num_tokens = }")
+        except:
+            pass
         
         # When sequence_parallel is enabled, the embedding layer scatters hidden_states
         # across tensor_model_parallel_size ranks, dividing the sequence length.
         # We need to adjust ping/pong token counts to match the scattered tensor size.
-        if self.config.sequence_parallel:
+        if self.config.sequence_parallel and has_ping_pong_num_tokens:
             ping_num_tokens = ping_num_tokens // self.config.tensor_model_parallel_size
             pong_num_tokens = pong_num_tokens // self.config.tensor_model_parallel_size
-        
-        print(f"🟡 {ping_num_tokens = }, {pong_num_tokens = }")
+            print(f"🟡 Due to sequence_parallel, set {ping_num_tokens = }, {pong_num_tokens = }")
 
         with rng_context, outer_fp8_context:
             # Forward pass.
@@ -138,8 +145,10 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                 for k, v in arg_group.items():
                     print(f"🟡 [arg_group] {k} = {v.shape if v is not None else None}")
                 # TODO: Make the var len tensors implementation here.
-                # arg_group_0, arg_group_1 = split_all_dict(arg_group, 2)
-                arg_group_0, arg_group_1 = split_all_dict_with_num_tokens(arg_group, [ping_num_tokens, pong_num_tokens])
+                if not has_ping_pong_num_tokens:
+                    arg_group_0, arg_group_1 = split_all_dict(arg_group, 2)
+                else:
+                    arg_group_0, arg_group_1 = split_all_dict_with_num_tokens(arg_group, [ping_num_tokens, pong_num_tokens])
                 del arg_group
 
                 arg_group_0["packed_seq_params"] = packed_seq_params_0

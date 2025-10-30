@@ -221,6 +221,8 @@ class MegatronE2eWorker(MegatronBaseWorker):
         if self.rank == 0:
             print(f"Model config after override: {hf_config}")
         tf_config = hf_to_mcore_config(hf_config, dtype, **override_transformer_config)
+        
+        tf_config.sequence_parallel = os.environ.get("EXPERIMENT_SET_SEQUENCE_PARALLEL", "1") == "1"
 
         def add_optimization_config_to_tf_config(tf_config):
             # add optimization config to tf_config, e.g. checkpointing
@@ -260,8 +262,14 @@ class MegatronE2eWorker(MegatronBaseWorker):
         forward_backward_func = get_forward_backward_func()
         n_micro_batch = len(microbatches)
         # thd layout
-        # total_seqlen = microbatches[0]['input_ids'].shape[0]
-        total_seqlen = sum(microbatches[0]['packed_seq_params'].ping_pong_num_tokens)
+        total_seqlen = microbatches[0]['input_ids'].shape[0]
+        try:
+            total_seqlen = sum(microbatches[0]['packed_seq_params'].ping_pong_num_tokens)
+        except:
+            pass
+        print(f"🟡 [Rank {self.rank}] n_micro_batch = {n_micro_batch}")
+        for mb in microbatches:
+            print(f"🟡 [Rank {self.rank}] mb['input_ids'].shape = {mb['input_ids'].shape}")
         print(f"🟡 [Rank {self.rank}] total_seqlen = {total_seqlen}")
 
         # from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
@@ -1412,13 +1420,15 @@ def test(args):
             rich.print(f"🟡 [Rank {rank}] seq_lens_1 = {seq_lens_1}")
             
             # load_from_plan_ahead = False
-            load_from_plan_ahead = True
+            load_from_plan_ahead = os.environ.get("EXPERIMENT_LOAD_FROM_PLAN_AHEAD", "0") == "1"
             if load_from_plan_ahead:
                 from test_planner import load_plan_ahead_data
                 rich.print(f"🟡 Sample {sample_id} is loading plan ahead data...")
                 # sample_name = "wlbllm"
                 sample_name = args.sample_name
-                time_limit = 60
+                # time_limit = 60
+                time_limit = os.environ.get("EXPERIMENT_ILP_TIME_LIMIT", "5") # seconds
+                time_limit = int(time_limit)
                 total_batch_size = batch_size * 2
                 num_token = total_seq_len
                 planned_ahead_data = load_plan_ahead_data(sample_name, num_token, total_batch_size, world_size, time_limit, sample_id)
@@ -1469,8 +1479,6 @@ def test(args):
                 print(f"🟡 [Rank {rank}] hidden_size_q_tp = {hidden_size_q_tp}, hidden_size_k_tp = {hidden_size_k_tp}, element_size = {element_size}")
 
                 
-                
-
                 # Origin Item for ILP.
                 flat_seq_lens_0 = [length for batch in seq_lens_0 for length in (batch if isinstance(batch, list) else [batch])]
                 flat_seq_lens_1 = [length for batch in seq_lens_1 for length in (batch if isinstance(batch, list) else [batch])]
@@ -1484,9 +1492,33 @@ def test(args):
                 # tolerance_factor already initialized at the start of ILP branch
                 planner = Planner(world_size, parallel_config, model_config=model_config, planner_type = "ilp")
                 
-                time_limit = 5 # seconds
-                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0, planned_items_0 = planner.plan(_items_0, time_limit=time_limit, is_resend_qkv=resend_qkv, verbose=verbose, return_items=True)
-                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1, planned_items_1 = planner.plan(_items_1, time_limit=time_limit, is_resend_qkv=resend_qkv, verbose=verbose, return_items=True)
+                time_limit = os.environ.get("EXPERIMENT_ILP_TIME_LIMIT", "5") # seconds
+                time_limit = int(time_limit)
+                if rank == 0:
+                    fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0, planned_items_0 = planner.plan(_items_0, time_limit=time_limit, is_resend_qkv=resend_qkv, verbose=verbose, return_items=True)
+                    fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1, planned_items_1 = planner.plan(_items_1, time_limit=time_limit, is_resend_qkv=resend_qkv, verbose=verbose, return_items=True)
+                else:
+                    pass
+                torch.distributed.barrier()
+                # Broadcast the solution from rank 0 to all other ranks.
+                if rank != 0:
+                    fa2a_metadata_0 = None
+                    as_attn_metadata_0 = None
+                    mlp_shard_len_0 = None
+                    planned_items_0 = None
+                    fa2a_metadata_1 = None
+                    as_attn_metadata_1 = None
+                    mlp_shard_len_1 = None
+                    planned_items_1 = None
+                _broadcast_list = [
+                    fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0, planned_items_0,
+                    fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1, planned_items_1,
+                ]
+                torch.distributed.broadcast_object_list(_broadcast_list, src=0)
+                (
+                    fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0, planned_items_0,
+                    fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1, planned_items_1,
+                ) = _broadcast_list
 
                 # print(f"🟡 [Rank {rank}] mlp_shard_len_0 = {mlp_shard_len_0}")
                 # print(f"🟡 [Rank {rank}] mlp_shard_len_1 = {mlp_shard_len_1}")
