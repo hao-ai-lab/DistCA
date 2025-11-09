@@ -121,6 +121,20 @@ def log_memory_usage_context():
     yield
     os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = old_env_var
 
+
+def dump_tensor(tensor, name: str, msg:str=None):
+    tensor_dump_dir = os.environ.get("TENSOR_DUMP_DIR", None)
+    tensor_dump_suffix = os.environ.get("TENSOR_DUMP_SUFFIX", None)
+    if not torch.isfinite(tensor).all():
+        print(f"🔴 {msg}: Non-finite values detected.")
+    else:
+        print(f"🟢 {msg}: No non-finite values detected.")
+        pass
+    if tensor_dump_dir is not None and tensor_dump_suffix is not None:
+        torch.save(tensor.cpu(), os.path.join(tensor_dump_dir, f"{name}.{tensor_dump_suffix}.pt"))
+        print(f"🟡 Dumped tensor to {os.path.join(tensor_dump_dir, f"{name}.{tensor_dump_suffix}.pt")}")
+    return
+
 class MegatronE2eWorker(MegatronBaseWorker):
     def __init__(self, rank: int, world_size: int):
         super().__init__(rank, world_size)
@@ -255,7 +269,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
         # thd layout
         total_seqlen = microbatches[0]['input_ids'].shape[0]
 
-        # from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+        from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
         def loss_func(logits):
             loss = logits.sum()  # no gradient, but can trigger backward
             # Print the memory usage here
@@ -273,7 +287,23 @@ class MegatronE2eWorker(MegatronBaseWorker):
             output = gptmodel_forward(
                 model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel, packed_seq_params
             )
-            return output, loss_func
+            # Build next-token labels (shifted by 1, ignore the last token)
+            labels = input_ids.clone()
+            labels[:-1] = input_ids[1:]
+            labels[-1] = -100
+
+            def loss_func_ce(logits, _labels=labels):
+                dump_tensor(logits, f"nonfinite_output.rank{self.rank}", msg="before loss_func_ce")
+                ce = vocab_parallel_cross_entropy(logits.contiguous(), _labels)
+                dump_tensor(ce, f"nonfinite_ce.rank{self.rank}", msg="after loss_func_ce")
+                loss_mask = (_labels != -100).float()
+                denom = loss_mask.sum().clamp(min=1.0)
+                loss = (ce * loss_mask).sum() / denom
+                log_memory_usage("loss_func")
+                # Dump final scalar loss
+                dump_tensor(loss, f"loss.rank{self.rank}", msg="after normalized loss")
+                return loss, {'loss': loss}
+            return output, loss_func_ce
 
         batch_generator = make_batch_generator(microbatches, vpp_size=len(self.train_module))
         if mpu.get_pipeline_model_parallel_world_size() > 1:
