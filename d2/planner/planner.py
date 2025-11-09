@@ -602,6 +602,7 @@ class Planner:
         planned_items: list[Item] = self.plan_items(items_, time_limit, verbose, plot)
         # After ILP planner, source gpu id should equals to the doc's gpuid.
         if self.planner_type == "ilp":
+            planned_items, cp_groups = planned_items 
             assert all(item.src_gpuid == item.gpuid for item in planned_items), "After ILP planner, source gpu id should equals to the doc's gpuid. But got {item.src_gpuid} != {item.gpuid} for item {item}."
             mlp_shard_len = self.items_to_mlp_doc_len(planned_items, device)
         planned_items: list[dict] = self.postprocess_items(planned_items) 

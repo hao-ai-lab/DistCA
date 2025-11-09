@@ -37,7 +37,7 @@ DRY_RUN=${DRY_RUN:-0}
 export ENABLE_NSYS=0
 export MAX_SAMPLE_ID=3
 
-export OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251029_flexsp/logs.v1-8B-nsys"
+export OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks3/_251103_correctnes/logs.v1"
 
 # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
 # "astronomer/Llama-3-70B-Special-Tokens-Adjusted 170000 80" \
@@ -46,6 +46,9 @@ for model_config in \
 ; do
 
 configs=(
+# N = 1
+#    s r b   tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
+    "1 1 1 32768  1  1  d2     1   8   prolong      0.3"
 # N = 8
 #      s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
     # "1 1 4 131072  2  8  d2     8   8   prolong      0.3"
@@ -61,8 +64,8 @@ configs=(
 # N = 32
 #      s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
     # "1 1 16 131072  2 32  d2     32   8  prolong      0.3"
-    "1 1 8 262144  4 32  d2     32   8   prolong      0.3"
-    "1 1 4 524288  8 32  d2     32   8   prolong      0.3"
+    # "1 1 8 262144  4 32  d2     32   8   prolong      0.3"
+    # "1 1 4 524288  8 32  d2     32   8   prolong      0.3"
 
 )
 
@@ -93,48 +96,21 @@ for config in "${configs[@]}"; do
 
     export OUTPUT_DIR_SUFFIX_ADDON="-${mode}-nsys-${sample_name}"
     
-    if [ "$mode" == "d2" ]; then
-        # Run d2 mode with all on
-        export MODE=d2
-        # export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=$buffer_size
-        echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-        if [ $DRY_RUN -eq 0 ]; then
-            bash test_e2e_combined.salloc.sh
-            echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-            echo "\a"
-        fi
-    fi
-
-
-    if [ "$mode" == "ilp" ]; then
-        export MODE=ilp
-        echo "🟡 Running ilp with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-        if [ $DRY_RUN -eq 0 ]; then
-            bash test_e2e_combined.salloc.sh
-            echo "🟡 Finished running ilp with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-            echo "\a"
-        fi
+    if [ "$mode" != "d2" ]; then
+        echo "Error: mode must be d2, got: $mode"
+        exit 1
     fi
     
-    
-    
-    # for CP_SIZE in 32 16 8 4 2 1; do
-    if [ "$mode" == "wlbllm" ] || [ "$mode" == "wlbllm_perseq" ]; then
-        # Run wlbllm mode with different CP sizes
-        DP_SIZE=$((NNODES / CP_SIZE))
-        if [ $DP_SIZE -gt $(($BATCH_SIZE * 2)) ]; then
-            continue
-        fi
-
-        export MODE=$mode
-        export OUTPUT_DIR_SUFFIX_ADDON="-${MODEL_PATH_NORMALIZED}-${sample_name}"
-        echo "🟡 Running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
-        if [ $DRY_RUN -eq 0 ]; then
-            bash test_e2e_combined.salloc.sh
-            echo "🟡 Finished running wlbllm with CP_SIZE=$CP_SIZE, DP_SIZE=$DP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
-            echo "\a"
-        fi
+    # Run d2 mode with all on
+    export MODE=d2
+    # export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=$buffer_size
+    echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR"
+    if [ $DRY_RUN -eq 0 ]; then
+        bash test_correctness_dpcp_e2e.salloc.sh
+        echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR. Not guaranteed to be successful."
+        echo "\a"
     fi
+
 
 
 done

@@ -16,18 +16,18 @@ export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=0
 
 # torch: avoid recording streams 
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=1
+export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=0.25
 
 # Control how many GPUs per node we should use.
 export GPUS_PER_NODE=8
 # Control if we should use srun.
 export EXPERIMENT_NO_SRUN=0
 export EXPERIMENT_USE_PYTORCH_A2A=1
-export EXPERIMENT_LOAD_FROM_PLAN_AHEAD=0
-# export EXPERIMENT_ILP_TIME_LIMIT=300
+export EXPERIMENT_LOAD_FROM_PLAN_AHEAD=1
 # export EXPERIMENT_ILP_TIME_LIMIT=10
-# export EXPERIMENT_ILP_TIME_LIMIT=60
-export EXPERIMENT_ILP_TIME_LIMIT=300
+export EXPERIMENT_ILP_TIME_LIMIT=60
+# export EXPERIMENT_ILP_TIME_LIMIT=300
+# export EXPERIMENT_ILP_TIME_LIMIT=300
 export D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE=1
 export EXPERIMENT_SET_SEQUENCE_PARALLEL=0
 
@@ -38,47 +38,48 @@ DRY_RUN=${DRY_RUN:-0}
 # ------------------------------------
 
 export ENABLE_NSYS=0
-export MAX_SAMPLE_ID=1
+export MAX_SAMPLE_ID=3
 
-export OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251029_flexsp/logs.v2-34B-nsys"
+export OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251029_flexsp/logs.v2-8B-nsys"
 
 # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
 # "astronomer/Llama-3-70B-Special-Tokens-Adjusted 170000 80" \
-# "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
 for model_config in \
-"codellama/CodeLlama-34b-hf 131072 48" \
+"deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
 ; do
 
 configs=(
+
+    # "1 1 1  32768  2  2  ilp     2   8   prolong      0.3"
+    
 # N = 8
 #      s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
-    # "1 1 2 131072  2  8  ilp     8   8   wlbllm       0.0"
-    # "1 1 1 262144  4  8  ilp     8   8   wlbllm       0.0"
+    # "1 1 4 131072  2  8  ilp     8   8   wlbllm       0.0"
+    # "1 1 2 262144  4  8  ilp     8   8   wlbllm       0.0"
     # "1 1 1 524288  8  8  ilp     8   8   wlbllm       0.0"
 
-    # "1 1 2 131072  2  8  ilp     8   8   prolong      0.3"
-    # "1 1 1 262144  4  8  ilp     8   8   prolong      0.3"
+    # "1 1 4 131072  2  8  ilp     8   8   prolong      0.3"
+    # "1 1 2 262144  4  8  ilp     8   8   prolong      0.3"
     # "1 1 1 524288  8  8  ilp     8   8   prolong      0.3"
-
+    
 # N = 16
-#      s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
-    # "1 1 4 131072  2 16  ilp     16  8   wlbllm       0.0"
-    # "1 1 2 262144  4 16  ilp     16  8   wlbllm       0.0"
-    # "1 1 1 524288  8 16  ilp     16  8   wlbllm       0.0"
-
-    # "1 1 4 131072  2 16  ilp     16  8   prolong      0.3"
-    "1 1 2 262144  4 16  ilp     16  8   prolong      0.3"
-    "1 1 1 524288  8 16  ilp     16  8   prolong      0.3"
+#     s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
+    # "1 1 8 131072  2 16  ilp     16   8  prolong      0.3"
+    # "1 1 8 131072  2 16  ilp     16   8  wlbllm      0.0"
+    "1 1 4 262144  4 16  ilp     16   8  prolong      0.3"
+    # "1 1 4 262144  4 16  ilp     16   8  wlbllm       0.0"
+    "1 1 2 524288  8 16  ilp     16   8  prolong      0.3"
+    # "1 1 2 524288  8 16  ilp     16   8  wlbllm       0.0"
     
 # N = 32
-#      s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
-    # "1 1 8 131072  2 32  ilp     32  8   wlbllm       0.0"
-    "1 1 4 262144  4 32  ilp     32  8   wlbllm       0.0"
-    "1 1 4 524288  8 32  ilp     32  8   wlbllm       0.0"
+#     s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
+    # "1 1 16 131072  2 32  ilp     32   8  prolong      0.3"
+    # "1 1 16 131072  2 32  ilp     32   8  wlbllm      0.0"
+    "1 1 8 262144  4 32  ilp     32   8  prolong      0.3"
+    "1 1 8 262144  4 32  ilp     32   8  wlbllm       0.0"
+    "1 1 4 524288  8 32  ilp     32   8  prolong      0.3"
+    # "1 1 4 524288  8 32  ilp     32   8  wlbllm       0.0"
 
-    # "1 1 8 131072  2 32  ilp     32  8   prolong      0.3"
-    "1 1 4 262144  4 32  ilp     32  8   prolong      0.3"
-    "1 1 4 524288  8 32  ilp     32  8   prolong      0.3"
 )
 
 

@@ -40,13 +40,7 @@ DRY_RUN=${DRY_RUN:-0}
 export ENABLE_NSYS=0
 export MAX_SAMPLE_ID=1
 
-export OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251029_flexsp/logs.v1-34B-nsys"
-
-# Run one d2 + one wlbllm-cpMax to justify the result.
-for sample_config in \
-"wlbllm 0.0" \
-"prolong 0.3" \
-; do
+export OUTPUT_DIR_PREFIX="/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks2/_251029_flexsp/logs.v2-34B-nsys"
 
 # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
 # "astronomer/Llama-3-70B-Special-Tokens-Adjusted 170000 80" \
@@ -55,24 +49,36 @@ for model_config in \
 "codellama/CodeLlama-34b-hf 131072 48" \
 ; do
 
-#    s r b    tok  e  N  mode    cp   tp
 configs=(
 # N = 8
-    "1 1 2 131072  2  8  ilp     8   8"
-    "1 1 1 262144  4  8  ilp     8   8"
-    "1 1 1 524288  8  8  ilp     8   8"
+#      s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
+    # "1 1 2 131072  2  8  ilp     8   8   wlbllm       0.0"
+    # "1 1 1 262144  4  8  ilp     8   8   wlbllm       0.0"
+    # "1 1 1 524288  8  8  ilp     8   8   wlbllm       0.0"
+
+    # "1 1 2 131072  2  8  ilp     8   8   prolong      0.3"
+    # "1 1 1 262144  4  8  ilp     8   8   prolong      0.3"
+    # "1 1 1 524288  8  8  ilp     8   8   prolong      0.3"
 
 # N = 16
-    "1 1 4 131072  2 16  ilp     16  8"
-    "1 1 2 262144  4 16  ilp     16  8"
-    "1 1 1 524288  8 16  ilp     16  8"
+#      s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
+    # "1 1 4 131072  2 16  ilp     16  8   wlbllm       0.0"
+    # "1 1 2 262144  4 16  ilp     16  8   wlbllm       0.0"
+    # "1 1 1 524288  8 16  ilp     16  8   wlbllm       0.0"
+
+    # "1 1 4 131072  2 16  ilp     16  8   prolong      0.3"
+    "1 1 2 262144  4 16  ilp     16  8   prolong      0.3"
+    "1 1 1 524288  8 16  ilp     16  8   prolong      0.3"
     
-    # N = 32
-    "1 1 8 131072  2 32  ilp     32  8"
-    "1 1 4 262144  4 32  ilp     32  8"
-    "1 1 4 524288  8 32  ilp     32  8"
+# N = 32
+#      s r b    tok  e  N  mode   cp   tp  sample_name  change_long_doc_ratio
+    # "1 1 8 131072  2 32  ilp     32  8   wlbllm       0.0"
+    "1 1 4 262144  4 32  ilp     32  8   wlbllm       0.0"
+    "1 1 4 524288  8 32  ilp     32  8   wlbllm       0.0"
 
-
+    # "1 1 8 131072  2 32  ilp     32  8   prolong      0.3"
+    "1 1 4 262144  4 32  ilp     32  8   prolong      0.3"
+    "1 1 4 524288  8 32  ilp     32  8   prolong      0.3"
 )
 
 
@@ -82,8 +88,7 @@ export WLBLLM_ENABLE_SHUFFLE=0
 
 
 for config in "${configs[@]}"; do
-    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes mode cp_size tp_size <<< "$config"
-    read -r sample_name change_long_doc_ratio <<< "$sample_config"
+    read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes mode cp_size tp_size sample_name change_long_doc_ratio <<< "$config"
     read -r model_path attn_linear_breakpoint num_layers <<< "$model_config"
     
     export EXPERIMENT_ADD_SELECTIVE_CKPT=$selective_ckpt
@@ -146,7 +151,6 @@ for config in "${configs[@]}"; do
     fi
 
 
-done
 done
 done
 
