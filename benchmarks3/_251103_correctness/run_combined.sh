@@ -34,7 +34,7 @@ export EXPERIMENT_REPEAT_TIMES=1
 export EXPERIMENT_WARMUP_TIMES=1
 export EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND=1 # default 1
 export SHOULD_ADD_DEBUG_CASES=0
-export EXPERIMENT_SKIP_OPTIMIZER_STEP=1
+export EXPERIMENT_SKIP_OPTIMIZER_STEP=0
 export EXPERIMENT_FA2A_BARRIER=0
 export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=0
 # export EXPERIMENT_FA2A_BARRIER=1
@@ -72,8 +72,10 @@ for sample_config in \
 # "astronomer/Llama-3-70B-Special-Tokens-Adjusted 170000 80" \
 # "codellama/CodeLlama-34b-hf 131072 48" \
 # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
+# meta-llama/Llama-3.2-1B
+# "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 16" \
 for model_config in \
-"deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 16" \
+"meta-llama/Llama-3.2-1B 64000 16" \
 ; do
 
 
@@ -87,7 +89,7 @@ for model_config in \
 
 # selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes
 for config in \
-    "1 1 1 32768 2 1" \
+    "1 1 1 32768 2 2" \
     ; do
 
 
@@ -113,58 +115,10 @@ for config in \
     export MIN_TOLERANCE_FACTOR=$tolerance_factor
     export OUTPUT_DIR_SUFFIX_ADDON="-tol${tolerance_factor}"
     eid="d2-cp1-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}-tol${tolerance_factor}"
-    echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
-    bash test_e2e_combined.salloc.sh
+    echo "🟡 Running d2 with TP_SIZE=$TP_SIZE, NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
+    bash training_3d.sh
     echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
     echo "\a"
-
-#    1. Signal Communication for non-PP (EST: 1hr for fig, 1hr for text?) (no need for extra coding. Experiment est: 1hr)
-#       1. Only run one model, only one or two #nodes to speedup experiment
-#    2. Non-PingPong (use one stream for compute and comm) (EST: 1hr for fig, 1hr for text?) (no need for extra coding. Experiment est: 1hr)
-#       1. Same as above.
-#    3. Modifying scheduler's tolerance factor for non-PP (EST: 1hr for fig, 1hr for text?) (no need for extra coding. Experiment est: 
-    
-    # # Run d2 with signal only
-    # export MODE=d2
-    # export MIN_TOLERANCE_FACTOR=0.05
-    # export OUTPUT_DIR_SUFFIX_ADDON="-signal"
-    # export EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=1 # <- set to 1 to enable signal-only communication
-    # echo "🟡 Running d2-signal with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
-    # if [ $DRY_RUN -eq 0 ]; then
-    #     bash test_e2e_combined.salloc.sh
-    #     echo "🟡 Finished running d2-signal with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
-    #     echo "\a"
-    # fi
-    # unset MIN_TOLERANCE_FACTOR
-        
-
-    # # Run d2 with same comm and compute stream
-    # export MODE=d2
-    # export MIN_TOLERANCE_FACTOR=0.05
-    # export D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE=1
-    # export OUTPUT_DIR_SUFFIX_ADDON="-single-stream"
-    # echo "🟡 Running d2-onestream with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
-    # if [ $DRY_RUN -eq 0 ]; then
-    #     bash test_e2e_combined.salloc.sh
-    #     echo "🟡 Finished running d2-onestream with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
-    #     echo "\a"
-    # fi
-    # unset D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE
-
-    # Run d2 with sweeping some tolerance factors
-    # for tolerance_factor in 0.05 0.2 0.5 0.8 1.0; do
-    #     export MODE=d2
-    #     export MIN_TOLERANCE_FACTOR=$tolerance_factor
-    #     export OUTPUT_DIR_SUFFIX_ADDON="-tol${tolerance_factor}"
-    #     eid="d2-cp1-n${NNODES}-b${BATCH_SIZE}-t${NUM_TOKENS}-tol${tolerance_factor}"
-    #     echo "🟡 Running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR"
-    #     if [ $DRY_RUN -eq 0 ]; then
-    #         bash test_e2e_combined.salloc.sh
-    #         echo "🟡 Finished running d2 with NNODES=$NNODES, JOBID=$JOBID, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, ELONGATE_FACTOR=$ELONGATE_FACTOR, MIN_TOLERANCE_FACTOR=$MIN_TOLERANCE_FACTOR. Not guaranteed to be successful."
-    #         echo "\a"
-    #     fi
-    # done
-
 
 done
 done

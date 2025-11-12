@@ -27,7 +27,7 @@ export TENSOR_DUMP_SUFFIX=
 
 
 # ⚪ Ready
-export JOBID=1007962
-export HEAD_NODE_IP=fs-mbz-gpu-765
-export TP_SIZE=1
+export JOBID=1011962
+export HEAD_NODE_IP=fs-mbz-gpu-788
+export TP_SIZE=2
 bash /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks3/_251103_correctness/run_combined.sh
