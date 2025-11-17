@@ -12,7 +12,6 @@ bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
 """
 
-
 import time
 start_time__ = time.time()
 
@@ -49,6 +48,7 @@ import signal
 import traceback
 import sys
 from contextlib import contextmanager
+import numpy as np
 
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
@@ -61,6 +61,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 from d2.runtime.attn_kernels.ops import DispatcherWrapper
 from d2.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
 from d2.runtime.compute_metadata import get_attn_metadata
+from d2.runtime.megatron.ops.stream_sync_fn import TickSync
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
 from test_pingpong_layer import get_single_step_packed_seq_params
@@ -75,6 +76,10 @@ from d2.planner.planner import (
     Planner,
     Item,
 )
+
+
+from d2.utils.traceback import enable_clickable_excepthook, enable_trace_calls
+enable_clickable_excepthook()
 
 
 def timeout_handler(signum, frame):
@@ -530,10 +535,17 @@ def setup_global_batch(
 
     if should_add_debug_cases:
         GLOBAL_BATCH = list(GLOBAL_BATCH)
+        # manual_case = [
+        #     [total_seq_len],
+        #     # [total_seq_len // 32] * 32
+        # ] * 128
         manual_case = [
-            [total_seq_len],
-            # [total_seq_len // 32] * 32
-        ] * 16
+            [total_seq_len // 2, ] + [total_seq_len // 32] * 16,
+        ] + [
+            # [total_seq_len // 2] * 2,
+            # [total_seq_len // 4] * 4,
+            [total_seq_len // 32] * 32,
+        ] * 128
         GLOBAL_BATCH = manual_case + GLOBAL_BATCH
         GLOBAL_BATCH = iter(GLOBAL_BATCH)
     return
@@ -599,6 +611,7 @@ def test(args):
     should_add_debug_cases = args.should_add_debug_cases
     resend_qkv = args.should_resend_qkv
     sample_start_idx = args.sample_start_idx
+    alpha_factor = args.alpha_factor
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
@@ -612,8 +625,33 @@ def test(args):
     normal_forward_fn = (mode in ["baseline", "wlbllm"])
     # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
     os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
+    
+    # Setup unified attention timing collection for both WLBLLM and D2 modes
+    if os.getenv("UNIFIED_RECORD_ATTENTION_TIMES", "0") == "1":
+        setup_unified_attention_timing_patch()
+        print(f"🟡 Unified attention timing collection setup. This may impact the performance, but recording the attention timing.")
+    
+    # Setup unified all-to-all timing collection for both WLBLLM and D2 modes
+    if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
+        setup_unified_a2a_timing_patch()
+        print(f"🟡 Unified all-to-all timing collection setup. This may impact the performance, but recording the all-to-all timing.")
+    
+    # Setup tick operations timing collection
+    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+        from d2.runtime.megatron.ping_pong.tick_ops import setup_tick_timing
+        setup_tick_timing()
+        print(f"🟡 Unified tick operations timing collection setup. This may impact the performance, but recording the tick operations timing.")
+    
+    # Setup TickSync blocking detection
+    if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
+        threshold_ms = float(os.getenv("D2_TICKSYNC_THRESHOLD_MS", "1.0"))
+        TickSync.enable_blocking_detection(enabled=True, threshold_ms=threshold_ms)
+        print(f"🟡 TickSync blocking detection enabled with threshold {threshold_ms}ms")
+    
+    memory_log_output_dir = os.path.join(output_dir, "mem-log")
+    enable_memory_usage_logging(memory_log_output_dir)
 
-
+    log_memory_usage("enter test", force=True)
     
     def write_status_log(message):
         # get the caller's file and line number
@@ -677,9 +715,7 @@ def test(args):
         )
 
     write_status_log(f"Finish init worker")
-
-    memory_log_output_dir = os.path.join(output_dir, "mem-log")
-    enable_memory_usage_logging(memory_log_output_dir)
+    log_memory_usage("init worker object done", force=True)
 
     enable_gradient_checkpointing = False
     gradient_checkpointing_kwargs = {}
@@ -699,7 +735,7 @@ def test(args):
     )
     worker.init(model_path, seed=seed)
     print(f"🟡 [Rank {worker.rank}] init done")
-    log_memory_usage("init done")
+    log_memory_usage("init done", force=True)
     write_status_log(f"Finish worker.init()")
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
@@ -738,6 +774,14 @@ def test(args):
 
     sample_times = []
     for sample_id in range(sample_start_idx, max_sample_id):
+        # Set current sample ID for unified timing collection
+        if os.getenv("UNIFIED_RECORD_ATTENTION_TIMES", "0") == "1":
+            set_unified_current_sample_id(sample_id)
+        if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
+            set_unified_current_a2a_sample_id(sample_id)
+        if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+            from d2.runtime.megatron.ping_pong.tick_ops import set_current_tick_sample_id
+            set_current_tick_sample_id(sample_id)
         if mode == "baseline":
             try:
                 # TOOD: This should be batch_size * 2
@@ -798,14 +842,29 @@ def test(args):
                 return [y for x in a for y in x]
 
             
+            alpha_factor = args.alpha_factor # at max tolerate 2x memory imbalance. This number can go infinite...
             seq_lens, new_batch = d2.planner.wlb_planner.balance_data_for_wlbllm(
                 dp_size, dp_rank, total_seq_len, batch_size, _seq_lens, 
                 ENABLE_BALANCED_FLOS_NO_DEFER=True,
                 model_config=hf_config, # TODO: (Refactor) This is a hack to pass the model config to the WLBLLM planner.
+                Lmax=int(total_seq_len * 2 * batch_size // dp_size * alpha_factor),
             )
             
             # TODO: Estimate and calculate flops imbalance and print it here...
             print(f"🟡 [Rank {rank}] WLBLLM Reordered Batch: new_batch={new_batch}")
+            # also calculate the flops 
+            def calc_relative_flops(batches: list[list[int]]):
+                flops_per_batch = [0] * len(batches)
+                for batch_idx, batch in enumerate(batches):
+                    for seq_len in batch:
+                        flops_per_batch[batch_idx] += seq_len ** 2
+                # Now find the min flops per gpu, and everyone divide the min flops per gpu
+                min_flops_per_gpu = min(flops_per_batch)
+                flops_per_batch = [flops / min_flops_per_gpu for flops in flops_per_batch]
+                return flops_per_batch
+            
+            relative_flops_per_batch = calc_relative_flops(new_batch)
+            print(f"🟡 [Rank {rank}] Relative Flops per batch: {relative_flops_per_batch}")
             print(f"🟡 [Rank {rank}] Taking seq_lens={seq_lens}")
 
 
@@ -913,6 +972,11 @@ def test(args):
             wlbllm.registry.set("global_tensor_length", context_length)
             # wlbllm.registry.set("global_tensor_length", (total_seq_len * cp_size * 2))
             wlbllm.registry.set("memcpy_args", wlb_memcpy_args)
+            # Set current sample ID for attention timing
+            wlbllm.registry.set("current_sample_id", sample_id)
+            # Initialize timing for this sample if enabled
+            if os.getenv("WLBLLM_RECORD_ATTENTION_TIMES", "0") == "1":
+                wlbllm.registry.init_attention_timing_for_sample(sample_id)
 
         
         elif mode == "d2":
@@ -939,19 +1003,27 @@ def test(args):
                 break
             
             # Rebalance Ping pong
-            def balance_ping_pong(seq_lens: list[list[int]]) -> list[list[int]]:
-                # [1k x 4 ], [2k x 2 ], [4k] ...
-                # taking a list of batch, and interleave them by sorted workload.
-                sorted_attn_workload = sorted(seq_lens, key=lambda x: sum(y ** 2 for y in x))
-                ping = []
-                pong = []
-                for batch in sorted_attn_workload:
-                    if len(ping) < len(pong):
+            def balance_ping_pong(seq_lens: list[list[int]]) -> tuple[list[list[int]], list[list[int]]]:
+                def batch_flops(batch):
+                    return sum(y ** 2 // 2 for y in batch)
+
+                assert len(seq_lens) % 2 == 0, f"ping pong should have even number of batches, but got {len(seq_lens)} batches, seq_lens={seq_lens}"
+                sorted_batches = sorted(seq_lens, key=batch_flops, reverse=True)
+                ping, pong = [], []
+                ping_flops, pong_flops = 0, 0
+                avg_num_batches = len(seq_lens) // 2
+
+                for batch in sorted_batches:
+                    if (ping_flops <= pong_flops and len(ping) < avg_num_batches) or len(pong) >= avg_num_batches:
                         ping.append(batch)
+                        ping_flops += batch_flops(batch)
                     else:
                         pong.append(batch)
-                assert len(ping) == len(pong)
+                        pong_flops += batch_flops(batch)
+
+                assert len(ping) == len(pong) == avg_num_batches, f"ping batches={ping}, pong batches={pong}"
                 return ping, pong
+
                 
             rich.print(f"🟡 [Rank {rank}] _seq_lens = {_seq_lens}")
 
@@ -1383,6 +1455,15 @@ def test(args):
         start_time = time.time()
         torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
         
+        
+        should_log_memory_during_real_experiment = (
+            os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_REAL_EXPERIMENT", "0") == "1"
+        )
+        if should_log_memory_during_real_experiment:
+            log_memory_usage_ctx = log_memory_usage_context()
+            log_memory_usage_ctx.__enter__()
+            pass
+        
         for repeat_idx in range(N):
             # start_event = torch.cuda.Event(enable_timing=True)
             # end_event = torch.cuda.Event(enable_timing=True)pr:
@@ -1435,6 +1516,147 @@ def test(args):
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
+        # Log attention timing data for this iteration if unified timing enabled
+        if os.getenv("UNIFIED_RECORD_ATTENTION_TIMES", "0") == "1":
+            # Synchronize and collect timing data from CUDA events
+            sync_and_collect_timing()
+            
+            timing_data = get_unified_attention_times().get(sample_id, {"forward_times": [], "backward_times": []})
+            forward_times = timing_data["forward_times"]
+            backward_times = timing_data["backward_times"]
+            
+            # Calculate medians
+            forward_median = np.median(forward_times) if forward_times else 0.0
+            backward_median = np.median(backward_times) if backward_times else 0.0
+            
+            # Create attn_time directory structure
+            attn_time_dir = os.path.join(output_dir, "attn_time")
+            os.makedirs(attn_time_dir, exist_ok=True)
+            
+            # Log to per-rank JSONL file
+            attn_time_file = os.path.join(attn_time_dir, f"attn_time.rank{rank}.jsonl")
+            iteration_data = {
+                "sample_id": sample_id,
+                "mode": mode,
+                "forward_times": forward_times,
+                "backward_times": backward_times,
+                "forward_median_ms": forward_median,
+                "backward_median_ms": backward_median,
+                "forward_count": len(forward_times),
+                "backward_count": len(backward_times)
+            }
+            
+            with open(attn_time_file, 'a') as f:
+                f.write(json.dumps(iteration_data) + '\n')
+            
+            # Print median times for this iteration
+            if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
+                rich.print(f"🕒 [Sample {sample_id}] {mode.upper()} Attention timing - Forward median: {forward_median:.2f} ms ({len(forward_times)} measurements), Backward median: {backward_median:.2f} ms ({len(backward_times)} measurements)")
+
+        # Log all-to-all timing data for this iteration if unified timing enabled
+        if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
+            # Synchronize and collect timing data from CUDA events
+            sync_and_collect_a2a_timing()
+            
+            timing_data = get_unified_a2a_times().get(sample_id, {"a2a_forward": []})
+            a2a_times = timing_data["a2a_forward"]
+            
+            # Calculate median
+            a2a_median = np.median(a2a_times) if a2a_times else 0.0
+            
+            # Create a2a_time directory structure
+            a2a_time_dir = os.path.join(output_dir, "a2a_time")
+            os.makedirs(a2a_time_dir, exist_ok=True)
+            
+            # Log to per-rank JSONL file
+            a2a_time_file = os.path.join(a2a_time_dir, f"a2a_time.rank{rank}.jsonl")
+            iteration_data = {
+                "sample_id": sample_id,
+                "mode": mode,
+                "a2a_forward_times": a2a_times,
+                "a2a_forward_median_ms": a2a_median,
+                "a2a_forward_count": len(a2a_times)
+            }
+            
+            with open(a2a_time_file, 'a') as f:
+                f.write(json.dumps(iteration_data) + '\n')
+            
+            # Print median times for this iteration
+            if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
+                rich.print(f"🕒 [Sample {sample_id}] {mode.upper()} All-to-All timing - Median: {a2a_median:.2f} ms ({len(a2a_times)} measurements)")
+
+        # Log TickSync blocking events for this iteration if enabled
+        if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
+            # Create ticksync_blocking directory structure    
+            ticksync_blocking_dir = os.path.join(output_dir, "ticksync_blocking")
+            os.makedirs(ticksync_blocking_dir, exist_ok=True)
+            ticksync_blocking_file = os.path.join(ticksync_blocking_dir, f"ticksync_blocking.rank{rank}.jsonl")
+
+            # Process pending CUDA events to measure actual GPU timing
+            TickSync.process_pending_events()
+            blocking_events = TickSync.get_blocking_events()
+            
+            # Log each blocking event separately to per-rank JSONL file
+            for event in blocking_events:
+                iteration_data = {
+                    "sample_id": sample_id,
+                    "mode": mode,
+                    "blocking_event": event
+                }
+                with open(ticksync_blocking_file, 'a') as f:
+                    f.write(json.dumps(iteration_data) + '\n')
+            
+            # Print blocking events for this iteration
+            # if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
+            #     rich.print(f"⚠️  [Sample {sample_id}] {mode.upper()} TickSync Blocking - {len(blocking_events)} events detected")
+            #     for event in blocking_events[-3:]:  # Show last 3 events
+            #         rich.print(f"    {event['layer_info']} {event['operation_info']} ({event['phase']}): {event['wait_time_ms']:.2f}ms > {event['threshold_ms']}ms")
+            
+            # Clear events after logging
+            TickSync.clear_blocking_events()
+
+        # Log tick operations timing data for this iteration if enabled
+        if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+            # Synchronize and collect timing data from CUDA events
+            from d2.runtime.megatron.ping_pong.tick_ops import sync_and_collect_tick_timing, get_tick_times
+            sync_and_collect_tick_timing()
+            
+            timing_data = get_tick_times().get(sample_id, {
+                "forward_pre_core_attn": [], 
+                "forward_post_core_attn": [],
+            })
+            pre_attn_times = timing_data["forward_pre_core_attn"]
+            post_attn_times = timing_data["forward_post_core_attn"]
+            
+            # Calculate medians
+            pre_attn_median = np.median([t["duration_ms"] for t in pre_attn_times]) if pre_attn_times else 0.0
+            post_attn_median = np.median([t["duration_ms"] for t in post_attn_times]) if post_attn_times else 0.0
+            
+            # Create tick_time directory structure
+            tick_time_dir = os.path.join(output_dir, "tick_time")
+            os.makedirs(tick_time_dir, exist_ok=True)
+            
+            # Log to per-rank JSONL file
+            tick_time_file = os.path.join(tick_time_dir, f"tick_time.rank{rank}.jsonl")
+            iteration_data = {
+                "sample_id": sample_id,
+                "mode": mode,
+                "forward_pre_core_attn_times": pre_attn_times,
+                "forward_post_core_attn_times": post_attn_times,
+                "forward_pre_core_attn_median_ms": pre_attn_median,
+                "forward_post_core_attn_median_ms": post_attn_median,
+                "forward_pre_core_attn_count": len(pre_attn_times),
+                "forward_post_core_attn_count": len(post_attn_times)
+            }
+            
+            
+            with open(tick_time_file, 'a') as f:
+                f.write(json.dumps(iteration_data) + '\n')
+            
+            # Print median times for this iteration
+            if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
+                timing_msg = f"🕒 [Sample {sample_id}] {mode.upper()} Tick Operations timing - Forward Pre-attn median: {pre_attn_median:.2f} ms ({len(pre_attn_times)} measurements), Forward Post-attn median: {post_attn_median:.2f} ms ({len(post_attn_times)} measurements)"
+                rich.print(timing_msg)
 
         # Write to the benchmark jsonl log
         if rank == 0:
@@ -1531,9 +1753,131 @@ def test(args):
     #     rich.print(f"🟢 Sample {idx}: {sample}, duration: {duration} ms")
 
     # Report memory usage
-    save_memory_usage_to_file(memory_usage_output_dir)
+    # save_memory_usage_to_file(memory_usage_output_dir)
     
-
+    # Save attention timing data if unified timing was enabled
+    if os.getenv("UNIFIED_RECORD_ATTENTION_TIMES", "0") == "1":
+        # Final synchronization to collect any remaining timing data
+        sync_and_collect_timing()
+        
+        if rank == 0:
+            all_attention_times = get_unified_attention_times()
+            attention_timing_file = os.path.join(output_dir, "attention_timing.json")
+            with open(attention_timing_file, 'w') as f:
+                json.dump(all_attention_times, f, indent=2)
+            rich.print(f"🟢 {mode.upper()} Attention timing data saved to: {attention_timing_file}")
+            
+            # Also print summary with medians
+            
+            rich.print(f"🟢 ===== {mode.upper()} Attention Timing Summary =====")
+            for sample_id, timing_data in all_attention_times.items():
+                fwd_times = timing_data["forward_times"]
+                bwd_times = timing_data["backward_times"]
+                if fwd_times:
+                    avg_fwd = sum(fwd_times) / len(fwd_times)
+                    median_fwd = np.mean(fwd_times)
+                    rich.print(f"Sample {sample_id}: Forward - Avg: {avg_fwd:.2f} ms, Mean: {median_fwd:.2f} ms ({len(fwd_times)} measurements)")
+                if bwd_times:
+                    avg_bwd = sum(bwd_times) / len(bwd_times)
+                    median_bwd = np.mean(bwd_times)
+                    rich.print(f"Sample {sample_id}: Backward - Avg: {avg_bwd:.2f} ms, Mean: {median_bwd:.2f} ms ({len(bwd_times)} measurements)")
+            rich.print(f"🟢 Individual rank attention timing logs saved to: {os.path.join(output_dir, 'attn_time')}")
+    
+    # Save all-to-all timing data if unified timing was enabled
+    if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
+        # Final synchronization to collect any remaining timing data
+        sync_and_collect_a2a_timing()
+        
+        if rank == 0:
+            all_a2a_times = get_unified_a2a_times()
+            a2a_timing_file = os.path.join(output_dir, "a2a_timing.json")
+            with open(a2a_timing_file, 'w') as f:
+                json.dump(all_a2a_times, f, indent=2)
+            rich.print(f"🟢 {mode.upper()} All-to-All timing data saved to: {a2a_timing_file}")
+            
+            # Also print summary with medians
+            rich.print(f"🟢 ===== {mode.upper()} All-to-All Timing Summary =====")
+            for sample_id, timing_data in all_a2a_times.items():
+                a2a_times = timing_data["a2a_forward"]
+                if a2a_times:
+                    avg_a2a = sum(a2a_times) / len(a2a_times)
+                    median_a2a = np.median(a2a_times)
+                    rich.print(f"Sample {sample_id}: All-to-All Forward - Avg: {avg_a2a:.2f} ms, Median: {median_a2a:.2f} ms ({len(a2a_times)} measurements)")
+            rich.print(f"🟢 Individual rank all-to-all timing logs saved to: {os.path.join(output_dir, 'a2a_time')}")
+    
+    # Save tick operations timing data if enabled
+    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
+        # Final synchronization to collect any remaining timing data
+        from d2.runtime.megatron.ping_pong.tick_ops import sync_and_collect_tick_timing, get_tick_times
+        sync_and_collect_tick_timing()
+        
+        if rank == 0:
+            all_tick_times = get_tick_times()
+            tick_timing_file = os.path.join(output_dir, "tick_timing.json")
+            with open(tick_timing_file, 'w') as f:
+                json.dump(all_tick_times, f, indent=2)
+            rich.print(f"🟢 {mode.upper()} Tick operations timing data saved to: {tick_timing_file}")
+            
+            # Also print summary with medians
+            rich.print(f"🟢 ===== {mode.upper()} Tick Operations Timing Summary =====")
+            for sample_id, timing_data in all_tick_times.items():
+                pre_attn_times = timing_data["forward_pre_core_attn"]
+                post_attn_times = timing_data["forward_post_core_attn"]
+                
+                if pre_attn_times:
+                    avg_pre = sum(t["duration_ms"] for t in pre_attn_times) / len(pre_attn_times)
+                    median_pre = np.median([t["duration_ms"] for t in pre_attn_times])
+                    rich.print(f"Sample {sample_id}: Forward Pre-Core Attn - Avg: {avg_pre:.2f} ms, Median: {median_pre:.2f} ms ({len(pre_attn_times)} measurements)")
+                if post_attn_times:
+                    avg_post = sum(t["duration_ms"] for t in post_attn_times) / len(post_attn_times)
+                    median_post = np.median([t["duration_ms"] for t in post_attn_times])
+                    rich.print(f"Sample {sample_id}: Forward Post-Core Attn - Avg: {avg_post:.2f} ms, Median: {median_post:.2f} ms ({len(post_attn_times)} measurements)")
+                
+                        
+            rich.print(f"🟢 Individual rank tick operations timing logs saved to: {os.path.join(output_dir, 'tick_time')}")
+    
+    # Save TickSync blocking data if enabled
+    if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
+        # Process any remaining pending events
+        TickSync.process_pending_events()
+        # Final collection of any remaining blocking events
+        final_blocking_events = TickSync.get_blocking_events()
+        
+        if rank == 0:
+            # Create summary of all blocking events
+            ticksync_summary_file = os.path.join(output_dir, "ticksync_blocking_summary.json")
+            summary_data = {
+                "total_blocking_events": len(final_blocking_events),
+                "blocking_events": final_blocking_events,
+                "threshold_ms": float(os.getenv("D2_TICKSYNC_THRESHOLD_MS", "1.0"))
+            }
+            
+            with open(ticksync_summary_file, 'w') as f:
+                json.dump(summary_data, f, indent=2)
+            rich.print(f"🟢 {mode.upper()} TickSync blocking summary saved to: {ticksync_summary_file}")
+            
+            # Print summary
+            if final_blocking_events:
+                rich.print(f"🟢 ===== {mode.upper()} TickSync Blocking Summary =====")
+                rich.print(f"Total blocking events: {len(final_blocking_events)}")
+                
+                # Group by layer and operation
+                layer_ops = {}
+                for event in final_blocking_events:
+                    key = f"{event['layer_info']} {event['operation_info']}"
+                    if key not in layer_ops:
+                        layer_ops[key] = []
+                    layer_ops[key].append(event['wait_time_ms'])
+                
+                for key, times in layer_ops.items():
+                    avg_time = sum(times) / len(times)
+                    max_time = max(times)
+                    rich.print(f"{key}: {len(times)} events, avg: {avg_time:.2f}ms, max: {max_time:.2f}ms")
+            else:
+                rich.print(f"✅ No TickSync blocking events detected")
+            
+            rich.print(f"🟢 Individual rank TickSync blocking logs saved to: {os.path.join(output_dir, 'ticksync_blocking')}")
+    
     # Cleanup and exit
     rich.print(f"❄️ [Rank {rank}] Finished test and exit.")        
     write_status_log(f"Finish test and exit.")
@@ -1559,12 +1903,205 @@ def save_memory_usage_to_file(memory_usage_dir: str):
 
 def enable_memory_usage_logging(memory_usage_dir: str):
     os.makedirs(memory_usage_dir, exist_ok=True)
-    rank = torch.distributed.get_rank()
+    rank = os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0"))
     memory_usage_log_file = os.path.join(memory_usage_dir, f"mem.rank{rank}.log.jsonl")
     with open(memory_usage_log_file, 'w') as f:
         pass
     d2.mem.set_memory_usage_log_file(memory_usage_log_file)
     pass
+
+# Unified Attention Timing Collection (works for both WLBLLM and D2)
+_unified_attention_times = {}
+_current_sample_id = None
+_pending_events = []  # List of (sample_id, phase, start_event, end_event) tuples
+
+def setup_unified_attention_timing_patch():
+    """Setup monkey patching for unified attention timing collection (WLBLLM + D2)."""
+    import flash_attn.flash_attn_interface as flash_attn_interface
+    
+    # Store original functions
+    original_forward = flash_attn_interface._wrapped_flash_attn_varlen_forward
+    original_backward = flash_attn_interface._wrapped_flash_attn_varlen_backward
+    
+    def timed_forward(*args, **kwargs):
+        if _current_sample_id is not None:
+            # Create CUDA events for timing
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            # Record start event
+            start_event.record()
+        
+        result = original_forward(*args, **kwargs)
+        
+        if _current_sample_id is not None:
+            # Record end event
+            end_event.record()
+            
+            # Store events for later synchronization
+            _pending_events.append((_current_sample_id, "forward", start_event, end_event))
+        
+        return result
+    
+    def timed_backward(*args, **kwargs):
+        if _current_sample_id is not None:
+            # Create CUDA events for timing
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            # Record start event
+            start_event.record()
+        
+        result = original_backward(*args, **kwargs)
+        
+        if _current_sample_id is not None:
+            # Record end event
+            end_event.record()
+            
+            # Store events for later synchronization
+            _pending_events.append((_current_sample_id, "backward", start_event, end_event))
+        
+        return result
+    
+    # Apply monkey patches
+    flash_attn_interface._wrapped_flash_attn_varlen_forward = timed_forward
+    flash_attn_interface._wrapped_flash_attn_varlen_backward = timed_backward
+    
+    print("🟢 Unified attention timing patch applied successfully (works for both WLBLLM and D2)")
+
+def set_unified_current_sample_id(sample_id):
+    """Set the current sample ID for unified attention timing."""
+    global _current_sample_id
+    _current_sample_id = sample_id
+
+def sync_and_collect_timing():
+    """Synchronize all pending events and collect timing data."""
+    global _pending_events, _unified_attention_times
+    
+    if not _pending_events:
+        return
+    
+    # Synchronize all events
+    torch.cuda.synchronize()
+    
+    # Process all pending events
+    for sample_id, phase, start_event, end_event in _pending_events:
+        # Calculate duration in milliseconds
+        duration_ms = start_event.elapsed_time(end_event)
+        
+        # Initialize sample data if needed
+        if sample_id not in _unified_attention_times:
+            _unified_attention_times[sample_id] = {"forward_times": [], "backward_times": []}
+        
+        # Store timing data
+        if phase == "forward":
+            _unified_attention_times[sample_id]["forward_times"].append(duration_ms)
+        elif phase == "backward":
+            _unified_attention_times[sample_id]["backward_times"].append(duration_ms)
+    
+    # Clear pending events
+    _pending_events.clear()
+
+def get_unified_attention_times():
+    """Get all unified attention timing data."""
+    return _unified_attention_times.copy()
+
+def clear_unified_attention_times():
+    """Clear unified attention timing data."""
+    global _unified_attention_times, _pending_events
+    _unified_attention_times.clear()
+    _pending_events.clear()
+
+# Unified All-to-All Timing Collection (works for both WLBLLM and D2)
+_a2a_attention_times = {}
+_current_a2a_sample_id = None
+_pending_a2a_events = []  # List of (sample_id, operation, start_event, end_event) tuples
+
+def setup_unified_a2a_timing_patch():
+    """Setup monkey patching for unified all-to-all timing collection."""
+    from d2.runtime.attn_kernels.ops import _ops_fast_a2a_wrapper, DispatcherWrapper
+    
+    # Store original function
+    original_wrapper = _ops_fast_a2a_wrapper
+    
+    def timed_wrapper(*args):
+        if _current_a2a_sample_id is not None:
+            # Get the communication stream
+            comm_stream = DispatcherWrapper.comm_stream
+            if comm_stream is None:
+                comm_stream = torch.cuda.current_stream()
+            
+            # Create CUDA events for timing
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            # Record start event on the communication stream
+            start_event.record(comm_stream)
+        
+        # Call original function
+        result = original_wrapper(*args)
+        
+        if _current_a2a_sample_id is not None:
+            # Record end event on the communication stream
+            end_event.record(comm_stream)
+            
+            # Store events for later synchronization
+            _pending_a2a_events.append((_current_a2a_sample_id, "a2a_forward", start_event, end_event))
+        
+        return result
+    
+    # Apply monkey patch
+    import d2.runtime.attn_kernels.ops as ops_module
+    ops_module._ops_fast_a2a_wrapper = timed_wrapper
+    
+    print("🟢 Unified all-to-all timing patch applied successfully")
+
+def set_unified_current_a2a_sample_id(sample_id):
+    """Set the current sample ID for unified all-to-all timing."""
+    global _current_a2a_sample_id
+    _current_a2a_sample_id = sample_id
+
+def sync_and_collect_a2a_timing():
+    """Synchronize all pending all-to-all events and collect timing data."""
+    global _pending_a2a_events, _a2a_attention_times
+    
+    if not _pending_a2a_events:
+        return {}
+    
+    # Get the communication stream and synchronize
+    from d2.runtime.attn_kernels.ops import DispatcherWrapper
+    comm_stream = DispatcherWrapper.comm_stream
+    if comm_stream is not None:
+        comm_stream.synchronize()
+    else:
+        torch.cuda.synchronize()
+    
+    # Process all pending events
+    for sample_id, operation, start_event, end_event in _pending_a2a_events:
+        # Calculate duration in milliseconds
+        duration_ms = start_event.elapsed_time(end_event)
+        
+        # Initialize sample data if needed
+        if sample_id not in _a2a_attention_times:
+            _a2a_attention_times[sample_id] = {"a2a_forward": []}
+        
+        # Store timing data
+        if operation in _a2a_attention_times[sample_id]:
+            _a2a_attention_times[sample_id][operation].append(duration_ms)
+    
+    # Clear pending events
+    _pending_a2a_events.clear()
+    return _a2a_attention_times.copy()
+
+def get_unified_a2a_times():
+    """Get all unified all-to-all timing data."""
+    return _a2a_attention_times.copy()
+
+def clear_unified_a2a_times():
+    """Clear unified all-to-all timing data."""
+    global _a2a_attention_times, _pending_a2a_events
+    _a2a_attention_times.clear()
+    _pending_a2a_events.clear()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1593,6 +2130,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample-start-idx", type=int, default=0, help="Start index of the sample ids to sample") 
     parser.add_argument("--change-long-doc-ratio", type=float, default=0.0, help="Ratio of long docs to change")
     parser.add_argument("--sample-name", type=str, default="wlbllm", help="Name of the sample to use", choices=["wlbllm", "prolong"])
+    parser.add_argument("--alpha-factor", type=float, default=1.0, help="Alpha factor for memory imbalance")
     
     args = parser.parse_args()
     print(f"🟡 Args: {args}")
@@ -1668,7 +2206,8 @@ if __name__ == "__main__":
         memory_timeline_output_raw = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.json.gz")
         print(f"🟡 Will save mem snapshot to: {mem_snapshot_output_path}")
         print(f"🟡 Will save mem timeline to: {memory_timeline_output_path}")
-        if rank % 8 == 0:
+        # if rank % 8 == 0:
+        if rank == 0:
             print("Dumping memory snapshot")
             torch.cuda.memory._dump_snapshot(mem_snapshot_output_path)
             prof.export_memory_timeline(memory_timeline_output_path, device=torch.cuda.current_device())

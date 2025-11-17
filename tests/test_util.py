@@ -10,6 +10,7 @@ from datetime import timedelta
 from megatron.core import parallel_state as mpu
 import ray
 import torch
+import time
 
 from d2.runtime.attn_kernels.ops import (
     nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper
@@ -106,21 +107,15 @@ class BaseWorker:
                 pass
 
     def init_nvshmem(self, buffer_size: int, local_rank: int = None):
-        print("====== init_nvshmem ======")
         if self.rank == 0:
             uid = nvshmem_get_unique_id()
-            print(f"Init uid = {uid}")
         else:
             uid = nvshmem_alloc_empty_unique_id()
-        print(f"Broadcast uid: {uid}")
         torch.distributed.broadcast(uid, src=0)
-        print(f"Rank {self.rank} uid = {uid}")
-        
-        print("DispatcherWrapper.init")
+
         DispatcherWrapper.init(
             self.rank, local_rank, self.world_size, buffer_size, uid
         )
-        print("====== init_nvshmem done ======")
 
     def init_comm(self, buffer_size: int, local_rank: int = None):
         if local_rank is None:
@@ -435,6 +430,7 @@ def _block_reverse_list(l: list, d: int):
     """
     return [item for i in range(len(l), 0, -d) for item in l[max(0, i - d):i]]
 
+
 from global_batch_provider import get_next_batch, GLOBAL_BATCH
 def create_pipeline_doclens(
     ref_doc_lens: Optional[list[list[int]]],
@@ -508,6 +504,7 @@ def create_pipeline_doclens(
     print(f"In util.py, finally tick_per_rank_doc_len is: {tick_per_rank_doc_len}")
 
     if return_original_doclen:
+        print("In util.py, return_original_doclen is True, returning (tick_per_rank_doc_len, pp_head_new_doc_len)")
         return (tick_per_rank_doc_len, pp_head_new_doc_len)
     # exit(0)
     return tick_per_rank_doc_len
@@ -562,6 +559,7 @@ def create_qkv_dispatch_pipeline_tick(
         dp_size=dp_size,
     )
 
+    # Calls `get_next_batch` if use_planner is True and get the new sequence lens.
     cur_tick_per_rank_doc_lens, original_cur_tick_per_rank_doc_lens = create_pipeline_doclens(
         ref_doc_lens, add_dummy, is_backward=False, num_batches = num_batches, use_planner=use_planner,
         **create_pp_doclen_kwargs, return_original_doclen=True,
@@ -571,81 +569,184 @@ def create_qkv_dispatch_pipeline_tick(
     print(f"🟡 original_cur_tick_per_rank_doc_lens: {original_cur_tick_per_rank_doc_lens}, len(original_cur_tick_per_rank_doc_lens): {len(original_cur_tick_per_rank_doc_lens)}")
 
 
-    if use_planner:
-        # TODO: This pp_size should really come from mpu or some module that handles the world size...
-        pp_size = world_size // dp_size        # in this function, world size is actual as_world_size. pp = world_size // dp_size
-        planner = Planner.from_individual_params(
-            tp_size=tp_size,
-            pp_size=pp_size,
-            dp_size=dp_size,
-            world_size=tp_size * pp_size * dp_size,
-            hidden_size_q=hidden_size_q,
-            hidden_size_k=hidden_size_k
-        )
-        
-        # Create a temp_model_config for item initialization.
-        temp_model_config = SimpleNamespace(
-            hidden_size=hidden_size_q * tp_size,
-            num_attention_heads = 1,
-            num_key_value_heads = hidden_size_q // hidden_size_k,
-            num_hidden_layers = 1
-        )
-        # Use batch_to_items_with_dummy to handle dummy doc to item.
-        items = batch_to_items_with_dummy(batches=cur_tick_per_rank_doc_lens, 
-                                          num_tokens_per_rank = num_token_per_rank,
-                                          as_world_size=world_size,
-                                          model_config=temp_model_config)
-        fwd_planner_out = planner.items_to_shardinfo(items)
-    else:
-        fwd_planner_out = random_tick_shard_from_doclens(
-            cur_tick_per_rank_doc_lens, tp_size, max_cp_degree,
-        )
+    # Try different tolerance_factor values to find one that passes the buffer size check
+    tolerance_factors_to_try = [0.05, 0.1, 0.15, 0.2, 0.22, 0.25, 0.28, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    MIN_TOLERANCE_FACTOR = 0.05
+    try:
+        MIN_TOLERANCE_FACTOR = os.environ.get("MIN_TOLERANCE_FACTOR", "0.05")
+        MIN_TOLERANCE_FACTOR = float(MIN_TOLERANCE_FACTOR)
+    except ValueError:
+        pass
+    print(f"🟡 MIN_TOLERANCE_FACTOR = {MIN_TOLERANCE_FACTOR}")
 
-
-    (qkv_linear_to_attn_fa2a, _, out_attn_to_linear_fa2a, _, fwd_attn_metadata,
-     ) = from_planner_output(
-         world_size, fwd_planner_out, hidden_size_q, hidden_size_k,
-         softmax_lse_size, element_size, is_pipeline_tick=True
-        )
-
-    # CP flip logic.
-    print(f"🟡 fwd_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
-    if len(cur_tick_per_rank_doc_lens) < world_size:
-        print("🟡 CP flip logic.")
-        bwd_tick_per_rank_doc_lens = _block_reverse_list(cur_tick_per_rank_doc_lens, num_batches)
-    else:
-        # None CP flip logic.
-        print("🟡 None CP flip logic.")
-        bwd_tick_per_rank_doc_lens = create_pipeline_doclens(
-            cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
-            **create_pp_doclen_kwargs,
-        )
-    print(f"🟡 bwd_tick_per_rank_doc_lens: {bwd_tick_per_rank_doc_lens}")
+    tolerance_factors_to_try.append(MIN_TOLERANCE_FACTOR)
+    tolerance_factors_to_try = set(tolerance_factors_to_try)
+    tolerance_factors_to_try = list(tolerance_factors_to_try)
+    tolerance_factors_to_try.sort()
     
-    if use_planner:
-        items = batch_to_items_with_dummy(batches=bwd_tick_per_rank_doc_lens, 
-                                          num_tokens_per_rank=num_token_per_rank,
-                                          as_world_size=world_size,
-                                          model_config=temp_model_config)
-        bwd_planner_out = planner.items_to_shardinfo(items)
-    else:
-        bwd_planner_out = random_tick_shard_from_doclens(
-            bwd_tick_per_rank_doc_lens, tp_size, max_cp_degree,
+    for tolerance_factor in tolerance_factors_to_try:
+        if tolerance_factor < MIN_TOLERANCE_FACTOR:
+            continue
+        print(f"🟡 Trying tolerance_factor: {tolerance_factor}")
+        
+        start_time = time.time()
+        if use_planner:
+            # TODO: This pp_size should really come from mpu or some module that handles the world size...
+            pp_size = world_size // dp_size        # in this function, world size is actual as_world_size. pp = world_size // dp_size
+            planner = Planner.from_individual_params(
+                tp_size=tp_size,
+                pp_size=pp_size,
+                dp_size=dp_size,
+                world_size=tp_size * pp_size * dp_size,
+                hidden_size_q=hidden_size_q,
+                hidden_size_k=hidden_size_k
+            )
+            planner.tolerance_factor = tolerance_factor
+            
+            # Create a temp_model_config for item initialization.
+            temp_model_config = SimpleNamespace(
+                hidden_size=hidden_size_q * tp_size,
+                num_attention_heads = 1,
+                num_key_value_heads = hidden_size_q // hidden_size_k,
+                num_hidden_layers = 1
+            )
+            # Use batch_to_items_with_dummy to handle dummy doc to item.
+            items = batch_to_items_with_dummy(batches=cur_tick_per_rank_doc_lens, 
+                                              num_tokens_per_rank = num_token_per_rank,
+                                              as_world_size=world_size,
+                                              model_config=temp_model_config)
+            fwd_planner_out = planner.items_to_shardinfo(items)
+        else:
+            fwd_planner_out = random_tick_shard_from_doclens(
+                cur_tick_per_rank_doc_lens, tp_size, max_cp_degree,
+            )
+
+
+        fa2a_metadata = from_planner_output(
+            world_size, fwd_planner_out, hidden_size_q, hidden_size_k,
+            softmax_lse_size, element_size, is_pipeline_tick=True
         )
-    (qkv_resend_and_out_grad_linear_to_attn_fa2a, qkv_grad_attn_to_linear_fa2a,
-     bwd_attn_metadata) = backward_from_planner_output(
-         world_size, bwd_planner_out, hidden_size_q, hidden_size_k,
-         softmax_lse_size, element_size,
-    )
+        (qkv_linear_to_attn_fa2a, _, out_attn_to_linear_fa2a, _, fwd_attn_metadata) = fa2a_metadata
+        end_time = time.time()
+        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - fwd_planner_out duration: {(end_time - start_time):.2f} sec", flush=True)
+
+        
+        # CP flip logic.
+        start_time = time.time()
+        print(f"🟡 fwd_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
+        if len(cur_tick_per_rank_doc_lens) < world_size:
+            print("🟡 CP flip logic.")
+            bwd_tick_per_rank_doc_lens = _block_reverse_list(cur_tick_per_rank_doc_lens, num_batches)
+        else:
+            # None CP flip logic.
+            print("🟡 None CP flip logic.")
+            bwd_tick_per_rank_doc_lens = create_pipeline_doclens(
+                cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
+                **create_pp_doclen_kwargs,
+            )
+        print(f"🟡 bwd_tick_per_rank_doc_lens: {bwd_tick_per_rank_doc_lens}")
+        
+        if use_planner:
+            items = batch_to_items_with_dummy(batches=bwd_tick_per_rank_doc_lens, 
+                                              num_tokens_per_rank=num_token_per_rank,
+                                              as_world_size=world_size,
+                                              model_config=temp_model_config)
+            bwd_planner_out = planner.items_to_shardinfo(items)
+        else:
+            bwd_planner_out = random_tick_shard_from_doclens(
+                bwd_tick_per_rank_doc_lens, tp_size, max_cp_degree,
+            )
+        (qkv_resend_and_out_grad_linear_to_attn_fa2a, qkv_grad_attn_to_linear_fa2a,
+         bwd_attn_metadata) = backward_from_planner_output(
+             world_size, bwd_planner_out, hidden_size_q, hidden_size_k,
+             softmax_lse_size, element_size,
+        )
 
 
-    ret = (fwd_attn_metadata, bwd_attn_metadata,
-            qkv_linear_to_attn_fa2a, qkv_grad_attn_to_linear_fa2a,
-            out_attn_to_linear_fa2a, qkv_resend_and_out_grad_linear_to_attn_fa2a,
-            cur_tick_per_rank_doc_lens,)
-    if return_original_doclen:
-        ret += (original_cur_tick_per_rank_doc_lens,)
-    return ret
+        ret = (fwd_attn_metadata, bwd_attn_metadata,
+                qkv_linear_to_attn_fa2a, qkv_grad_attn_to_linear_fa2a,
+                out_attn_to_linear_fa2a, qkv_resend_and_out_grad_linear_to_attn_fa2a,
+                cur_tick_per_rank_doc_lens,)
+        if return_original_doclen:
+            ret += (original_cur_tick_per_rank_doc_lens,)
+
+        end_time = time.time()
+        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - cp flip duration: {(end_time - start_time):.2f} sec")
+
+        # FIXME: Properly pass the output dir down here.
+        start_time = time.time()
+        from d2.utils.network_inspect import inspect_network_metadata
+        output_dir = os.environ.get("EXPERIMENT_OUTPUT_DIR")
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            # NOTE: This can potentially cause race condition. Mindful!
+            # rank = 0 
+            rank = 1 # so we don't write anything into the log file, but still print the result to console.
+        
+        # FIXME: Check the network metadata logic here.
+        network_metadata = (
+            qkv_linear_to_attn_fa2a, qkv_resend_and_out_grad_linear_to_attn_fa2a,
+            out_attn_to_linear_fa2a, qkv_grad_attn_to_linear_fa2a,
+        )
+
+
+        sample_id = os.environ.get("__PRG__INTERNAL__EXPERIMENT_SAMPLE_ID", "0")
+        network_buffer_requirements = inspect_network_metadata(
+            network_metadata, is_ping=None, sample_id=sample_id, 
+            tolerance_factor=tolerance_factor, 
+            output_dir=output_dir, rank=rank,
+            seq_len=cur_tick_per_rank_doc_lens,
+        )
+        end_time = time.time()
+        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - network_inspect duration: {(end_time - start_time):.2f} sec")
+
+        def debug_set_metadata_transfer_size_to_0(
+            qkv_fwd_metadata,
+            qkv_bwd_metadata,
+            attn_out_fwd_metadata,
+            attn_out_bwd_metadata,
+        ):
+            for param in [
+                qkv_fwd_metadata,
+                qkv_bwd_metadata,
+                attn_out_fwd_metadata,
+                attn_out_bwd_metadata,
+            ]:
+                param.fa2a_metadata[1][:] = 1
+                param.fa2a_metadata[3][:] = 1
+                param.my_rank_send_sz = 1
+            return
+        
+        
+        if os.environ.get("EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0", "0") == "1":
+            print(f"🟡 [Rank {rank}] Debug set metadata transfer size to 0")
+            debug_set_metadata_transfer_size_to_0(
+                qkv_linear_to_attn_fa2a, qkv_resend_and_out_grad_linear_to_attn_fa2a,
+                out_attn_to_linear_fa2a, qkv_grad_attn_to_linear_fa2a,
+            )
+
+
+        def is_buffer_size_enough(buffer_size, network_buffer_requirements):
+            max_buffer_budget_all_rank = network_buffer_requirements["max_buffer_budget_all_rank"]
+            print(f"🟡 Got max_buffer_budget_all_rank = {max_buffer_budget_all_rank / 1024 ** 3} GB ({max_buffer_budget_all_rank}), buffer_size = {buffer_size / 1024 ** 3} GB ({buffer_size}). Is enough: {(buffer_size >= max_buffer_budget_all_rank) = }")
+
+            return buffer_size >= max_buffer_budget_all_rank
+
+        from d2.runtime.attn_kernels.ops import DispatcherWrapper
+        buffer_size = DispatcherWrapper.instance[0].buffer_size
+        
+        # Check if current tolerance_factor works
+        if is_buffer_size_enough(buffer_size, network_buffer_requirements):
+            print(f"🟡 Found working tolerance_factor: {tolerance_factor}")
+            return ret
+        else:
+            print(f"🟡 tolerance_factor {tolerance_factor} failed: buffer_size={buffer_size}, required={network_buffer_requirements['max_buffer_budget_all_rank']}")
+    
+    # If we reach here, none of the tolerance_factors worked
+    raise ValueError(f"None of the tolerance factors {tolerance_factors_to_try} resulted in sufficient buffer size. "
+                     f"Buffer size: {buffer_size}, latest requirements: {network_buffer_requirements}. "
+                     f"You may need to increase the buffer size or try larger tolerance factors.")
 
 
 ######## TODO: deprecate all below

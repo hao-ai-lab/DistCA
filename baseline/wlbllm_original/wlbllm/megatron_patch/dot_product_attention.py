@@ -16,7 +16,8 @@ import logging
 import rich
 import torch
 
-import transformer_engine_torch as tex
+# import transformer_engine_torch as tex
+import transformer_engine.pytorch as tex
 from transformer_engine.pytorch.utils import get_cudnn_version
 from transformer_engine.pytorch.fp8 import get_fp8_te_dtype
 from transformer_engine.pytorch.float8_tensor import Float8Tensor

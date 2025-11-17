@@ -17,9 +17,9 @@ from megatron.core.transformer.transformer_layer import (
 from d2.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams
 
 
-def log_memory_usage(message: str):
+def log_memory_usage(message: str, comment: str = None):
     import d2.mem
-    d2.mem.log_memory_usage(message)
+    d2.mem.log_memory_usage(message, comment=comment)
 
 
 class TransformerLayer(MegatronTransformerLayer):
@@ -259,7 +259,9 @@ class TransformerLayer(MegatronTransformerLayer):
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
         # q, k, v
+        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(before qkv)")
         query, key, value = self.self_attention.get_query_key_value_tensors(input_layernorm_output, None)
+        # print(f"🟡 query: {query.shape} (query.dtype: {query.dtype}), key: {key.shape} (key.dtype: {key.dtype}), value: {value.shape} (value.dtype: {value.dtype})")
 
         #### Some code in core_attention. This is because we don't want the pos embedding
         # being handled in the attention layout (the pos id will be hard to handle)

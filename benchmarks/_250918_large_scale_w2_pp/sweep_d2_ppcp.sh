@@ -1,7 +1,8 @@
 set -e
 
 # export JOBID=${JOBID:-710588}
-export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250918_large_scale_w2_pp/logs.v1-sweep-pp-memory
+TS=$(TZ=America/Los_Angeles date +%m%d_%H%M%S)_PST
+export OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_250918_large_scale_w2_pp/logs.v2-sweep-pp-memory/${TS}
 
 # -----------------------------
 # TorchRun Final Logging Flag (for cleaner console)
@@ -30,22 +31,29 @@ export EXPERIMENT_FA2A_SPLIT_SENDRECV=1
 
 
 model_configs=(
-    "codellama/CodeLlama-34b-hf 48"
-    # "deepseek-ai/DeepSeek-R1-Distill-Llama-70B 80"
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 32" \
+    "codellama/CodeLlama-34b-hf 24" \
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-70B 40"
 )
 
 cases=(
     #n bs mb t       mode cp  pp  tp )
-    "8  1 4 131072 wlbllm  2  4   8"
-    "8  1 4 131072     d2  2  4   8"
-    "8  1 4 131072 wlbllm  4  2   8"
-    "8  1 4 131072     d2  4  2   8"
+    "8  1 4 262144 wlbllm  2  4   8"
+    "8  1 4 262144     d2  2  4   8"
+    "8  2 2 262144 wlbllm  4  2   8"
+    "8  2 2 262144     d2  4  2   8"
 
-    "8  1 4 65536 wlbllm  2  4   8"
-    "8  1 4 65536     d2  2  4   8"
-    "8  1 4 65536 wlbllm  4  2   8"
-    "8  1 4 65536     d2  4  2   8"
+    "8  1 8 131072 wlbllm  2  4   8"
+    "8  1 8 131072     d2  2  4   8"
+    "8  2 4 131072 wlbllm  4  2   8"
+    "8  2 4 131072     d2  4  2   8"
+
+    "8  1 8 65536 wlbllm  2  4   8"
+    "8  1 8 65536     d2  2  4   8"
+    "8  2 4 65536 wlbllm  4  2   8"
+    "8  2 4 65536     d2  4  2   8"
 )
+
 max_cases=10000
 echo "🏁 Start regression sweep. Only running $max_cases cases."
 cases_index=0

@@ -23,18 +23,11 @@ def nvshmem_unique_id_size() -> int:
 def nvshmem_alloc_empty_unique_id() -> torch.Tensor:
     return torch.zeros(nvshmem_unique_id_size(), dtype=torch.uint8, device="cpu")
 
-import datetime
 def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int=-1) -> int:
     # NOTE: this is because we set device in python. Should move it to the cpp end.
-    print(f"Calling nvshmem_init with uid = {uid}")
     torch.cuda.synchronize()
     status = _ops.nvshmem_init(uid, rank, world_size, local_rank)
-    print("nvshmem_init returns with status =", status)
     torch.cuda.synchronize()
-    print("nvshmem_init synchronized. Ready to call barrier")
-    import traceback
-    # traceback.print_stack()
-    print("nvshmem_init passed barrier.")
     global _is_nvshmem_initialized
     _is_nvshmem_initialized = True
     return status
@@ -159,14 +152,18 @@ class DispatcherWrapper:
 
 def a2a_memcpy_non_cp(
     tensor: torch.Tensor, nvshmem_offset: torch.Tensor,
-    seq_tokens: torch.Tensor, to_nvshmem: bool,
+    shard_tokens: torch.Tensor, to_nvshmem: bool,
+    shard_do_copy_mask: Optional[torch.Tensor]=None,
     buffer: Optional[torch.Tensor]=None, instance_id: int=None
 ):
     if buffer is not None:
         # Debug mode, explicitly pass the "nvshmem" buffer.
         return _ops.fast_a2a_memcpy_non_cp_debug(
-            tensor, nvshmem_offset, seq_tokens, to_nvshmem, buffer
+            tensor, nvshmem_offset, shard_tokens, shard_do_copy_mask,
+            to_nvshmem, buffer
         )
+    if shard_do_copy_mask is not None:
+        assert to_nvshmem
 
     if instance_id is not None:
         if to_nvshmem:
@@ -177,20 +174,20 @@ def a2a_memcpy_non_cp(
 
     return _ops.fast_a2a_memcpy_non_cp(
         DispatcherWrapper.get_instance(instance_id).handle,
-        tensor, nvshmem_offset, seq_tokens, to_nvshmem
+        tensor, nvshmem_offset, shard_tokens, shard_do_copy_mask, to_nvshmem
     )
 
 
 def a2a_memcpy_cp(
     tensor: torch.Tensor, do_shard: torch.Tensor,
-    nvshmem_offset: torch.Tensor, seq_tokens: torch.Tensor,
+    nvshmem_offset: torch.Tensor, shard_tokens: torch.Tensor,
     to_nvshmem: bool, buffer: Optional[torch.Tensor]=None,
     instance_id: int=None,
 ):
     if buffer is not None:
         # Debug mode, explicitly pass the "nvshmem" buffer.
         return _ops.fast_a2a_memcpy_cp_debug(
-            tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem, buffer
+            tensor, do_shard, nvshmem_offset, shard_tokens, to_nvshmem, buffer
         )
 
     if instance_id is not None:
@@ -202,9 +199,23 @@ def a2a_memcpy_cp(
 
     return _ops.fast_a2a_memcpy_cp(
         DispatcherWrapper.get_instance(instance_id).handle,
-        tensor, do_shard, nvshmem_offset, seq_tokens, to_nvshmem
+        tensor, do_shard, nvshmem_offset, shard_tokens, to_nvshmem
     )
 
+
+def pre_a2a_grad_acc(
+    tensor: torch.Tensor, num_copies: torch.Tensor,
+    copy_start_id: torch.Tensor, shard_tokens: torch.Tensor,
+):
+    """
+    When kv has multiple copies, and we accumulates their gradients to the main copy,
+    so that we only need to send one gradient back.
+    """
+    _ops.fast_a2a_grad_acc(tensor, num_copies, copy_start_id, shard_tokens)
+    return tensor
+
+def _ops_fast_a2a_wrapper(*args):
+    return _ops.fast_a2a(*args)
 
 def fast_a2a(
     sender_send_disp: torch.Tensor, sender_transfer_sz: torch.Tensor,
@@ -214,7 +225,6 @@ def fast_a2a(
 ):
     should_fa2a_barrier = os.environ.get("EXPERIMENT_FA2A_BARRIER", "0") == "1"
     should_skip_fa2a_op = os.environ.get("EXPERIMENT_SKIP_FA2A_OP", "0") == "1"
-    should_fa2a_split_sendrecv = os.environ.get("EXPERIMENT_FA2A_SPLIT_SENDRECV", "0") == "1"
     
     if instance_id is not None:
         assert not DispatcherWrapper.is_acquired[instance_id]
@@ -237,7 +247,7 @@ def fast_a2a(
             fast_a2a._printed_skip_message = True
         return
 
-    ret = _ops.fast_a2a(
+    ret = _ops_fast_a2a_wrapper(
         DispatcherWrapper.get_instance(instance_id).handle,
         sender_send_disp, sender_transfer_sz,
         sender_recv_disp, recver_transfer_sz,

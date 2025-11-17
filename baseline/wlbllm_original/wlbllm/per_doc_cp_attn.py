@@ -88,6 +88,10 @@ class PerDocumentCPAttention(torch.autograd.Function):
         should_sync_time_flash_attn = os.getenv("WLBLLM_SYNC_TIME_FLASH_ATTN", "0") == "1"
         should_sync_time_perdocattn = os.getenv("WLBLLM_SYNC_TIME_PERDOC_ATTN", "0") == "1"
         should_sync_time_ag = os.getenv("WLBLLM_SYNC_TIME_AG", "0") == "1"
+        should_empty_cache = os.getenv("WLBLLM_EMPTY_CACHE", "0") == "1"
+        if should_empty_cache and not hasattr(PerDocumentCPAttention, '_empty_cache_warning_printed'):
+            print("🟡 WLBLLM_EMPTY_CACHE is enabled. May have performance impact.")
+            PerDocumentCPAttention._empty_cache_warning_printed = True
         ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "0") == "1"
 
         if should_sync_time_perdocattn:
@@ -116,12 +120,14 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         if should_sync_time_perdocattn:
             torch.cuda.synchronize()
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             start_time__gather = time.time()
 
         if cp_size > 1:
+            log_memory_usage("PerDocumentCPAttention.forward(before kv allocated)")
             gather_k_list = [torch.empty_like(local_k) for _ in range(cp_size)]
             gather_v_list = [torch.empty_like(local_v) for _ in range(cp_size)]
+            log_memory_usage("PerDocumentCPAttention.forward(after kv allocated)")
             with torch.cuda.stream(cp_stream):
                 local_k = local_k.contiguous()
                 local_v = local_v.contiguous()
@@ -144,6 +150,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
                     end_time__ag = time.time()
                     duration_ms__ag = (end_time__ag - start_time__ag) * 1000
                     print(f"🟡 PerDocumentCPAttention allgather-v time: {duration_ms__ag} ms")
+            log_memory_usage("PerDocumentCPAttention.forward(after kv allgather)")
 
                 # print("🟡 All gather local_k.shape =", local_k.shape)
 
@@ -154,12 +161,13 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 if ENABLE_SHUFFLE:
                     start_time__shuffle = time.time()
 
+                    log_memory_usage("PerDocumentCPAttention.forward(before kv shuffle)")
                     chunk_shard_lens, shard_src_offset, num_tokens = wlbllm.registry.get("memcpy_args")
                     k_global, v_global = kv_shuffle_for_per_doc_cp_fast(
                         context_length, gather_k_list, gather_v_list, cp_size,
                         chunk_shard_lens, shard_src_offset, num_tokens
                     )
-
+                    log_memory_usage("PerDocumentCPAttention.forward(after kv shuffle)")
                     end_time__shuffle = time.time()
                     duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
                     debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
@@ -171,8 +179,10 @@ class PerDocumentCPAttention(torch.autograd.Function):
                     # print(f"global_tensor_length =", global_tensor_length)
                 else:
                     # Simply using a random global tensor for testing. This avoids a significant performance issue introduced by the shuffle logic.
+                    log_memory_usage("PerDocumentCPAttention.forward(before kv create)")
                     k_global = torch.randn(context_length, nkvheads, d_head, device=local_k.device, dtype=local_k.dtype)
                     v_global = torch.randn(context_length, nkvheads, d_head, device=local_v.device, dtype=local_v.dtype)
+                    log_memory_usage("PerDocumentCPAttention.forward(after kv create)")
                     print(f"(no shuffle) k_global.shape =", k_global.shape)
                     print(f"(no shuffle) v_global.shape =", v_global.shape)
 
@@ -182,6 +192,23 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 if ENABLE_SHUFFLE:
                     assert k_global.shape[0] == context_length, f"k_global.shape[0] = {k_global.shape[0]} must equals context length {context_length}."
             
+            
+            log_memory_usage("PerDocumentCPAttention.forward(finish kv shuffle or create and before release gather_k_list and gather_v_list)")
+            # Release gather_k_list and gather_v_list
+            # More aggressive cleanup to free CUDA memory
+            for tensor in gather_k_list:
+                del tensor
+            for tensor in gather_v_list:
+                del tensor
+            del gather_k_list
+            del gather_v_list
+            
+            # Force PyTorch to release CUDA memory back to the system
+            # This has a small latency cost (~1-10ms) but prevents OOM errors
+            if should_empty_cache:
+                torch.cuda.empty_cache()
+            
+            log_memory_usage("PerDocumentCPAttention.forward(after release gather_k_list and gather_v_list)")
             # exit(0)
 
 
@@ -195,6 +222,8 @@ class PerDocumentCPAttention(torch.autograd.Function):
         if allgather_events is not None:
             allgather_events[1].record()
         nvtx_range_pop()
+
+        log_memory_usage("PerDocumentCPAttention.forward(after kv allocated finished)")
 
         if should_sync_time_perdocattn:
             torch.cuda.synchronize()
@@ -214,6 +243,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
         local_ks, local_vs = [], []
         q_chunks = local_q.chunk(2, dim=0)
         for chunk_id in range(2):
+            log_memory_usage(f"PerDocumentCPAttention before cats[{chunk_id}]")
             local_k_list = []
             local_v_list = []
             for start, end in kv_idx_list[chunk_id]:
@@ -224,9 +254,10 @@ class PerDocumentCPAttention(torch.autograd.Function):
             local_v = torch.cat(local_v_list, dim=0)
             local_ks.append(local_k)
             local_vs.append(local_v)
+            log_memory_usage(f"PerDocumentCPAttention after cats[{chunk_id}]")
 
             
-            rank = torch.distributed.get_rank()
+            # rank = torch.distributed.get_rank()
             # if rank % 8 == 0:
             #     debug_print("🟡 Inside WLBLLM's PerDocumentCPAttention.forward(). Printing this may mean we have performance issue.")
             #     debug_print(f"  - q_chunks[chunk_id].shape = {q_chunks[chunk_id].shape}")
@@ -246,6 +277,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 torch.cuda.synchronize()
                 start_time = time.time()
 
+            log_memory_usage("PerDocumentCPAttention before flash_attn_varlen_func")
             out, lse, _ = flash_attn_varlen_func(
                 q=q_chunks[chunk_id],
                 k=local_k,
@@ -260,6 +292,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 return_attn_probs=True,
                 deterministic=False, # do not turn on this flag - performance will degrade!
             )
+            log_memory_usage("PerDocumentCPAttention after flash_attn_varlen_func")
             
             if should_sync_time_flash_attn:
                 torch.cuda.synchronize()
@@ -270,12 +303,15 @@ class PerDocumentCPAttention(torch.autograd.Function):
             outputs.append(out)
             lses.append(lse)
 
+        log_memory_usage("PerDocumentCPAttention before output cat")
         final_out = torch.cat(outputs, dim=0)
+        log_memory_usage("PerDocumentCPAttention after output cat")
         if attn_events is not None:
             attn_events[1].record()
         nvtx_range_pop()
 
         nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.save_for_backward")
+        log_memory_usage("PerDocumentCPAttention before save_for_backward")
 
         if os.getenv("D2_DEBUG_PRINT", "0") == "1":
             if torch.distributed.get_rank() % 8 == 0:
@@ -312,11 +348,12 @@ class PerDocumentCPAttention(torch.autograd.Function):
         nvtx_range_pop()
         if should_sync_time_perdocattn:
             torch.cuda.synchronize()
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             end_time__fwd = time.time()
             duration_ms__fwd = (end_time__fwd - start_time__fwd) * 1000
             debug_print(f"🟡 PerDocumentCPAttention total forward time (with barrier): {duration_ms__fwd} ms")
             
+        log_memory_usage("PerDocumentCPAttention after save_for_backward")
         log_memory_usage("PerDocumentCPAttention.forward(end)")
         return final_out
 

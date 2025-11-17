@@ -116,6 +116,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
                     "activations_checkpoint_granularity", "full"
                 )
                 tf_config.recompute_num_layers = gradient_checkpointing_cfg.get("activations_checkpoint_num_layers", -1)
+            print(f"🟡 [Rank {self.rank}] Adding selective checkpoint: {tf_config.recompute_method = }, {tf_config.recompute_granularity = }, {tf_config.recompute_num_layers = }")
 
         add_optimization_config_to_tf_config(tf_config)
 

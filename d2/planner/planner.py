@@ -2,7 +2,7 @@ from collections import defaultdict
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-
+import time
 import rich
 import torch
 from d2.runtime.compute_metadata import from_planner_output
@@ -48,6 +48,7 @@ def batch_to_items_class(batches: list[list[int]], model_config=None):
             seqid += 1
     return items
 
+# Can handle MLP DPCP and dummy doc.
 def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int, as_world_size: int, model_config: dict):
 
     items = []
@@ -119,7 +120,7 @@ def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int
 """
 Partition and place a batch of variable-length documents onto GPU ranks under a
 hybrid Data-Parallel (DP) and Context-Parallel (CP) policy, returning a list of
-Item objects.
+Item objects.(Can handle MLP DPCP. Can't handle dummy docs.)
 
 Steps
 1. Schedule each document to the next available rank in original order (DP).
@@ -340,7 +341,13 @@ class Item:
         for item in self.items:
             q = int(item['q'])
             kv = int(item['kv'])
-            flops += sum(kv - i for i in range(q))
+            # For each q token, it needs to attend to all previous kv tokens
+            # So for q tokens from 0 to q-1, each token i attends to kv-i tokens
+            # This gives us: sum(kv-i) for i in range(q)
+            # Which is equivalent to: q*kv - sum(i) for i in range(q)
+            # And sum(i) from 0 to q-1 is q*(q-1)/2
+            # So final formula is: q*kv - q*(q-1)/2
+            flops += q * kv - (q * (q - 1)) // 2
         return flops
 
     def get_q_size(self, length):
@@ -460,7 +467,10 @@ class Item:
             assert newly_split_item.total_flops == moved_flops_actual, "Total moved flops should be equal"
             return newly_split_item, moved_flops_actual
 
-    def to_dicts(self):
+    # Transfer Item to List of dict(s).
+    # Complete Item -> List[one dict]
+    # Split Item -> List[two dicts]
+    def to_dicts(self) -> List[Dict[str, Any]]:
         output_dicts = []
         for item_chunk in self.items:
             if item_chunk['q'] <= 0:
@@ -531,7 +541,7 @@ class Planner:
     def plan(self, items_: list[Item], verbose=False, plot=False, is_resend_qkv:bool=False):
         mlp_shard_len = self.items_to_mlp_doc_len(items_)
         planned_items: list[Item] = self.plan_items(items_, verbose, plot)
-        planned_items: list[Item] = self.postprocess_items(planned_items)
+        planned_items: list[dict] = self.postprocess_items(planned_items)
         planner_output: list[list[ShardInfo]] = self.items_into_shardinfos(planned_items)
         tp_size = self.parallel_config.tensor_model_parallel_size
         if self.parallel_config.pipeline_model_parallel_size == 1:
@@ -593,6 +603,25 @@ class Planner:
         def rlog(message):
             if verbose:
                 rich.print(message)
+        
+        def format_flops(flops):
+            """Convert FLOPs to human-readable format (K, M, G, T, P)"""
+            if flops == 0:
+                return "0"
+            
+            abs_flops = abs(flops)
+            if abs_flops >= 1e15:
+                return f"{flops/1e15:.2f}P"
+            elif abs_flops >= 1e12:
+                return f"{flops/1e12:.2f}T"
+            elif abs_flops >= 1e9:
+                return f"{flops/1e9:.2f}G"
+            elif abs_flops >= 1e6:
+                return f"{flops/1e6:.2f}M"
+            elif abs_flops >= 1e3:
+                return f"{flops/1e3:.2f}K"
+            else:
+                return f"{flops:.2f}"
 
         flops_per_gpu = [0.0] * self.attention_server_world_size
         for item in items:
@@ -600,7 +629,7 @@ class Planner:
         total_flops = sum(flops_per_gpu)
         
         avg_flops_per_gpu = total_flops / self.attention_server_world_size
-        rlog(f"Total FLOPs: {total_flops:.2f}, Average FLOPs per GPU: {avg_flops_per_gpu:.2f}")
+        rlog(f"Total FLOPs: {format_flops(total_flops)}, Average FLOPs per GPU: {format_flops(avg_flops_per_gpu)}")
         
         surplus_deficit = [f - avg_flops_per_gpu for f in flops_per_gpu]
         threshold_flops = avg_flops_per_gpu * self.tolerance_factor
@@ -609,10 +638,10 @@ class Planner:
             [(i, deficit) for i, deficit in enumerate(surplus_deficit) if deficit < 0],
             key=lambda x: x[1]
         )
-        rlog(f"Threshold FLOPs for moving: {threshold_flops:.2f}")
+        rlog(f"Threshold FLOPs for moving: {format_flops(threshold_flops)}")
         for recipient_id, deficit in recipients:
             needed_flops = -deficit
-            rlog(f"\n[bold yellow]Planning for GPU {recipient_id}[/bold yellow] (needs {needed_flops:.2f} FLOPs)")
+            rlog(f"\n[bold yellow]Planning for GPU {recipient_id}[/bold yellow] (needs {format_flops(needed_flops)} FLOPs)")
             
             while needed_flops > threshold_flops:
                 donor_gpus = {i for i, s in enumerate(surplus_deficit) if s > 0}
@@ -646,7 +675,7 @@ class Planner:
                 max_flops_to_move = best_candidate['max_flops']
                 
                 rlog(f"  - Candidate: {item_to_move} with priority {best_candidate['priority']:.4f}")
-                rlog(f"    - Provides: {item_to_move.total_flops:.2f} FLOPs, Max possible to move: {max_flops_to_move:.2f}")
+                rlog(f"    - Provides: {format_flops(item_to_move.total_flops)} FLOPs, Max possible to move: {format_flops(max_flops_to_move)}")
 
                 newly_split_item, moved_flops_actual = item_to_move.split_item(max_flops_to_move, recipient_id, verbose=verbose)
 
@@ -670,7 +699,7 @@ class Planner:
             
             rlog("Final FLOPs distribution per GPU:")
             for i, f in enumerate(final_flops_per_gpu):
-                rlog(f"  - GPU {i}: {f:.2f} FLOPs (Target: {avg_flops_per_gpu:.2f})")
+                rlog(f"  - GPU {i}: {format_flops(f)} FLOPs (Target: {format_flops(avg_flops_per_gpu)})")
         rlog("\n[bold green]Relocation planning finished.[/bold green]")
         return final_items
     
@@ -682,7 +711,7 @@ class Planner:
         return shard_infos
     
 
-    def postprocess_items(self, items: list[Item]) -> list[Item]:
+    def postprocess_items(self, items: list[Item]) -> list[dict]:
         dict_items = []
         for item in items:
             dict_items.extend(item.to_dicts())
@@ -734,14 +763,15 @@ class Planner:
         return items_into_shardinfos(item_dicts)
     
     @classmethod
-    def from_individual_params(cls,
-                               tp_size: int,
-                               pp_size: int,
-                               dp_size: int,
-                               world_size: int,
-                               hidden_size_q: int,
-                               hidden_size_k: int,
-                              ):
+    def from_individual_params(
+        cls,
+        tp_size: int,
+        pp_size: int,
+        dp_size: int,
+        world_size: int,
+        hidden_size_q: int,
+        hidden_size_k: int,
+    ):
         parallel_config = SimpleNamespace(
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=pp_size

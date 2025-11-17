@@ -20,6 +20,9 @@ def simulate_all2all(
     metadata: AlltoAllMetadata,
     element_size: int, hidden_q: int, hidden_k: int,
     is_from_linear_layout: bool,
+    # init kv grad cache with torch.zeros instead of torch.empty.
+    # This is to compare with the behavior of the real op.
+    zero_mask_kv_grad: bool=False,
 ):
     world_size = len(q)
     has_kv = k is not None
@@ -87,8 +90,12 @@ def simulate_all2all(
         dst_q = torch.empty(q_shape, dtype=q[rank].dtype, device=q[rank].device)
         if has_kv:
             k_shape = metadata_local.tensor_shape[1].recv_shape
-            dst_k = torch.empty(k_shape, dtype=k[rank].dtype, device=k[rank].device)
-            dst_v = torch.empty(k_shape, dtype=v[rank].dtype, device=v[rank].device)
+            if zero_mask_kv_grad:
+                dst_k = torch.zeros(k_shape, dtype=k[rank].dtype, device=k[rank].device)
+                dst_v = torch.zeros(k_shape, dtype=v[rank].dtype, device=v[rank].device)
+            else:
+                dst_k = torch.empty(k_shape, dtype=k[rank].dtype, device=k[rank].device)
+                dst_v = torch.empty(k_shape, dtype=v[rank].dtype, device=v[rank].device)
         else:
             dst_k = dst_v = None
 
@@ -170,7 +177,7 @@ def test(args):
     )
 
     tik = time.time()
-    fwd_qkv_metadata, bwd_qkv_metadata, fwd_attn_out_metadata, bwd_attn_out_metadata = from_planner_output(
+    fwd_qkv_metadata, bwd_qkv_metadata, fwd_attn_out_metadata, bwd_attn_out_metadata, _ = from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
         is_pipeline_tick=False
     )

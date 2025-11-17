@@ -4,7 +4,8 @@ import torch.nn.functional as F
 
 from d2.runtime.attn_kernels.ops import (
     DispatcherWrapper, a2a_memcpy_non_cp,
-    a2a_memcpy_cp, fast_a2a,
+    a2a_memcpy_cp, pre_a2a_grad_acc
+
 )
 from d2.runtime.utils import size_pad_by_int4
 
@@ -14,7 +15,12 @@ def pre_a2a_qkv(
     q_seq_tokens: Tensor, k_seq_tokens: Tensor,
     q_send_buffer_offset: Tensor, k_send_buffer_offset: Tensor, v_send_buffer_offset: Tensor,
     is_fwd: bool, instance_id: int=None,
+    # TODO: reorder args to make it more logical
+    kv_grad_copy_shard_mask: Tensor=None,
+    # this includes (num_copies, copy_start_id, shard_tokens)
+    pre_a2a_grad_acc_args = None,
 ):
+    """pre_a2a_grad_acc_args is effective only when it's a backward."""
     # copy in advance
     to_nvshmem = True
     a2a_memcpy_non_cp(
@@ -31,12 +37,21 @@ def pre_a2a_qkv(
             instance_id=instance_id,
         )
     else:
+        assert kv_grad_copy_shard_mask is not None, "kv grad copy requires a dedup mask."
+        k = k.contiguous()
+        v = v.contiguous()
+        if pre_a2a_grad_acc_args is not None:
+            pre_a2a_grad_acc(k, *pre_a2a_grad_acc_args)
+            pre_a2a_grad_acc(v, *pre_a2a_grad_acc_args)
+
         a2a_memcpy_non_cp(
-            k.contiguous(), k_send_buffer_offset, k_seq_tokens, to_nvshmem,
+            k, k_send_buffer_offset, k_seq_tokens, to_nvshmem,
+            shard_do_copy_mask=kv_grad_copy_shard_mask,
             instance_id=instance_id,
         )
         a2a_memcpy_non_cp(
-            v.contiguous(), v_send_buffer_offset, k_seq_tokens, to_nvshmem,
+            v, v_send_buffer_offset, k_seq_tokens, to_nvshmem,
+            shard_do_copy_mask=kv_grad_copy_shard_mask,
             instance_id=instance_id,
         )
     return q, k, v
@@ -76,43 +91,6 @@ def post_a2a_qkv(
         DispatcherWrapper.switch_buffer()
     if instance_id is not None:
         DispatcherWrapper.release(instance_id)
-    return recv_q, recv_k, recv_v
-
-
-def fast_a2a_qkv(
-    q: Tensor, k: Tensor, v: Tensor, kv_dispatch_mask: Tensor,
-    recv_q: Tensor, recv_k: Tensor, recv_v: Tensor,
-    q_seq_tokens: Tensor, k_seq_tokens: Tensor,
-    q_recv_seq_tokens: Tensor, k_recv_seq_tokens: Tensor,
-    q_send_buffer_offset: Tensor, k_send_buffer_offset: Tensor, v_send_buffer_offset: Tensor,
-    q_recv_buffer_offset: Tensor, k_recv_buffer_offset: Tensor, v_recv_buffer_offset: Tensor,
-    sender_send_disp: Tensor, sender_transfer_sz: Tensor,
-    sender_recv_disp: Tensor, recver_transfer_sz: Tensor,
-    my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
-    is_fwd: bool,
-    switch_buffer: bool = True,
-    instance_id: int=None
-):
-    # copy in advance
-    q, k, v = pre_a2a_qkv(
-        q, k, v, kv_dispatch_mask, q_seq_tokens, k_seq_tokens,
-        q_send_buffer_offset, k_send_buffer_offset, v_send_buffer_offset,
-        is_fwd=is_fwd, instance_id=instance_id,
-    )
-    # all2all
-    fast_a2a(
-        sender_send_disp, sender_transfer_sz,
-        sender_recv_disp, recver_transfer_sz,
-        my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz,
-        instance_id=instance_id,
-    )
-    # copy back
-    recv_q, recv_k, recv_v = post_a2a_qkv(
-        recv_q, recv_k, recv_v, kv_dispatch_mask,
-        q_recv_seq_tokens, k_recv_seq_tokens,
-        q_recv_buffer_offset, k_recv_buffer_offset, v_recv_buffer_offset,
-        is_fwd=is_fwd, switch_buffer=switch_buffer, instance_id=instance_id,
-    )
     return recv_q, recv_k, recv_v
 
 
@@ -176,8 +154,8 @@ def pre_a2a_attn_out_grad_resend_qkv(
     # create merged_q
     merged_q = _concat_with_uint8_and_pad([attn_out_grad, attn_out, lse_norm, q], dim=1)
     return pre_a2a_qkv(merged_q, k, v, kv_dispatch_mask, q_seq_tokens, k_seq_tokens,
-                            q_send_buffer_offset, k_send_buffer_offset, v_send_buffer_offset,
-                            is_fwd=is_fwd, instance_id=instance_id)
+                       q_send_buffer_offset, k_send_buffer_offset, v_send_buffer_offset,
+                       is_fwd=is_fwd, instance_id=instance_id)
 
 
 def post_a2a_attn_out_grad_resend_qkv(
@@ -235,6 +213,6 @@ def pre_a2a_attn_out_with_lse(
     assert softmax_lse.shape[0] == attn_out.shape[0]
     merged_attn_out = _concat_with_uint8_and_pad([attn_out, softmax_lse], dim=1)
     return pre_a2a_attn_out(
-        merged_attn_out, send_seqlens, send_memcpy_metadata[0],
+        merged_attn_out, send_seqlens, send_memcpy_metadata,
         instance_id=dispatcher_id,
     )

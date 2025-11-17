@@ -198,6 +198,7 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                 arg_group_0, "signal",  # compute out
                 # prev layer's comm out, or anything if it's the first layer
                 arg_group_1, "signal" if l_no > 0 else "hidden_states",
+                layer_info=f"L{l_no}", operation_info="tick_0"
             )
 
         # tick 1
@@ -213,6 +214,7 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                 compute_stream, self.comm_stream,
                 arg_group_0, "signal",  # comm out
                 arg_group_1, "signal",  # compute out
+                layer_info=f"L{l_no}", operation_info="tick_1"
             )
 
         # tick 2
@@ -227,6 +229,7 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                 compute_stream, self.comm_stream,
                 arg_group_0, "signal",  # compute out
                 arg_group_1, "signal",  # comm out.
+                layer_info=f"L{l_no}", operation_info="tick_2"
             )
 
         # tick 3
@@ -241,6 +244,7 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                 compute_stream, self.comm_stream,
                 arg_group_0, "signal",  # comm out
                 arg_group_1, "signal",  # compute out
+                layer_info=f"L{l_no}", operation_info="tick_3"
             )
 
         # tick 4, communication. also the tick 0 of the next layer
@@ -261,6 +265,7 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                     compute_stream, self.comm_stream,
                     arg_group_0, "hidden_states",   # place holder
                     arg_group_1, "signal",          # comm out
+                    layer_info=f"L{l_no}", operation_info="tick_4"
                 )
             with torch.cuda.nvtx.range(f"forward[{l_no}].post_core_attn.1"):
                 arg_group_1 = self.tick_nonca_compute(layer, None, arg_group_1,

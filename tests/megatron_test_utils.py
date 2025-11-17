@@ -443,6 +443,7 @@ class BaseModelInitializer(ABC):
         transformer_layer_spec = self.get_transformer_layer_spec()
         rope_scaling_args = self.get_rope_scaling_args()
         mtp_block_spec = extra_kwargs.get("mtp_block_spec", None)
+        print(f"🟡 BaseModelInitializer: {self.tfconfig = }")
         model = PingPongGPTModel(
             config=self.tfconfig,
             transformer_layer_spec=transformer_layer_spec,

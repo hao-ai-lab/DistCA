@@ -14,7 +14,7 @@ from test_fa2a_metadata import (
 
 def test(args):
     world_size = args.world_size
-    num_doc = args.num_doc
+    num_doc = args.num_docs
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     hidden_size_q = args.hidden_size_q
     hidden_size_k = args.hidden_size_k
@@ -27,7 +27,7 @@ def test(args):
     lse_size = 0    # we do not test pp here so it can be 0
     scheduler_output, _ = create_random_shard_info(args.seed, world_size, num_doc, max_cp_degree,
                                                    min_shard_len=8, tot_num_token=total_seq_len)
-    qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata, _, _ = from_planner_output(
+    qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata, _, _, _ = from_planner_output(
         world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
         is_pipeline_tick=False,
     )
@@ -62,6 +62,7 @@ def test(args):
         src_shard = src_buffer[rank]
         src_shard_cor = src_shard.clone()
         send_mask = metadata_slice.kv_replica_mask
+        max_cp = metadata_slice.kv_replica_mask.shape[1]
         # Q shard
         src_shard_cor = simulate_fa2a_copy_non_cp(
             q_shard.flatten(), src_shard_cor, q_src_offsets, q_src_seqlen,
@@ -78,7 +79,7 @@ def test(args):
         # K shard
         src_shard_cor = simulate_fa2a_copy_cp(
             k_shard.flatten(), src_shard_cor, k_src_offsets,
-            kv_src_seqlen, hidden_size_k, element_size, max_cp_degree,
+            kv_src_seqlen, hidden_size_k, element_size, max_cp,
             send_mask, is_send=True,
         )
         do_shard = send_mask.to(torch.int8).cuda()
@@ -92,7 +93,7 @@ def test(args):
         print(f"copying rank {rank} k shard to src buffer done.")
         src_shard_cor = simulate_fa2a_copy_cp(
             v_shard.flatten(), src_shard_cor, v_src_offsets,
-            kv_src_seqlen, hidden_size_k, element_size, max_cp_degree,
+            kv_src_seqlen, hidden_size_k, element_size, max_cp,
             send_mask, is_send=True,
         )
         src_buffer[rank] = src_shard_cor
@@ -146,6 +147,7 @@ def test(args):
         torch.cuda.synchronize()
         torch.testing.assert_close(dst_q_shard_cor, dst_q_shard_out.flatten())
         print(f"copying rank {rank} q shard from dst buffer done.")
+        dst_q[rank] = dst_q_shard_out
         # K
         dst_k_shard_cor = dst_k_shard.clone().flatten()
         dst_k_shard_cor = simulate_fa2a_copy_non_cp(
@@ -160,6 +162,48 @@ def test(args):
         torch.cuda.synchronize()
         torch.testing.assert_close(dst_k_shard_cor, dst_k_shard_out.flatten())
         print(f"copying rank {rank} k shard from dst buffer done.")
+        dst_k[rank] = dst_k_shard_out
+        # V
+        dst_v_shard_cor = dst_v_shard.clone().flatten()
+        dst_v_shard_cor = simulate_fa2a_copy_non_cp(
+            dst_v_shard_cor, dst_shard, v_recv_offsets,
+            recv_seqlen_kv, hidden_size_k, element_size, is_send=False,
+        )
+        dst_v_shard_out = dst_v_shard.clone()
+        a2a_memcpy_non_cp(
+            dst_v_shard_out, v_recv_offsets.long().cuda(),
+            recv_seqlen_kv.long().cuda(), to_nvshmem=False, buffer=dst_shard.cuda()
+        )
+        torch.testing.assert_close(dst_v_shard_cor, dst_v_shard_out.flatten())
+        dst_v[rank] = dst_v_shard_out
+
+    # Test send copy of backward
+    grad_buffer = torch.zeros_like(dst_buffer)
+    for rank in range(world_size):
+        metadata_slice = qkv_bwd_fa2a_metadata.get_slice(rank).normalize()
+        dst_shard = grad_buffer[rank]
+
+        attn_q_shard = dst_q[rank]
+        attn_k_shard = dst_k[rank]
+        attn_v_shard = dst_v[rank]
+        q_send_offsets, k_send_offsets, v_send_offsets = metadata_slice.send_memcpy_metadata
+
+        a2a_memcpy_non_cp(
+            attn_q_shard, q_send_offsets, metadata_slice.seq_lens[0].send_seqlens,
+            to_nvshmem=True, buffer=dst_shard
+        )
+
+        copy_seq_mask = metadata_slice.kv_grad_send_dedup.main_copy_mask
+        a2a_memcpy_non_cp(
+            attn_k_shard, k_send_offsets, metadata_slice.seq_lens[1].send_seqlens,
+            to_nvshmem=True, buffer=dst_shard, copy_seq_mask=copy_seq_mask
+        )
+        a2a_memcpy_non_cp(
+            attn_v_shard, v_send_offsets, metadata_slice.seq_lens[1].send_seqlens,
+            to_nvshmem=True, buffer=dst_shard, copy_seq_mask=copy_seq_mask
+        )
+        torch.testing.assert_close(dst_shard, dst_buffer[rank])
+        print(f"copying rank {rank} grads to send buffer done.")
 
     # Test recv copy cp (kv grad)
     grad_k = torch.zeros(
@@ -176,6 +220,7 @@ def test(args):
         grad_v_shard = grad_v[rank]
         # assume grad equals the original value
         grad_shard = src_buffer[rank]
+        max_cp = metadata_slice.kv_replica_mask.shape[1]
         # K
         grad_send_mask = metadata_slice.kv_replica_mask
         grad_do_shard = grad_send_mask.to(torch.int8).cuda()
@@ -183,7 +228,7 @@ def test(args):
         grad_k_shard_cor = grad_k_shard.flatten(start_dim=1).clone()
         grad_k_shard_cor = simulate_fa2a_copy_cp(
             grad_k_shard_cor, grad_shard, grad_k_recv_offsets, grad_seqlen_kv,
-            hidden_size_k, element_size, max_cp_degree, grad_send_mask, is_send=False,
+            hidden_size_k, element_size, max_cp, grad_send_mask, is_send=False,
         )
         grad_k_shard_cor = grad_k_shard_cor.reshape_as(grad_k_shard)
         torch.testing.assert_close(
@@ -206,12 +251,12 @@ def test(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--world_size', type=int, default=2)
-    parser.add_argument('--num_doc', type=int, default=4)
-    parser.add_argument('--num_tokens', type=int, default=128)
-    parser.add_argument('--hidden_size_q', type=int, default=256)
-    parser.add_argument('--hidden_size_k', type=int, default=128)
-    parser.add_argument('--max_seq_shard', type=int, default=2)
+    parser.add_argument('--world-size', type=int, default=2)
+    parser.add_argument('--num-docs', type=int, default=4)
+    parser.add_argument('--num-tokens', type=int, default=128)
+    parser.add_argument('--hidden-size-q', type=int, default=64)
+    parser.add_argument('--hidden-size-k', type=int, default=16)
+    parser.add_argument('--max-seq-shard', type=int, default=2)
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
     test(args)
