@@ -46,7 +46,7 @@ class FlashAttnArgs:
         if self.deterministic is None:
             env_val = os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
             self.deterministic = env_val != "1"
-            print(f"[FlashAttnArgs] Set deterministic to {self.deterministic} (NVTE_ALLOW_NONDETERMINISTIC_ALGO={env_val})")
+            # print(f"[FlashAttnArgs] Set deterministic to {self.deterministic} (NVTE_ALLOW_NONDETERMINISTIC_ALGO={env_val})")
         if self.deterministic:
             print("⚠️⚠️⚠️ Using deterministic = True! This is not recommended when profiling for performance as it will degrade backward pass performance!")
 

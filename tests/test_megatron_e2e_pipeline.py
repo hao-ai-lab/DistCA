@@ -134,6 +134,7 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
                 forward_only=forward_only,
             )
         grad_sample = unwrap_model(self.train_module[0]).decoder.layers[-1].self_attention.linear_proj.weight.main_grad.clone()
+        print(f"{losses_reduced=}, {grad_sample=}")
 
         # when testing numerical correctness, instead of running optimizer step, reset grads.
         for tm in self.train_module:
@@ -293,6 +294,9 @@ def test(args):
     )
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
+
+    # torch.distributed.breakpoint()
+    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
@@ -369,12 +373,12 @@ def test(args):
         orig_impl_microbatches.append(orig_mb)
 
     time.sleep(2)
-    loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
-        microbatches=orig_impl_microbatches,
-        forward_only=False,
-        mode="orig_reimpl",
-        with_dummy=True,
-    )
+    # loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
+    #     microbatches=orig_impl_microbatches,
+    #     forward_only=False,
+    #     mode="orig_reimpl",
+    #     with_dummy=True,
+    # )
     loss_orig, grad_orig = worker.forward_backward_batch(
         microbatches=orig_impl_microbatches,
         forward_only=False,

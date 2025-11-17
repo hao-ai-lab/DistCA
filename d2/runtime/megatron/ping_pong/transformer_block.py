@@ -18,7 +18,7 @@ from d2.runtime.attn_kernels.ops import DispatcherWrapper
 from d2.runtime.megatron.ops.fused_comm_attn import dummy_backward
 from d2.runtime.megatron.packed_seq_params import PingPangPackedSeqParams
 from d2.runtime.megatron.ping_pong.tick_ops import (
-    forward_core_attn, layout_mlp_to_attn, layout_attn_to_mlp, log_memory_usage, tick_nonca_compute,
+    forward_core_attn, layout_mlp_to_attn, layout_attn_to_mlp, log_memory_usage, tick_nonca_compute, tick_nonca_compute_cuda_graph,
     tick_sync
 )
 from d2.runtime.megatron.ping_pong.transformer_layer import TransformerLayer
@@ -47,6 +47,22 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
         self.comm_stream: torch.cuda.Stream = None
         self._ping_pong_debug: bool = False
         self._debug_forward_impl: str = "orig"
+        self.use_cuda_graph: bool = True  # FIXME: ugly hardcode here
+        self.tick_nonca_compute = tick_nonca_compute_cuda_graph if self.use_cuda_graph else tick_nonca_compute
+    
+    def init_layer_cuda_graphs(self):
+        prev_layer = None
+        for layer in self.layers:
+            layer: TransformerLayer
+            layer.init_pre_attn_cuda_graph(prev_layer, seq_len=1024,  # FIXME: ugly hardcode here
+                                           device=layer.self_attention.linear_qkv.weight.device,
+                                           dtype=layer.self_attention.linear_qkv.weight.dtype)
+            prev_layer = layer
+        
+        # This is the last layer
+        layer.init_post_attn_cuda_graph(seq_len=1024,  # FIXME: ugly hardcode here
+                                        device=layer.self_attention.linear_qkv.weight.device,
+                                        dtype=layer.self_attention.linear_qkv.weight.dtype)
 
     def init_ping_pong_communication_ctx(self, device: torch.device):
         assert not self.ping_pong_comm_initialized
@@ -174,8 +190,8 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
 
         # tick 0, compute part
         with torch.cuda.nvtx.range(linear_name + ".0"):
-            arg_group_0 = tick_nonca_compute(layer, prev_layer, arg_group_0,
-                                             is_last_layer_post_attn=False)
+            arg_group_0 = self.tick_nonca_compute(layer, prev_layer, arg_group_0,
+                                                  is_last_layer_post_attn=False)
         with torch.cuda.nvtx.range(f"forward[{l_no}].sync_tick.0"):
             tick_sync(
                 compute_stream, self.comm_stream,
@@ -190,8 +206,8 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
             arg_group_0 = layout_mlp_to_attn(layer, arg_group_0)
         # compute
         with torch.cuda.nvtx.range(linear_name + ".1"):
-            arg_group_1 = tick_nonca_compute(layer, prev_layer, arg_group_1,
-                                             is_last_layer_post_attn=False)
+            arg_group_1 = self.tick_nonca_compute(layer, prev_layer, arg_group_1,
+                                                  is_last_layer_post_attn=False)
         with torch.cuda.nvtx.range(f"forward[{l_no}].sync_tick.1"):
             tick_sync(
                 compute_stream, self.comm_stream,
@@ -238,8 +254,8 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
             # No next layer, do the sync here.
             # compute
             with torch.cuda.nvtx.range(f"forward[{l_no}].post_core_attn.0"):
-                arg_group_0 = tick_nonca_compute(layer, None, arg_group_0,
-                                                 is_last_layer_post_attn=True)
+                arg_group_0 = self.tick_nonca_compute(layer, None, arg_group_0,
+                                                      is_last_layer_post_attn=True)
             with torch.cuda.nvtx.range(f"forward[{l_no}].sync_tick.4"):
                 tick_sync(
                     compute_stream, self.comm_stream,
@@ -247,8 +263,8 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                     arg_group_1, "signal",          # comm out
                 )
             with torch.cuda.nvtx.range(f"forward[{l_no}].post_core_attn.1"):
-                arg_group_1 = tick_nonca_compute(layer, None, arg_group_1,
-                                                 is_last_layer_post_attn=True)
+                arg_group_1 = self.tick_nonca_compute(layer, None, arg_group_1,
+                                                      is_last_layer_post_attn=True)
             # gathering the result
             with torch.cuda.nvtx.range(f"forward[{l_no}].gather_ping_pong"):
                 hidden_states = gather_tensor([arg_group_0["hidden_states"], arg_group_1["hidden_states"]], 2)
@@ -295,6 +311,8 @@ def add_ping_pong_forward(block: MegatronTransformerBlock) -> PingPongTransforme
         PingPongTransformerBlockInterface.forward_layer_ping_pong, block)
     block.forward = types.MethodType(
         PingPongTransformerBlockInterface.forward, block)
+    block.init_layer_cuda_graphs = types.MethodType(
+        PingPongTransformerBlockInterface.init_layer_cuda_graphs, block)
 
     return block
 

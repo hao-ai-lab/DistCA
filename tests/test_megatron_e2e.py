@@ -295,6 +295,9 @@ def test(args):
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
+    # torch.distributed.breakpoint()
+    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
+
     as_rank = worker.as_rank
     as_world_size = worker.as_world_size
 
@@ -347,6 +350,7 @@ def test(args):
             normal_forward_fn=False,
             forward_only=False,
         )
+        print(f"{ref=}")
     time.sleep(1)
     torch.cuda.synchronize()
     torch.distributed.barrier()
@@ -357,6 +361,7 @@ def test(args):
             normal_forward_fn=False,
             forward_only=False,
         )
+        print(f"{ref=}")
     torch.cuda.synchronize()
     torch.distributed.barrier()
     print("=" * 20 + "forward_backward_batch attention server, done")

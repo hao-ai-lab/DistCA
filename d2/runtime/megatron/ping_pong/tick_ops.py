@@ -1,5 +1,9 @@
+from decimal import Context
 import os
+from turtle import forward
 from typing import Any, Dict, Optional
+
+import torch
 
 from d2.runtime.megatron.ops import FusedCommAttn, TickSync, post_a2a_attn_out_with_lse
 from d2.runtime.megatron.ops.fused_comm_attn import FlashAttnArgs
@@ -27,17 +31,23 @@ def forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
     )
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(after pre core attn)")
 
-    log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(before pre mlp to attn)")
-    signal = layer._pre_mlp_to_attn(query, key, value, args["packed_seq_params"])
-    log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(after pre mlp to attn)")
-
     args["query"] = query
     args["key"] = key
     args["value"] = value
     args["residual"] = residual
     args["attn_mask_type"] = attn_mask_type
-    args["signal"] = signal
+    forward_pre_core_attn_comm(layer, args)
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(return)")
+    return args
+
+
+def forward_pre_core_attn_comm(layer: TransformerLayer, args: Dict[str, Any]):
+    log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(before pre mlp to attn)")
+    signal = layer._pre_mlp_to_attn(
+        args["query"], args["key"], args["value"], args["packed_seq_params"],
+    )
+    log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(after pre mlp to attn)")
+    args["signal"] = signal
     return args
 
 
@@ -108,8 +118,7 @@ def layout_attn_to_mlp(layer: TransformerLayer, args: Dict[str, Any]):
     return args
 
 
-def forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
-    log_memory_usage(f"(L{layer.layer_number}) forward_post_core_attn:(start)")
+def forward_post_core_attn_comm(layer: TransformerLayer, args: Dict[str, Any]):
     signal = args.pop("signal")
     packed_seq_params: PingPangSingleStepPackedSeqParams = args["packed_seq_params"]
     bwd_resend_qkv = packed_seq_params.bwd_packed_seq_params is not None
@@ -124,15 +133,82 @@ def forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
         args.pop("query"), args.pop("key"), args.pop("value")
     else:
         core_attn_out = layer._post_attn_to_mlp(signal, args["packed_seq_params"])
-    residual = args.pop("residual")
+    args["core_attn_out"] = core_attn_out
+    return args
+
+
+def forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
+    log_memory_usage(f"(L{layer.layer_number}) forward_post_core_attn:(start)")
+    forward_post_core_attn_comm(layer, args)
     mlp_output, context = layer._forward_post_core_attn(
-        core_attn_out,
-        residual,
+        args.pop("core_attn_out"),
+        args.pop("residual"),
         args["context"],
         args["context_mask"],
     )
     args["hidden_states"] = mlp_output
     args["context"] = context
+    log_memory_usage(f"(L{layer.layer_number}) forward_post_core_attn:(end)")
+    return args
+
+
+def forward_post_then_pre_core_attn_cuda_graph(layer: TransformerLayer, args: Dict[str, Any]):
+    log_memory_usage(f"(L{layer.layer_number}) forward_post_then_pre_core_attn:(start)")
+    assert args["context"] is None and args["context_mask"] is None, "not supported in cudagraph"
+    forward_post_core_attn_comm(layer, args)
+    log_memory_usage(f"(L{layer.layer_number}) forward_post_then_pre_core_attn:(before non core attn)")
+    query, key, value, residual, attn_mask_type = layer._forward_pre_attn_cuda_graph(
+        (args.pop("core_attn_out"), args.pop("residual")),
+        args["rotary_pos_emb"],
+        args["rotary_pos_cos"],
+        args["rotary_pos_sin"],
+        args["mlp_packed_seq_params"],
+        args["sequence_len_offset"],
+    )
+    log_memory_usage(f"(L{layer.layer_number}) forward_post_then_pre_core_attn:(after non core attn)")
+    args["query"] = query
+    args["key"] = key
+    args["value"] = value
+    args["residual"] = residual
+    args["attn_mask_type"] = attn_mask_type
+    forward_pre_core_attn_comm(layer, args)
+    log_memory_usage(f"(L{layer.layer_number}) forward_pre_then_pre_core_attn:(return)")
+    return args
+
+
+def forward_pre_core_attn_cuda_graph(layer: TransformerLayer, args: Dict[str, Any]):
+    log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(start)")
+    log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(before pre core attn)")
+    hidden_states = args.pop("hidden_states")
+    query, key, value, residual, attn_mask_type = layer._forward_pre_attn_cuda_graph(
+        (hidden_states,),
+        args["rotary_pos_emb"],
+        args["rotary_pos_cos"],
+        args["rotary_pos_sin"],
+        args["mlp_packed_seq_params"],
+        args["sequence_len_offset"],
+    )
+    log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(after pre core attn)")
+
+    args["query"] = query
+    args["key"] = key
+    args["value"] = value
+    args["residual"] = residual
+    args["attn_mask_type"] = attn_mask_type
+    forward_pre_core_attn_comm(layer, args)
+    log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(return)")
+    return args
+
+
+def forward_post_core_attn_cuda_graph(layer: TransformerLayer, args: Dict[str, Any]):
+    forward_post_core_attn_comm(layer, args)
+    mlp_output = layer._forward_post_attn_cuda_graph(
+        args.pop("core_attn_out"),
+        args.pop("residual"),
+        args["context"],
+        args["context_mask"],
+    )
+    args["hidden_states"] = mlp_output
     log_memory_usage(f"(L{layer.layer_number}) forward_post_core_attn:(end)")
     return args
 
@@ -173,3 +249,13 @@ def tick_nonca_compute(
         arg_group = forward_post_core_attn(prev_layer, arg_group)
     arg_group = forward_pre_core_attn(layer, arg_group)
     return arg_group
+
+def tick_nonca_compute_cuda_graph(
+    layer: TransformerLayer, prev_layer: Optional[TransformerLayer],
+    arg_group: Dict[str, Any], is_last_layer_post_attn: bool
+):
+    if is_last_layer_post_attn:
+        return forward_post_core_attn_cuda_graph(layer, arg_group)
+    if prev_layer is None:
+        return forward_pre_core_attn(layer, arg_group)
+    return forward_post_then_pre_core_attn_cuda_graph(layer, arg_group)
