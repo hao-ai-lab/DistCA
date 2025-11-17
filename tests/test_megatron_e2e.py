@@ -351,7 +351,6 @@ def test(args):
             normal_forward_fn=False,
             forward_only=False,
         )
-        print(f"{ref=}")
     time.sleep(1)
     torch.cuda.synchronize()
     torch.distributed.barrier()
@@ -362,7 +361,6 @@ def test(args):
             normal_forward_fn=False,
             forward_only=False,
         )
-        print(f"{ref=}")
     torch.cuda.synchronize()
     torch.distributed.barrier()
     print("=" * 20 + "forward_backward_batch attention server, done")

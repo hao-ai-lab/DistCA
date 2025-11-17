@@ -499,7 +499,7 @@ def create_pipeline_doclens(
             other_pp_doc_len = ref_doc_lens[:-num_batches]
     else:
         dummy_fwd_num = world_size - dp_size
-        other_pp_doc_len = [[total_token_on_rank // dp_size] for _ in range(dummy_fwd_num)]
+        other_pp_doc_len = [[total_token_on_rank // dp_size] for _ in range(dummy_fwd_num)]  # FIXME: using total_token_on_rank for cudagraph to work out-of-box, can be tp_size when cudagraph is disabled.
     tick_per_rank_doc_len = pp_head_new_doc_len + other_pp_doc_len
     print(f"In util.py, finally tick_per_rank_doc_len is: {tick_per_rank_doc_len}")
 

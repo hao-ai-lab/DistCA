@@ -2,9 +2,6 @@ from typing import Any, Dict, Optional
 import os
 import torch
 
-import torch
-
-from d2.runtime.megatron.ops import FusedCommAttn, TickSync, post_a2a_attn_out_with_lse
 from d2.runtime.megatron.ops import FusedCommAttn, post_a2a_attn_out_with_lse
 from d2.runtime.megatron.ops.stream_sync_fn import tick_sync_with_info
 from d2.runtime.megatron.ops.fused_comm_attn import FlashAttnArgs
@@ -156,7 +153,7 @@ def forward_post_core_attn_comm(layer: TransformerLayer, args: Dict[str, Any]):
 
 def forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
     log_memory_usage(f"(L{layer.layer_number}) forward_post_core_attn:(start)")
-    
+
     # Setup timing if enabled
     start_event = None
     end_event = None

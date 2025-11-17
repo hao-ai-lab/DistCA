@@ -134,7 +134,6 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
                 forward_only=forward_only,
             )
         grad_sample = unwrap_model(self.train_module[0]).decoder.layers[-1].self_attention.linear_proj.weight.main_grad.clone()
-        print(f"{losses_reduced=}, {grad_sample=}")
 
         # when testing numerical correctness, instead of running optimizer step, reset grads.
         for tm in self.train_module:
@@ -373,12 +372,12 @@ def test(args):
         orig_impl_microbatches.append(orig_mb)
 
     time.sleep(2)
-    # loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
-    #     microbatches=orig_impl_microbatches,
-    #     forward_only=False,
-    #     mode="orig_reimpl",
-    #     with_dummy=True,
-    # )
+    loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
+        microbatches=orig_impl_microbatches,
+        forward_only=False,
+        mode="orig_reimpl",
+        with_dummy=True,
+    )
     loss_orig, grad_orig = worker.forward_backward_batch(
         microbatches=orig_impl_microbatches,
         forward_only=False,
@@ -414,7 +413,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-gpus-per-node", type=int, default=4)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--pp-size", type=int, default=4)
-    parser.add_argument("--num-microbatch", type=int, default=2)
+    parser.add_argument("--num-microbatch", type=int, default=6)
     parser.add_argument("--use-planner", action="store_true")
     args = parser.parse_args()
     test(args)
