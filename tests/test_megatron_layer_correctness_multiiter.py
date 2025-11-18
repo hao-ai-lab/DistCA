@@ -66,6 +66,66 @@ def get_key_module_grads(layer):
     return grads
 
 
+def clone_layer_parameters(layer):
+    return [param.detach().clone() for param in layer.parameters()]
+
+
+def compare_parameter_sets(layer_normal, layer_pingpong, as_rank: int, prefix: str):
+    for (name_a, param_a), (name_b, param_b) in zip(
+        layer_normal.named_parameters(),
+        layer_pingpong.named_parameters(),
+    ):
+        assert name_a == name_b, "Parameter ordering mismatch between model replicas."
+        check_close(
+            param_a, param_b,
+            f"[Rank {as_rank}] {prefix}{name_a} parameter update match (normal vs ping-pong)"
+        )
+
+
+def run_backward_pair(
+    worker: 'MegatronLayerWorker',
+    tensor_shard: torch.Tensor,
+    packed_seq_params: PackedSeqParams,
+    ping_pong_params: PingPangSingleStepPackedSeqParams,
+    loss_fn,
+    base_seed: int,
+    seed_offset: int,
+    return_grad: bool,
+):
+    torch.manual_seed(base_seed + seed_offset)
+    normal_backward_out, _ = worker.forward_normal(
+        tensor_shard, packed_seq_params, return_grad=return_grad, loss_fn=loss_fn
+    )
+    torch.manual_seed(base_seed + seed_offset)
+    ping_backward_out, _ = worker.forward_ping_pang_one_stage(
+        tensor_shard, ping_pong_params, return_grad=return_grad, loss_fn=loss_fn
+    )
+    return normal_backward_out, ping_backward_out
+
+
+def compare_backward_results(normal_backward_out, ping_backward_out, as_rank: int, prefix: str = ""):
+    _, _, normal_input_grad, normal_loss = normal_backward_out
+    _, _, pp_input_grad, pp_loss = ping_backward_out
+    check_close(
+        normal_loss, pp_loss,
+        f"[Rank {as_rank}] {prefix}Loss value comparison (normal vs ping-pong)"
+    )
+    check_close(
+        normal_input_grad, pp_input_grad,
+        f"[Rank {as_rank}] {prefix}Input gradient comparison (normal vs ping-pong)"
+    )
+
+
+def compare_module_gradients(worker: 'MegatronLayerWorker', as_rank: int, prefix: str = ""):
+    normal_grads = get_key_module_grads(worker.layer_normal)
+    pp_grads = get_key_module_grads(worker.layer_pingpong)
+    for name in normal_grads:
+        check_close(
+            normal_grads[name], pp_grads[name],
+            f"[Rank {as_rank}] {prefix}{name} weight gradient (normal vs ping-pong)"
+        )
+
+
 class MegatronLayerWorker(MegatronBaseWorker):
     def __init__(self, rank: int, world_size: int):
         super().__init__(rank, world_size)
@@ -160,6 +220,7 @@ def test_forward(
     seed: int, total_seq_len: int, num_docs: int, max_cp_degree: int,
     worker: MegatronLayerWorker, hidden_size_q: int, hidden_size_k: int,
     tp_size: int = 1, return_grad: bool = True,
+    num_iterations = 3
 ):
     # ========================================
     # Setup and metadata preparation
@@ -237,34 +298,6 @@ def test_forward(
     # ========================================
     if return_grad:
         loss_fn = lambda x: x.mean()
-        torch.manual_seed(seed + 1000)
-        normal_backward_out, _ = worker.forward_normal(
-            tensor_shard, packed_seq_params, return_grad=return_grad, loss_fn=loss_fn
-        )
-        torch.manual_seed(seed + 1000)
-        ping_backward_out, _ = worker.forward_ping_pang_one_stage(
-            tensor_shard, ping_pong_params, return_grad=return_grad, loss_fn=loss_fn
-        )
-
-        _, _, normal_input_grad, normal_loss = normal_backward_out
-        _, _, pp_input_grad, pp_loss = ping_backward_out
-        check_close(
-            normal_loss, pp_loss,
-            f"[Rank {as_rank}] Loss value comparison (normal vs ping-pong)"
-        )
-        check_close(
-            normal_input_grad, pp_input_grad,
-            f"[Rank {as_rank}] Input gradient comparison (normal vs ping-pong)"
-        )
-
-        normal_grads = get_key_module_grads(worker.layer_normal)
-        pp_grads = get_key_module_grads(worker.layer_pingpong)
-        for name in normal_grads:
-            check_close(
-                normal_grads[name], pp_grads[name],
-                f"[Rank {as_rank}] {name} weight gradient (normal vs ping-pong)"
-            )
-
         opt_normal = torch.optim.SGD(
             [param for param in worker.layer_normal.parameters() if param.requires_grad],
             lr=1e-3,
@@ -273,64 +306,64 @@ def test_forward(
             [param for param in worker.layer_pingpong.parameters() if param.requires_grad],
             lr=1e-3,
         )
-
-        normal_before = [param.detach().clone() for param in worker.layer_normal.parameters()]
-        ping_before = [param.detach().clone() for param in worker.layer_pingpong.parameters()]
-
-        opt_normal.step()
-        opt_pingpong.step()
-
-        for (name_a, param_a), (name_b, param_b) in zip(
-            worker.layer_normal.named_parameters(),
-            worker.layer_pingpong.named_parameters(),
-        ):
-            assert name_a == name_b, "Parameter ordering mismatch between model replicas."
-            check_close(
-                param_a, param_b,
-                f"[Rank {as_rank}] Post-optimizer {name_a} parameter update match (normal vs ping-pong)"
-            )
-
-        changed_normal = any(
-            not torch.allclose(param, before)
-            for param, before in zip(worker.layer_normal.parameters(), normal_before)
-        )
-        changed_ping = any(
-            not torch.allclose(param, before)
-            for param, before in zip(worker.layer_pingpong.parameters(), ping_before)
-        )
-        if not (changed_normal or changed_ping):
-            print(f"⚠️ [Rank {as_rank}] Optimizer step did not change any parameters.")
-
+        
         opt_normal.zero_grad(set_to_none=True)
         opt_pingpong.zero_grad(set_to_none=True)
 
-        torch.manual_seed(seed + 2000)
-        normal_backward_out_post, _ = worker.forward_normal(
-            tensor_shard, packed_seq_params, return_grad=return_grad, loss_fn=loss_fn
-        )
-        torch.manual_seed(seed + 2000)
-        ping_backward_out_post, _ = worker.forward_ping_pang_one_stage(
-            tensor_shard, ping_pong_params, return_grad=return_grad, loss_fn=loss_fn
-        )
+        for iter_idx in range(num_iterations):
+            iter_prefix = f"Iter {iter_idx + 1}/{num_iterations} "
+            print(f"[Rank {as_rank}] ===== {iter_prefix}pre-step validation =====")
 
-        _, _, normal_input_grad_post, normal_loss_post = normal_backward_out_post
-        _, _, pp_input_grad_post, pp_loss_post = ping_backward_out_post
-        check_close(
-            normal_loss_post, pp_loss_post,
-            f"[Rank {as_rank}] Post-optimizer Loss value comparison (normal vs ping-pong)"
-        )
-        check_close(
-            normal_input_grad_post, pp_input_grad_post,
-            f"[Rank {as_rank}] Post-optimizer Input gradient comparison (normal vs ping-pong)"
-        )
-
-        normal_grads_post = get_key_module_grads(worker.layer_normal)
-        pp_grads_post = get_key_module_grads(worker.layer_pingpong)
-        for name in normal_grads_post:
-            check_close(
-                normal_grads_post[name], pp_grads_post[name],
-                f"[Rank {as_rank}] Post-optimizer {name} weight gradient (normal vs ping-pong)"
+            # Pre-step backward/gradient comparison
+            seed_pre = 1000 + iter_idx * 100
+            normal_backward_out, ping_backward_out = run_backward_pair(
+                worker, tensor_shard, packed_seq_params, ping_pong_params,
+                loss_fn, seed, seed_pre, return_grad
             )
+            compare_backward_results(normal_backward_out, ping_backward_out, as_rank)
+            compare_module_gradients(worker, as_rank)
+
+            # Optimizer step
+            normal_before = clone_layer_parameters(worker.layer_normal)
+            ping_before = clone_layer_parameters(worker.layer_pingpong)
+
+            opt_normal.step()
+            opt_pingpong.step()
+
+            compare_parameter_sets(
+                worker.layer_normal, worker.layer_pingpong, as_rank,
+                prefix="Post-optimizer "
+            )
+
+            changed_normal = any(
+                not torch.allclose(param, before)
+                for param, before in zip(worker.layer_normal.parameters(), normal_before)
+            )
+            changed_ping = any(
+                not torch.allclose(param, before)
+                for param, before in zip(worker.layer_pingpong.parameters(), ping_before)
+            )
+            if not (changed_normal or changed_ping):
+                print(f"⚠️ [Rank {as_rank}] Optimizer step did not change any parameters.")
+
+            opt_normal.zero_grad(set_to_none=True)
+            opt_pingpong.zero_grad(set_to_none=True)
+            print(f"[Rank {as_rank}] ----- {iter_prefix}post-step validation -----")
+
+            # Post-step backward/gradient comparison
+            seed_post = 2000 + iter_idx * 100
+            normal_backward_out_post, ping_backward_out_post = run_backward_pair(
+                worker, tensor_shard, packed_seq_params, ping_pong_params,
+                loss_fn, seed, seed_post, return_grad
+            )
+            compare_backward_results(
+                normal_backward_out_post, ping_backward_out_post, as_rank, prefix="Post-optimizer "
+            )
+            compare_module_gradients(worker, as_rank, prefix="Post-optimizer ")
+
+            opt_normal.zero_grad(set_to_none=True)
+            opt_pingpong.zero_grad(set_to_none=True)
+            print(f"[Rank {as_rank}] ===== Completed {iter_prefix}cycle =====")
 
 
 def init_megatron_test(
@@ -392,6 +425,7 @@ def test(args):
         args.seed, args.num_tokens, args.num_docs, max_cp_degree,
         worker, hidden_size, hidden_size_kv,
         tp_size, return_grad=args.return_grad,
+        num_iterations=args.num_iterations,
     )
 
 
@@ -413,8 +447,9 @@ if __name__ == "__main__":
         "--return-grad",
         action="store_true",
         default=False,
-        help="Run backward pass, compare grads, perform an optimizer step, and re-validate.",
+        help="Run backward pass, compare grads, perform THREE optimizer steps (with prints), and re-validate each time.",
     )
+    parser.add_argument("--num-iterations", type=int, default=3)
     args = parser.parse_args()
     test(args)
 

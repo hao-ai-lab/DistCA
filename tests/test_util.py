@@ -390,7 +390,7 @@ def random_shard_info_linear_layout_dp(
         if not has_shard_dst[rank]:
             # 1. find a doc to modify.
             token_updated = False
-            for did in range(glob_doc_lens[rank]):
+            for did in range(len(glob_doc_lens[rank])):
                 for shard in scheduler_output_per_rank[rank][did]:
                     if shard.shard_len < 2 * min_shard_len:
                         continue
