@@ -27,7 +27,10 @@ export TENSOR_DUMP_SUFFIX=
 
 
 # ⚪ Ready
-export JOBID=1017017
-export HEAD_NODE_IP=fs-mbz-gpu-070
+#            1028445   lowprio interact yonghao.  R    1:58:04      4 fs-mbz-gpu-[033,331,380,961]
+export JOBID=1028445
+export HEAD_NODE_IP=fs-mbz-gpu-033
 export TP_SIZE=8
+export NNODES=2
+export NPROC_PER_NODE=8
 bash /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks3/_251103_correctness/train_3d.sh

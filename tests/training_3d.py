@@ -1,26 +1,68 @@
 
-"""
-Combined Megatron E2E Test (D2 + Baseline)
 
-This script combines both D2 and baseline approaches for testing:
-- Baseline mode: Uses simple batch generation and normal forward function
-- D2 mode: Uses balanced flops planning and ping-pang parameters
+"""
+Combined Megatron E2E Test (D2)
+
+This script runs the D2 attention server pipeline with balanced flops planning
+and ping-pang parameters.
+
+Dataset Options:
+- Synthetic sequence distributions: 'wlbllm', 'prolong' (default)
+- Real datasets with tokens: 'bookcorpus', 'wikitext', 'openwebtext', 'c4'
 
 Usage:
 ```bash
+# With synthetic data (default)
 bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
+
+# With real dataset (e.g., bookcorpus)
+python training_3d.py --sample-name bookcorpus ...
 ```
 """
-
+import traceback
 import time
+import psutil, os
+from dataclasses import dataclass
 start_time__ = time.time()
 
-import psutil, os
 rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID","0")))
 local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID","0")))
 p = psutil.Process(os.getpid())
 p.cpu_affinity([local * 16, local * 16 + 1])  # pin to core based on local rank
 print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
+
+
+def extract_scalar_loss(losses_reduced):
+    loss_value = None
+    if isinstance(losses_reduced, dict):
+        val = losses_reduced.get("loss")
+        if val is not None:
+            if isinstance(val, (list, tuple)):
+                vals = []
+                for v in val:
+                    if torch.is_tensor(v):
+                        vals.append(v.item())
+                    else:
+                        vals.append(float(v))
+                if vals:
+                    loss_value = sum(vals) / len(vals)
+            else:
+                loss_value = val.item() if torch.is_tensor(val) else float(val)
+    elif torch.is_tensor(losses_reduced):
+        loss_value = losses_reduced.item()
+    elif isinstance(losses_reduced, (list, tuple)) and len(losses_reduced) > 0:
+        vals = []
+        for v in losses_reduced:
+            if torch.is_tensor(v):
+                vals.append(v.item())
+            elif isinstance(v, (int, float)):
+                vals.append(float(v))
+            elif isinstance(v, dict) and "loss" in v:
+                lv = v["loss"]
+                vals.append(lv.item() if torch.is_tensor(lv) else float(lv))
+        if vals:
+            loss_value = sum(vals) / len(vals)
+    return loss_value
 
 # ----------------
 # Taskset confirm
@@ -33,7 +75,6 @@ print(f"CPUS={aff} MEMS={mems}")
 # ----------------
 # Main Imports
 # ----------------
-from torch.profiler import profile, record_function, ProfilerActivity
 import d2.planner.wlb_planner
 import d2.mem
 import math
@@ -43,11 +84,10 @@ import gc
 import pytz
 import json
 import time
-import rich
-import signal
 import traceback
 import sys
 from contextlib import contextmanager
+from collections import defaultdict
 import numpy as np
 
 from megatron.core import mpu
@@ -61,7 +101,6 @@ from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 from d2.runtime.attn_kernels.ops import DispatcherWrapper
 from d2.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
 from d2.runtime.compute_metadata import get_attn_metadata
-from d2.runtime.megatron.ops.stream_sync_fn import TickSync
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
 from test_pingpong_layer import get_single_step_packed_seq_params
@@ -80,6 +119,8 @@ from d2.planner.planner import (
 
 from d2.utils.traceback import enable_clickable_excepthook, enable_trace_calls
 enable_clickable_excepthook()
+
+from wandb_driver import WandbDriver
 
 
 def timeout_handler(signum, frame):
@@ -120,6 +161,51 @@ def log_memory_usage_context():
     os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = "1"
     yield
     os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = old_env_var
+
+
+def _write_status_log(output_dir: str, message: str):
+    import traceback
+    stack = traceback.extract_stack()
+    caller_file = stack[-2].filename
+    caller_line = stack[-2].lineno
+
+    status_log_file = os.path.join(output_dir, "status.log")
+    elapsed_time = time.time() - start_time__
+    message = f"🕛 [T{elapsed_time:.2f}] ({caller_file}:{caller_line}) {message}"
+    with open(status_log_file, "a") as f:
+        f.write(message + "\n")
+    print(message)
+    return
+
+
+def _write_loss_log(
+    output_dir: str,
+    loss_value,
+    sample_id: int | None = None,
+    repeat_idx: int | None = None,
+):
+    import traceback
+
+    stack = traceback.extract_stack()
+    caller_file = stack[-2].filename
+    caller_line = stack[-2].lineno
+
+    loss_log_file = os.path.join(output_dir, "loss.log")
+    elapsed_time = time.time() - start_time__
+    sid = "NA" if sample_id is None else sample_id
+    rep = "NA" if repeat_idx is None else repeat_idx
+    try:
+        loss_float = float(loss_value)
+    except Exception:
+        loss_float = loss_value.item() if torch.is_tensor(loss_value) else float("nan")
+    message = (
+        f"📉 [T{elapsed_time:.2f}] ({caller_file}:{caller_line}) "
+        f"sample_id={sid} repeat={rep} loss={loss_float:.6f}"
+    )
+    with open(loss_log_file, "a") as f:
+        f.write(message + "\n")
+    print(message)
+    return
 
 
 def dump_tensor(tensor, name: str, msg:str=None):
@@ -328,6 +414,11 @@ class MegatronE2eWorker(MegatronBaseWorker):
                 forward_only=forward_only,
             )
 
+        # In forward-only mode (e.g., validation), skip the optimizer step entirely.
+        if forward_only:
+            grad_norm = None
+            return losses_reduced, grad_norm
+
         with torch.cuda.nvtx.range("optimizer_step"):
             # torch.cuda.synchronize()
             log_memory_usage("optimizer_step:(start)")
@@ -440,80 +531,19 @@ def init_megatron_e2e_test(
 
     log_memory_usage("comm group initialized", force=True)
 
-    
-    # # FIXME: We don't have to do the hack like that...
-    # # # If the buffer size is < 2GB, 
-    # # update the real buffer size to 2GB,
-    # # but keep the nominal buffer size to the original value.
-    # if buffer_size < 2 * 1024 ** 3:
-    #     FastDispatcherWrapper.update_buffer_size(2 * 1024 ** 3)
-    #     # now the real buffer size is 2GB, but the nominal buffer size is the original value.
-    #     FastDispatcherWrapper.update_buffer_size(buffer_size)
-    #     print(f"🟡 [Rank {worker.rank}] Updated real buffer size to 2GB, but keep the nominal buffer size to {buffer_size / 1024**3} GB")
-    #     # now the nominal buffer size remains the original value.
-    #     # this will help us do replanning with the original buffer size.
-
     log_memory_usage("buffer initialized", force=True)
-    # exit(0)
-    return worker
-
-def init_wlbllm_e2e_test(
-    hidden_size_q: int, hidden_size_kv: int, num_tokens: int,
-    world_size: int, max_cp_degree: int, tp_size: int,
-    dtype, worker_cls=MegatronE2eWorker
-):
-    token_bytes_q = hidden_size_q * dtype.itemsize // tp_size
-    token_bytes_kv = hidden_size_kv * dtype.itemsize // tp_size
-    max_tokens_query = num_tokens * (world_size // tp_size)
-    max_tokens_key_value = num_tokens * (world_size // tp_size)
-    buffer_size = (
-        token_bytes_q * max_tokens_query +
-        token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
-    )
-    parallel_config = ParallelConfig(
-        tensor_model_parallel_size=tp_size,
-        context_parallel_size=max_cp_degree,
-    )
-    # TODO(HACK): We bypass some logic in init_worker_torch_distributed.
-    # worker = init_worker_torch_distributed(
-    #     world_size, buffer_size, worker_cls, parallel_config, skip_nvshmem_init=True
-    # )
-    assert world_size == int(os.environ.get("WORLD_SIZE"))
-    rank = int(os.environ.get("RANK"))
-    local_rank = int(os.environ.get("LOCAL_RANK"))
-    torch.cuda.set_device(local_rank)
-    worker = worker_cls(
-        rank, world_size
-    )
-    assert parallel_config is not None
-    # worker.init_comm(buffer_size, parallel_config, local_rank)
-    # -- if use the original one, it will hit the nvshmem init logic, 
-    # which needs to assert that other group initialization is not called.
-    log_memory_usage("init_worker_torch_distributed", force=True)
-    worker.init_torch_distributed()
-    mpu.initialize_model_parallel(
-        tensor_model_parallel_size=parallel_config.tensor_model_parallel_size,
-        pipeline_model_parallel_size=parallel_config.pipeline_model_parallel_size,
-        virtual_pipeline_model_parallel_size=parallel_config.virtual_pipeline_model_parallel_size,
-        pipeline_model_parallel_split_rank=None,
-        use_sharp=False,
-        context_parallel_size=parallel_config.context_parallel_size,
-        expert_model_parallel_size=parallel_config.expert_model_parallel_size,
-        expert_tensor_parallel_size=parallel_config.expert_tensor_parallel_size,
-        nccl_communicator_config_path=None,
-        # order="tp-cp-ep-dp-pp",
-    )
-    print("Communication groups initialized")
-
-    log_memory_usage("comm_group_init finished", force=True)
     return worker
 
 
-from typing import Iterable, List, Optional
-from d2.simulator.optimizers.samples import sample_wlbllm_docs_upsample, batch_documents, sample_prolong_docs
+from typing import List, Optional, Dict, Tuple
 
-ITERATION_ID = 0
-GLOBAL_BATCH: Optional[Iterable[List[int]]] = None
+# Import data loading and batch utilities
+from training_utils import (
+    setup_global_batch,
+    get_next_batch,
+    build_sequence_records,
+    build_rank_shards,
+)
 
 K = 1024
 # TODO(Refactor): Remove this global variable.
@@ -522,105 +552,9 @@ modified_batches = []
 fa2a_metadata_list = []
 
 
-def setup_global_batch(
-    total_seq_len, 
-    up_sample_factor=2,
-    elongate_factor=1,
-    filter_threshold=64 * 1024,
-    filter_ratio=0.90,
-    should_add_debug_cases=False,
-    change_long_doc_ratio=0.0,
-    sample_name='wlbllm',
-):
-    global GLOBAL_BATCH
-    if GLOBAL_BATCH is not None:
-        return
-
-    assert elongate_factor > 0, f"elongate_factor: {elongate_factor} must be greater than 0"
-
-    if sample_name == 'wlbllm':
-        sample_func = sample_wlbllm_docs_upsample
-    elif sample_name == 'prolong':
-        sample_func = sample_prolong_docs
-    else:
-        raise ValueError(f"Invalid sample_name: {sample_name}")
-
-    GLOBAL_BATCH = batch_documents(
-        sample_func(
-            size=10000,
-            filter_threshold=filter_threshold,
-            filter_ratio=filter_ratio,
-            upsample_long_factor=up_sample_factor,
-            elongate_factor=elongate_factor,
-            change_long_doc_ratio=change_long_doc_ratio,
-        ), max_ctx_length=total_seq_len
-    )
-    
-    # if should_add_debug_cases:
-    #     GLOBAL_BATCH = list(GLOBAL_BATCH)
-    #     manual_case = [
-    #         [total_seq_len // 4 * 3 - 512, 512, total_seq_len // 4],
-    #     ] * 16
-    #     GLOBAL_BATCH = manual_case + GLOBAL_BATCH
-    #     GLOBAL_BATCH = iter(GLOBAL_BATCH)
-
-    if should_add_debug_cases:
-        GLOBAL_BATCH = list(GLOBAL_BATCH)
-        # manual_case = [
-        #     [total_seq_len],
-        #     # [total_seq_len // 32] * 32
-        # ] * 128
-        manual_case = [
-            [total_seq_len // 2, ] + [total_seq_len // 32] * 16,
-        ] + [
-            # [total_seq_len // 2] * 2,
-            # [total_seq_len // 4] * 4,
-            [total_seq_len // 32] * 32,
-        ] * 128
-        GLOBAL_BATCH = manual_case + GLOBAL_BATCH
-        GLOBAL_BATCH = iter(GLOBAL_BATCH)
-    return
-
-
-def get_next_batch(dp_size) -> Iterable[List[List[int]]]:
-    global GLOBAL_BATCH
-    global ITERATION_ID
-    global iterated_samples
-    # get dp_size number of batches 
-    batches = []
-    for _ in range(dp_size):    
-        batches.append(next(GLOBAL_BATCH))
-    ITERATION_ID += 1
-    iterated_samples.append(batches)
-    return batches
-
-
 # ========== D2 Specific Functions ==========
 
-# from transformer_engine.pytorch.attention.dot_product_attention.backends import get_attention_duration
-import traceback
-try:
-    import wlbllm
-    import wlbllm.utils
-    import wlbllm.registry
-    import wlbllm.megatron_patch.dot_product_attention
-    import wlbllm.megatron_patch.backends
-    import wlbllm.fastmemcpy.fast_memcpy
-    from wlbllm.fastmemcpy.fast_memcpy import prepare_metadata as wlb_memcpy_prepare_metadata
-except ImportError as e:
-    traceback.print_exc()
-    print(f"🟡 ImportError: {e}")
-    print("""⚠️ WLBLLM is not installed. This only affects if you're testing WLBLLM tests. To install:
-
-    cd d2/baseline/wlbllm_original
-    pip install -e .
-    """)
-    exit(1)
-
-
-
-
-def test(args):
+def main(args):
     global start_time__
     num_nodes = args.num_nodes
     num_gpus_per_node = args.num_gpus_per_node
@@ -643,101 +577,40 @@ def test(args):
     resend_qkv = args.should_resend_qkv
     sample_start_idx = args.sample_start_idx
     alpha_factor = args.alpha_factor
+    output_dir = args.output_dir
+    val_every_n_steps = getattr(args, "val_every_n_steps", 1)
+    
+    # Wandb configuration (support both CLI args and env vars)
+    enable_wandb = args.enable_wandb or os.environ.get("ENABLE_WANDB", "0") == "1"
+    wandb_project = args.wandb_project or os.environ.get("WANDB_PROJECT", "d2-training")
+    wandb_run_name = args.wandb_run_name or os.environ.get("WANDB_RUN_NAME", None)
+    allow_all_ranks_loss = os.environ.get("ALLOW_ALL_RANKS_LOSS", "0") == "1"
+    print(f"🟡 allow_all_ranks_loss = {allow_all_ranks_loss}")
+
+    normal_forward_fn = False # becuase D2 mode doesn't use normal forward
+
     if num_layers is not None:
         os.environ["NUM_LAYERS"] = str(num_layers)
 
-
     mode = args.mode
-    output_dir = args.output_dir
+    assert mode == "d2", f"Mode {mode} is not supported for D2"
+    
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
-    # Set forward function mode based on test mode
-    normal_forward_fn = (mode in ["baseline", "wlbllm"])
-    # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
-    os.environ["WLBLLM_MODE"] = "1" if mode == "wlbllm" else "0"
-    
-    # Setup unified attention timing collection for both WLBLLM and D2 modes
-    if os.getenv("UNIFIED_RECORD_ATTENTION_TIMES", "0") == "1":
-        setup_unified_attention_timing_patch()
-        print(f"🟡 Unified attention timing collection setup. This may impact the performance, but recording the attention timing.")
-    
-    # Setup unified all-to-all timing collection for both WLBLLM and D2 modes
-    if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
-        setup_unified_a2a_timing_patch()
-        print(f"🟡 Unified all-to-all timing collection setup. This may impact the performance, but recording the all-to-all timing.")
-    
-    # Setup tick operations timing collection
-    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
-        from d2.runtime.megatron.ping_pong.tick_ops import setup_tick_timing
-        setup_tick_timing()
-        print(f"🟡 Unified tick operations timing collection setup. This may impact the performance, but recording the tick operations timing.")
-    
-    # Setup TickSync blocking detection
-    if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
-        threshold_ms = float(os.getenv("D2_TICKSYNC_THRESHOLD_MS", "1.0"))
-        TickSync.enable_blocking_detection(enabled=True, threshold_ms=threshold_ms)
-        print(f"🟡 TickSync blocking detection enabled with threshold {threshold_ms}ms")
-    
-    memory_log_output_dir = os.path.join(output_dir, "mem-log")
-    enable_memory_usage_logging(memory_log_output_dir)
+    def write_status_log(message: str):
+        _write_status_log(output_dir, message)
+        return
 
+    def write_loss_log(loss_value, sample_id: int | None = None):
+        _write_loss_log(output_dir, loss_value, sample_id=sample_id)
+        return
+
+    # Set forward function mode based on test mode
     log_memory_usage("enter test", force=True)
     
-    def write_status_log(message):
-        # get the caller's file and line number
-        import traceback
-        stack = traceback.extract_stack()
-        caller_file = stack[-2].filename
-        caller_line = stack[-2].lineno
-
-        status_log_file = os.path.join(output_dir, "status.log")
-        elapsed_time = time.time() - start_time__
-        message = f"🕛 [T{elapsed_time:.2f}] ({caller_file}:{caller_line}) {message}"
-        with open(status_log_file, "a") as f:
-            f.write(message + "\n")
-        print(message)
-        return
-
-    def write_loss_log(loss_value, sample_id=None, repeat_idx=None):
-        # get the caller's file and line number
-        import traceback
-        stack = traceback.extract_stack()
-        caller_file = stack[-2].filename
-        caller_line = stack[-2].lineno
-        
-        loss_log_file = os.path.join(output_dir, "loss.log")
-        elapsed_time = time.time() - start_time__
-        sid = "NA" if sample_id is None else sample_id
-        rep = "NA" if repeat_idx is None else repeat_idx
-        try:
-            loss_float = float(loss_value)
-        except Exception:
-            # best effort conversion
-            loss_float = loss_value.item() if torch.is_tensor(loss_value) else float("nan")
-        message = f"📉 [T{elapsed_time:.2f}] ({caller_file}:{caller_line}) sample_id={sid} repeat={rep} loss={loss_float:.6f}"
-        with open(loss_log_file, "a") as f:
-            f.write(message + "\n")
-        print(message)
-        return
-    
-
-
-    if mode == "wlbllm":
-        import wlbllm.megatron_patch.dot_product_attention
-        wlbllm.megatron_patch.dot_product_attention.monkey_patch()
-        import wlbllm.megatron_patch.backends
-        wlbllm.megatron_patch.backends.monkey_patch()
-        pass
-    
     # Check world size
-    if mode == "wlbllm":
-        # assert cp_degree * tp_size == world_size, f"WLBLLM world size ({world_size}) = num_nodes ({args.num_nodes}) * num_gpus_per_node ({args.num_gpus_per_node}) must be divisible by cp_degree ({cp_degree}) * tp_size ({tp_size})"
-        print(f"🟡 Running WLBLLM config: cp_degree={cp_degree}, tp_size={tp_size}, world_size={world_size}")
-    elif mode == "d2":
-        print(f"🟡 Running D2 config: tp_size={tp_size}, world_size={world_size}")
-    else:
-        pass
+    print(f"🟡 Running D2 config: tp_size={tp_size}, world_size={world_size}")
         
     write_status_log(f"Pass world size check")
     
@@ -752,23 +625,12 @@ def test(args):
         hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
                           hf_config.num_attention_heads)
 
-    # TODO(HACK): WLBLLM and Megatron have different comm group initialization process.
-    # This is a code divergence. We need to consolidate the comm group.
-    if mode == "wlbllm":
-        worker: MegatronE2eWorker = init_wlbllm_e2e_test(
-            hidden_size_q, hidden_size_kv, num_tokens,
-            world_size, max_cp_degree * 1, tp_size,
-            dtype, MegatronE2eWorker
-        )
-    else:
-        worker: MegatronE2eWorker = init_megatron_e2e_test(
-            hidden_size_q, hidden_size_kv, num_tokens,
-            world_size, max_cp_degree * 1, tp_size,
-            dtype, MegatronE2eWorker
-        )
-
-    if mode == "d2":
-        print(f"🟡 [Rank {worker.rank}] {worker.as_rank = } {worker.as_world_size = }")
+    worker: MegatronE2eWorker = init_megatron_e2e_test(
+        hidden_size_q, hidden_size_kv, num_tokens,
+        world_size, max_cp_degree * 1, tp_size,
+        dtype, MegatronE2eWorker
+    )
+    print(f"🟡 [Rank {worker.rank}] {worker.as_rank = } {worker.as_world_size = }")
 
 
     write_status_log(f"Finish init worker")
@@ -797,611 +659,339 @@ def test(args):
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
-    # parallel_config = worker.parallel_config
-
-    # torch.cuda.memory.set_per_process_memory_fraction(0.85)
-    # print("🟡 [Rank {worker.rank}] torch.cuda.memory.set_per_process_memory_fraction to 0.85")
-
-    if mode == "wlbllm":
-        rank = torch.distributed.get_rank()
-        as_rank = mpu.get_context_parallel_rank()
-        as_world_size = mpu.get_context_parallel_world_size() * mpu.get_data_parallel_world_size()
-        pass
-    else:
-        rank = worker.rank
-        as_rank = worker.as_rank
-        as_world_size = worker.as_world_size
+    rank = worker.rank
+    as_rank = worker.as_rank
+    as_world_size = worker.as_world_size
+    
+    # Initialize wandb driver
+    wandb_driver = WandbDriver()
+    wandb_driver.initialize(
+        enable_wandb=enable_wandb,
+        rank=rank,
+        project=wandb_project,
+        run_name=wandb_run_name,
+        allow_all_ranks=allow_all_ranks_loss,
+        config={
+            "num_nodes": num_nodes,
+            "num_gpus_per_node": num_gpus_per_node,
+            "world_size": world_size,
+            "tp_size": tp_size,
+            "cp_degree": cp_degree,
+            "batch_size": batch_size,
+            "num_tokens": num_tokens,
+            "num_layers": num_layers,
+            "model_path": model_path,
+            "seed": seed,
+            "sample_name": args.sample_name,
+        }
+    )
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
 
-    # TODO(Refactor): Properly refactor this into a function and we call it multiple times
+    if rank == 0:
+        setup_global_batch(
+            total_seq_len,
+            up_sample_factor=up_sample_factor,
+            elongate_factor=elongate_factor,
+            filter_threshold=filter_threshold,
+            filter_ratio=filter_ratio,
+            should_add_debug_cases=should_add_debug_cases,
+            change_long_doc_ratio=args.change_long_doc_ratio,
+            sample_name=args.sample_name,
+            tokenizer=worker.tokenizer,  # Pass the tokenizer to load real datasets
+            max_total_tokens=args.max_total_tokens,
+        )
+    torch.distributed.barrier()
 
-    setup_global_batch(
-        total_seq_len,
-        up_sample_factor=up_sample_factor,
-        elongate_factor=elongate_factor,
-        filter_threshold=filter_threshold,
-        filter_ratio=filter_ratio,
-        should_add_debug_cases=should_add_debug_cases,
-        change_long_doc_ratio=args.change_long_doc_ratio,
-        sample_name=args.sample_name,
-    )
 
-
+    print(f"🟡 [Rank {rank}] hidden_size_q_tp = {hidden_size_q_tp}, hidden_size_k_tp = {hidden_size_k_tp}, element_size = {element_size}")
     sample_times = []
+    sample_losses = []
+    val_sample_times = []
+    val_sample_losses = []
+    total_tokens_consumed = 0  # cumulative token counter across all iterations
     for sample_id in range(sample_start_idx, max_sample_id):
-        # Set current sample ID for unified timing collection
-        if os.getenv("UNIFIED_RECORD_ATTENTION_TIMES", "0") == "1":
-            set_unified_current_sample_id(sample_id)
-        if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
-            set_unified_current_a2a_sample_id(sample_id)
-        if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
-            from d2.runtime.megatron.ping_pong.tick_ops import set_current_tick_sample_id
-            set_current_tick_sample_id(sample_id)
-        if mode == "baseline":
-            raise NotImplementedError("Baseline mode is not supported for D2")
+
+        # D2 will get 2 batch each time, one for ping, the other for pong.
+        # Suppose we have 
+        #   as_world_size = 4
+        # Then that means we implicitly have dpcp = 4
+        # 1. We get 2 batch, each batch has `total_seq_len`` number of tokens
+        # 2. Each GPU should get total_seq_len // as_world_size number of tokens. 
         
-        elif mode == "d2":
-            # D2 will get 2 batch each time, one for ping, the other for pong.
-            # Suppose we have 
-            #   as_world_size = 4
-            # Then that means we implicitly have dpcp = 4
-            # 1. We get 2 batch, each batch has `total_seq_len`` number of tokens
-            # 2. Each GPU should get total_seq_len // as_world_size number of tokens. 
-            
-            print(f"🟡 [Rank {rank}] hidden_size_q_tp = {hidden_size_q_tp}, hidden_size_k_tp = {hidden_size_k_tp}, element_size = {element_size}")
 
-            dp_size = as_world_size
+        dp_size = as_world_size
 
-            model_config = hf_config
-            parallel_config = ParallelConfig(
-                tensor_model_parallel_size=tp_size,
-                pipeline_model_parallel_size=1,
-            )
+        model_config = hf_config
+        parallel_config = ParallelConfig(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=1,
+        )
 
+        if rank == 0:
             try:
-                _seq_lens: list[list[int]] = get_next_batch(batch_size * 2)
+                _seq_lens: list[list[int]]
+                _batch_tokens: list[Optional[List[torch.Tensor]]]
+                _seq_lens, _batch_tokens = get_next_batch(batch_size * 2, iterated_samples)
             except StopIteration:
-                break
-            
-            # Rebalance Ping pong
-            def balance_ping_pong(seq_lens: list[list[int]]) -> tuple[list[list[int]], list[list[int]]]:
-                def batch_flops(batch):
-                    return sum(y ** 2 // 2 for y in batch)
-
-                assert len(seq_lens) % 2 == 0, f"ping pong should have even number of batches, but got {len(seq_lens)} batches, seq_lens={seq_lens}"
-                sorted_batches = sorted(seq_lens, key=batch_flops, reverse=True)
-                ping, pong = [], []
-                ping_flops, pong_flops = 0, 0
-                avg_num_batches = len(seq_lens) // 2
-
-                for batch in sorted_batches:
-                    if (ping_flops <= pong_flops and len(ping) < avg_num_batches) or len(pong) >= avg_num_batches:
-                        ping.append(batch)
-                        ping_flops += batch_flops(batch)
-                    else:
-                        pong.append(batch)
-                        pong_flops += batch_flops(batch)
-
-                assert len(ping) == len(pong) == avg_num_batches, f"ping batches={ping}, pong batches={pong}"
-                return ping, pong
-
-                
-            rich.print(f"🟡 [Rank {rank}] _seq_lens = {_seq_lens}")
-
-            should_d2_balance_ping_pong = os.environ.get("EXPERIMENT_D2_BALANCE_PING_PONG", "0") == "1"
-            if should_d2_balance_ping_pong:
-                print(f"🟢 [Rank {rank}] Balancing ping pong")
-                seq_lens_0, seq_lens_1 = balance_ping_pong(_seq_lens)
-            else:
-                print(f"🟡 [Rank {rank}] Not Balancing ping pong")
-                seq_lens_0, seq_lens_1 = _seq_lens[:batch_size], _seq_lens[batch_size:]
-            
-            rich.print(f"🟡 [Rank {rank}] seq_lens_0 = {seq_lens_0}")
-            rich.print(f"🟡 [Rank {rank}] seq_lens_1 = {seq_lens_1}")
-
-            # num_batched_token_per_as_rank = tokens per as rank = tokens per batch * num batch / (as_world_size = dp_size)
-            num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
-
-            _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
-            _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
-
-            if rank % 8 == 0:
-                rich.print(f"🟡 [Rank {rank}] _items_0 = {_items_0}")
-                rich.print(f"🟡 [Rank {rank}] _items_1 = {_items_1}")
-
-            
-            # Try different tolerance factors and see which one fits the buffer size.
-            # This will sacrifice performance for safety.
-            
-            # TODO: Pass a knob as a tradeoff of network and latency balance.
-            verbose = (rank % 8 == 0)
-            did_pass_overflow_check = False
-            required_buffer_size: list[float] = []
-            can_pass_tolerance_factor: list[bool] = []
-
-            MIN_TOLERANCE_FACTOR = 0.05
-            try:
-                MIN_TOLERANCE_FACTOR = os.environ.get("MIN_TOLERANCE_FACTOR", "0.05")
-                MIN_TOLERANCE_FACTOR = float(MIN_TOLERANCE_FACTOR)
-            except ValueError:
-                pass
-            print(f"🟡 [Rank {rank}] MIN_TOLERANCE_FACTOR = {MIN_TOLERANCE_FACTOR}")
-
-            candidate_tolerance_factors = [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-
-            # FIXME: (Only for ablation) Tune the candidate tolerance factor.
-
-            for tolerance_factor in candidate_tolerance_factors:
-                if tolerance_factor < MIN_TOLERANCE_FACTOR:
-                    continue
-
-                print(f"[Rank {rank}] =========== Tolerance factor = {tolerance_factor} ============ ")
-                
-                planner = Planner(world_size, parallel_config, model_config=model_config, tolerance_factor=tolerance_factor)
-                
-                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose)
-                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose)
-
-
-                if verbose:
-                    def print_2d_tensor(name: str, tensor):
-                        print(f"🟡 [Rank {rank}] {name} = ")
-                        for row in tensor.tolist():
-                            print(f"    {row}")
-                    
-                    def exclude_self_and_sum(t):
-                        for i in range(len(t)):
-                            t[i][i] = 0
-                        return t.sum(dim=1)
-                        
-                    def inspect_network_metadata(metadata, is_ping, sample_id, tolerance_factor, output_dir, rank):
-                        qkv_fwd_metadata__send_transfer_sz_mb = metadata[0].fa2a_metadata[1] // 1024 // 1024
-                        qkv_fwd_metadata__recv_transfer_sz_mb = metadata[0].fa2a_metadata[3] // 1024 // 1024
-                        attn_out_fwd_metadata__send_transfer_sz_mb = metadata[1].fa2a_metadata[1] // 1024 // 1024
-                        attn_out_fwd_metadata__recv_transfer_sz_mb = metadata[1].fa2a_metadata[3] // 1024 // 1024
-                                
-                        # Print qkv_fwd_metadata
-                        print_2d_tensor("qkv_fwd_metadata.send_transfer_sz_mb", qkv_fwd_metadata__send_transfer_sz_mb)
-                        print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz_mb", qkv_fwd_metadata__recv_transfer_sz_mb)
-                        
-                        # Print attn_out_fwd_metadata  
-                        print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz_mb", attn_out_fwd_metadata__send_transfer_sz_mb)
-                        print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz_mb", attn_out_fwd_metadata__recv_transfer_sz_mb)
-
-
-                        # Calculate send size from me to others by subtracting diagonal (self-send) from total send
-                        qkv_fwd_metadata__send_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_metadata__send_transfer_sz_mb)
-                        qkv_fwd_metadata__recv_transfer_sz_mb_to_others = exclude_self_and_sum(qkv_fwd_metadata__recv_transfer_sz_mb)
-                        
-                        print_2d_tensor("qkv_fwd_metadata.send_transfer_sz_mb_to_others", qkv_fwd_metadata__send_transfer_sz_mb_to_others)
-                        print_2d_tensor("qkv_fwd_metadata.recv_transfer_sz_mb_to_others", qkv_fwd_metadata__recv_transfer_sz_mb_to_others)
-
-                        attn_out_fwd_metadata__send_transfer_sz_mb_to_others = exclude_self_and_sum(attn_out_fwd_metadata__send_transfer_sz_mb)
-                        attn_out_fwd_metadata__recv_transfer_sz_mb_to_others = exclude_self_and_sum(attn_out_fwd_metadata__recv_transfer_sz_mb)
-
-                        print_2d_tensor("attn_out_fwd_metadata.send_transfer_sz_mb_to_others", attn_out_fwd_metadata__send_transfer_sz_mb_to_others)
-                        print_2d_tensor("attn_out_fwd_metadata.recv_transfer_sz_mb_to_others", attn_out_fwd_metadata__recv_transfer_sz_mb_to_others)
-                        
-                        # Expected send-recv time
-                        bandwidth_mb = 40 # MB/ms
-                        send_time_ms = qkv_fwd_metadata__send_transfer_sz_mb_to_others / bandwidth_mb
-                        recv_time_ms = qkv_fwd_metadata__recv_transfer_sz_mb_to_others / bandwidth_mb
-                        print_2d_tensor("send_time_ms", send_time_ms)
-                        print_2d_tensor("recv_time_ms", recv_time_ms)
-
-                        max_comm_budget_all_rank = (
-                              qkv_fwd_metadata__send_transfer_sz_mb_to_others 
-                            + qkv_fwd_metadata__recv_transfer_sz_mb_to_others 
-                            + attn_out_fwd_metadata__send_transfer_sz_mb_to_others 
-                            + attn_out_fwd_metadata__recv_transfer_sz_mb_to_others
-                        ).max().item()
-
-                        if rank == 0:
-                            network_inspect_file = os.path.join(output_dir, "network_inspect.jsonl")
-                            with open(network_inspect_file, "a") as f:
-                                f.write(json.dumps({
-                                    "sample_id": sample_id,
-                                    "is_ping": is_ping,
-                                    "tolerance_factor": tolerance_factor,
-                                    "qkv_fwd_metadata__send_transfer_sz_mb": qkv_fwd_metadata__send_transfer_sz_mb.tolist(),
-                                    "qkv_fwd_metadata__recv_transfer_sz_mb": qkv_fwd_metadata__recv_transfer_sz_mb.tolist(),
-                                    "attn_out_fwd_metadata__send_transfer_sz_mb": attn_out_fwd_metadata__send_transfer_sz_mb.tolist(),
-                                    "attn_out_fwd_metadata__recv_transfer_sz_mb": attn_out_fwd_metadata__recv_transfer_sz_mb.tolist(),
-
-                                    "qkv_fwd_metadata__send_transfer_sz_mb_to_others": qkv_fwd_metadata__send_transfer_sz_mb_to_others.tolist(),
-                                    "qkv_fwd_metadata__recv_transfer_sz_mb_from_others": qkv_fwd_metadata__recv_transfer_sz_mb_to_others.tolist(),
-
-                                    "max_comm_budget_all_rank": max_comm_budget_all_rank,
-                                    "bandwidth_mb": bandwidth_mb,
-                                    "send_time_ms": send_time_ms.tolist(),
-                                    "recv_time_ms": recv_time_ms.tolist(),
-                                }) + "\n")
-
-                            network_inspect_summary_file = os.path.join(output_dir, "network_inspect.summary.jsonl")
-                            with open(network_inspect_summary_file, "a") as f:
-                                f.write(json.dumps({
-                                    "sample_id": sample_id,
-                                    "is_ping": is_ping,
-                                    "tolerance_factor": tolerance_factor,
-                                    "qkv_fwd_send_mb": qkv_fwd_metadata__send_transfer_sz_mb_to_others.tolist(),
-                                    "qkv_fwd_recv_mb": qkv_fwd_metadata__recv_transfer_sz_mb_to_others.tolist(),
-
-                                    "max_comm_budget_all_rank_mb": max_comm_budget_all_rank,
-                                    "send_time_ms": send_time_ms.tolist(),
-                                    "recv_time_ms": recv_time_ms.tolist(),
-                                }) + "\n")
-
-                    # Inspect both metadata sets
-                    inspect_network_metadata(fa2a_metadata_0, True, sample_id, tolerance_factor, output_dir, rank)
-                    inspect_network_metadata(fa2a_metadata_1, False, sample_id, tolerance_factor, output_dir, rank)
-                    
-                    
-
-                # Check size:
-                buffer_size = DispatcherWrapper.instance[0].buffer_size
-                
-                def _check_self_overflow(fa2a_metadata, as_rank_):
-                    """Return the self-overflow status and the maximum size provisioned."""
-                    send_sz = [torch.sum(m.fa2a_metadata[1][as_rank_]).item() for m in fa2a_metadata]
-                    dst_last_offset = [(m.fa2a_metadata[1] + m.fa2a_metadata[2])[as_rank_] for m in fa2a_metadata]
-                    recv_sz = [torch.sum(m.fa2a_metadata[3][as_rank_]).item() for m in fa2a_metadata]
-                    src_last_offset = [(m.fa2a_metadata[0] + m.fa2a_metadata[1])[as_rank_] for m in fa2a_metadata]
-                    max_send_sz = max(send_sz)
-                    max_recv_sz = max(recv_sz)
-                    max_dst_last_offset = max(torch.max(o).item() for o in dst_last_offset)
-                    max_src_last_offset = max(torch.max(o).item() for o in src_last_offset)
-                    
-                    if rank % 8 == 0:
-                        print(
-                            f"🟡 [Rank {rank}]  Overflow check of as_rank_ = {as_rank_}: "
-                            f"{max_send_sz / 1024**3:.2f} GB send size, "
-                            f"{max_recv_sz / 1024**3:.2f} GB recv size, "
-                            f"{max_dst_last_offset / 1024**3:.2f} GB dst last offset, "
-                            f"{max_src_last_offset / 1024**3:.2f} GB src last offset, "
-                            f"{buffer_size / 1024**3:.2f} GB buffer size"
-                        )
-
-                    max_size_provisioned = max(
-                        max_send_sz, max_recv_sz, 
-                        max_dst_last_offset, max_src_last_offset,
-                    )
-                    if not (buffer_size >= max_size_provisioned):
-                        return False, max_size_provisioned
-                    return True, max_size_provisioned
-
-                def _check_all_overflow(fa2a_metadata, as_world_size_):
-                    all_max_size_provisioned = 0
-                    states = []
-                    for as_rank_ in range(as_world_size_):
-                        state, max_size_provisioned = _check_self_overflow(fa2a_metadata, as_rank_)
-                        all_max_size_provisioned = max(all_max_size_provisioned, max_size_provisioned)
-                        states.append(state)
-                    all_state = all(states)
-                    return all_state, all_max_size_provisioned
-                    
-                check_0, max_size_provisioned_0 = _check_all_overflow(fa2a_metadata_0, as_world_size)
-                check_1, max_size_provisioned_1 = _check_all_overflow(fa2a_metadata_1, as_world_size)
-                max_size_provisioned = max(max_size_provisioned_0, max_size_provisioned_1) / 1024**3
-                required_buffer_size.append(max_size_provisioned)
-                
-                
-                can_pass_tolerance_factor.append(check_0 and check_1)
-                if not (check_0 and check_1):
-                    print(f"⚠️ [Rank {rank}] Tolerance factor = {tolerance_factor}: Overflow check failed for fa2a_metadata_0 or fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB. Retry...")
-                else:
-                    did_pass_overflow_check = True
-                    break
-
-                    
-            
-            if not did_pass_overflow_check:
-                print(f"🔴 [Rank {rank}] Inspected required_buffer_size = {required_buffer_size}")
-                print(f"🔴 [Rank {rank}] Specified buffer_size = {buffer_size / 1024**3} GB")
-                recommended_buffer_size = math.ceil(max_size_provisioned) + 0.5
-                print(f"🔴 [Rank {rank}] Force update buffer_size to = {recommended_buffer_size} GB")
-                buffer_size = int(recommended_buffer_size * 1024**3) # bytes
-
-
-                DispatcherWrapper.update_buffer_size(buffer_size)
-
-
-                rich.print(f"🟡 [Rank {rank}] Successfully force updated buffer_size to = {buffer_size / 1024**3} GB")
-                buffer_size = DispatcherWrapper.instance[0].buffer_size
-
-            rich.print(f"🟡 [Rank {rank}] Overflow check passed for fa2a_metadata_0 and fa2a_metadata_1 with tolerance_factor {tolerance_factor} and buffer_size {buffer_size / 1024**3} GB")
-
-            # params for ping-pong batch0
-            ping_pang_params_0 = get_single_step_packed_seq_params(
-                fa2a_metadata_0, as_attn_metadata_0, as_rank, resend_qkv=resend_qkv
-            )
-            # params for ping-pong batch1
-            ping_pang_params_1 = get_single_step_packed_seq_params(
-                fa2a_metadata_1, as_attn_metadata_1, as_rank, resend_qkv=resend_qkv
-            )
-
-            mlp_seq_params_0 = get_attn_metadata(mlp_shard_len_0[as_rank], get_packed_seq_params=True)
-            mlp_seq_params_1 = get_attn_metadata(mlp_shard_len_1[as_rank], get_packed_seq_params=True)
-
-            # if rank % 8 == 0:
-            #     rich.print(f"🟡 [Rank {rank}] all_metadata[0] -> qkv_fwd_fa2a_metadata =", fa2a_metadata_0[0].fa2a_metadata.__better_print__())
-            #     rich.print(f"🟡 [Rank {rank}] all_metadata[0] -> qkv_rev_fa2a_metadata =", fa2a_metadata_0[1].fa2a_metadata.__better_print__())
-            #     rich.print(f"🟡 [Rank {rank}] all_metadata[1] -> qkv_fwd_fa2a_metadata =", fa2a_metadata_1[0].fa2a_metadata.__better_print__())
-            #     rich.print(f"🟡 [Rank {rank}] all_metadata[1] -> qkv_rev_fa2a_metadata =", fa2a_metadata_1[1].fa2a_metadata.__better_print__())
-
-            def debug_set_metadata_transfer_size_to_0(ping_pang_params: 'PingPangSingleStepPackedSeqParams'):
-                for param in [
-                    ping_pang_params.qkv_fwd_metadata,
-                    ping_pang_params.qkv_bwd_metadata,
-                    ping_pang_params.attn_out_fwd_metadata,
-                    ping_pang_params.attn_out_bwd_metadata,
-                ]:
-                    param.fa2a_metadata[1][:] = 1
-                    param.fa2a_metadata[3][:] = 1
-                    param.my_rank_send_sz = 1
-                return
-            
-            
-            if os.environ.get("EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0", "0") == "1":
-                print(f"🟡 [Rank {rank}] Debug set metadata transfer size to 0")
-                debug_set_metadata_transfer_size_to_0(ping_pang_params_0)
-                debug_set_metadata_transfer_size_to_0(ping_pang_params_1)
-
-
-            if rank % 8 == 0:
-                rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_fwd_metadata =", ping_pang_params_0.qkv_fwd_metadata.__better_print__())
-                rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_fwd_metadata =", ping_pang_params_1.qkv_fwd_metadata.__better_print__())
-                rich.print(f"🟡 [Rank {rank}] mlp_seq_params_0 =", mlp_seq_params_0)
-                rich.print(f"🟡 [Rank {rank}] mlp_seq_params_1 =", mlp_seq_params_1)
-
-                # Adding backward metadata
-                rich.print(f"🟡 [Rank {rank}] ping_pang_params_0.qkv_bwd_metadata =", ping_pang_params_0.qkv_bwd_metadata.__better_print__())
-                rich.print(f"🟡 [Rank {rank}] ping_pang_params_1.qkv_bwd_metadata =", ping_pang_params_1.qkv_bwd_metadata.__better_print__())
-
-            packed_seq_params = PingPangPackedSeqParams(
-                seq_params=[ping_pang_params_0, ping_pang_params_1],
-                mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
-                # max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-                # max_seqlen_kv=torch.tensor([total_seq_len_including_cp * 2], dtype=torch.int32)[0],
-                
-                # TODO:(Question) Not sure if the values are correct here??
-                max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-                max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
-                qkv_format="thd",
-            )
-
-            input_ids_local = torch.randint(0, 100, (1, num_batched_token_per_as_rank * 2))[0]
-            position_ids_local = torch.arange(num_batched_token_per_as_rank, dtype=torch.int64).repeat(1, 2)[0]
-
-            if rank % 8 == 0:
-                rich.print(f"🟡 [Rank {rank}] [{sample_id = }] input_ids_local.shape =", input_ids_local.shape)
-                rich.print(f"🟡 [Rank {rank}] [{sample_id = }] position_ids_local.shape =", position_ids_local.shape)
-
-
-            microbatch = {
-                "input_ids": input_ids_local,
-                "position_ids": position_ids_local,
-                "packed_seq_params": packed_seq_params,
-            }
-            pass
-
+                _seq_lens, _batch_tokens = None, None
         else:
-            raise ValueError(f"Unknown mode: {mode}")
+            _seq_lens, _batch_tokens = None, None
+
+        payload = [_seq_lens, _batch_tokens]
+        torch.distributed.broadcast_object_list(payload, src=0)
+        _seq_lens, _batch_tokens = payload
+        if _seq_lens is None:
+            print(f"🟡 [Rank {rank}] StopIteration at sample_id={sample_id}: Ran out of batches. Total batches consumed: {len(iterated_samples)}")
+            break
+        # Count tokens for this iteration and update cumulative counter
+        tokens_this_iter = sum(sum(batch) for batch in _seq_lens)
+        total_tokens_consumed += tokens_this_iter
+        
+        # Rebalance Ping pong
+        def balance_ping_pong(seq_lens: list[list[int]]) -> tuple[list[list[int]], list[list[int]]]:
+            def batch_flops(batch):
+                return sum(y ** 2 // 2 for y in batch)
+
+            assert len(seq_lens) % 2 == 0, f"ping pong should have even number of batches, but got {len(seq_lens)} batches, seq_lens={seq_lens}"
+            sorted_batches = sorted(seq_lens, key=batch_flops, reverse=True)
+            ping, pong = [], []
+            ping_flops, pong_flops = 0, 0
+            avg_num_batches = len(seq_lens) // 2
+
+            for batch in sorted_batches:
+                if (ping_flops <= pong_flops and len(ping) < avg_num_batches) or len(pong) >= avg_num_batches:
+                    ping.append(batch)
+                    ping_flops += batch_flops(batch)
+                else:
+                    pong.append(batch)
+                    pong_flops += batch_flops(batch)
+
+            assert len(ping) == len(pong) == avg_num_batches, f"ping batches={ping}, pong batches={pong}"
+            return ping, pong
+
+            
+        print(f"🟡 [Rank {rank}] _seq_lens = {_seq_lens}")
+
+        should_d2_balance_ping_pong = os.environ.get("EXPERIMENT_D2_BALANCE_PING_PONG", "0") == "1"
+        if should_d2_balance_ping_pong:
+            print(f"🟢 [Rank {rank}] Balancing ping pong")
+            seq_lens_0, seq_lens_1 = balance_ping_pong(_seq_lens)
+        else:
+            print(f"🟡 [Rank {rank}] Not Balancing ping pong")
+        seq_lens_0, seq_lens_1 = _seq_lens[:batch_size], _seq_lens[batch_size:]
+        batch_tokens_ping = _batch_tokens[:batch_size]
+        batch_tokens_pong = _batch_tokens[batch_size:]
+        
+        print(f"🟡 [Rank {rank}] seq_lens_0 = {seq_lens_0}")
+        print(f"🟡 [Rank {rank}] seq_lens_1 = {seq_lens_1}")
+
+        # num_batched_token_per_as_rank = tokens per as rank = tokens per batch * num batch / (as_world_size = dp_size)
+        num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
+
+        _items_0: list[Item] = batch_to_items_general(seq_lens_0, num_batched_token_per_as_rank, as_world_size, model_config)
+        _items_1: list[Item] = batch_to_items_general(seq_lens_1, num_batched_token_per_as_rank, as_world_size, model_config)
+
+        
+        tolerance_factor = 0.05
+        print(f"[Rank {rank}] Using tolerance factor = {tolerance_factor}")
+
+        planner = Planner(
+            world_size,
+            parallel_config,
+            model_config=model_config,
+            tolerance_factor=tolerance_factor,
+        )
+
+        verbose = False
+        fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(
+            _items_0, is_resend_qkv=resend_qkv, verbose=verbose
+        )
+        fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(
+            _items_1, is_resend_qkv=resend_qkv, verbose=verbose
+        )
+
+
+        # params for ping-pong batch0
+        ping_pang_params_0 = get_single_step_packed_seq_params(
+            fa2a_metadata_0, as_attn_metadata_0, as_rank, resend_qkv=resend_qkv
+        )
+        # params for ping-pong batch1
+        ping_pang_params_1 = get_single_step_packed_seq_params(
+            fa2a_metadata_1, as_attn_metadata_1, as_rank, resend_qkv=resend_qkv
+        )
+
+        mlp_seq_params_0 = get_attn_metadata(mlp_shard_len_0[as_rank], get_packed_seq_params=True)
+        mlp_seq_params_1 = get_attn_metadata(mlp_shard_len_1[as_rank], get_packed_seq_params=True)
+
+        
+        packed_seq_params = PingPangPackedSeqParams(
+            seq_params=[ping_pang_params_0, ping_pang_params_1],
+            mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
+            # max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+            # max_seqlen_kv=torch.tensor([total_seq_len_including_cp * 2], dtype=torch.int32)[0],
+            
+            # TODO:(Question) Not sure if the values are correct here??
+            max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+            max_seqlen_kv=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
+            qkv_format="thd",
+        )
+
+        doc_records_ping = build_sequence_records(seq_lens_0, batch_tokens_ping)
+        doc_records_pong = build_sequence_records(seq_lens_1, batch_tokens_pong)
+
+        rank_tokens_ping, rank_positions_ping = build_rank_shards(
+            _items_0, doc_records_ping, as_world_size
+        )
+        rank_tokens_pong, rank_positions_pong = build_rank_shards(
+            _items_1, doc_records_pong, as_world_size
+        )
+
+        input_ids_ping = rank_tokens_ping[as_rank].to(dtype=torch.long)
+        input_ids_pong = rank_tokens_pong[as_rank].to(dtype=torch.long)
+        position_ids_ping = rank_positions_ping[as_rank].to(dtype=torch.long)
+        position_ids_pong = rank_positions_pong[as_rank].to(dtype=torch.long)
+
+        expected_ping = int(torch.sum(mlp_shard_len_0[as_rank]).item())
+        expected_pong = int(torch.sum(mlp_shard_len_1[as_rank]).item())
+        if input_ids_ping.numel() != expected_ping:
+            raise RuntimeError(
+                f"Rank {as_rank} ping tokens mismatch: expected {expected_ping}, got {input_ids_ping.numel()}."
+            )
+        if input_ids_pong.numel() != expected_pong:
+            raise RuntimeError(
+                f"Rank {as_rank} pong tokens mismatch: expected {expected_pong}, got {input_ids_pong.numel()}."
+            )
+
+        input_ids_local = torch.cat([input_ids_ping, input_ids_pong], dim=0)
+        position_ids_local = torch.cat([position_ids_ping, position_ids_pong], dim=0)
+
+        if rank % 8 == 0:
+            print(f"🟡 [Rank {rank}] [{sample_id = }] input_ids_local.shape =", input_ids_local.shape)
+            print(f"🟡 [Rank {rank}] [{sample_id = }] position_ids_local.shape =", position_ids_local.shape)
+            if _batch_tokens is not None and _batch_tokens[0] is not None:
+                print(f"🟢 [Rank {rank}] Using REAL tokens from dataset")
+            else:
+                print(f"🟡 [Rank {rank}] Using RANDOM tokens (fallback)")
+
+
+        microbatch = {
+            "input_ids": input_ids_local,
+            "position_ids": position_ids_local,
+            "packed_seq_params": packed_seq_params,
+        }
 
         microbatches = [microbatch]
 
-        if sample_id == 0:
-            log_memory_usage("warmup start")
-            write_status_log(f"Warmup start")
-            with log_memory_usage_context():
-                # Warmup
-                warmup_times = 5
-                try:
-                    warmup_times = int(os.environ.get("EXPERIMENT_WARMUP_TIMES", 5))
-                except:
-                    pass
-
-                warmup_timeout_sec = 240
-                try:
-                    warmup_timeout_sec = int(os.environ.get("EXPERIMENT_WARMUP_TIMEOUT_SEC", 240))
-                except:
-                    pass
-
-                # Test passing the nvshmem init
-                try:
-                    signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(warmup_timeout_sec)  # 60 seconds = 1 minute
-
-                    should_dump_traceback = os.environ.get("EXPERIMENT_SHOULD_DUMP_TRACEBACK", "0") == "1"
-                    if should_dump_traceback:
-                        print("Start profiling with stack trace...")
-                        with torch.profiler.profile(
-                            activities=[
-                                torch.profiler.ProfilerActivity.CPU,
-                                torch.profiler.ProfilerActivity.CUDA,
-                            ],
-                            record_shapes=True,
-                            with_stack=True,
-                        ) as prof:
-                            ref = worker.forward_backward_batch(
-                                microbatches=microbatches,
-                                normal_forward_fn=normal_forward_fn,
-                                forward_only=False,
-                            )
-                        signal.alarm(0)
-                        print("End profiling with stack trace. Now dumping stack trace to trace.json...")
-                        if rank == 0:
-                            prof.export_chrome_trace(os.path.join(output_dir, "trace.json"))
-                    else:
-                        ref = worker.forward_backward_batch(
-                            microbatches=microbatches,
-                            normal_forward_fn=normal_forward_fn,
-                            forward_only=False,
-                        )
-                        signal.alarm(0)
-                except TimeoutError as e:
-                    print(f"🔴 Timeout {warmup_timeout_sec} seconds at the first warmup forward_backward function. It may suggest our all2all kernel failed, or just warmup did not completed.")
-                    sys.exit(1)
-
-            
-            write_status_log(f"Finish warmup first time.")
-            for warmup_idx in range(max(warmup_times - 1, 0)):
-                ref = worker.forward_backward_batch(
-                    microbatches=microbatches,
-                    normal_forward_fn=normal_forward_fn,
-                    forward_only=False,
-                )
-                
-            time.sleep(1)
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-            if rank == 0:
-                print("=" * 20 + "warmup done")
-            log_memory_usage("warmup done")
-            write_status_log(f"Finish warmup.")
-        
-        
-        # # --------------
-        # # Profiling Run
-        # # --------------
-        # Useless - doesn't dump as much information as nsys profile as we want.
-        # EXPERIMENT_PROFILE_RUN = os.environ.get("EXPERIMENT_PROFILE_RUN", "0")
-        # try:
-        #     EXPERIMENT_PROFILE_RUN = int(EXPERIMENT_PROFILE_RUN)
-        # except:
-        #     EXPERIMENT_PROFILE_RUN = 0
-        #     pass
-        # EXPERIMENT_PROFILE_RUN = 1
-
-        
-        # print(f"[Rank {rank}] ⚪ Reaching profiling run.")
-        # if EXPERIMENT_PROFILE_RUN > 0:
-        #     print(f"[Rank {rank}] ⚪ Running profiling run...")
-        #     profile_output_dir = os.path.join(output_dir, "profile_runs")
-        #     profile_chrom_trace = os.path.join(profile_output_dir, f"prof_trace.sid{sample_id}.r{rank}.json")
-        #     os.makedirs(profile_output_dir, exist_ok=True)
-            
-        #     with ProfilerCtx(profile_output_dir, chrome_name=profile_chrom_trace) as prof:
-        #         for run_id in range(EXPERIMENT_PROFILE_RUN):
-        #             print(f"[Rank {rank}] ⚪ Running profiling run (repeat={run_id})...")
-        #             torch.cuda.synchronize()  
-        #             torch.distributed.barrier()
-
-        #             ref = worker.forward_backward_batch(
-        #                 microbatches=microbatches,
-        #                 normal_forward_fn=normal_forward_fn,
-        #                 forward_only=False,
-        #             )
-        #             torch.cuda.synchronize()  
-        #             torch.distributed.barrier()
-        #             print(f"[Rank {rank}] ⚪ Finish profiling run (repeat={run_id}).")
-        #             prof.step()
-        #             print(f"[Rank {rank}] ⚪ Finish step in profiling run (repeat={run_id})...")
-
-        # exit(1)   
-
-            
         # --------------
         # Real Experiment
         # --------------
-        N = 3
-        try:
-            N = int(os.environ.get("EXPERIMENT_REPEAT_TIMES", 3))
-        except:
-            N = 3
 
         torch.cuda.synchronize()
         torch.distributed.barrier()
         
-        # Calculate the average duration of the forward_backward_batch
-        iteration_times = []
-        start_time = time.time()
-        torch.cuda.nvtx.range_push(f"sample_{sample_id}(repeat={N})")
-        
-        
+        # Calculate the duration of the forward_backward_batch
+        torch.cuda.nvtx.range_push(f"sample_{sample_id}")
+
         should_log_memory_during_real_experiment = (
             os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_REAL_EXPERIMENT", "0") == "1"
         )
+        log_memory_usage_ctx = None
         if should_log_memory_during_real_experiment:
             log_memory_usage_ctx = log_memory_usage_context()
             log_memory_usage_ctx.__enter__()
-            pass
-        
-        for repeat_idx in range(N):
-            # start_event = torch.cuda.Event(enable_timing=True)
-            # end_event = torch.cuda.Event(enable_timing=True)pr:
-            write_status_log(f"Start Forward_backward_batch (sample_id={sample_id},repeat={repeat_idx})")
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-            # start_event.record()
-            start_it_time = time.time()
-            log_memory_usage(f"forward_backward_batch:start(sample_id={sample_id},repeat={repeat_idx})")
-            losses_reduced, grad_norm = worker.forward_backward_batch(
-                microbatches=microbatches,
-                normal_forward_fn=normal_forward_fn,
-                forward_only=False,
-            )
-            # Try to extract a scalar loss for logging
-            try:
-                loss_value = None
-                if isinstance(losses_reduced, dict):
-                    val = losses_reduced.get('loss', None)
-                    if val is not None:
-                        if isinstance(val, (list, tuple)):
-                            vals = []
-                            for v in val:
-                                if torch.is_tensor(v):
-                                    vals.append(v.item())
-                                else:
-                                    vals.append(float(v))
-                            if len(vals) > 0:
-                                loss_value = sum(vals) / len(vals)
-                        else:
-                            loss_value = val.item() if torch.is_tensor(val) else float(val)
-                elif torch.is_tensor(losses_reduced):
-                    loss_value = losses_reduced.item()
-                elif isinstance(losses_reduced, (list, tuple)) and len(losses_reduced) > 0:
-                    # Handle list of tensors or floats
-                    vals = []
-                    for v in losses_reduced:
-                        if torch.is_tensor(v):
-                            vals.append(v.item())
-                        elif isinstance(v, (int, float)):
-                            vals.append(float(v))
-                        elif isinstance(v, dict) and 'loss' in v:
-                            lv = v['loss']
-                            vals.append(lv.item() if torch.is_tensor(lv) else float(lv))
-                    if len(vals) > 0:
-                        loss_value = sum(vals) / len(vals)
-                if loss_value is not None:
-                    write_status_log(f"Loss (sample_id={sample_id},repeat={repeat_idx}) = {loss_value:.6f}")
-                    write_loss_log(loss_value, sample_id=sample_id, repeat_idx=repeat_idx)
-            except Exception as _:
-                # Best-effort logging; ignore extraction failures
-                pass
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-            # end_event.record()
-            end_it_time = time.time()
-            log_memory_usage(f"forward_backward_batch:done(sample_id={sample_id},repeat={repeat_idx})")
-            iteration_time = end_it_time - start_it_time
-            write_status_log(f"Finish Forward_backward_batch (sample_id={sample_id},repeat={repeat_idx})")
-            iteration_times.append(iteration_time)
+
+        write_status_log(f"Start Forward_backward_batch (sample_id={sample_id})")
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        start_it_time = time.time()
+        log_memory_usage(f"forward_backward_batch:start(sample_id={sample_id})")
+        losses_reduced, grad_norm = worker.forward_backward_batch(
+            microbatches=microbatches,
+            normal_forward_fn=normal_forward_fn,
+            forward_only=False,
+        )
+        loss_value = extract_scalar_loss(losses_reduced)
+        if loss_value is not None:
+            write_status_log(f"Loss (sample_id={sample_id}) = {loss_value:.6f}")
+            write_loss_log(loss_value, sample_id=sample_id)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        end_it_time = time.time()
+        log_memory_usage(f"forward_backward_batch:done(sample_id={sample_id})")
+        iteration_time = end_it_time - start_it_time
+        write_status_log(f"Finish Forward_backward_batch (sample_id={sample_id})")
+        if log_memory_usage_ctx is not None:
+            log_memory_usage_ctx.__exit__(None, None, None)
         torch.cuda.nvtx.range_pop()
         
         torch.cuda.synchronize()
         torch.distributed.barrier()
-        end_time = time.time()
-        duration = end_time - start_time
-        # duration_ms = duration * 1000
-        # avg_duration_ms = duration_ms / N
-        avg_duration_ms = 0
-        if iteration_times:
-            avg_duration_ms = sum(iteration_times) / len(iteration_times) * 1000
+        avg_duration_ms = iteration_time * 1000
         sample_times.append(avg_duration_ms)
+        sample_losses.append(loss_value)
+
+        # -----------------
+        # Validation step
+        # -----------------
+        val_loss_value = None
+        if val_every_n_steps > 0 and ((sample_id + 1) % val_every_n_steps == 0):
+            write_status_log(f"Start Validation (sample_id={sample_id})")
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            val_start_it_time = time.time()
+            log_memory_usage(f"validation:start(sample_id={sample_id})")
+            torch.cuda.nvtx.range_push(f"val_sample_{sample_id}")
+            val_losses_reduced, _ = worker.forward_backward_batch(
+                microbatches=microbatches,
+                normal_forward_fn=normal_forward_fn,
+                forward_only=True,
+            )
+            val_loss_value = extract_scalar_loss(val_losses_reduced)
+            if val_loss_value is not None:
+                write_status_log(f"Validation Loss (sample_id={sample_id}) = {val_loss_value:.6f}")
+                # Use repeat_idx=-1 to distinguish validation entries in loss.log
+                _write_loss_log(output_dir, val_loss_value, sample_id=sample_id, repeat_idx=-1)
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            val_end_it_time = time.time()
+            log_memory_usage(f"validation:done(sample_id={sample_id})")
+            torch.cuda.nvtx.range_pop()
+
+            val_iteration_time = val_end_it_time - val_start_it_time
+            val_avg_duration_ms = val_iteration_time * 1000
+            val_sample_times.append(val_avg_duration_ms)
+            val_sample_losses.append(val_loss_value)
+            write_status_log(f"Finish Validation (sample_id={sample_id})")
+        
+        # Print loss from all ranks if enabled
+        wandb_driver.print_loss(
+            sample_id=sample_id,
+            loss=loss_value,
+            rank=rank,
+            allow_all_ranks=allow_all_ranks_loss,
+        )
+        
+        # Log to wandb if enabled (only on rank 0). Attach validation loss if available.
+        extra_metrics = {
+            "tokens_this_iter": tokens_this_iter,
+            "tokens_consumed": total_tokens_consumed,
+        }
+        if val_loss_value is not None:
+            extra_metrics["val_loss"] = float(val_loss_value)
+
+        wandb_driver.log(
+            sample_id=sample_id,
+            duration_ms=avg_duration_ms,
+            iteration_time_ms=iteration_time * 1000,
+            loss=loss_value,
+            rank=rank,
+            **extra_metrics,
+        )
+        
         if rank == 0:
-            rich.print(f"[Sample ID=({sample_id})] Mode={mode} forward_backward_batch: avg_time_per_iteration = {avg_duration_ms:.2f} ms")
+            print(f"[Sample ID=({sample_id})] Mode={mode} forward_backward_batch: avg_time_per_iteration = {avg_duration_ms:.2f} ms")
         device = torch.cuda.current_device()
         
         if rank % 8 == 0:
@@ -1411,154 +1001,21 @@ def test(args):
                 total_alloc
             ) = d2.mem.get_torch_cuda_memory_usage(device)
             pynvml_gpu_memory_usage = d2.mem.get_pynvml_gpu_memory_usage(device)
-            rich.print(f"Ⓜ️Ⓜ️ [Sample ID=({sample_id})] Memory usage: allocated_cur: {(allocated_cur/1024):.2f} GB, allocated_peak: {(allocated_peak/1024):.2f} GB, total_alloc: {(total_alloc/1024):.2f} GB, pynvml_gpu_memory_usage: {(pynvml_gpu_memory_usage/1024):.2f} GB")
+            print(f"Ⓜ️Ⓜ️ [Sample ID=({sample_id})] Memory usage: allocated_cur: {(allocated_cur/1024):.2f} GB, allocated_peak: {(allocated_peak/1024):.2f} GB, total_alloc: {(total_alloc/1024):.2f} GB, pynvml_gpu_memory_usage: {(pynvml_gpu_memory_usage/1024):.2f} GB")
+            
+            # Log memory usage to wandb with separate step
+            wandb_driver.log_memory(
+                allocated_cur_gb=allocated_cur,
+                allocated_peak_gb=allocated_peak,
+                total_alloc_gb=total_alloc,
+                pynvml_gpu_memory_usage_gb=pynvml_gpu_memory_usage,
+                rank=rank,
+            )
             
 
         time.sleep(2) # to ensure the profile sees a better profiling result
         torch.cuda.synchronize()
         torch.distributed.barrier()
-
-        # Log attention timing data for this iteration if unified timing enabled
-        if os.getenv("UNIFIED_RECORD_ATTENTION_TIMES", "0") == "1":
-            # Synchronize and collect timing data from CUDA events
-            sync_and_collect_timing()
-            
-            timing_data = get_unified_attention_times().get(sample_id, {"forward_times": [], "backward_times": []})
-            forward_times = timing_data["forward_times"]
-            backward_times = timing_data["backward_times"]
-            
-            # Calculate medians
-            forward_median = np.median(forward_times) if forward_times else 0.0
-            backward_median = np.median(backward_times) if backward_times else 0.0
-            
-            # Create attn_time directory structure
-            attn_time_dir = os.path.join(output_dir, "attn_time")
-            os.makedirs(attn_time_dir, exist_ok=True)
-            
-            # Log to per-rank JSONL file
-            attn_time_file = os.path.join(attn_time_dir, f"attn_time.rank{rank}.jsonl")
-            iteration_data = {
-                "sample_id": sample_id,
-                "mode": mode,
-                "forward_times": forward_times,
-                "backward_times": backward_times,
-                "forward_median_ms": forward_median,
-                "backward_median_ms": backward_median,
-                "forward_count": len(forward_times),
-                "backward_count": len(backward_times)
-            }
-            
-            with open(attn_time_file, 'a') as f:
-                f.write(json.dumps(iteration_data) + '\n')
-            
-            # Print median times for this iteration
-            if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
-                rich.print(f"🕒 [Sample {sample_id}] {mode.upper()} Attention timing - Forward median: {forward_median:.2f} ms ({len(forward_times)} measurements), Backward median: {backward_median:.2f} ms ({len(backward_times)} measurements)")
-
-        # Log all-to-all timing data for this iteration if unified timing enabled
-        if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
-            # Synchronize and collect timing data from CUDA events
-            sync_and_collect_a2a_timing()
-            
-            timing_data = get_unified_a2a_times().get(sample_id, {"a2a_forward": []})
-            a2a_times = timing_data["a2a_forward"]
-            
-            # Calculate median
-            a2a_median = np.median(a2a_times) if a2a_times else 0.0
-            
-            # Create a2a_time directory structure
-            a2a_time_dir = os.path.join(output_dir, "a2a_time")
-            os.makedirs(a2a_time_dir, exist_ok=True)
-            
-            # Log to per-rank JSONL file
-            a2a_time_file = os.path.join(a2a_time_dir, f"a2a_time.rank{rank}.jsonl")
-            iteration_data = {
-                "sample_id": sample_id,
-                "mode": mode,
-                "a2a_forward_times": a2a_times,
-                "a2a_forward_median_ms": a2a_median,
-                "a2a_forward_count": len(a2a_times)
-            }
-            
-            with open(a2a_time_file, 'a') as f:
-                f.write(json.dumps(iteration_data) + '\n')
-            
-            # Print median times for this iteration
-            if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
-                rich.print(f"🕒 [Sample {sample_id}] {mode.upper()} All-to-All timing - Median: {a2a_median:.2f} ms ({len(a2a_times)} measurements)")
-
-        # Log TickSync blocking events for this iteration if enabled
-        if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
-            # Create ticksync_blocking directory structure    
-            ticksync_blocking_dir = os.path.join(output_dir, "ticksync_blocking")
-            os.makedirs(ticksync_blocking_dir, exist_ok=True)
-            ticksync_blocking_file = os.path.join(ticksync_blocking_dir, f"ticksync_blocking.rank{rank}.jsonl")
-
-            # Process pending CUDA events to measure actual GPU timing
-            TickSync.process_pending_events()
-            blocking_events = TickSync.get_blocking_events()
-            
-            # Log each blocking event separately to per-rank JSONL file
-            for event in blocking_events:
-                iteration_data = {
-                    "sample_id": sample_id,
-                    "mode": mode,
-                    "blocking_event": event
-                }
-                with open(ticksync_blocking_file, 'a') as f:
-                    f.write(json.dumps(iteration_data) + '\n')
-            
-            # Print blocking events for this iteration
-            # if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
-            #     rich.print(f"⚠️  [Sample {sample_id}] {mode.upper()} TickSync Blocking - {len(blocking_events)} events detected")
-            #     for event in blocking_events[-3:]:  # Show last 3 events
-            #         rich.print(f"    {event['layer_info']} {event['operation_info']} ({event['phase']}): {event['wait_time_ms']:.2f}ms > {event['threshold_ms']}ms")
-            
-            # Clear events after logging
-            TickSync.clear_blocking_events()
-
-        # Log tick operations timing data for this iteration if enabled
-        if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
-            # Synchronize and collect timing data from CUDA events
-            from d2.runtime.megatron.ping_pong.tick_ops import sync_and_collect_tick_timing, get_tick_times
-            sync_and_collect_tick_timing()
-            
-            timing_data = get_tick_times().get(sample_id, {
-                "forward_pre_core_attn": [], 
-                "forward_post_core_attn": [],
-            })
-            pre_attn_times = timing_data["forward_pre_core_attn"]
-            post_attn_times = timing_data["forward_post_core_attn"]
-            
-            # Calculate medians
-            pre_attn_median = np.median([t["duration_ms"] for t in pre_attn_times]) if pre_attn_times else 0.0
-            post_attn_median = np.median([t["duration_ms"] for t in post_attn_times]) if post_attn_times else 0.0
-            
-            # Create tick_time directory structure
-            tick_time_dir = os.path.join(output_dir, "tick_time")
-            os.makedirs(tick_time_dir, exist_ok=True)
-            
-            # Log to per-rank JSONL file
-            tick_time_file = os.path.join(tick_time_dir, f"tick_time.rank{rank}.jsonl")
-            iteration_data = {
-                "sample_id": sample_id,
-                "mode": mode,
-                "forward_pre_core_attn_times": pre_attn_times,
-                "forward_post_core_attn_times": post_attn_times,
-                "forward_pre_core_attn_median_ms": pre_attn_median,
-                "forward_post_core_attn_median_ms": post_attn_median,
-                "forward_pre_core_attn_count": len(pre_attn_times),
-                "forward_post_core_attn_count": len(post_attn_times)
-            }
-            
-            
-            with open(tick_time_file, 'a') as f:
-                f.write(json.dumps(iteration_data) + '\n')
-            
-            # Print median times for this iteration
-            if rank % 8 == 0:  # Only print from a subset of ranks to avoid spam
-                timing_msg = f"🕒 [Sample {sample_id}] {mode.upper()} Tick Operations timing - Forward Pre-attn median: {pre_attn_median:.2f} ms ({len(pre_attn_times)} measurements), Forward Post-attn median: {post_attn_median:.2f} ms ({len(post_attn_times)} measurements)"
-                rich.print(timing_msg)
 
         # Write to the benchmark jsonl log
         if rank == 0:
@@ -1578,7 +1035,9 @@ def test(args):
     torch.distributed.barrier()
     print("=" * 20 + "forward_backward_batch attention server, done")
 
-    # Collect attention start and end events and calculate the average duration.
+    # ------------------------------------------------------------------
+    # Collect attention start/end timestamps and emit summary logs
+    # ------------------------------------------------------------------
     from datetime import datetime
     pst = pytz.timezone('US/Pacific')
     timestamp = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S PST")
@@ -1592,7 +1051,7 @@ def test(args):
             f.write("===============Summary Log===============\n")
 
         def log_to_console_and_file(*args, **kwargs):
-            rich.print(*args, **kwargs)
+            print(*args, **kwargs)
             if rank == 0:
                 with open(summary_log_file, "a") as f:
                     print(*args, **kwargs, file=f)
@@ -1626,390 +1085,86 @@ def test(args):
         for idx in range(len(sample_times)):
             samples = iterated_samples[idx]
             duration = sample_times[idx]
-            log_to_console_and_file(f"🟢 Sample {idx}: duration: {duration:.2f} ms, samples = {samples}")
+            loss = sample_losses[idx] if idx < len(sample_losses) else None
+            # log_to_console_and_file(f"🟢 Sample {idx}: duration: {duration:.2f} ms, samples = {samples}")
+            if loss is not None:
+                log_to_console_and_file(f"🟢 Sample {idx}: duration: {duration:.2f} ms, loss: {loss:.6f}")
+            else:
+                log_to_console_and_file(f"🟢 Sample {idx}: duration: {duration:.2f} ms, loss: N/A")
             benchmark_data["samples"].append({
                 "sample_id": idx,
                 "samples": samples,
-                "duration_ms": duration
+                "duration_ms": duration,
+                "loss": float(loss) if loss is not None else None
             })
-        
-        
+    # ------------------------------------------------------------------
+    # Write benchmark results to file
+    # ------------------------------------------------------------------
     if rank == 0:
-        # Write benchmark results to file
-        # TODO: Legacy behavior. Can delete this later... just treat this as a log file.
         file_dir = os.path.dirname(os.path.abspath(__file__))
-        benchmark_dir = os.path.join(file_dir, "..", "benchmarks", "_250809_e2e_benchmark", "data")
-        os.makedirs(benchmark_dir, exist_ok=True)
-        benchmark_file = os.path.join(benchmark_dir, f"benchmark.{now_ts}.{mode}.json")
-        with open(benchmark_file, 'w') as f:
-            json.dump(benchmark_data, f, indent=2)
-
         # Save another copy of the benchmark data to the output directory
         output_file = os.path.join(output_dir, "benchmark.json")
         with open(output_file, 'w') as f:
             json.dump(benchmark_data, f, indent=2)
         
-        rich.print(f"🟢 Benchmark results saved to: {output_file}")
-
-    # for idx, (sample, duration) in enumerate(zip(iterated_samples, sample_times)):
-    #     rich.print(f"🟢 Sample {idx}: {sample}, duration: {duration} ms")
-
-    # Report memory usage
-    # save_memory_usage_to_file(memory_usage_output_dir)
+        print(f"🟢 Benchmark results saved to: {output_file}")
     
-    # Save attention timing data if unified timing was enabled
-    if os.getenv("UNIFIED_RECORD_ATTENTION_TIMES", "0") == "1":
-        # Final synchronization to collect any remaining timing data
-        sync_and_collect_timing()
-        
-        if rank == 0:
-            all_attention_times = get_unified_attention_times()
-            attention_timing_file = os.path.join(output_dir, "attention_timing.json")
-            with open(attention_timing_file, 'w') as f:
-                json.dump(all_attention_times, f, indent=2)
-            rich.print(f"🟢 {mode.upper()} Attention timing data saved to: {attention_timing_file}")
-            
-            # Also print summary with medians
-            
-            rich.print(f"🟢 ===== {mode.upper()} Attention Timing Summary =====")
-            for sample_id, timing_data in all_attention_times.items():
-                fwd_times = timing_data["forward_times"]
-                bwd_times = timing_data["backward_times"]
-                if fwd_times:
-                    avg_fwd = sum(fwd_times) / len(fwd_times)
-                    median_fwd = np.mean(fwd_times)
-                    rich.print(f"Sample {sample_id}: Forward - Avg: {avg_fwd:.2f} ms, Mean: {median_fwd:.2f} ms ({len(fwd_times)} measurements)")
-                if bwd_times:
-                    avg_bwd = sum(bwd_times) / len(bwd_times)
-                    median_bwd = np.mean(bwd_times)
-                    rich.print(f"Sample {sample_id}: Backward - Avg: {avg_bwd:.2f} ms, Mean: {median_bwd:.2f} ms ({len(bwd_times)} measurements)")
-            rich.print(f"🟢 Individual rank attention timing logs saved to: {os.path.join(output_dir, 'attn_time')}")
-    
-    # Save all-to-all timing data if unified timing was enabled
-    if os.getenv("UNIFIED_RECORD_A2A_TIMES", "0") == "1":
-        # Final synchronization to collect any remaining timing data
-        sync_and_collect_a2a_timing()
-        
-        if rank == 0:
-            all_a2a_times = get_unified_a2a_times()
-            a2a_timing_file = os.path.join(output_dir, "a2a_timing.json")
-            with open(a2a_timing_file, 'w') as f:
-                json.dump(all_a2a_times, f, indent=2)
-            rich.print(f"🟢 {mode.upper()} All-to-All timing data saved to: {a2a_timing_file}")
-            
-            # Also print summary with medians
-            rich.print(f"🟢 ===== {mode.upper()} All-to-All Timing Summary =====")
-            for sample_id, timing_data in all_a2a_times.items():
-                a2a_times = timing_data["a2a_forward"]
-                if a2a_times:
-                    avg_a2a = sum(a2a_times) / len(a2a_times)
-                    median_a2a = np.median(a2a_times)
-                    rich.print(f"Sample {sample_id}: All-to-All Forward - Avg: {avg_a2a:.2f} ms, Median: {median_a2a:.2f} ms ({len(a2a_times)} measurements)")
-            rich.print(f"🟢 Individual rank all-to-all timing logs saved to: {os.path.join(output_dir, 'a2a_time')}")
-    
-    # Save tick operations timing data if enabled
-    if os.getenv("UNIFIED_RECORD_TICK_TIMES", "0") == "1":
-        # Final synchronization to collect any remaining timing data
-        from d2.runtime.megatron.ping_pong.tick_ops import sync_and_collect_tick_timing, get_tick_times
-        sync_and_collect_tick_timing()
-        
-        if rank == 0:
-            all_tick_times = get_tick_times()
-            tick_timing_file = os.path.join(output_dir, "tick_timing.json")
-            with open(tick_timing_file, 'w') as f:
-                json.dump(all_tick_times, f, indent=2)
-            rich.print(f"🟢 {mode.upper()} Tick operations timing data saved to: {tick_timing_file}")
-            
-            # Also print summary with medians
-            rich.print(f"🟢 ===== {mode.upper()} Tick Operations Timing Summary =====")
-            for sample_id, timing_data in all_tick_times.items():
-                pre_attn_times = timing_data["forward_pre_core_attn"]
-                post_attn_times = timing_data["forward_post_core_attn"]
-                
-                if pre_attn_times:
-                    avg_pre = sum(t["duration_ms"] for t in pre_attn_times) / len(pre_attn_times)
-                    median_pre = np.median([t["duration_ms"] for t in pre_attn_times])
-                    rich.print(f"Sample {sample_id}: Forward Pre-Core Attn - Avg: {avg_pre:.2f} ms, Median: {median_pre:.2f} ms ({len(pre_attn_times)} measurements)")
-                if post_attn_times:
-                    avg_post = sum(t["duration_ms"] for t in post_attn_times) / len(post_attn_times)
-                    median_post = np.median([t["duration_ms"] for t in post_attn_times])
-                    rich.print(f"Sample {sample_id}: Forward Post-Core Attn - Avg: {avg_post:.2f} ms, Median: {median_post:.2f} ms ({len(post_attn_times)} measurements)")
-                
-                        
-            rich.print(f"🟢 Individual rank tick operations timing logs saved to: {os.path.join(output_dir, 'tick_time')}")
-    
-    # Save TickSync blocking data if enabled
-    if os.getenv("D2_TICKSYNC_BLOCKING_DETECTION", "0") == "1":
-        # Process any remaining pending events
-        TickSync.process_pending_events()
-        # Final collection of any remaining blocking events
-        final_blocking_events = TickSync.get_blocking_events()
-        
-        if rank == 0:
-            # Create summary of all blocking events
-            ticksync_summary_file = os.path.join(output_dir, "ticksync_blocking_summary.json")
-            summary_data = {
-                "total_blocking_events": len(final_blocking_events),
-                "blocking_events": final_blocking_events,
-                "threshold_ms": float(os.getenv("D2_TICKSYNC_THRESHOLD_MS", "1.0"))
-            }
-            
-            with open(ticksync_summary_file, 'w') as f:
-                json.dump(summary_data, f, indent=2)
-            rich.print(f"🟢 {mode.upper()} TickSync blocking summary saved to: {ticksync_summary_file}")
-            
-            # Print summary
-            if final_blocking_events:
-                rich.print(f"🟢 ===== {mode.upper()} TickSync Blocking Summary =====")
-                rich.print(f"Total blocking events: {len(final_blocking_events)}")
-                
-                # Group by layer and operation
-                layer_ops = {}
-                for event in final_blocking_events:
-                    key = f"{event['layer_info']} {event['operation_info']}"
-                    if key not in layer_ops:
-                        layer_ops[key] = []
-                    layer_ops[key].append(event['wait_time_ms'])
-                
-                for key, times in layer_ops.items():
-                    avg_time = sum(times) / len(times)
-                    max_time = max(times)
-                    rich.print(f"{key}: {len(times)} events, avg: {avg_time:.2f}ms, max: {max_time:.2f}ms")
-            else:
-                rich.print(f"✅ No TickSync blocking events detected")
-            
-            rich.print(f"🟢 Individual rank TickSync blocking logs saved to: {os.path.join(output_dir, 'ticksync_blocking')}")
-    
+    # ------------------------------------------------------------------
     # Cleanup and exit
-    rich.print(f"❄️ [Rank {rank}] Finished test and exit.")        
+    # ------------------------------------------------------------------
+    
+    # Finish wandb run if enabled
+    wandb_driver.finish(rank=rank)
+
+    # ------------------------------------------------------------------
+    # Save final checkpoint (per-rank sharded weights) if requested
+    # ------------------------------------------------------------------
+    ckpt_root = os.environ.get("CKPT_DIR", "/mnt/sharefs/users/yonghao.zhuang/d2-logs/ckpts")
+    if ckpt_root:
+        try:
+            # Each run gets its own subdirectory named after the output_dir basename
+            run_name = os.path.basename(os.path.abspath(output_dir.rstrip("/")))
+            ckpt_dir = os.path.join(ckpt_root, run_name)
+            if rank == 0:
+                os.makedirs(ckpt_dir, exist_ok=True)
+            torch.distributed.barrier()
+
+            # Save this rank's model shard and minimal metadata
+            model_to_save = unwrap_model(worker.train_module[0])
+            ckpt_path = os.path.join(ckpt_dir, f"rank{rank}_final.pt")
+            ckpt_obj = {
+                "model_state_dict": model_to_save.state_dict(),
+                "optimizer_state_dict": worker.optimizer.state_dict() if hasattr(worker, "optimizer") else None,
+                "hf_config": getattr(worker, "hf_config", None),
+                "tf_config": getattr(worker, "tf_config", None),
+                "args": vars(args),
+                "total_tokens_consumed": total_tokens_consumed,
+                "max_sample_id": max_sample_id,
+            }
+            torch.save(ckpt_obj, ckpt_path)
+            if rank == 0:
+                write_status_log(f"Saved final checkpoints to {ckpt_dir}")
+                print(f"🟢 [Rank {rank}] Saved final checkpoint shard to: {ckpt_path}")
+        except Exception as e:
+            if rank == 0:
+                write_status_log(f"Failed to save checkpoint to CKPT_DIR={ckpt_root}: {e}")
+                print(f"⚠️ [Rank {rank}] Failed to save checkpoint: {e}")
+
+    
+    print(f"❄️ [Rank {rank}] Finished test and exit.")        
     write_status_log(f"Finish test and exit.")
-    # if False: # Only use it when force exit
-    if args.force_exit: 
-        print(f"[Rank {rank}] Starting aggressive cleanup process...")
-        os._exit(0)
-
-
-
-def save_memory_usage_to_file(memory_usage_dir: str):
-    os.makedirs(memory_usage_dir, exist_ok=True)
     
-    rank = torch.distributed.get_rank()
-    memory_usage: list[dict] = d2.mem.get_memory_usage()
-    memory_usage_output_file = os.path.join(memory_usage_dir, f"mem.rank{rank}.jsonl")
-    with open(memory_usage_output_file, 'w') as f:
-        for memory_usage_item in memory_usage:
-            f.write(json.dumps(memory_usage_item) + '\n')
-    rich.print(f"🟢 Memory usage saved to: {memory_usage_output_file}")
-    return
-
-
-def enable_memory_usage_logging(memory_usage_dir: str):
-    os.makedirs(memory_usage_dir, exist_ok=True)
-    rank = os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0"))
-    memory_usage_log_file = os.path.join(memory_usage_dir, f"mem.rank{rank}.log.jsonl")
-    with open(memory_usage_log_file, 'w') as f:
-        pass
-    d2.mem.set_memory_usage_log_file(memory_usage_log_file)
-    pass
-
-# Unified Attention Timing Collection (works for both WLBLLM and D2)
-_unified_attention_times = {}
-_current_sample_id = None
-_pending_events = []  # List of (sample_id, phase, start_event, end_event) tuples
-
-def setup_unified_attention_timing_patch():
-    """Setup monkey patching for unified attention timing collection (WLBLLM + D2)."""
-    import flash_attn.flash_attn_interface as flash_attn_interface
-    
-    # Store original functions
-    original_forward = flash_attn_interface._wrapped_flash_attn_varlen_forward
-    original_backward = flash_attn_interface._wrapped_flash_attn_varlen_backward
-    
-    def timed_forward(*args, **kwargs):
-        if _current_sample_id is not None:
-            # Create CUDA events for timing
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            # Record start event
-            start_event.record()
-        
-        result = original_forward(*args, **kwargs)
-        
-        if _current_sample_id is not None:
-            # Record end event
-            end_event.record()
-            
-            # Store events for later synchronization
-            _pending_events.append((_current_sample_id, "forward", start_event, end_event))
-        
-        return result
-    
-    def timed_backward(*args, **kwargs):
-        if _current_sample_id is not None:
-            # Create CUDA events for timing
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            # Record start event
-            start_event.record()
-        
-        result = original_backward(*args, **kwargs)
-        
-        if _current_sample_id is not None:
-            # Record end event
-            end_event.record()
-            
-            # Store events for later synchronization
-            _pending_events.append((_current_sample_id, "backward", start_event, end_event))
-        
-        return result
-    
-    # Apply monkey patches
-    flash_attn_interface._wrapped_flash_attn_varlen_forward = timed_forward
-    flash_attn_interface._wrapped_flash_attn_varlen_backward = timed_backward
-    
-    print("🟢 Unified attention timing patch applied successfully (works for both WLBLLM and D2)")
-
-def set_unified_current_sample_id(sample_id):
-    """Set the current sample ID for unified attention timing."""
-    global _current_sample_id
-    _current_sample_id = sample_id
-
-def sync_and_collect_timing():
-    """Synchronize all pending events and collect timing data."""
-    global _pending_events, _unified_attention_times
-    
-    if not _pending_events:
-        return
-    
-    # Synchronize all events
-    torch.cuda.synchronize()
-    
-    # Process all pending events
-    for sample_id, phase, start_event, end_event in _pending_events:
-        # Calculate duration in milliseconds
-        duration_ms = start_event.elapsed_time(end_event)
-        
-        # Initialize sample data if needed
-        if sample_id not in _unified_attention_times:
-            _unified_attention_times[sample_id] = {"forward_times": [], "backward_times": []}
-        
-        # Store timing data
-        if phase == "forward":
-            _unified_attention_times[sample_id]["forward_times"].append(duration_ms)
-        elif phase == "backward":
-            _unified_attention_times[sample_id]["backward_times"].append(duration_ms)
-    
-    # Clear pending events
-    _pending_events.clear()
-
-def get_unified_attention_times():
-    """Get all unified attention timing data."""
-    return _unified_attention_times.copy()
-
-def clear_unified_attention_times():
-    """Clear unified attention timing data."""
-    global _unified_attention_times, _pending_events
-    _unified_attention_times.clear()
-    _pending_events.clear()
-
-# Unified All-to-All Timing Collection (works for both WLBLLM and D2)
-_a2a_attention_times = {}
-_current_a2a_sample_id = None
-_pending_a2a_events = []  # List of (sample_id, operation, start_event, end_event) tuples
-
-def setup_unified_a2a_timing_patch():
-    """Setup monkey patching for unified all-to-all timing collection."""
-    from d2.runtime.attn_kernels.ops import _ops_fast_a2a_wrapper, DispatcherWrapper
-    
-    # Store original function
-    original_wrapper = _ops_fast_a2a_wrapper
-    
-    def timed_wrapper(*args):
-        if _current_a2a_sample_id is not None:
-            # Get the communication stream
-            comm_stream = DispatcherWrapper.comm_stream
-            if comm_stream is None:
-                comm_stream = torch.cuda.current_stream()
-            
-            # Create CUDA events for timing
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            # Record start event on the communication stream
-            start_event.record(comm_stream)
-        
-        # Call original function
-        result = original_wrapper(*args)
-        
-        if _current_a2a_sample_id is not None:
-            # Record end event on the communication stream
-            end_event.record(comm_stream)
-            
-            # Store events for later synchronization
-            _pending_a2a_events.append((_current_a2a_sample_id, "a2a_forward", start_event, end_event))
-        
-        return result
-    
-    # Apply monkey patch
-    import d2.runtime.attn_kernels.ops as ops_module
-    ops_module._ops_fast_a2a_wrapper = timed_wrapper
-    
-    print("🟢 Unified all-to-all timing patch applied successfully")
-
-def set_unified_current_a2a_sample_id(sample_id):
-    """Set the current sample ID for unified all-to-all timing."""
-    global _current_a2a_sample_id
-    _current_a2a_sample_id = sample_id
-
-def sync_and_collect_a2a_timing():
-    """Synchronize all pending all-to-all events and collect timing data."""
-    global _pending_a2a_events, _a2a_attention_times
-    
-    if not _pending_a2a_events:
-        return {}
-    
-    # Get the communication stream and synchronize
-    from d2.runtime.attn_kernels.ops import DispatcherWrapper
-    comm_stream = DispatcherWrapper.comm_stream
-    if comm_stream is not None:
-        comm_stream.synchronize()
-    else:
-        torch.cuda.synchronize()
-    
-    # Process all pending events
-    for sample_id, operation, start_event, end_event in _pending_a2a_events:
-        # Calculate duration in milliseconds
-        duration_ms = start_event.elapsed_time(end_event)
-        
-        # Initialize sample data if needed
-        if sample_id not in _a2a_attention_times:
-            _a2a_attention_times[sample_id] = {"a2a_forward": []}
-        
-        # Store timing data
-        if operation in _a2a_attention_times[sample_id]:
-            _a2a_attention_times[sample_id][operation].append(duration_ms)
-    
-    # Clear pending events
-    _pending_a2a_events.clear()
-    return _a2a_attention_times.copy()
-
-def get_unified_a2a_times():
-    """Get all unified all-to-all timing data."""
-    return _a2a_attention_times.copy()
-
-def clear_unified_a2a_times():
-    """Clear unified all-to-all timing data."""
-    global _a2a_attention_times, _pending_a2a_events
-    _a2a_attention_times.clear()
-    _pending_a2a_events.clear()
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, choices=["baseline", "d2", "wlbllm"], default="baseline", 
-                        help="Test mode: 'baseline' for simple batch generation, 'd2' for balanced flops planning, 'wlbllm' for wlbllm")
+    parser.add_argument("--mode", type=str, choices=["d2"], default="d2", 
+                        help="Test mode: currently only supports 'd2' for balanced flops planning")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--val-every-n-steps",
+        type=int,
+        default=1,
+        help="Evaluate validation loss every N training steps (set to 0 to disable validation).",
+    )
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--cp-degree", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -2026,13 +1181,28 @@ if __name__ == "__main__":
     parser.add_argument("--filter-ratio", type=float, default=0.90)
     parser.add_argument("--force-exit", action="store_true")
     parser.add_argument("--should-add-debug-cases", action="store_true")
-    parser.add_argument("--should-profile-memory", type=str, default=None)
     parser.add_argument("--should-resend-qkv", action="store_true", help="Whether to resend qkv in the backward pass")
     parser.add_argument("--output-dir", type=str, default=None)   
     parser.add_argument("--sample-start-idx", type=int, default=0, help="Start index of the sample ids to sample") 
     parser.add_argument("--change-long-doc-ratio", type=float, default=0.0, help="Ratio of long docs to change")
-    parser.add_argument("--sample-name", type=str, default="wlbllm", help="Name of the sample to use", choices=["wlbllm", "prolong"])
+    parser.add_argument("--sample-name", type=str, default="wlbllm", 
+                        help="Name of the sample/dataset to use. Use 'bookcorpus', 'wikitext', 'openwebtext', or 'c4' for real datasets with actual tokens.", 
+                        choices=["wlbllm", "prolong", "bookcorpus", "wikitext", "openwebtext", "c4"])
     parser.add_argument("--alpha-factor", type=float, default=1.0, help="Alpha factor for memory imbalance")
+    parser.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional global token budget for the data loader. If set, the real-data loader "
+            "in training_utils will stop tokenizing once this many tokens have been produced "
+            "from the underlying dataset, even if max-sample-id has not been reached."
+        ),
+    )
+    parser.add_argument("--enable-wandb", action="store_true", help="Enable Weights & Biases logging (or set ENABLE_WANDB=1)")
+    parser.add_argument("--wandb-project", type=str, default="d2-training", help="Wandb project name (or set WANDB_PROJECT env var)")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name (or set WANDB_RUN_NAME env var). Set WANDB_API_KEY for authentication.")
+    parser.add_argument("--allow-all-ranks-loss", action="store_true", help="Allow all ranks to output loss values (or set ALLOW_ALL_RANKS_LOSS=1)")
     
     args = parser.parse_args()
     print(f"🟡 Args: {args}")
@@ -2047,72 +1217,17 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
 
     
-    should_profile_memory = args.should_profile_memory
-    if should_profile_memory:
-        torch.cuda.memory._record_memory_history()
-        mem_snapshots_dir = os.path.join(args.output_dir, "mem_snapshots")
-        os.makedirs(mem_snapshots_dir, exist_ok=True)
-        print(f"🟡 Will save mem snapshots to: {mem_snapshots_dir}")
-        pass
-
-    memory_usage_output_dir = os.path.join(args.output_dir, "mem")
-    memory_log_output_dir = os.path.join(args.output_dir, "mem-log")
-    os.makedirs(memory_usage_output_dir, exist_ok=True)
-    os.makedirs(memory_log_output_dir, exist_ok=True)
-
     start_time = time.time()
     
-    if should_profile_memory:
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-        ) as prof:
-            try:
-                test(args)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-            finally:
-                save_memory_usage_to_file(memory_usage_output_dir)
-    else:
-        try:
-            test(args)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            raise e
-        finally:
-            save_memory_usage_to_file(memory_usage_output_dir)
+    try:
+        main(args)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise e
     log_memory_usage("test:end", force=True)
     
     end_time = time.time()
     elapsed_time = end_time - start_time
-    rich.print(f"🕛 Test elapsed time: {elapsed_time:.2f} seconds")
-    
-    if should_profile_memory:
-        mode = args.mode
-        batch_size = args.batch_size
-        num_tokens = args.num_tokens
-        cp_degree = args.cp_degree
-        tp_size = args.tp_size
-        num_layers = args.num_layers
-
-        rank = torch.distributed.get_rank()
-        mem_snapshot_output_path = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.pickle")
-        memory_timeline_output_path = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.html")
-        memory_timeline_output_raw = os.path.join(mem_snapshots_dir, f"memory_profile.rank{rank}.json.gz")
-        print(f"🟡 Will save mem snapshot to: {mem_snapshot_output_path}")
-        print(f"🟡 Will save mem timeline to: {memory_timeline_output_path}")
-        # if rank % 8 == 0:
-        if rank == 0:
-            print("Dumping memory snapshot")
-            torch.cuda.memory._dump_snapshot(mem_snapshot_output_path)
-            prof.export_memory_timeline(memory_timeline_output_path, device=torch.cuda.current_device())
-            prof.export_memory_timeline(memory_timeline_output_raw, device=torch.cuda.current_device())
-            print("Memory snapshot dumped")
+    print(f"🕛 Test elapsed time: {elapsed_time:.2f} seconds")
 
