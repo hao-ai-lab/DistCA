@@ -90,7 +90,7 @@ def send_forward_backward_recv_forward_backward(output_tensors, input_tensor_gra
 forward_backward_pipelining_without_interleaving_first_run = True
 
 
-import wlbllm.registry
+# import wlbllm.registry
 def wlb_swap_next_forward_metadata():
     # Call this function before entering forward step.
     swap_metadata_fn = wlbllm.registry.get("swap_metadata_fn")

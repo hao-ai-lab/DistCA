@@ -296,6 +296,9 @@ def test(args):
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
+    # torch.distributed.breakpoint()
+    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs(num_tokens, num_docs * max_cp_degree, max_cp_degree)  # FIXME: hardcode for now, where to put?
+
     as_rank = worker.as_rank
     as_world_size = worker.as_world_size
 
@@ -367,7 +370,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1024)
     parser.add_argument("--cp-degree", type=int, default=2)
-    parser.add_argument("--num-docs", type=int, default=3)
+    parser.add_argument("--num-docs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--num-gpus-per-node", type=int, default=2)

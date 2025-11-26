@@ -11,7 +11,7 @@ from d2.runtime.megatron.ops import TickSync, FusedCommAttn, post_a2a_attn_out_w
 from d2.runtime.megatron.ops.fused_comm_attn import FlashAttnArgs
 from d2.runtime.megatron.ping_pong.utils import splits_all, repack_args, gather_tensor
 from d2.runtime.dispatch_fn import (
-    all_to_all, post_all2all_layout_transfer, pre_all2all_layout_transfer
+    all_to_all, post_all2all_layout_transfer, pre_all2all_layout_transfer, pre_all2all_layout_transfer_for_cuda_graph_bwd
 )
 
 
@@ -95,6 +95,28 @@ class TransformerLayer(BaseTransformerLayer):
         )
         torch.cuda.nvtx.range_pop()
 
+        return signal
+    
+    def _pre_mlp_to_attn_no_forward_for_cuda_graph(
+        self, query: Tensor, key: Tensor, value: Tensor,
+        packed_seq_params: PingPangSingleStepPackedSeqParams,
+    ):
+        """
+        Communication between attention layout and mlp layout.
+        This operation runs on the stream `packed_seq_params.stream`.
+        """
+
+        torch.cuda.nvtx.range_push("mlp_to_attn_no_forward_for_cuda_graph")
+        signal = pre_all2all_layout_transfer_for_cuda_graph_bwd.apply(
+            query, key, value,
+            [seq_len.recv_seqlens for seq_len in packed_seq_params.qkv_bwd_metadata.seq_lens],
+            packed_seq_params.qkv_bwd_metadata.kv_replica_mask,
+            packed_seq_params.qkv_bwd_metadata.recv_memcpy_metadata,
+            self.qkv_bwd_tensor_shapes,
+            packed_seq_params.dispatcher_id,
+            True,  # is_qkv
+        )
+        torch.cuda.nvtx.range_pop()
         return signal
 
     def _post_mlp_to_attn(

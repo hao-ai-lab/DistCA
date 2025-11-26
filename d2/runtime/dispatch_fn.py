@@ -1,3 +1,4 @@
+from typing import Iterable
 import torch
 
 from d2.runtime.attn_kernels.dispatch import (
@@ -102,6 +103,102 @@ class pre_all2all_layout_transfer(torch.autograd.Function):
             )
             # the dummy position k,v should have a None gradient.
             return (grad_attn_out,) + (None,) * 6
+
+
+# No stream because this should always run on the compute stream.
+# FIXME: currently duplicating above for easy debugging
+class pre_all2all_layout_transfer_for_cuda_graph_fwd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        send_seqlens: tuple[torch.Tensor, torch.Tensor],
+        kv_replica_mask: torch.Tensor,
+        send_memcpy_metadata: Iterable[torch.Tensor],
+        # metadata: AlltoAllMetadata, bwd_metadata: AlltoAllMetadata,
+        dispatcher_id: int, is_qkv: bool,
+    ):
+        # a signal tensor output to maintain the autograd graph dependency.
+        signal = torch.empty((1,), dtype=q.dtype, device=q.device)
+        save_tensors = []
+
+        if is_qkv:
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            q_seq_lens, k_seq_lens = send_seqlens
+            pre_a2a_qkv(
+                q, k, v, kv_replica_mask, q_seq_lens, k_seq_lens,
+                *send_memcpy_metadata,
+                is_fwd=True, instance_id=dispatcher_id,
+            )
+        else:
+            q = q.contiguous()
+            assert k is None and v is None
+            pre_a2a_attn_out(
+                q, metadata.seq_lens[0].send_seqlens,
+                *metadata.send_memcpy_metadata, instance_id=dispatcher_id
+            )
+        return q, k, v
+    
+    @staticmethod
+    def backward(ctx, q_grad, k_grad, v_grad):
+        return (q_grad, k_grad, v_grad) + (None,) * 5
+
+
+class pre_all2all_layout_transfer_for_cuda_graph_bwd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        recv_seqlens: tuple[torch.Tensor, torch.Tensor],
+        kv_replica_mask: torch.Tensor,
+        recv_memcpy_metadata: Iterable[torch.Tensor],
+        tensor_shapes: Iterable[tuple[int, ...]],
+        dispatcher_id: int, is_qkv: bool,
+    ):
+        signal = torch.empty((1,), dtype=q.dtype, device=q.device)
+        ctx.bwd_recv_shapes = tuple(tensor_shapes)
+        ctx.dispatcher_id = dispatcher_id
+        ctx.is_qkv = is_qkv
+        ctx.save_for_backward(
+            kv_replica_mask,
+            *recv_seqlens,
+            *recv_memcpy_metadata,
+        )
+        return signal
+
+    @staticmethod
+    def backward(ctx, signal_grad):
+        switch_buffer = ctx.dispatcher_id is None
+        if ctx.is_qkv:
+            grad_q_shape = ctx.bwd_recv_shapes[0]
+            grad_k_shape = ctx.bwd_recv_shapes[1]
+            grad_q = torch.empty(grad_q_shape, dtype=signal_grad.dtype, device=signal_grad.device)
+            grad_k = torch.zeros(grad_k_shape, dtype=signal_grad.dtype, device=signal_grad.device)  # must be zero not empty
+            grad_v = torch.zeros_like(grad_k)
+            post_a2a_qkv(
+                grad_q, grad_k, grad_v,
+                # qkv dispatch, q_seq_tokens, k_seq_tokens, v_seq_tokens, q_offset, k_offset, v_offset
+                *ctx.saved_tensors,
+                is_fwd=False,
+                switch_buffer=switch_buffer,
+                instance_id=ctx.dispatcher_id,
+            )
+            grad_k = grad_k.sum(dim=0)
+            grad_v = grad_v.sum(dim=0)
+            return (grad_q, grad_k, grad_v) + (None,) * 6
+        else:
+            grad_attn_out_shape = ctx.bwd_recv_shapes[0]
+            grad_attn_out = torch.empty(
+                grad_attn_out_shape, dtype=signal_grad.dtype, device=signal_grad.device
+            )
+            post_a2a_attn_out(
+                grad_attn_out,
+                *ctx.saved_tensors,
+                switch_buffer=switch_buffer,
+                instance_id=ctx.dispatcher_id,
+            )
+            # the dummy position k,v should have a None gradient.
+            return (grad_attn_out,) + (None,) * 8
 
 
 # we have to add the arg stream here because backward cannot be assigned

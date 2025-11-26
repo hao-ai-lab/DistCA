@@ -293,6 +293,9 @@ def test(args):
     )
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
+
+    # torch.distributed.breakpoint()
+    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs(num_tokens, num_seqs * max_cp_degree, max_cp_degree)  # FIXME: hardcode for now, where to put?
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
@@ -410,7 +413,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-gpus-per-node", type=int, default=4)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--pp-size", type=int, default=4)
-    parser.add_argument("--num-microbatch", type=int, default=2)
+    parser.add_argument("--num-microbatch", type=int, default=6)
     parser.add_argument("--use-planner", action="store_true")
     args = parser.parse_args()
     test(args)

@@ -99,7 +99,7 @@ def inspect_network_metadata(metadata: 'FastAllToAllMetadata_Tuple', is_ping, sa
         + attn_out_fwd_metadata__recv_transfer_sz_to_others
     ).max().item()
 
-    if rank == 0:
+    if rank == 0 and output_dir is not None:
         network_inspect_file = os.path.join(output_dir, "network_inspect.jsonl")
         with open(network_inspect_file, "a") as f:
             f.write(json.dumps({

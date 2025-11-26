@@ -468,7 +468,7 @@ def create_pipeline_doclens(
     if add_dummy:
         # Each rank only gets one dummy document, which is of `tp_size`
         # to avoid Sequence Parallel having an issue.
-        pp_head_new_doc_len = [[tp_size] for _ in range(dp_size)]
+        pp_head_new_doc_len = [[total_token_on_rank // dp_size] for _ in range(dp_size)]  # FIXME: using total_token_on_rank for cudagraph to work out-of-box, can be tp_size when cudagraph is disabled.
     else:
         assert total_token_on_rank % tp_size == 0, "Sequence Parallel requires total token divisible by tp_size"
         # TODO: Do not do "use_planner" to decide if we should grab batch from global batch or random.
@@ -499,7 +499,7 @@ def create_pipeline_doclens(
             other_pp_doc_len = ref_doc_lens[:-num_batches]
     else:
         dummy_fwd_num = world_size - dp_size
-        other_pp_doc_len = [[tp_size] for _ in range(dummy_fwd_num)]
+        other_pp_doc_len = [[total_token_on_rank // dp_size] for _ in range(dummy_fwd_num)]  # FIXME: using total_token_on_rank for cudagraph to work out-of-box, can be tp_size when cudagraph is disabled.
     tick_per_rank_doc_len = pp_head_new_doc_len + other_pp_doc_len
     print(f"In util.py, finally tick_per_rank_doc_len is: {tick_per_rank_doc_len}")
 
