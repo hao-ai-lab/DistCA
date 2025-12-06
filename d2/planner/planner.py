@@ -538,8 +538,8 @@ class Planner:
         self.tolerance_factor = tolerance_factor
 
     # from item to metadata.
-    def plan(self, items_: list[Item], verbose=False, plot=False, is_resend_qkv:bool=False):
-        mlp_shard_len, shard_logical_range = self.items_to_mlp_doc_len(items_)
+    def plan(self, items_: list[Item], verbose=False, plot=False, is_resend_qkv:bool=False, device: str = 'cuda'):
+        mlp_shard_len, shard_logical_range = self.items_to_mlp_doc_len(items_, device=device)
         planned_items: list[Item] = self.plan_items(items_, verbose, plot)
         planned_items: list[dict] = self.postprocess_items(planned_items)
         planner_output: list[list[ShardInfo]] = self.items_into_shardinfos(planned_items)
