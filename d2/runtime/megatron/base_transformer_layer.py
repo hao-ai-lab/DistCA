@@ -137,21 +137,23 @@ class TransformerLayer(MegatronTransformerLayer):
                 query = apply_rotary_pos_emb_d2(
                     query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q, shard_logical_range=shard_logical_range
                 )
-            elif q_pos_emb is not None:
-                # TODO VIJAY: simplify
-                query = apply_rotary_pos_emb(
-                    query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
-                )
+            # In d2, we can't use default RoPE.
+            # elif q_pos_emb is not None:
+            #     # TODO VIJAY: simplify
+            #     query = apply_rotary_pos_emb(
+            #         query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
+            #     )
 
             if k_pos_emb is not None and shard_logical_range is not None:
                 key = apply_rotary_pos_emb_d2(
                     key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv, shard_logical_range=shard_logical_range
                 )
-            elif k_pos_emb is not None:
-                # TODO VIJAY: simplify
-                key = apply_rotary_pos_emb(
-                    key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
-                )
+            # In d2, we can't use default RoPE.
+            # elif k_pos_emb is not None:
+            #     # TODO VIJAY: simplify
+            #     key = apply_rotary_pos_emb(
+            #         key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
+            #     )
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
@@ -168,7 +170,7 @@ class TransformerLayer(MegatronTransformerLayer):
         attention_mask: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         attn_mask_type: Optional[AttnMaskType] = None,
-        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
+        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams, MLPLayoutPackedSeqParams] = None,
     ):
         """
         Copied from megatron.core.transformer.attention.Attention.forward
