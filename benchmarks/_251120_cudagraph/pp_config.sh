@@ -1,7 +1,7 @@
 
 
 # Global variable overrides (use # $$ syntax)
-# $$OUTPUT_DIR_PREFIX=/mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks3/_251120_cudagraph/logs.v2
+# $$OUTPUT_DIR_PREFIX=./logs.v1
 # $$FOLDER_SEPARATOR=1
 # $$EXPERIMENT_DISTS=("wlbllm 0.0")
 
@@ -17,3 +17,5 @@
 
 
 # bash /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_251120_cudagraph/test_4d.sh --config /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks/_251120_cudagraph/pp_config.sh
+
+# bash ../benchmarks/_251120_cudagraph/test_4d.sh --config ../benchmarks/_251120_cudagraph/pp_config.sh

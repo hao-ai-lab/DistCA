@@ -521,9 +521,12 @@ def test(args):
     log_memory_usage("after worker.init", force=True)
     rank = torch.distributed.get_rank()
 
+
     MAX_NUM_SEQS = 128 # TODO: Hardcode for now.
     MAX_CP_DEGREE = 32 # TODO: Hardcode for now.
+    # num_tokens
     worker.train_module[0].module.module.decoder.init_layer_cuda_graphs(num_tokens, MAX_NUM_SEQS, MAX_CP_DEGREE)
+
     
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
