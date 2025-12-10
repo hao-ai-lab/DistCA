@@ -1,0 +1,11 @@
+{"cp_shard_len": 16384, "num_seq": 1, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.964230537414551}
+{"cp_shard_len": 8192, "num_seq": 2, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.956777572631836}
+{"cp_shard_len": 4096, "num_seq": 4, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.843299865722656}
+{"cp_shard_len": 2048, "num_seq": 8, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.755728721618652}
+{"cp_shard_len": 1024, "num_seq": 16, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.701264381408691}
+{"cp_shard_len": 512, "num_seq": 32, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.69865608215332}
+{"cp_shard_len": 256, "num_seq": 64, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.7295026779174805}
+{"cp_shard_len": 128, "num_seq": 128, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.764788627624512}
+{"cp_shard_len": 64, "num_seq": 256, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 6.843857765197754}
+{"cp_shard_len": 32, "num_seq": 512, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 13.379859924316406}
+{"cp_shard_len": 16, "num_seq": 1024, "L": 16384, "num_heads": 32, "head_dim": 128, "causal": true, "mode": "fwd", "duration_ms": 26.47303581237793}
