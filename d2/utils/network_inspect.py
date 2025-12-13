@@ -100,47 +100,50 @@ def inspect_network_metadata(metadata: 'FastAllToAllMetadata_Tuple', is_ping, sa
     ).max().item()
 
     if rank == 0:
-        network_inspect_file = os.path.join(output_dir, "network_inspect.jsonl")
-        with open(network_inspect_file, "a") as f:
-            f.write(json.dumps({
-                "sample_id": sample_id,
-                "is_ping": is_ping,
-                "tolerance_factor": tolerance_factor,
-                "qkv_fwd_metadata__send_transfer_sz_mb": (qkv_fwd_metadata__send_transfer_sz // (1024 * 1024)).tolist(),
-                "qkv_fwd_metadata__recv_transfer_sz_mb": (qkv_fwd_metadata__recv_transfer_sz // (1024 * 1024)).tolist(),
-                "attn_out_fwd_metadata__send_transfer_sz_mb": (attn_out_fwd_metadata__send_transfer_sz // (1024 * 1024)).tolist(),
-                "attn_out_fwd_metadata__recv_transfer_sz_mb": (attn_out_fwd_metadata__recv_transfer_sz // (1024 * 1024)).tolist(),
+        try:
+            network_inspect_file = os.path.join(output_dir, "network_inspect.jsonl")
+            with open(network_inspect_file, "a") as f:
+                f.write(json.dumps({
+                    "sample_id": sample_id,
+                    "is_ping": is_ping,
+                    "tolerance_factor": tolerance_factor,
+                    "qkv_fwd_metadata__send_transfer_sz_mb": (qkv_fwd_metadata__send_transfer_sz // (1024 * 1024)).tolist(),
+                    "qkv_fwd_metadata__recv_transfer_sz_mb": (qkv_fwd_metadata__recv_transfer_sz // (1024 * 1024)).tolist(),
+                    "attn_out_fwd_metadata__send_transfer_sz_mb": (attn_out_fwd_metadata__send_transfer_sz // (1024 * 1024)).tolist(),
+                    "attn_out_fwd_metadata__recv_transfer_sz_mb": (attn_out_fwd_metadata__recv_transfer_sz // (1024 * 1024)).tolist(),
 
-                "qkv_fwd_metadata__send_transfer_sz_mb_to_others": (qkv_fwd_metadata__send_transfer_sz_to_others // (1024 * 1024)).tolist(),
-                "qkv_fwd_metadata__recv_transfer_sz_mb_from_others": (qkv_fwd_metadata__recv_transfer_sz_to_others // (1024 * 1024)).tolist(),
+                    "qkv_fwd_metadata__send_transfer_sz_mb_to_others": (qkv_fwd_metadata__send_transfer_sz_to_others // (1024 * 1024)).tolist(),
+                    "qkv_fwd_metadata__recv_transfer_sz_mb_from_others": (qkv_fwd_metadata__recv_transfer_sz_to_others // (1024 * 1024)).tolist(),
 
-                "max_comm_budget_all_rank_mb": max_comm_budget_all_rank // (1024 * 1024),
-                "max_buffer_budget_all_rank_mb": max_buffer_budget_all_rank // (1024 * 1024),
-                "bandwidth_mb": bandwidth_mb,
-                "send_time_ms": send_time_ms.tolist(),
-                "recv_time_ms": recv_time_ms.tolist(),
-                "max_send_time_ms": max_send_time_ms,
-                "max_recv_time_ms": max_recv_time_ms,
-                "seq_len": seq_len if seq_len is not None else None,
-            }) + "\n")
+                    "max_comm_budget_all_rank_mb": max_comm_budget_all_rank // (1024 * 1024),
+                    "max_buffer_budget_all_rank_mb": max_buffer_budget_all_rank // (1024 * 1024),
+                    "bandwidth_mb": bandwidth_mb,
+                    "send_time_ms": send_time_ms.tolist(),
+                    "recv_time_ms": recv_time_ms.tolist(),
+                    "max_send_time_ms": max_send_time_ms,
+                    "max_recv_time_ms": max_recv_time_ms,
+                    "seq_len": seq_len if seq_len is not None else None,
+                }) + "\n")
 
-        network_inspect_summary_file = os.path.join(output_dir, "network_inspect.summary.jsonl")
-        with open(network_inspect_summary_file, "a") as f:
-            f.write(json.dumps({
-                "sample_id": sample_id,
-                "is_ping": is_ping,
-                "tolerance_factor": tolerance_factor,
-                "qkv_fwd_send_mb": (qkv_fwd_metadata__send_transfer_sz_to_others // (1024 * 1024)).tolist(),
-                "qkv_fwd_recv_mb": (qkv_fwd_metadata__recv_transfer_sz_to_others // (1024 * 1024)).tolist(),
+            network_inspect_summary_file = os.path.join(output_dir, "network_inspect.summary.jsonl")
+            with open(network_inspect_summary_file, "a") as f:
+                f.write(json.dumps({
+                    "sample_id": sample_id,
+                    "is_ping": is_ping,
+                    "tolerance_factor": tolerance_factor,
+                    "qkv_fwd_send_mb": (qkv_fwd_metadata__send_transfer_sz_to_others // (1024 * 1024)).tolist(),
+                    "qkv_fwd_recv_mb": (qkv_fwd_metadata__recv_transfer_sz_to_others // (1024 * 1024)).tolist(),
 
-                "max_comm_budget_all_rank_mb": max_comm_budget_all_rank // (1024 * 1024),
-                "max_buffer_budget_all_rank_mb": max_buffer_budget_all_rank // (1024 * 1024),
-                "send_time_ms": send_time_ms.tolist(),
-                "recv_time_ms": recv_time_ms.tolist(),
-                "max_send_time_ms": max_send_time_ms,
-                "max_recv_time_ms": max_recv_time_ms,
-                "seq_len": seq_len if seq_len is not None else None,
-            }) + "\n")
+                    "max_comm_budget_all_rank_mb": max_comm_budget_all_rank // (1024 * 1024),
+                    "max_buffer_budget_all_rank_mb": max_buffer_budget_all_rank // (1024 * 1024),
+                    "send_time_ms": send_time_ms.tolist(),
+                    "recv_time_ms": recv_time_ms.tolist(),
+                    "max_send_time_ms": max_send_time_ms,
+                    "max_recv_time_ms": max_recv_time_ms,
+                    "seq_len": seq_len if seq_len is not None else None,
+                }) + "\n")
+        except Exception as e:
+            print(f"🟡 Error writing network inspect summary file: {e}")
 
     ret = dict(
         max_comm_budget_all_rank=max_comm_budget_all_rank,

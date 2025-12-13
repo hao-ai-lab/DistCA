@@ -47,20 +47,24 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
         self.comm_stream: torch.cuda.Stream = None
         self._ping_pong_debug: bool = False
         self._debug_forward_impl: str = "orig"
-        self.use_cuda_graph: bool = True  # FIXME: ugly hardcode here
+        self.use_cuda_graph: bool = False
         self.tick_nonca_compute = tick_nonca_compute_cuda_graph if self.use_cuda_graph else tick_nonca_compute
     
     def init_layer_cuda_graphs(self):
+        self.use_cuda_graph = True
         prev_layer = None
+        seq_len = int(os.environ.get("D2_SEQ_LEN", -1))
+        if seq_len == -1:
+            raise ValueError("D2_SEQ_LEN is not set")
         for layer in self.layers:
             layer: TransformerLayer
-            layer.init_pre_attn_cuda_graph(prev_layer, seq_len=1024,  # FIXME: ugly hardcode here
+            layer.init_pre_attn_cuda_graph(prev_layer, seq_len=seq_len,
                                            device=layer.self_attention.linear_qkv.weight.device,
                                            dtype=layer.self_attention.linear_qkv.weight.dtype)
             prev_layer = layer
         
         # This is the last layer
-        layer.init_post_attn_cuda_graph(seq_len=1024,  # FIXME: ugly hardcode here
+        layer.init_post_attn_cuda_graph(seq_len=seq_len,
                                         device=layer.self_attention.linear_qkv.weight.device,
                                         dtype=layer.self_attention.linear_qkv.weight.dtype)
 
