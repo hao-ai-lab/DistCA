@@ -2,6 +2,10 @@
 Debug example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 """
+
+from d2.utils.traceback import enable_clickable_excepthook, enable_trace_calls
+enable_clickable_excepthook()
+
 import argparse
 from functools import partial
 import os
@@ -151,12 +155,13 @@ def init_megatron_e2e_test(
     token_bytes_kv = hidden_size_kv * dtype.itemsize // tp_size
     max_tokens_query = num_tokens * (world_size // tp_size)
     max_tokens_key_value = num_tokens * (world_size // tp_size)
-    buffer_size = (
-        token_bytes_q * max_tokens_query * 3 +
-        # lse_norm. TODO: the factor of 2 might be removed
-        num_heads * torch.float32.itemsize * 2 * max_tokens_query +
-        token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
-    )
+    # buffer_size = (
+    #     token_bytes_q * max_tokens_query * 3 +
+    #     # lse_norm. TODO: the factor of 2 might be removed
+    #     num_heads * torch.float32.itemsize * 2 * max_tokens_query +
+    #     token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
+    # )
+    buffer_size = 512 * 1024 ** 2 # 512MB
     print(f'{buffer_size=}', flush=True)
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=tp_size,
@@ -286,6 +291,10 @@ def test(args):
         hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
                           hf_config.num_attention_heads)
 
+    
+    num_tokens_for_cuda_graph = num_token_per_rank
+    os.environ["D2_SEQ_LEN"] = str(num_tokens_for_cuda_graph)
+
     worker: MegatronE2eWorker = init_megatron_e2e_test(
         hidden_size_q, hidden_size_kv, hf_config.num_attention_heads, num_tokens,
         world_size, max_cp_degree, tp_size, pp_size,
@@ -400,7 +409,7 @@ def test(args):
         torch.testing.assert_close(grad_orig_reimpl, grad_sample, rtol=1.1e-3, atol=1.1e-3)
     print(f"{worker.rank} finish pingpong")
 
-    print("=" * 20 + "forward_backward_batch attention server, done")
+    print("=" * 20 + "✅ forward_backward_batch attention server, done")
 
 
 if __name__ == "__main__":
