@@ -11,6 +11,7 @@ Usage:
 bash test_e2e_combined.multi.sh <rzv_endpoint> <n_nodes>
 ```
 """
+import torch.distributed
 
 import time
 start_time__ = time.time()
@@ -120,6 +121,20 @@ def log_memory_usage_context():
     os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = "1"
     yield
     os.environ["EXPERIMENT_LOG_MEMORY_USAGE"] = old_env_var
+
+
+def dump_tensor(tensor, name: str, msg:str=None):
+    tensor_dump_dir = os.environ.get("TENSOR_DUMP_DIR", None)
+    tensor_dump_suffix = os.environ.get("TENSOR_DUMP_SUFFIX", None)
+    if not torch.isfinite(tensor).all():
+        print(f"🔴 {msg}: Non-finite values detected.")
+    else:
+        print(f"🟢 {msg}: No non-finite values detected.")
+        pass
+    # if tensor_dump_dir is not None and tensor_dump_suffix is not None:
+    #     torch.save(tensor.cpu(), os.path.join(tensor_dump_dir, f"{name}.{tensor_dump_suffix}.pt"))
+    #     print(f"🟡 Dumped tensor to {os.path.join(tensor_dump_dir, f"{name}.{tensor_dump_suffix}.pt")}")
+    return
 
 class MegatronE2eWorker(MegatronBaseWorker):
     def __init__(self, rank: int, world_size: int):
@@ -255,7 +270,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
         # thd layout
         total_seqlen = microbatches[0]['input_ids'].shape[0]
 
-        # from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+        from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
         def loss_func(logits):
             loss = logits.sum()  # no gradient, but can trigger backward
             # Print the memory usage here
@@ -273,7 +288,24 @@ class MegatronE2eWorker(MegatronBaseWorker):
             output = gptmodel_forward(
                 model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel, packed_seq_params
             )
-            return output, loss_func
+            # Build next-token labels (shifted by 1, ignore the last token)
+            labels = input_ids.clone()
+            labels[:-1] = input_ids[1:]
+            labels[-1] = -100
+
+            def loss_func_ce(logits, _labels=labels):
+                dump_tensor(logits, f"nonfinite_output.rank{self.rank}", msg="before loss_func_ce")
+                ce = vocab_parallel_cross_entropy(logits.contiguous(), _labels)
+                dump_tensor(ce, f"nonfinite_ce.rank{self.rank}", msg="after loss_func_ce")
+                loss_mask = (_labels != -100).float()
+                denom = loss_mask.sum().clamp(min=1.0)
+                loss = (ce * loss_mask).sum() / denom
+                log_memory_usage("loss_func")
+                # Dump final scalar loss
+                # dump_tensor(loss, f"loss.rank{self.rank}", msg="after normalized loss")
+                print(f"🟡 [Rank {self.rank}] loss = {loss}")
+                return loss, {'loss': loss}
+            return output, loss_func_ce
 
         batch_generator = make_batch_generator(microbatches, vpp_size=len(self.train_module))
         if mpu.get_pipeline_model_parallel_world_size() > 1:
@@ -297,9 +329,21 @@ class MegatronE2eWorker(MegatronBaseWorker):
                 forward_only=forward_only,
             )
 
+        # Optional distributed barrier before optimizer step
+        if os.getenv("EXPERIMENT_BARRIER_BEFORE_OPTIMIZER_STEP", "0") == "1":
+            if torch.distributed.is_initialized():
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                log_memory_usage("barrier_before_optimizer_step")
+        
         with torch.cuda.nvtx.range("optimizer_step"):
-            # torch.cuda.synchronize()
+            # Enhanced optimizer step timing
+            torch.cuda.synchronize()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            opt_start_time = time.time()
             log_memory_usage("optimizer_step:(start)")
+            
             if os.getenv("EXPERIMENT_SKIP_OPTIMIZER_STEP", "0") == "1":
                 # when testing numerical correctness, instead of running optimizer step, reset grads.
                 update_successful, grad_norm, num_zeros_in_grad = True, 0.0, 0
@@ -308,8 +352,25 @@ class MegatronE2eWorker(MegatronBaseWorker):
                         param.main_grad.zero_()
             else:
                 update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
-            # torch.cuda.synchronize()
+                
+            torch.cuda.synchronize()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            opt_end_time = time.time()
+            
+            current_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            opt_duration_ms = (opt_end_time - opt_start_time) * 1000
+            print(f"🚀 OptimizerStep [Rank {current_rank}]: duration={opt_duration_ms:.3f}ms")
+            print(f"🚀 OptimizerStep [Rank {current_rank}]: grad_norm={grad_norm}")
+            print(f"🚀 OptimizerStep [Rank {current_rank}]: update_successful={update_successful}")
+            
             log_memory_usage("optimizer_step:(end)")
+            if os.getenv("EXPERIMENT_BARRIER_BEFORE_OPTIMIZER_STEP", "0") == "1":
+                if torch.distributed.is_initialized():
+                    torch.cuda.synchronize()
+                    torch.distributed.barrier()
+                    log_memory_usage("barrier_after_optimizer_step")
+
         return losses_reduced, grad_norm
 
     def _build_model_optimizer(self,
@@ -365,6 +426,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
 
         self.train_module = train_module
         self.optimizer = optimizer
+        print(f"🟡 [Rank {self.rank}] optimizer = {optimizer}")
         self.optimizer_scheduler = optimizer_scheduler
         self.hf_config = self.hf_config
         self.optim_config = optim_config
@@ -668,6 +730,28 @@ def test(args):
         print(message)
         return
 
+    def write_loss_log(loss_value, sample_id=None, repeat_idx=None):
+        # get the caller's file and line number
+        import traceback
+        stack = traceback.extract_stack()
+        caller_file = stack[-2].filename
+        caller_line = stack[-2].lineno
+        
+        loss_log_file = os.path.join(output_dir, "loss.log")
+        elapsed_time = time.time() - start_time__
+        sid = "NA" if sample_id is None else sample_id
+        rep = "NA" if repeat_idx is None else repeat_idx
+        try:
+            loss_float = float(loss_value)
+        except Exception:
+            # best effort conversion
+            loss_float = loss_value.item() if torch.is_tensor(loss_value) else float("nan")
+        message = f"📉 [T{elapsed_time:.2f}] ({caller_file}:{caller_line}) sample_id={sid} repeat={rep} loss={loss_float:.6f}"
+        with open(loss_log_file, "a") as f:
+            f.write(message + "\n")
+        print(message)
+        return
+    
 
 
     if mode == "wlbllm":
@@ -713,6 +797,10 @@ def test(args):
             world_size, max_cp_degree * 1, tp_size,
             dtype, MegatronE2eWorker
         )
+
+    if mode == "d2":
+        print(f"🟡 [Rank {worker.rank}] {worker.as_rank = } {worker.as_world_size = }")
+
 
     write_status_log(f"Finish init worker")
     log_memory_usage("init worker object done", force=True)
@@ -771,6 +859,50 @@ def test(args):
         sample_name=args.sample_name,
     )
 
+
+
+    
+    # Test out the distributed all gather latency as a simple test.
+    # if False: 
+    if True: 
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+        
+        print("🟡 Start testing all gather")
+        # Create a group containing ranks 0, 2, 4, ..., 14
+        odd_ranks = list(range(1, 16, 2))  # [1, 3, 5, 7, 9, 11, 13, 15]
+        even_ranks = list(range(0, 16, 2))  # [0, 2, 4, 6, 8, 10, 12, 14]
+        even_group = torch.distributed.new_group(even_ranks)
+        odd_group = torch.distributed.new_group(odd_ranks)
+        if rank % 2 == 0:
+            group = even_group
+        else:
+            group = odd_group
+        output_size = 125301120
+        input_size = output_size // 8
+        output_tensor = torch.randn(output_size, device="cuda")
+        input_tensor = torch.randn(input_size, device="cuda")
+
+        for i in range(10):
+            torch.distributed.barrier()
+            torch.cuda.synchronize()
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            with torch.cuda.nvtx.range(f"all_gather.{mode}.{i}"):
+                dist_all_gather_func(
+                    output_tensor,
+                    input_tensor,
+                    group=group,
+                    async_op=False,
+                )
+            end_event.record()
+            torch.distributed.barrier()
+            torch.cuda.synchronize()
+            elapsed_time = start_event.elapsed_time(end_event)
+            print(f"🟡 All gather latency: {elapsed_time}ms")
+        
+        # return
 
     sample_times = []
     for sample_id in range(sample_start_idx, max_sample_id):
@@ -1315,6 +1447,7 @@ def test(args):
                 rich.print(f"🟡 [Rank {rank}] [{sample_id = }] input_ids_local.shape =", input_ids_local.shape)
                 rich.print(f"🟡 [Rank {rank}] [{sample_id = }] position_ids_local.shape =", position_ids_local.shape)
 
+
             microbatch = {
                 "input_ids": input_ids_local,
                 "position_ids": position_ids_local,
@@ -1473,11 +1606,49 @@ def test(args):
             # start_event.record()
             start_it_time = time.time()
             log_memory_usage(f"forward_backward_batch:start(sample_id={sample_id},repeat={repeat_idx})")
-            ref = worker.forward_backward_batch(
+            losses_reduced, grad_norm = worker.forward_backward_batch(
                 microbatches=microbatches,
                 normal_forward_fn=normal_forward_fn,
                 forward_only=False,
             )
+            # Try to extract a scalar loss for logging
+            try:
+                loss_value = None
+                if isinstance(losses_reduced, dict):
+                    val = losses_reduced.get('loss', None)
+                    if val is not None:
+                        if isinstance(val, (list, tuple)):
+                            vals = []
+                            for v in val:
+                                if torch.is_tensor(v):
+                                    vals.append(v.item())
+                                else:
+                                    vals.append(float(v))
+                            if len(vals) > 0:
+                                loss_value = sum(vals) / len(vals)
+                        else:
+                            loss_value = val.item() if torch.is_tensor(val) else float(val)
+                elif torch.is_tensor(losses_reduced):
+                    loss_value = losses_reduced.item()
+                elif isinstance(losses_reduced, (list, tuple)) and len(losses_reduced) > 0:
+                    # Handle list of tensors or floats
+                    vals = []
+                    for v in losses_reduced:
+                        if torch.is_tensor(v):
+                            vals.append(v.item())
+                        elif isinstance(v, (int, float)):
+                            vals.append(float(v))
+                        elif isinstance(v, dict) and 'loss' in v:
+                            lv = v['loss']
+                            vals.append(lv.item() if torch.is_tensor(lv) else float(lv))
+                    if len(vals) > 0:
+                        loss_value = sum(vals) / len(vals)
+                if loss_value is not None:
+                    write_status_log(f"Loss (sample_id={sample_id},repeat={repeat_idx}) = {loss_value:.6f}")
+                    write_loss_log(loss_value, sample_id=sample_id, repeat_idx=repeat_idx)
+            except Exception as _:
+                # Best-effort logging; ignore extraction failures
+                pass
             torch.cuda.synchronize()
             torch.distributed.barrier()
             # end_event.record()

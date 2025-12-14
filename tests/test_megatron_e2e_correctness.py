@@ -2,11 +2,6 @@
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
     --num-nodes=1 --num-gpus-per-node=4 --tp-size=2
-
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 \
-srun -N 1 -G 8 -w fs-mbz-gpu-018 \
-torchrun --nnodes 1 --nproc_per_node 8 test_megatron_e2e.py \
-    --num-nodes=1 --num-gpus-per-node=8 --tp-size=2
 """
 import argparse
 import os
@@ -300,9 +295,6 @@ def test(args):
     worker.init(model_path, seed=seed)
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
-
-    # torch.distributed.breakpoint()
-    # worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
 
     as_rank = worker.as_rank
     as_world_size = worker.as_world_size

@@ -45,6 +45,8 @@ PROFILE_MEMORY_PATH=${PROFILE_MEMORY_PATH:"${OUTPUT_DIR}/"}
 SAMPLE_NAME=${SAMPLE_NAME:-"wlbllm"}
 CHANGE_LONG_DOC_RATIO=${CHANGE_LONG_DOC_RATIO:-0.0}
 ALPHA_FACTOR=${ALPHA_FACTOR:-1.0}
+MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-}   # optional global token budget for data loader
+VAL_EVERY_N_STEPS=${VAL_EVERY_N_STEPS:-1}  # how often to run validation (0 to disable)
 
 JOBID=${JOBID:-${SLURM_JOB_ID}}
 if [ -z "$JOBID" ]; then
@@ -281,7 +283,7 @@ TORCHRUN_CMD=(
   --rdzv_endpoint=${RZV_ENDPOINT}
   --rdzv_id=${RZV_ID}
   --max_restarts=0
-  --no-python bash ./bind_and_exec.sh python test_e2e_combined.py
+  --no-python bash ./bind_and_exec.sh python training_3d.py
     --model-path ${MODEL_PATH}
     --mode ${MODE}
     --replan-iter ${REPLAN_ITER}
@@ -301,6 +303,7 @@ TORCHRUN_CMD=(
     --sample-name ${SAMPLE_NAME}
     --change-long-doc-ratio ${CHANGE_LONG_DOC_RATIO}
     --alpha-factor ${ALPHA_FACTOR}
+    --val-every-n-steps ${VAL_EVERY_N_STEPS}
 )
 
 if [ ${SHOULD_ADD_DEBUG_CASES} -eq 1 ]; then
@@ -320,6 +323,11 @@ if [ ${EXPERIMENT_SHOULD_RESEND_QKV} -eq 1 ]; then
 fi
 if [ ${SAMPLE_START_IDX} -ne "" ]; then
     TORCHRUN_CMD+=(--sample-start-idx ${SAMPLE_START_IDX})
+fi
+
+# Optional: pass max total tokens to cap data loader tokenization
+if [ -n "${MAX_TOTAL_TOKENS}" ]; then
+    TORCHRUN_CMD+=(--max-total-tokens ${MAX_TOTAL_TOKENS})
 fi
 
 # Serialize TORCHRUN_CMD array so we can pass it through bash -lc cleanly
@@ -355,12 +363,14 @@ echo_and_tee "$EXP_README" "- CP_SIZE: $CP_SIZE"
 echo_and_tee "$EXP_README" "- BATCH_SIZE: $BATCH_SIZE"
 echo_and_tee "$EXP_README" "- NUM_TOKENS: $NUM_TOKENS"
 echo_and_tee "$EXP_README" "- MAX_SAMPLE_ID: $MAX_SAMPLE_ID"
+echo_and_tee "$EXP_README" "- MAX_TOTAL_TOKENS: ${MAX_TOTAL_TOKENS:-None}"
 echo_and_tee "$EXP_README" "- UP_SAMPLE_FACTOR: $UP_SAMPLE_FACTOR"
 echo_and_tee "$EXP_README" "- ELONGATE_FACTOR: $ELONGATE_FACTOR"
 echo_and_tee "$EXP_README" "- FILTER_THRESHOLD: $FILTER_THRESHOLD"
 echo_and_tee "$EXP_README" "- FILTER_RATIO: $FILTER_RATIO"
 echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
 echo_and_tee "$EXP_README" "- SAMPLE_START_IDX: $SAMPLE_START_IDX"
+echo_and_tee "$EXP_README" "- VAL_EVERY_N_STEPS: $VAL_EVERY_N_STEPS"
 
 echo_and_tee "$EXP_README" "## Experiment Flags"
 echo_and_tee "$EXP_README" "- ENABLE_NSYS: $ENABLE_NSYS"
@@ -503,3 +513,8 @@ if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
 else 
     echo "🟢 Experiment success. See the $OUTPUT_DIR/benchmark.json file."
 fi
+
+
+echo '\a'
+echo '\a'
+echo '\a'

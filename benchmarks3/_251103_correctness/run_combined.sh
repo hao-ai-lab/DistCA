@@ -1,0 +1,2 @@
+MODE=d2 bash /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks3/_251103_correctness/train_3d_combined.sh;
+MODE=wlbllm bash /mnt/weka/home/yonghao.zhuang/jd/d2/benchmarks3/_251103_correctness/train_3d_combined.sh;
