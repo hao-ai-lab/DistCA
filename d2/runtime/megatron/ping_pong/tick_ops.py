@@ -15,6 +15,33 @@ def log_memory_usage(message: str):
     return
 
 
+def _log_tensor_shapes(layer: TransformerLayer, where: str, **named_values: Any) -> None:
+    """Debug helper: print shape/dtype/device for tensors (guarded by env var)."""
+    # if os.getenv("D2_LOG_TENSOR_SHAPES", "0") != "1":
+    #     return
+
+    def _emit(name: str, v: Any):
+        if v is None:
+            return
+        if torch.is_tensor(v):
+            print(
+                f"[L{layer.layer_number}] {where}: {name} "
+                f"shape={tuple(v.shape)} dtype={v.dtype} device={v.device} req_grad={getattr(v, 'requires_grad', False)}"
+            )
+            return
+        if isinstance(v, (tuple, list)):
+            for i, vv in enumerate(v):
+                _emit(f"{name}[{i}]", vv)
+            return
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                _emit(f"{name}.{kk}", vv)
+            return
+
+    for k, v in named_values.items():
+        _emit(k, v)
+
+
 def forward_pre_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(start)")
     
@@ -185,8 +212,20 @@ def forward_post_core_attn(layer: TransformerLayer, args: Dict[str, Any]):
 def forward_post_then_pre_core_attn_cuda_graph(layer: TransformerLayer, args: Dict[str, Any]):
     log_memory_usage(f"(L{layer.layer_number}) forward_post_then_pre_core_attn:(start)")
     assert args["context"] is None and args["context_mask"] is None, "not supported in cudagraph"
+    _log_tensor_shapes(layer, "post_then_pre_cuda_graph.entry", **args)
     forward_post_core_attn_comm(layer, args)
+    _log_tensor_shapes(layer, "post_then_pre_cuda_graph.after_post_core_attn_comm", **args)
     log_memory_usage(f"(L{layer.layer_number}) forward_post_then_pre_core_attn:(before non core attn)")
+    _log_tensor_shapes(
+        layer,
+        "post_then_pre_cuda_graph.pre__forward_pre_attn_cuda_graph",
+        core_attn_out=args.get("core_attn_out", None),
+        residual=args.get("residual", None),
+        rotary_pos_emb=args.get("rotary_pos_emb", None),
+        rotary_pos_cos=args.get("rotary_pos_cos", None),
+        rotary_pos_sin=args.get("rotary_pos_sin", None),
+        sequence_len_offset=args.get("sequence_len_offset", None),
+    )
     query, key, value, residual, attn_mask_type = layer._forward_pre_attn_cuda_graph(
         (args.pop("core_attn_out"), args.pop("residual")),
         args["rotary_pos_emb"],
@@ -196,6 +235,14 @@ def forward_post_then_pre_core_attn_cuda_graph(layer: TransformerLayer, args: Di
         args["sequence_len_offset"],
     )
     log_memory_usage(f"(L{layer.layer_number}) forward_post_then_pre_core_attn:(after non core attn)")
+    _log_tensor_shapes(
+        layer,
+        "post_then_pre_cuda_graph.post__forward_pre_attn_cuda_graph",
+        query=query,
+        key=key,
+        value=value,
+        residual=residual,
+    )
     args["query"] = query
     args["key"] = key
     args["value"] = value
@@ -209,7 +256,17 @@ def forward_post_then_pre_core_attn_cuda_graph(layer: TransformerLayer, args: Di
 def forward_pre_core_attn_cuda_graph(layer: TransformerLayer, args: Dict[str, Any]):
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(start)")
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(before pre core attn)")
+    _log_tensor_shapes(layer, "pre_cuda_graph.entry", **args)
     hidden_states = args.pop("hidden_states")
+    _log_tensor_shapes(
+        layer,
+        "pre_cuda_graph.pre__forward_pre_attn_cuda_graph",
+        hidden_states=hidden_states,
+        rotary_pos_emb=args.get("rotary_pos_emb", None),
+        rotary_pos_cos=args.get("rotary_pos_cos", None),
+        rotary_pos_sin=args.get("rotary_pos_sin", None),
+        sequence_len_offset=args.get("sequence_len_offset", None),
+    )
     query, key, value, residual, attn_mask_type = layer._forward_pre_attn_cuda_graph(
         (hidden_states,),
         args["rotary_pos_emb"],
@@ -219,6 +276,14 @@ def forward_pre_core_attn_cuda_graph(layer: TransformerLayer, args: Dict[str, An
         args["sequence_len_offset"],
     )
     log_memory_usage(f"(L{layer.layer_number}) forward_pre_core_attn:(after pre core attn)")
+    _log_tensor_shapes(
+        layer,
+        "pre_cuda_graph.post__forward_pre_attn_cuda_graph",
+        query=query,
+        key=key,
+        value=value,
+        residual=residual,
+    )
 
     args["query"] = query
     args["key"] = key
@@ -231,13 +296,16 @@ def forward_pre_core_attn_cuda_graph(layer: TransformerLayer, args: Dict[str, An
 
 
 def forward_post_core_attn_cuda_graph(layer: TransformerLayer, args: Dict[str, Any]):
+    _log_tensor_shapes(layer, "post_cuda_graph.entry", **args)
     forward_post_core_attn_comm(layer, args)
+    _log_tensor_shapes(layer, "post_cuda_graph.after_post_core_attn_comm", **args)
     mlp_output = layer._forward_post_attn_cuda_graph(
         args.pop("core_attn_out"),
         args.pop("residual"),
         args["context"],
         args["context_mask"],
     )
+    _log_tensor_shapes(layer, "post_cuda_graph.post__forward_post_attn_cuda_graph", hidden_states=mlp_output)
     args["hidden_states"] = mlp_output
     log_memory_usage(f"(L{layer.layer_number}) forward_post_core_attn:(end)")
     return args
@@ -289,7 +357,7 @@ def tick_nonca_compute_cuda_graph(
     layer: TransformerLayer, prev_layer: Optional[TransformerLayer],
     arg_group: Dict[str, Any], is_last_layer_post_attn: bool
 ):
-    print("-- use cudagraph --")
+    print(f"-- use cudagraph --: {layer.layer_number}")
     if is_last_layer_post_attn:
         return forward_post_core_attn_cuda_graph(layer, arg_group)
     if prev_layer is None:
