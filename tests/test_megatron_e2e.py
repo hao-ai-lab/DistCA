@@ -2,6 +2,11 @@
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
     --num-nodes=1 --num-gpus-per-node=4 --tp-size=2
+
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
+nsys profile -o ./test_megatron_e2e.nsys-rep --trace=cuda,nvtx --force-overwrite true \
+torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
+    --num-nodes=1 --num-gpus-per-node=4 --tp-size=2
 """
 import argparse
 import os
@@ -296,11 +301,16 @@ def test(args):
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
-    # torch.distributed.breakpoint()
-    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
-
     as_rank = worker.as_rank
     as_world_size = worker.as_world_size
+
+    # torch.distributed.breakpoint()
+    dp_size = as_world_size
+    num_batched_token_per_as_rank = num_tokens // dp_size
+    os.environ["D2_SEQ_LEN"] = str(num_batched_token_per_as_rank)
+    print(f"🟡 [Rank {as_rank}] {dp_size=}, {num_batched_token_per_as_rank=}, {os.environ['D2_SEQ_LEN']=}")
+    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
+
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size

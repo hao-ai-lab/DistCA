@@ -289,6 +289,7 @@ def tick_nonca_compute_cuda_graph(
     layer: TransformerLayer, prev_layer: Optional[TransformerLayer],
     arg_group: Dict[str, Any], is_last_layer_post_attn: bool
 ):
+    print("-- use cudagraph --")
     if is_last_layer_post_attn:
         return forward_post_core_attn_cuda_graph(layer, arg_group)
     if prev_layer is None:

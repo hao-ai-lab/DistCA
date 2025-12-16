@@ -52,6 +52,8 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
     
     def init_layer_cuda_graphs(self):
         self.use_cuda_graph = True
+        self.tick_nonca_compute = tick_nonca_compute_cuda_graph
+        
         prev_layer = None
         seq_len = int(os.environ.get("D2_SEQ_LEN", -1))
         if seq_len == -1:
