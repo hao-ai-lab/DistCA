@@ -623,6 +623,8 @@ def test(args):
     dtype = torch.bfloat16
     element_size = dtype.itemsize
 
+    
+
     # Set forward function mode based on test mode
     normal_forward_fn = (mode in ["baseline", "wlbllm"])
     # TODO: (Refactor) If WLBLLM is set, we must inform the transformer_engine to use the WLBLLM function. 
@@ -760,6 +762,12 @@ def test(args):
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
 
+    dp_size = as_world_size
+    num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
+    os.environ["D2_SEQ_LEN"] = str(num_batched_token_per_as_rank)
+
+    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
+    
     # TODO(Refactor): Properly refactor this into a function and we call it multiple times
 
     setup_global_batch(

@@ -56,17 +56,55 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
         seq_len = int(os.environ.get("D2_SEQ_LEN", -1))
         if seq_len == -1:
             raise ValueError("D2_SEQ_LEN is not set")
-        for layer in self.layers:
-            layer: TransformerLayer
-            layer.init_pre_attn_cuda_graph(prev_layer, seq_len=seq_len,
-                                           device=layer.self_attention.linear_qkv.weight.device,
-                                           dtype=layer.self_attention.linear_qkv.weight.dtype)
-            prev_layer = layer
         
-        # This is the last layer
-        layer.init_post_attn_cuda_graph(seq_len=seq_len,
-                                        device=layer.self_attention.linear_qkv.weight.device,
-                                        dtype=layer.self_attention.linear_qkv.weight.dtype)
+        # CUDA graph capture uses torch.autograd.grad() internally (via make_graphed_callables).
+        # Megatron checkpoint/recompute hooks are not compatible with .grad() (they require
+        # autograd.backward()), so we temporarily disable those recompute flags during capture.
+        #
+        # In particular, `recompute_mlp` uses `tensor_parallel.checkpoint()` (CheckpointFunction),
+        # which hard-errors under autograd.grad().
+        saved_recompute_flags = []
+        for layer in self.layers:
+            saved_recompute_flags.append(
+                (
+                    layer,
+                    getattr(layer, "recompute_input_layernorm", False),
+                    getattr(layer, "recompute_pre_mlp_layernorm", False),
+                    getattr(layer, "recompute_mlp", False),
+                )
+            )
+            if hasattr(layer, "recompute_input_layernorm"):
+                layer.recompute_input_layernorm = False
+            if hasattr(layer, "recompute_pre_mlp_layernorm"):
+                layer.recompute_pre_mlp_layernorm = False
+            if hasattr(layer, "recompute_mlp"):
+                layer.recompute_mlp = False
+
+        try:
+            for layer in self.layers:
+                layer: TransformerLayer
+                layer.init_pre_attn_cuda_graph(
+                    prev_layer,
+                    seq_len=seq_len,
+                    device=layer.self_attention.linear_qkv.weight.device,
+                    dtype=layer.self_attention.linear_qkv.weight.dtype,
+                )
+                prev_layer = layer
+
+            # This is the last layer
+            layer.init_post_attn_cuda_graph(
+                seq_len=seq_len,
+                device=layer.self_attention.linear_qkv.weight.device,
+                dtype=layer.self_attention.linear_qkv.weight.dtype,
+            )
+        finally:
+            for layer, recompute_input_ln, recompute_pre_mlp_ln, recompute_mlp in saved_recompute_flags:
+                if hasattr(layer, "recompute_input_layernorm"):
+                    layer.recompute_input_layernorm = recompute_input_ln
+                if hasattr(layer, "recompute_pre_mlp_layernorm"):
+                    layer.recompute_pre_mlp_layernorm = recompute_pre_mlp_ln
+                if hasattr(layer, "recompute_mlp"):
+                    layer.recompute_mlp = recompute_mlp
 
     def init_ping_pong_communication_ctx(self, device: torch.device):
         assert not self.ping_pong_comm_initialized
