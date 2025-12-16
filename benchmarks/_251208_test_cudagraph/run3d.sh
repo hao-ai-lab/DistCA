@@ -45,7 +45,7 @@ for sample_config in \
 # "astronomer/Llama-3-70B-Special-Tokens-Adjusted 170000 80" \
 # "codellama/CodeLlama-34b-hf 131072 24" \
 for model_config in \
-"deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 4" \
+"deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 3" \
 ; do
     
     
@@ -53,7 +53,7 @@ for model_config in \
 
 #    s r b   tok  e n
 for config in \
-    "1 1 2 32768 2 2" \
+    "1 1 2 32768 2 1" \
     ; do
 
     read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes <<< "$config"
