@@ -765,6 +765,7 @@ def test(args):
     dp_size = as_world_size
     num_batched_token_per_as_rank = total_seq_len * batch_size // dp_size
     os.environ["D2_SEQ_LEN"] = str(num_batched_token_per_as_rank)
+    print(f"🟡 [Rank {as_rank}] {dp_size=}, {num_batched_token_per_as_rank=}, {os.environ['D2_SEQ_LEN']=}")
 
     worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
     
@@ -1365,7 +1366,9 @@ def test(args):
         if sample_id == 0:
             log_memory_usage("warmup start")
             write_status_log(f"Warmup start")
-            with log_memory_usage_context():
+            from contextlib import nullcontext
+            # with log_memory_usage_context():
+            with nullcontext():
                 # Warmup
                 warmup_times = 5
                 try:

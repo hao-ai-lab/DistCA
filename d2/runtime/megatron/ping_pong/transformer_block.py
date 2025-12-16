@@ -58,6 +58,8 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
         seq_len = int(os.environ.get("D2_SEQ_LEN", -1))
         if seq_len == -1:
             raise ValueError("D2_SEQ_LEN is not set")
+
+        print(f"-- init_layer_cuda_graphs: {seq_len=}, {self.layers=}, {len(self.layers)=}", flush=True)
         
         # CUDA graph capture uses torch.autograd.grad() internally (via make_graphed_callables).
         # Megatron checkpoint/recompute hooks are not compatible with .grad() (they require
@@ -84,6 +86,7 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
 
         try:
             for layer in self.layers:
+                print(f"-- init_layer_cuda_graphs: layer.init_pre_attn_cuda_graph: {layer.layer_number=}, {layer.self_attention.linear_qkv.weight.shape=}", flush=True)
                 layer: TransformerLayer
                 layer.init_pre_attn_cuda_graph(
                     prev_layer,
@@ -94,6 +97,7 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                 prev_layer = layer
 
             # This is the last layer
+            print(f"-- init_layer_cuda_graphs: layer.init_post_attn_cuda_graph: {layer.layer_number=}, {layer.self_attention.linear_qkv.weight.shape=}")
             layer.init_post_attn_cuda_graph(
                 seq_len=seq_len,
                 device=layer.self_attention.linear_qkv.weight.device,
@@ -107,6 +111,9 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                     layer.recompute_pre_mlp_layernorm = recompute_pre_mlp_ln
                 if hasattr(layer, "recompute_mlp"):
                     layer.recompute_mlp = recompute_mlp
+
+
+        print(f"-- init_layer_cuda_graphs done --")
 
     def init_ping_pong_communication_ctx(self, device: torch.device):
         assert not self.ping_pong_comm_initialized
