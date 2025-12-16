@@ -27,8 +27,8 @@ def log_memory_usage(message: str, comment: str = None):
 
 def _log_tensor_shapes(layer: "TransformerLayer", where: str, **named_values: Any) -> None:
     """Debug helper: print shape/dtype/device for tensors (guarded by env var)."""
-    # if os.getenv("D2_LOG_TENSOR_SHAPES", "0") != "1":
-    #     return
+    if os.getenv("D2_LOG_TENSOR_SHAPES", "0") != "1":
+        return
 
     def _emit(name: str, v: Any):
         if v is None:
