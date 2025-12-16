@@ -538,8 +538,8 @@ class Planner:
         self.tolerance_factor = tolerance_factor
 
     # from item to metadata.
-    def plan(self, items_: list[Item], verbose=False, plot=False, is_resend_qkv:bool=False):
-        mlp_shard_len = self.items_to_mlp_doc_len(items_)
+    def plan(self, items_: list[Item], verbose=False, plot=False, is_resend_qkv:bool=False, device: str = 'cuda'):
+        mlp_shard_len, shard_logical_range = self.items_to_mlp_doc_len(items_, device=device)
         planned_items: list[Item] = self.plan_items(items_, verbose, plot)
         planned_items: list[dict] = self.postprocess_items(planned_items)
         planner_output: list[list[ShardInfo]] = self.items_into_shardinfos(planned_items)
@@ -572,7 +572,7 @@ class Planner:
                 qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
                 attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
             )
-            return fa2a_metadata, as_attn_metadata, mlp_shard_len
+            return fa2a_metadata, as_attn_metadata, mlp_shard_len, shard_logical_range
         else:
             # new metadata computation for pipeline parallel is in test_util. hard to import.
             # Now PP 3D parallel is directly support in: test_megatron_e2e_pipeline.py
@@ -727,9 +727,7 @@ class Planner:
                 
         return dict_items
     
-    # Get mlp_shard_len from items. May need to change later. 
-    # Currently, shards are put on MLP based on seq_id from small to big.
-    def items_to_mlp_doc_len(self, items: list[Item], device: str = 'cuda') -> torch.Tensor:
+    def items_to_mlp_doc_len(self, items: list[Item], device: str = 'cuda') -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         items_by_src_gpu = defaultdict(list)
         for item in items:
             items_by_src_gpu[item.src_gpuid].append(item)
@@ -738,6 +736,7 @@ class Planner:
             items_by_src_gpu[src_gpuid].sort(key=lambda x: x.seqid)
 
         final_shards_by_rank = [[] for _ in range(self.attention_server_world_size)]
+        final_ranges_by_rank = [[] for _ in range(self.attention_server_world_size)]
 
         sorted_src_gpuids = sorted(items_by_src_gpu.keys())
 
@@ -745,19 +744,34 @@ class Planner:
             sorted_items = items_by_src_gpu[src_gpuid]
             for item in sorted_items:
                 if item.complete:
-                    shard_len = item.complete_item['q'] # item.complete_item['q'] = item.seq_len
-                    final_shards_by_rank[src_gpuid].append(shard_len)
+                    q_len = item.complete_item['q']
+                    final_shards_by_rank[src_gpuid].append(q_len)
+                    
+                    final_ranges_by_rank[src_gpuid].append([0, q_len])
                 else:
-                    head_shard_len = item.head['q']
-                    final_shards_by_rank[src_gpuid].append(head_shard_len)
+                    head_q = item.head['q']
+                    head_kv = item.head['kv']
+                    final_shards_by_rank[src_gpuid].append(head_q)
+                    
+                    final_ranges_by_rank[src_gpuid].append([head_kv - head_q, head_kv])
 
-                    tail_shard_len = item.tail['q']
-                    final_shards_by_rank[src_gpuid].append(tail_shard_len)
+                    tail_q = item.tail['q']
+                    tail_kv = item.tail['kv']
+                    final_shards_by_rank[src_gpuid].append(tail_q)
+                    
+                    final_ranges_by_rank[src_gpuid].append([tail_kv - tail_q, tail_kv])
 
         doc_lens_per_rank = [
-            torch.tensor(shard_len_list, dtype=torch.int32, device=device) for shard_len_list in final_shards_by_rank
-            ]
-        return doc_lens_per_rank
+            torch.tensor(shard_len_list, dtype=torch.int32, device=device) 
+            for shard_len_list in final_shards_by_rank
+        ]
+
+        shard_logical_range = [
+            torch.tensor(range_list, dtype=torch.int32, device=device)
+            for range_list in final_ranges_by_rank
+        ]
+
+        return doc_lens_per_rank, shard_logical_range
 
     def items_into_shardinfos(self, item_dicts):
         return items_into_shardinfos(item_dicts)

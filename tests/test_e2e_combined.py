@@ -59,9 +59,10 @@ import torch
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 
 from d2.runtime.attn_kernels.ops import DispatcherWrapper
-from d2.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
+from d2.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams, MLPLayoutPackedSeqParams
 from d2.runtime.compute_metadata import get_attn_metadata
 from d2.runtime.megatron.ops.stream_sync_fn import TickSync
+from d2.runtime.megatron.d2_rope import precompute_rope_final_indices
 
 from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
 from test_pingpong_layer import get_single_step_packed_seq_params
@@ -566,7 +567,7 @@ def get_next_batch(dp_size) -> Iterable[List[List[int]]]:
 
 # ========== D2 Specific Functions ==========
 
-# from transformer_engine.pytorch.attention.dot_product_attention.backends import get_attention_duration
+
 import traceback
 try:
     import wlbllm
@@ -1078,8 +1079,8 @@ def test(args):
                 
                 planner = Planner(world_size, parallel_config, model_config=model_config, tolerance_factor=tolerance_factor)
                 
-                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose)
-                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose)
+                fa2a_metadata_0, as_attn_metadata_0, mlp_shard_len_0, shard_logical_range_0 = planner.plan(_items_0, is_resend_qkv=resend_qkv, verbose=verbose)
+                fa2a_metadata_1, as_attn_metadata_1, mlp_shard_len_1, shard_logical_range_1 = planner.plan(_items_1, is_resend_qkv=resend_qkv, verbose=verbose)
 
 
                 if verbose:
@@ -1261,6 +1262,31 @@ def test(args):
             mlp_seq_params_0 = get_attn_metadata(mlp_shard_len_0[as_rank], get_packed_seq_params=True)
             mlp_seq_params_1 = get_attn_metadata(mlp_shard_len_1[as_rank], get_packed_seq_params=True)
 
+            cu_seqlens_q_0 = mlp_seq_params_0.cu_seqlens_q
+            cu_seqlens_q_1 = mlp_seq_params_1.cu_seqlens_q
+            
+            rope_final_indices_0 = precompute_rope_final_indices(
+                cu_seqlens=cu_seqlens_q_0,
+                shard_logical_range=shard_logical_range_0[as_rank],
+                device='cpu'
+            )
+            rope_final_indices_1 = precompute_rope_final_indices(
+                cu_seqlens=cu_seqlens_q_1,
+                shard_logical_range=shard_logical_range_1[as_rank],
+                device='cpu'
+            )
+
+            mlp_layout_seq_params_0 = MLPLayoutPackedSeqParams(
+                mlp_layout_seq_params=[mlp_seq_params_0],
+                shard_logical_range=[shard_logical_range_0[as_rank]],
+                rope_final_indices=rope_final_indices_0,
+            )
+            mlp_layout_seq_params_1 = MLPLayoutPackedSeqParams(
+                mlp_layout_seq_params=[mlp_seq_params_1],
+                shard_logical_range=[shard_logical_range_1[as_rank]],
+                rope_final_indices=rope_final_indices_1,
+            )
+
             # if rank % 8 == 0:
             #     rich.print(f"🟡 [Rank {rank}] all_metadata[0] -> qkv_fwd_fa2a_metadata =", fa2a_metadata_0[0].fa2a_metadata.__better_print__())
             #     rich.print(f"🟡 [Rank {rank}] all_metadata[0] -> qkv_rev_fa2a_metadata =", fa2a_metadata_0[1].fa2a_metadata.__better_print__())
@@ -1298,7 +1324,7 @@ def test(args):
 
             packed_seq_params = PingPangPackedSeqParams(
                 seq_params=[ping_pang_params_0, ping_pang_params_1],
-                mlp_layout_seq_params=[mlp_seq_params_0, mlp_seq_params_1],
+                mlp_layout_seq_params=[mlp_layout_seq_params_0, mlp_layout_seq_params_1],
                 # max_seqlen_q=torch.tensor([total_seq_len * 2], dtype=torch.int32)[0],
                 # max_seqlen_kv=torch.tensor([total_seq_len_including_cp * 2], dtype=torch.int32)[0],
                 

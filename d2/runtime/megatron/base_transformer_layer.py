@@ -1,4 +1,4 @@
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 import time
 import torch
 from torch import Tensor
@@ -7,6 +7,7 @@ from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
 )
+from d2.runtime.megatron.d2_rope import apply_rotary_pos_emb_d2, apply_rotary_pos_emb_d2_triton
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -14,7 +15,8 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 
-from d2.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams
+from d2.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams, MLPLayoutPackedSeqParams
+import rich
 
 
 def log_memory_usage(message: str, comment: str = None):
@@ -293,26 +295,79 @@ class TransformerLayer(MegatronTransformerLayer):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
             if packed_seq_params is not None:
-                if packed_seq_params.cu_seqlens_q_padded is not None:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+                if isinstance(packed_seq_params, MLPLayoutPackedSeqParams):
+                    mlp_seq_param = packed_seq_params.mlp_layout_seq_params[0]
+                    if mlp_seq_param.cu_seqlens_q_padded is not None:
+                        cu_seqlens_q = mlp_seq_param.cu_seqlens_q_padded
+                    else:
+                        cu_seqlens_q = mlp_seq_param.cu_seqlens_q
+                    if mlp_seq_param.cu_seqlens_kv_padded is not None:
+                        cu_seqlens_kv = mlp_seq_param.cu_seqlens_kv_padded
+                    else:
+                        cu_seqlens_kv = mlp_seq_param.cu_seqlens_kv
+                    shard_logical_range = packed_seq_params.shard_logical_range[0]
+                    # Get max_seqlen from mlp_seq_param
+                    max_seqlen_q = mlp_seq_param.max_seqlen_q
+                    max_seqlen_kv = mlp_seq_param.max_seqlen_kv
+                    
+                    if os.getenv("D2_LOG_ROPE_METADATA", "0") == "1":
+                        seqlens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+                        rich.print(f"[bold yellow]🟡 [L{self.layer_number}] RoPE Metadata:[/bold yellow]")
+                        rich.print(f"  Physical Shard Lengths: {seqlens.tolist()}")
+                        rich.print(f"  Logical Ranges: {shard_logical_range.tolist()}")
                 else:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
-                if packed_seq_params.cu_seqlens_kv_padded is not None:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
-                else:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                    if packed_seq_params.cu_seqlens_q_padded is not None:
+                        cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+                    else:
+                        cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                    if packed_seq_params.cu_seqlens_kv_padded is not None:
+                        cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+                    else:
+                        cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                    shard_logical_range = None
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
+                shard_logical_range = None
 
             if q_pos_emb is not None:
-                # TODO VIJAY: simplify
-                query = apply_rotary_pos_emb(
-                    query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
-                )
+                if shard_logical_range is not None:
+                    with torch.cuda.nvtx.range(f"RoPE.L{self.layer_number}.query_d2"):
+                        final_indices = None
+                        if isinstance(packed_seq_params, MLPLayoutPackedSeqParams):
+                            final_indices = packed_seq_params.rope_final_indices
+                        
+                        if final_indices is not None:
+                            query = apply_rotary_pos_emb_d2(
+                                query, q_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                            )
+                        
+                            # query = apply_rotary_pos_emb_d2_triton(
+                            #     query, q_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                            # )
+                else:
+                    query = apply_rotary_pos_emb(
+                        query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
+                    )
+
             if k_pos_emb is not None:
-                key = apply_rotary_pos_emb(
-                    key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
-                )
+                if shard_logical_range is not None:
+                    with torch.cuda.nvtx.range(f"RoPE.L{self.layer_number}.key_d2"):
+                        final_indices = None
+                        if isinstance(packed_seq_params, MLPLayoutPackedSeqParams):
+                            final_indices = packed_seq_params.rope_final_indices
+                        
+                        if final_indices is not None:
+                            key = apply_rotary_pos_emb_d2(
+                                key, k_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                            )
+
+                            # key = apply_rotary_pos_emb_d2_triton(
+                            #     key, k_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                            # )
+                else:
+                    key = apply_rotary_pos_emb(
+                        key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
+                    )
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
@@ -329,7 +384,7 @@ class TransformerLayer(MegatronTransformerLayer):
         attention_mask: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         attn_mask_type: Optional[AttnMaskType] = None,
-        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
+        packed_seq_params: Optional[Union[PingPangSingleStepPackedSeqParams, MLPLayoutPackedSeqParams]] = None,
     ):
         """
         Copied from megatron.core.transformer.attention.Attention.forward
@@ -497,8 +552,8 @@ class TransformerLayer(MegatronTransformerLayer):
             assert context_mask is None, "cross-attention not supported yet"
 
             setattr(packed_seq_params, "stream", torch.cuda.current_stream())
-            # FIXME(yonghao): fix rope
-            rotary_pos_emb = None
+            # Enable RoPE.
+            # rotary_pos_emb = None
 
             log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(before pre core attn)")
 

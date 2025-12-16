@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
 import torch
@@ -15,6 +15,8 @@ def _to_cuda_int32(tensor: Optional[torch.Tensor]):
 
 
 def _to_int(tensor):
+    if tensor is None:
+        return None
     if isinstance(tensor, torch.Tensor):
         return tensor.cpu().item()
     assert isinstance(tensor, int), f"Must be int. Current type: {type(tensor)}"
@@ -54,11 +56,53 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
         )
 
 
+# MLP Layout Packed Seq Params used for RoPE.
+@dataclass
+class MLPLayoutPackedSeqParams(PackedSeqParams):
+    mlp_layout_seq_params: List[PackedSeqParams] = field(default_factory=list)
+    shard_logical_range: List[torch.Tensor] = field(default_factory=list)
+    rope_final_indices: Optional[torch.Tensor] = None
+
+    def to_device(self):
+        # Extract parent class fields from the first mlp_layout_seq_param if available
+        if len(self.mlp_layout_seq_params) > 0:
+            first_param = self.mlp_layout_seq_params[0]
+            max_seqlen_q = first_param.max_seqlen_q
+            max_seqlen_kv = first_param.max_seqlen_kv
+            cu_seqlens_q = first_param.cu_seqlens_q
+            cu_seqlens_kv = first_param.cu_seqlens_kv
+            cu_seqlens_q_padded = first_param.cu_seqlens_q_padded
+            cu_seqlens_kv_padded = first_param.cu_seqlens_kv_padded
+            qkv_format = first_param.qkv_format
+        else:
+            # Fallback to self's values or None
+            max_seqlen_q = getattr(self, 'max_seqlen_q', None)
+            max_seqlen_kv = getattr(self, 'max_seqlen_kv', None)
+            cu_seqlens_q = getattr(self, 'cu_seqlens_q', None)
+            cu_seqlens_kv = getattr(self, 'cu_seqlens_kv', None)
+            cu_seqlens_q_padded = getattr(self, 'cu_seqlens_q_padded', None)
+            cu_seqlens_kv_padded = getattr(self, 'cu_seqlens_kv_padded', None)
+            qkv_format = getattr(self, 'qkv_format', 'thd')
+        
+        return MLPLayoutPackedSeqParams(
+            qkv_format=qkv_format,
+            cu_seqlens_q=_to_cuda_int32(cu_seqlens_q),
+            cu_seqlens_kv=_to_cuda_int32(cu_seqlens_kv),
+            max_seqlen_q=_to_int(max_seqlen_q) if max_seqlen_q is not None else None,
+            max_seqlen_kv=_to_int(max_seqlen_kv) if max_seqlen_kv is not None else None,
+            cu_seqlens_q_padded=_to_cuda_int32(cu_seqlens_q_padded),
+            cu_seqlens_kv_padded=_to_cuda_int32(cu_seqlens_kv_padded),
+            mlp_layout_seq_params=[arg_to_cuda(seq_param) for seq_param in self.mlp_layout_seq_params],
+            shard_logical_range=[arg_to_cuda(shard_logical_range) for shard_logical_range in self.shard_logical_range],
+            rope_final_indices=arg_to_cuda(self.rope_final_indices) if self.rope_final_indices is not None else None,
+        )
+
+
 @dataclass
 class PingPangPackedSeqParams:
     seq_params: List[PingPangSingleStepPackedSeqParams]
     # The seq params for mlp layout. This is mainly used for the RoPE.
-    mlp_layout_seq_params: List[PackedSeqParams]
+    mlp_layout_seq_params: List[MLPLayoutPackedSeqParams]
     # NOTE: within a TransformerLayer, this will make sure all communications run on the compute stream.
     debug: bool = False
     do_gather: bool = False
@@ -96,6 +140,8 @@ def arg_to_cuda(v):
         return v.cuda()
     elif isinstance(v, PingPangPackedSeqParams):
         return v.to_device()
+    elif isinstance(v, MLPLayoutPackedSeqParams):
+        return v.to_device()
     elif isinstance(v, PingPangSingleStepPackedSeqParams):
         return v.to_device()
     elif isinstance(v, PackedSeqParams):
@@ -103,8 +149,8 @@ def arg_to_cuda(v):
             qkv_format=v.qkv_format,
             cu_seqlens_q=_to_cuda_int32(v.cu_seqlens_q),
             cu_seqlens_kv=_to_cuda_int32(v.cu_seqlens_kv),
-            max_seqlen_q=_to_int(v.max_seqlen_q),
-            max_seqlen_kv=_to_int(v.max_seqlen_kv),
+            max_seqlen_q=_to_int(v.max_seqlen_q) if v.max_seqlen_q is not None else None,
+            max_seqlen_kv=_to_int(v.max_seqlen_kv) if v.max_seqlen_kv is not None else None,
             cu_seqlens_q_padded=_to_cuda_int32(v.cu_seqlens_q_padded),
             cu_seqlens_kv_padded=_to_cuda_int32(v.cu_seqlens_kv_padded),
         )
