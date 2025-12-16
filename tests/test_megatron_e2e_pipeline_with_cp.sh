@@ -127,20 +127,38 @@ export TORCH_DIST_INIT_RETRY_TIMEOUT=30
 # ---------------------------
 # Setup paths
 # ---------------------------
-export CUDA_DIR=/mnt/sharefs/software/DeepEP/cuda-12-6
-export NCCL_HOME=/usr
-export NCCL_LIB=/usr/lib/x86_64-linux-gnu
-export NVSHMEM_DIR=/mnt/weka/home/yonghao.zhuang/opt/nvshmem
-export NVSHMEM_PREFIX=/mnt/weka/home/yonghao.zhuang/opt/nvshmem
-export OPENMPI_DIR=/mnt/weka/home/yonghao.zhuang/opt/openmpi
 
-export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:${CUDA_DIR}/lib64:${OPENMPI_DIR}/lib:${NCCL_LIB}/:$LD_LIBRARY_PATH"
-export PATH="${NVSHMEM_DIR}/bin:${OPENMPI_DIR}/bin:${CUDA_DIR}/bin:$PATH"
+# -- Setup CUDA
+# export CUDA_DIR=$HOME/jd/opt/cuda
+export CUDA_DIR=/usr/local/cuda-12.8
+export CUDA_HOME=$CUDA_DIR
+export PATH="$CUDA_HOME/bin:$PATH"
 
-export NVTE_NVTX_ENABLED=1
-export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
+# -- Setup NCCL
+export NCCL_HOME=$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/nccl/
+export NCCL_LIB=$NCCL_HOME/lib
+export NCCL_INCLUDE_DIR=$NCCL_HOME/include
+export NCCL_LIBRARY_DIR=$NCCL_LIB
 
-# export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+# -- Setup NVSHMEM
+export NVSHMEM_PREFIX=$HOME/jd/opt/nvshmem
+export NVSHMEM_DIR=$NVSHMEM_PREFIX
+export NVSHMEM_INCLUDE=$NVSHMEM_PREFIX/include
+
+# -- Setup OPENMPI
+export OPENMPI_DIR=$HOME/jd/opt/openmpi
+export OPENMPI_INCLUDE=$OPENMPI_DIR/include
+export OPENMPI_LIBRARY_DIR=$OPENMPI_DIR/lib
+
+# -- Setup CUDNN
+export CUDNN_LIB=$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cudnn/lib
+export CUDNN_INCLUDE_DIR=$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cudnn/include
+export CUDNN_INCLUDE=$CUDNN_INCLUDE_DIR
+export CUDNN_LIBRARY_PATH=$CUDNN_LIB
+
+export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:${CUDA_DIR}/lib64:${OPENMPI_DIR}/lib:${NCCL_LIBRARY_DIR}/:$LD_LIBRARY_PATH"
+export CPATH="${CUDNN_INCLUDE}:$CPATH"
+export PATH="${NVSHMEM_DIR}/bin:${OPENMPI_DIR}/bin:$PATH"
 
 
 # ---------------------------

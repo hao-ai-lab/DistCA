@@ -19,7 +19,8 @@ import psutil, os
 rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID","0")))
 local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID","0")))
 p = psutil.Process(os.getpid())
-p.cpu_affinity([local * 16, local * 16 + 1])  # pin to core based on local rank
+N_CORE_PER_RANK = 16
+p.cpu_affinity(list(range(local * N_CORE_PER_RANK, local * N_CORE_PER_RANK + N_CORE_PER_RANK)))  # pin to core based on local rank
 print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
 
 # ----------------
@@ -567,7 +568,7 @@ def get_next_batch(dp_size) -> Iterable[List[List[int]]]:
 
 # ========== D2 Specific Functions ==========
 
-
+# from transformer_engine.pytorch.attention.dot_product_attention.backends import get_attention_duration
 import traceback
 try:
     import wlbllm
