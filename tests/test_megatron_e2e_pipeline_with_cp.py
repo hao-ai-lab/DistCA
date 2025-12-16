@@ -538,6 +538,13 @@ def test(args):
     num_head_in_dtype = (hf_config.num_attention_heads *
                          torch.float32.itemsize // element_size // tp_size)
 
+    dp_size = dpcp_size
+    num_batched_token_per_as_rank = total_seq_len * num_batches // dp_size
+    os.environ["D2_SEQ_LEN"] = str(num_batched_token_per_as_rank)
+    print(f"🟡 [Rank {as_rank}] {dp_size=}, {num_batched_token_per_as_rank=}, {os.environ['D2_SEQ_LEN']=}")
+
+    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
+
 
     # for _ in range(20):
     #     print(f"🟡 get_next_batch: {get_next_batch(num_batches * 2)}")    
