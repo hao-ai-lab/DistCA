@@ -17,7 +17,7 @@ unset TORCH_SHOW_CPP_STACKTRACES        # disable those C++ frames in tracebacks
 # -----------------------------
 # Debugging Flags
 # -----------------------------
-# export ENABLE_NSYS=1
+export ENABLE_NSYS=1
 # export EXPERIMENT_PYTHON_DEBUG_TRACE_CALLS=1
 export EXPERIMENT_LOG_MEMORY_USAGE=0
 export EXPERIMENT_SKIP_FA2A_OP=0 # (DebugOnly: Ensure not stuck at fast a2a op)
@@ -178,7 +178,7 @@ model_config="deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 8"
 param_configs_cases=(
 # 8B 128k
 #    n bs mb t       mode  cp  pp  tp  comment 
-    "2  1  2 16384     d2   1   2   8  'd2-pretrain'  "
+    "2  1  32 16384     d2   1   2   8  'd2-pretrain'  "
     # "8  1  2 16384     d2   1   2   8  'd2-pretrain'  "
 )
 for config in "${param_configs_cases[@]}"; do
