@@ -61,6 +61,7 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
 class MLPLayoutPackedSeqParams(PackedSeqParams):
     mlp_layout_seq_params: List[PackedSeqParams] = field(default_factory=list)
     shard_logical_range: List[torch.Tensor] = field(default_factory=list)
+    rope_final_indices: Optional[torch.Tensor] = None
 
     def to_device(self):
         # Extract parent class fields from the first mlp_layout_seq_param if available
@@ -93,6 +94,7 @@ class MLPLayoutPackedSeqParams(PackedSeqParams):
             cu_seqlens_kv_padded=_to_cuda_int32(cu_seqlens_kv_padded),
             mlp_layout_seq_params=[arg_to_cuda(seq_param) for seq_param in self.mlp_layout_seq_params],
             shard_logical_range=[arg_to_cuda(shard_logical_range) for shard_logical_range in self.shard_logical_range],
+            rope_final_indices=arg_to_cuda(self.rope_final_indices) if self.rope_final_indices is not None else None,
         )
 
 
