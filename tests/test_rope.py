@@ -294,7 +294,11 @@ def test_end_to_end_rope_verification_triton():
     dp_cp_items = batch_to_items_general(batches, num_tokens_per_rank=num_batched_token, DP_degree=dp_degree, model_config=model_config)
     
     _, _, mlp_shard_lens, shard_logical_ranges = planner.plan(dp_cp_items, device=device)
-    
+    from d2.runtime.megatron.d2_rope import precompute_rope_final_indices
+    print(f"mlp_shard_lens: {mlp_shard_lens}")
+    print(f"shard_logical_ranges: {shard_logical_ranges}")
+
+
     max_seq_len = 2048
 
     freqs = torch.arange(max_seq_len, dtype=torch.float32, device=device)
@@ -316,15 +320,19 @@ def test_end_to_end_rope_verification_triton():
             half_dim = hidden_dim // 2
             t_in[..., :half_dim] = 1.0
             
-            logical_range = shard_logical_ranges[rank_id].to(device)
+            mlp_shard_len = mlp_shard_lens[rank_id].to(device)
+            shard_logical_range = shard_logical_ranges[rank_id].to(device)
             
+
+            final_indice = precompute_rope_final_indices(cu_seqlens, shard_logical_range, device='cpu').to(device)
+
             from d2.runtime.megatron.d2_rope import apply_rotary_pos_emb_d2_triton
             output = apply_rotary_pos_emb_d2_triton(
                 t=t_in,
                 freqs=freqs,
                 config=transformer_config,
-                cu_seqlens=cu_seqlens,
-                shard_logical_range=logical_range
+                shard_logical_range=shard_logical_range,
+                final_indices=final_indice,
             )
             
             expected_pos_ids = []
@@ -347,25 +355,29 @@ def test_end_to_end_rope_verification_triton():
             
             assert output.shape[0] == expected_tensor.shape[0], f"Rank {rank_id} shape mismatch"
             
-            actual_vals = output[:, 0, 0].cpu()
+            expected_values = torch.cos(expected_tensor).to(device)
             
-            if not torch.allclose(actual_vals, expected_tensor):
-                diff_indices = torch.nonzero(actual_vals != expected_tensor).flatten()
+            actual_vals = output[:, 0, 0]
+            
+            if not torch.allclose(actual_vals, expected_values, atol=1e-5):
+                diff_indices = torch.nonzero(torch.abs(actual_vals - expected_values) > 1e-5).flatten()
                 first_diff = diff_indices[0].item()
                 rich.print(f"[bold red]FAIL[/bold red] Rank {rank_id} Value Mismatch at index {first_diff}")
-                rich.print(f"  Expected: {expected_tensor[first_diff]}")
-                rich.print(f"  Actual:   {actual_vals[first_diff]}")
+                rich.print(f"  Pos ID:   {expected_tensor[first_diff]}")
+                rich.print(f"  Expected (Cos): {expected_values[first_diff]}")
+                rich.print(f"  Actual   (Cos): {actual_vals[first_diff]}")
+                
                 shard_idx = 0
+                temp_diff = first_diff
                 for i, l in enumerate(phys_lens):
-                    if first_diff < l:
+                    if temp_diff < l:
                         shard_idx = i
                         break
-                    first_diff -= l
+                    temp_diff -= l
                 rich.print(f"  Error occurred in Shard {shard_idx} (PhysLen: {phys_lens[shard_idx]})")
                 raise AssertionError(f"Rank {rank_id} RoPE verification failed")
-
+            
             rich.print(f"    [green]OK[/green] Rank {rank_id} passed.")
-
     rich.print(f"[bold green][PASS][/bold green] End-to-End RoPE Verification Completed Successfully.")
 
 if __name__ == '__main__':
