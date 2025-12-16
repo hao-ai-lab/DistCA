@@ -146,12 +146,18 @@ class TransformerLayer(MegatronTransformerLayer):
             if q_pos_emb is not None:
                 if shard_logical_range is not None:
                     with torch.cuda.nvtx.range(f"RoPE.L{self.layer_number}.query_d2"):
-                        # query = apply_rotary_pos_emb_d2(
-                        #     query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q, shard_logical_range=shard_logical_range
-                        # )
-                        query = apply_rotary_pos_emb_d2_triton(
-                            query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q, shard_logical_range=shard_logical_range, max_seq_len=max_seqlen_q
-                        )
+                        final_indices = None
+                        if isinstance(packed_seq_params, MLPLayoutPackedSeqParams):
+                            final_indices = packed_seq_params.rope_final_indices
+                        
+                        if final_indices is not None:
+                            query = apply_rotary_pos_emb_d2(
+                                query, q_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                            )
+                        
+                            # query = apply_rotary_pos_emb_d2_triton(
+                            #     query, q_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                            # )
                 else:
                     query = apply_rotary_pos_emb(
                         query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
@@ -160,12 +166,18 @@ class TransformerLayer(MegatronTransformerLayer):
             if k_pos_emb is not None:
                 if shard_logical_range is not None:
                     with torch.cuda.nvtx.range(f"RoPE.L{self.layer_number}.key_d2"):
-                        # key = apply_rotary_pos_emb_d2(
-                        #     key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv, shard_logical_range=shard_logical_range
-                        # )
-                        key = apply_rotary_pos_emb_d2_triton(
-                            key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv, shard_logical_range=shard_logical_range, max_seq_len=max_seqlen_kv
-                        )
+                        final_indices = None
+                        if isinstance(packed_seq_params, MLPLayoutPackedSeqParams):
+                            final_indices = packed_seq_params.rope_final_indices
+                        
+                        if final_indices is not None:
+                            key = apply_rotary_pos_emb_d2(
+                                key, k_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                            )
+
+                            # key = apply_rotary_pos_emb_d2_triton(
+                            #     key, k_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                            # )
                 else:
                     key = apply_rotary_pos_emb(
                         key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
