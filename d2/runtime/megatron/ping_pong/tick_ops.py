@@ -357,11 +357,12 @@ def tick_nonca_compute_cuda_graph(
     layer: TransformerLayer, prev_layer: Optional[TransformerLayer],
     arg_group: Dict[str, Any], is_last_layer_post_attn: bool
 ):
-    print(f"-- use cudagraph --: {layer.layer_number}")
+    # print(f"-- use cudagraph --: {layer.layer_number}")
     if is_last_layer_post_attn:
         return forward_post_core_attn_cuda_graph(layer, arg_group)
     if prev_layer is None:
-        return forward_pre_core_attn(layer, arg_group)
+        # return forward_pre_core_attn(layer, arg_group)
+        return forward_pre_core_attn_cuda_graph(layer, arg_group)
     return forward_post_then_pre_core_attn_cuda_graph(layer, arg_group)
 
 # ========== Tick Operations Timing Collection ==========
