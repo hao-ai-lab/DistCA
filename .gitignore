@@ -182,3 +182,4 @@ wandb/
 slurm/
 
 .cursor/
+env.sh
