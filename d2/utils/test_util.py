@@ -431,7 +431,7 @@ def _block_reverse_list(l: list, d: int):
     return [item for i in range(len(l), 0, -d) for item in l[max(0, i - d):i]]
 
 
-from global_batch_provider import get_next_batch, GLOBAL_BATCH
+from d2.utils.global_batch_provider import get_next_batch, GLOBAL_BATCH
 def create_pipeline_doclens(
     ref_doc_lens: Optional[list[list[int]]],
     add_dummy: bool,
