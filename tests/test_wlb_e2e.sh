@@ -129,20 +129,18 @@ export TORCH_DIST_INIT_RETRY_TIMEOUT=30
 # ---------------------------
 # Setup paths
 # ---------------------------
-export CUDA_DIR=/mnt/sharefs/software/DeepEP/cuda-12-6
-export NCCL_HOME=/usr
-export NCCL_LIB=/usr/lib/x86_64-linux-gnu
-export NVSHMEM_DIR=/mnt/weka/home/yonghao.zhuang/opt/nvshmem
-export NVSHMEM_PREFIX=/mnt/weka/home/yonghao.zhuang/opt/nvshmem
-export OPENMPI_DIR=/mnt/weka/home/yonghao.zhuang/opt/openmpi
+# Source the `env.sh` file from project root
+CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$CURDIR/.." && pwd)"
+export PROJECT_ROOT
 
-export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:${CUDA_DIR}/lib64:${OPENMPI_DIR}/lib:${NCCL_LIB}/:$LD_LIBRARY_PATH"
-export PATH="${NVSHMEM_DIR}/bin:${OPENMPI_DIR}/bin:${CUDA_DIR}/bin:$PATH"
-
-export NVTE_NVTX_ENABLED=1
-export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
-
-# export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+if [ -f "$PROJECT_ROOT/env.sh" ]; then
+  # shellcheck disable=SC1091
+  source "$PROJECT_ROOT/env.sh"
+else
+  echo -e "\033[31mError: missing $PROJECT_ROOT/env.sh (computed from script location).\nPlease copy $PROJECT_ROOT/env.template.sh to $PROJECT_ROOT/env.sh and customize it.\033[0m" >&2
+  exit 1
+fi
 
 
 # ---------------------------

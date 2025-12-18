@@ -6,7 +6,6 @@ seaborn
 transformers
 rich
 omegaconf
+
 # scikit-learn
 # numpy
-# streamlit
-# streamlit-cookies-manager

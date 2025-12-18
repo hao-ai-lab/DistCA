@@ -180,3 +180,6 @@ wandb/
 *.nsys-rep
 .idea/
 slurm/
+
+.cursor/
+env.sh
