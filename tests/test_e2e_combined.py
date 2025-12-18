@@ -1772,15 +1772,6 @@ def test(args):
         
     if rank == 0:
         # Write benchmark results to file
-        # TODO: Legacy behavior. Can delete this later... just treat this as a log file.
-        file_dir = os.path.dirname(os.path.abspath(__file__))
-        benchmark_dir = os.path.join(file_dir, "..", "benchmarks", "_250809_e2e_benchmark", "data")
-        os.makedirs(benchmark_dir, exist_ok=True)
-        benchmark_file = os.path.join(benchmark_dir, f"benchmark.{now_ts}.{mode}.json")
-        with open(benchmark_file, 'w') as f:
-            json.dump(benchmark_data, f, indent=2)
-
-        # Save another copy of the benchmark data to the output directory
         output_file = os.path.join(output_dir, "benchmark.json")
         with open(output_file, 'w') as f:
             json.dump(benchmark_data, f, indent=2)
