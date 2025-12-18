@@ -180,3 +180,5 @@ wandb/
 *.nsys-rep
 .idea/
 slurm/
+
+.cursor/
