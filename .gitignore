@@ -183,3 +183,4 @@ slurm/
 
 .cursor/
 env.sh
+logs/

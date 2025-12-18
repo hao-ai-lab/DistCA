@@ -431,7 +431,48 @@ def _block_reverse_list(l: list, d: int):
     return [item for i in range(len(l), 0, -d) for item in l[max(0, i - d):i]]
 
 
-from global_batch_provider import get_next_batch, GLOBAL_BATCH
+"""
+Batch provider note:
+
+Historically this module used `d2.utils.global_batch_provider`, which only supports
+synthetic seq-lens ("wlbllm"/"prolong").
+
+We now route planner-mode batch fetching through `d2.utils.training_utils`, which
+also supports real datasets (bookcorpus/wikitext/openwebtext/c4) when a tokenizer
+is provided by the caller that initializes the global batch.
+"""
+from d2.utils import training_utils as _training_utils
+
+# Track batches pulled from the global batch generator (debug/benchmark parity).
+_ITERATED_SAMPLES: list[list[list[int]]] = []
+
+
+def get_next_batch(num_batches: int) -> list[list[int]]:
+    """Compatibility wrapper: return only seq_lens for planner-mode."""
+    # In PP/CP scripts this is called on every rank. Only rank 0 should advance the
+    # global batch iterator; we broadcast seq_lens to keep all ranks consistent.
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        payload = [None]
+        if rank == 0:
+            seq_lens, _batch_tokens = _training_utils.get_next_batch(num_batches, _ITERATED_SAMPLES)
+            payload[0] = seq_lens
+        torch.distributed.broadcast_object_list(payload, src=0)
+        seq_lens = payload[0]
+        if seq_lens is None:
+            raise RuntimeError("Planner get_next_batch broadcast failed (seq_lens is None).")
+        return seq_lens
+
+    # Non-distributed fallback.
+    seq_lens, _batch_tokens = _training_utils.get_next_batch(num_batches, _ITERATED_SAMPLES)
+    return seq_lens
+
+
+def _get_global_batch_debug():
+    return getattr(_training_utils, "GLOBAL_BATCH", None)
+
+
+GLOBAL_BATCH = _get_global_batch_debug()
 def create_pipeline_doclens(
     ref_doc_lens: Optional[list[list[int]]],
     add_dummy: bool,
