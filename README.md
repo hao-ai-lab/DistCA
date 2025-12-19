@@ -1,7 +1,7 @@
-<p align="center">
+<!-- <p align="center"> -->
   <!-- <img src="assets/distca.logo.png" alt="DistCA" width="180" align="center"> -->
-  <img src="assets/distca.png" alt="DistCA" width="350" align="center">
-</p>
+  <!-- <img src="assets/distca.png" alt="DistCA" width="350" align="center"> -->
+<!-- </p> -->
 
 <div align="center"><h1>&nbsp;DistCA: Efficient Long-context Language Model Training by Core Attention Disaggregation</h1></div>
 
