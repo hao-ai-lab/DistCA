@@ -778,8 +778,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1024)
-    parser.add_argument("--num-batches", type=int,
-                        default=1)  # this is for cp. set num_batches and num_tokens to control cp doc length.
+    parser.add_argument("--num-batches", type=int, default=1)  
+    # this is for cp. set num_batches and num_tokens to control cp doc length.
     parser.add_argument("--cp-size", type=int, default=2)
     parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
