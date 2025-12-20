@@ -184,7 +184,7 @@ def _qkv_to_attn_out_bwd(
 
 class FusedCommAttn(torch.autograd.Function):
     """
-    Fused post-recv + core-attention + pre-send kernel.
+    Fused post-recv + core attention + pre-send kernel.
     """
     @staticmethod
     def forward(

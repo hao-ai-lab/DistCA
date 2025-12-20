@@ -431,7 +431,7 @@ class PingPongGPTModel(GPTModel):
         """
         A dummy backward that runs #layer times of decoder layer's backward.
         When the device is idle (at pipeline pre-fill or drain-out period),
-        this makes it serve as a remote Core-Attention Server.
+        this makes it serve as a remote Core Attention Server.
         """
         dtype = self.decoder.layers[0].self_attention.linear_qkv.weight.dtype
         device = self.decoder.layers[0].self_attention.linear_qkv.weight.device

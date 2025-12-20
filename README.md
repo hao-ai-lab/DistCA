@@ -28,17 +28,17 @@
 DistCA build on top of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM). -->
 
 
-**DistCA** is a distributed LLM training system designed for efficient **long-context** training. DistCA introduces **Core-Attention Disaggregation (CAD)**, a system-level technique that separates the quadratic **core-attention** computation (i.e. $\text{softmax}(QK^T)V$, or the FlashAttention kernel) from the remaining linear components of the model. 
+**DistCA** is a distributed LLM training system designed for efficient **long-context** training. DistCA introduces **Core Attention Disaggregation (CAD)**, a system-level technique that separates the quadratic **core attention** computation (i.e. $\text{softmax}(QK^T)V$, or the FlashAttention kernel) from the remaining linear components of the model. 
 
 
 
 ### What does DistCA do?
 
-DistCA addresses a fundamental limitation in long-context LLM training: severe workload imbalance caused by the uneven quadratic cost of core-attention across micro-batches. Existing systems and parallelization strategies (DP, PP, CP) colocate core-attention with linear layers. As context length and system scale increase, this colocation leads to stragglers, pipeline bubbles, and excessive communication or memory overhead.
+DistCA addresses a fundamental limitation in long-context LLM training: severe workload imbalance caused by the uneven quadratic cost of core attention across micro-batches. Existing systems and parallelization strategies (DP, PP, CP) colocate core attention with linear layers. As context length and system scale increase, this colocation leads to stragglers, pipeline bubbles, and excessive communication or memory overhead.
 
-DistCA treats core-attention (CA, the $\text{softmax}(QK^T)V$ operation) as an independent unit of work and dynamically redistributes CA tasks across GPUs, while keeping the rest of the model execution unchanged. This design enables:
+DistCA treats core attention (CA, the $\text{softmax}(QK^T)V$ operation) as an independent unit of work and dynamically redistributes CA tasks across GPUs, while keeping the rest of the model execution unchanged. This design enables:
 
-- Balanced core-attention execution across DP and PP ranks  
+- Balanced core attention execution across DP and PP ranks  
 - Elimination of stragglers and pipeline bubbles  
 - Significantly lower communication overhead than context parallelism  
 - Near-linear scalability to very long context lengths
