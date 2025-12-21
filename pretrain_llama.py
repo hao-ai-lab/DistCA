@@ -467,6 +467,8 @@ def main(args):
     num_batches = args.num_batches
     num_microbatch = args.num_microbatch
     num_layers = args.num_layers
+    val_every_n_steps = getattr(args, "val_every_n_steps", 1)
+    ckpt_every_n_steps = getattr(args, "ckpt_every_n_steps", 0)
     if num_layers is not None:
         # See `megatron_test_utils.py` for more details.
         os.environ["NUM_LAYERS"] = str(num_layers)
@@ -652,6 +654,36 @@ def main(args):
     else:
         print(f"🟡 [Rank {rank}] CUDA Graphs are disabled. Not initializing CUDA Graphs.")
 
+    run_name = os.path.basename(os.path.abspath(output_dir.rstrip("/")))
+    ckpt_root = os.environ.get("CKPT_DIR", os.path.join(output_dir, "ckpts"))
+    ckpt_dir = os.path.join(ckpt_root, run_name) if ckpt_root else None
+    ckpt_dir_prepared = False
+
+    def save_checkpoint(suffix: str):
+        nonlocal ckpt_dir_prepared
+        if ckpt_dir is None:
+            return
+        try:
+            if rank == 0 and not ckpt_dir_prepared:
+                os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_dir_prepared = True
+            torch.distributed.barrier()
+            model_to_save = unwrap_model(worker.train_module[0])
+            ckpt_path = os.path.join(ckpt_dir, f"rank{rank}_{suffix}.pt")
+            ckpt_obj = {
+                "model_state_dict": model_to_save.state_dict(),
+                "optimizer_state_dict": worker.optimizer.state_dict() if hasattr(worker, "optimizer") else None,
+                "hf_config": getattr(worker, "hf_config", None),
+                "tf_config": getattr(worker, "tf_config", None),
+                "args": vars(args),
+            }
+            torch.save(ckpt_obj, ckpt_path)
+            if rank == 0:
+                print(f"🟢 [Rank {rank}] Saved checkpoint shard to: {ckpt_path}")
+        except Exception as e:
+            if rank == 0:
+                print(f"⚠️ [Rank {rank}] Failed to save checkpoint: {e}")
+
     for sample_idx in range(max_sample_id):
         os.environ["__PRG__INTERNAL__EXPERIMENT_SAMPLE_ID"] = str(sample_idx)
         # this total_seq_len is token per rank.
@@ -731,6 +763,8 @@ def main(args):
         if sample_idx == 0:
             n_warmup = 1
 
+        val_loss_value = None
+        val_duration_ms = None
         for _ in range(n_repeats + n_warmup):
             mem_ctx = nullcontext()
             if _ < n_warmup and should_log_memory_during_warmup:
@@ -754,6 +788,24 @@ def main(args):
                     end_time = time.time()
                     duration_ms = (end_time - start_time) * 1000
 
+        if val_every_n_steps > 0 and ((sample_idx + 1) % val_every_n_steps == 0):
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            val_start_time = time.time()
+            val_losses_reduced, _ = worker.forward_backward_batch(
+                microbatches=microbatches,
+                forward_only=True,
+                mode="ping_pong",
+                with_dummy=True,
+            )
+            val_loss_value = extract_scalar_loss(val_losses_reduced)
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            val_end_time = time.time()
+            val_duration_ms = (val_end_time - val_start_time) * 1000
+            if val_loss_value is not None:
+                print(f"🟢 [Rank {rank}] Validation loss (sample={sample_idx}) = {val_loss_value}")
+
         # Wandb logging (per-sample, not per-repeat)
         wandb_driver.print_loss(
             sample_id=sample_idx,
@@ -769,7 +821,14 @@ def main(args):
             rank=rank,
             n_repeats=n_repeats,
             n_warmup=n_warmup,
+            val_loss=float(val_loss_value) if val_loss_value is not None else None,
+            val_duration_ms=float(val_duration_ms) if val_duration_ms is not None else None,
         )
+
+        if ckpt_every_n_steps > 0 and ((sample_idx + 1) % ckpt_every_n_steps == 0):
+            save_checkpoint(f"step{sample_idx+1}")
+
+    save_checkpoint("final")
 
     # Finish wandb run if enabled
     wandb_driver.finish(rank=rank)
@@ -820,6 +879,18 @@ if __name__ == "__main__":
     parser.add_argument("--num-layers", type=int, default=8)
     parser.add_argument("--max-sample-id", type=int, default=3)
     parser.add_argument("--should-add-debug-cases", action="store_true")
+    parser.add_argument(
+        "--val-every-n-steps",
+        type=int,
+        default=1,
+        help="Evaluate validation loss every N training steps (set to 0 to disable).",
+    )
+    parser.add_argument(
+        "--ckpt-every-n-steps",
+        type=int,
+        default=0,
+        help="Save a checkpoint every N training steps (set to 0 to disable).",
+    )
 
     parser.add_argument("--output-dir", type=str, default="./logs/")
 

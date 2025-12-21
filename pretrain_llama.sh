@@ -1,20 +1,18 @@
 #! /bin/bash
 
 #SBATCH --job-name=distca-llama
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --output=logs/slurm/stdout.%j.log
 #SBATCH --error=logs/slurm/stderr.%j.log
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=96
+#SBATCH --cpus-per-task=128
 #SBATCH --mem=512G
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
-#SBATCH --partition=lowprio 
-#SBATCH --qos=lowprio
 
 JOBID=$SLURM_JOB_ID
-NNODES=${SLURM_NNODES:-2}
+NNODES=${SLURM_NNODES:-1}
 # TODO: Get the head node IP from the job ID.
 # HEAD_NODE_IP=$(scontrol show hostnames $(scontrol show job $JOBID | awk -F= '/NodeList=fs/ {print $2}') | head -n 1)
 # echo HEAD_NODE_IP=$HEAD_NODE_IP
@@ -33,7 +31,7 @@ NUM_LAYERS=32
 # Parallelism settings
 TP_SIZE=8
 PP_SIZE=1                # Pipeline Parallelism size
-CP_SIZE=2                # Only useful in WLBLLM (D2 will have DPCP anyways)
+CP_SIZE=1                # Only useful in WLBLLM (D2 will have DPCP anyways)
 NUM_MICROBATCH=1
 
 # Experiment settings
@@ -41,6 +39,8 @@ MODE=distca               # Experiment mode (baseline, dynamic, etc.)
 BATCH_SIZE=1          # Batch size for training
 NUM_TOKENS=16384     # Number of tokens to process
 MAX_SAMPLE_ID=3   # Maximum sample ID
+VAL_EVERY_N_STEPS=1  # Validate every N training steps
+CKPT_EVERY_N_STEPS=1 # Checkpoint every N training steps (0=disable)
 # SAMPLE_EXPR=${SAMPLE_EXPR:-""}   # Sample expression
 SAMPLE_NAME=wlbllm
 CHANGE_LONG_DOC_RATIO=0.0
@@ -76,7 +76,8 @@ exec > >(tee "$OUTPUT_DIR/slurm.stdout") 2>&1
 
 export LOG_DIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOG_DIR"
-
+export CKPT_DIR="${CKPT_DIR:-${OUTPUT_DIR}/ckpts}"
+mkdir -p "$CKPT_DIR"
 
 # ---------------------------
 # Environment variables
@@ -174,6 +175,8 @@ TORCHRUN_CMD=(
     --tp-size ${TP_SIZE}
     --pp-size ${PP_SIZE}
     --num-microbatch ${NUM_MICROBATCH}
+    --val-every-n-steps ${VAL_EVERY_N_STEPS}
+    --ckpt-every-n-steps ${CKPT_EVERY_N_STEPS}
     --use-planner
     
     --model-path ${MODEL_PATH}
@@ -232,6 +235,8 @@ echo_and_tee "$EXP_README" "- TP_SIZE: $TP_SIZE"
 echo_and_tee "$EXP_README" "- PP_SIZE: $PP_SIZE"
 echo_and_tee "$EXP_README" "- CP_SIZE: $CP_SIZE"
 echo_and_tee "$EXP_README" "- NUM_MICROBATCH: $NUM_MICROBATCH"
+echo_and_tee "$EXP_README" "- VAL_EVERY_N_STEPS: $VAL_EVERY_N_STEPS"
+echo_and_tee "$EXP_README" "- CKPT_EVERY_N_STEPS: $CKPT_EVERY_N_STEPS"
 echo_and_tee "$EXP_README" "- BATCH_SIZE: $BATCH_SIZE"
 echo_and_tee "$EXP_README" "- NUM_TOKENS: $NUM_TOKENS"
 echo_and_tee "$EXP_README" "- MAX_SAMPLE_ID: $MAX_SAMPLE_ID"
@@ -273,6 +278,7 @@ echo_and_tee "$EXP_README" "## Other Variables"
 echo_and_tee "$EXP_README" "- TS: $TS"
 echo_and_tee "$EXP_README" "- JOBID: $JOBID"
 echo_and_tee "$EXP_README" "- OUTPUT_DIR: $OUTPUT_DIR"
+echo_and_tee "$EXP_README" "- CKPT_DIR: $CKPT_DIR"
 
 
 # ---------------------------
