@@ -14,7 +14,7 @@
 #SBATCH --qos=lowprio
 
 JOBID=$SLURM_JOB_ID
-NNODES=${SLURM_NNODES:-1}
+NNODES=${SLURM_NNODES:-2}
 # TODO: Get the head node IP from the job ID.
 # HEAD_NODE_IP=$(scontrol show hostnames $(scontrol show job $JOBID | awk -F= '/NodeList=fs/ {print $2}') | head -n 1)
 # echo HEAD_NODE_IP=$HEAD_NODE_IP
@@ -33,7 +33,7 @@ NUM_LAYERS=32
 # Parallelism settings
 TP_SIZE=8
 PP_SIZE=1                # Pipeline Parallelism size
-CP_SIZE=1                # Only useful in WLBLLM (D2 will have DPCP anyways)
+CP_SIZE=2                # Only useful in WLBLLM (D2 will have DPCP anyways)
 NUM_MICROBATCH=1
 
 # Experiment settings
