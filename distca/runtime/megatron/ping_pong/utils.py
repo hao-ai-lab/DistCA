@@ -16,7 +16,7 @@ def repack_args(args: List[List[torch.Tensor]], num_splits: int):
     ]
 
 def _repack_dicts(args: Dict[str, List[torch.Tensor]], num_splits: int):
-    assert all(len(a) == num_splits for a in args.values())
+    assert all(len(a) == num_splits for a in args.values()), f"Length of args must be {num_splits}, but got {len(args.values())}"
     return [
         {k: a[i] for k, a in args.items()}
         for i in range(num_splits)

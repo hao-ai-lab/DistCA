@@ -184,3 +184,4 @@ slurm/
 .cursor/
 env.sh
 logs/
+playground/

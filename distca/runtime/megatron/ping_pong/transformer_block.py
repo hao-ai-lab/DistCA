@@ -156,7 +156,10 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         # NOTE: (debug) This is a toggle to disable RoPE if needed.
-        # rotary_pos_emb = None
+        if os.environ.get("EXPERIMENT_DISABLE_ROPE", "0") == "1":
+            rotary_pos_emb = None
+        # else:
+        #     rotary_pos_emb = (rotary_pos_emb,) * 2
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
