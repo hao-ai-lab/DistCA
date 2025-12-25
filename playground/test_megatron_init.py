@@ -186,6 +186,11 @@ data_cache_path = log_paths.data_cache_path
 ckpt_path = log_paths.ckpt_path
 tensorboard_path = log_paths.tensorboard_path
 
+from pathlib import Path
+data_path = Path(__file__).parent / 'data_process' / 'code_content_document'
+data_path = data_path.resolve().absolute()
+logger.info(f"Data path: {data_path}")
+
 designated_args = [
     # Minimal required Megatron arguments to pass validation.
     # Organized to match megatron-args.txt ordering.
@@ -244,6 +249,7 @@ designated_args = [
     ####################
     # 6. Data/IO
     ####################
+    "--data-path", str(data_path),
     # "--mock-data",
     # "--tokenizer-type", "NullTokenizer",
     "--tokenizer-type", "HuggingFaceTokenizer",
