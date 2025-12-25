@@ -722,96 +722,33 @@ if rank == 0:
 logger.info('done with setup ...')
 
 # -----------------------------------------
-# Report theoretical memory usage
+# Report theoretical memory and FLOPS estimates
 # -----------------------------------------
-from megatron.training.theoretical_memory_usage import (
-    compute_weight_and_optimizer_memory,
-    compute_activation_memory,
-)
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-
-NUM_BYTES_IN_GIGABYTE = 1024 * 1024 * 1024
+from utils.estimate import log_memory_estimate, log_flops_estimate
 
 if rank == 0:
     num_microbatches = get_num_microbatches()
     
-    # Compute weight and optimizer memory (in GB)
-    weight_and_optimizer_memory_gb = (
-        compute_weight_and_optimizer_memory(args, verbose=True)
-        / NUM_BYTES_IN_GIGABYTE
+    # Log memory estimates
+    memory_estimate = log_memory_estimate(
+        args, 
+        num_microbatches=num_microbatches, 
+        verbose=True, 
+        logger=logger
     )
-    logger.info(f"Theoretical weight + optimizer memory: {weight_and_optimizer_memory_gb:.2f} GB")
     
-    # Compute activation memory (in GB) - only accurate with sequence_parallel + selective recompute
-    activation_memory_gb = (
-        compute_activation_memory(args, num_microbatches=num_microbatches, verbose=True) 
-        / NUM_BYTES_IN_GIGABYTE
+    # Log FLOPS estimates
+    flops_estimate = log_flops_estimate(
+        args,
+        num_microbatches=num_microbatches,
+        micro_batch_size=args.micro_batch_size,
+        dp_world_size=parallel_state.get_data_parallel_world_size(),
+        tp=tp,
+        pp=pp,
+        cp=cp,
+        logger=logger,
     )
-    logger.info(f"Theoretical activation memory: {activation_memory_gb:.2f} GB")
-    
-    total_memory_gb = weight_and_optimizer_memory_gb + activation_memory_gb
-    logger.info(f"Theoretical total memory: {total_memory_gb:.2f} GB")
-
-
-# -----------------------------------------
-# Report theoretical compute / FLOPS 
-# -----------------------------------------
-from megatron.training.training import num_floating_point_operations
-
-if rank == 0:
-    # Get batch size info
-    micro_batch_size = args.micro_batch_size
-    num_microbatches = get_num_microbatches()
-    global_batch_size = micro_batch_size * num_microbatches * parallel_state.get_data_parallel_world_size()
-    
-    # Calculate FLOPs per forward pass for one micro-batch
-    flops_per_forward_pass = num_floating_point_operations(args, micro_batch_size)
-    
-    # For training: forward + backward ≈ 3x forward (backward is ~2x forward)
-    flops_per_iteration_per_gpu = flops_per_forward_pass * 3  # forward + backward
-    
-    # Total FLOPs across all GPUs per iteration (considering all microbatches and DP)
-    total_flops_per_iteration = flops_per_forward_pass * 3 * num_microbatches * parallel_state.get_data_parallel_world_size()
-    
-    # Report in TFLOP (10^12)
-    tflops_per_forward = flops_per_forward_pass / 1e12
-    tflops_per_iteration_per_gpu = flops_per_iteration_per_gpu / 1e12
-    tflops_per_iteration_total = total_flops_per_iteration / 1e12
-    
-    logger.info(f"=== Theoretical FLOPS Report ===")
-    logger.info(f"  Batch size config: micro_batch={micro_batch_size}, num_microbatches={num_microbatches}, global_batch={global_batch_size}")
-    logger.info(f"  Parallelism: TP={tp}, PP={pp}, CP={cp}, DP={parallel_state.get_data_parallel_world_size()}")
-    logger.info(f"  FLOPs per forward pass (1 micro-batch): {flops_per_forward_pass:.2e} ({tflops_per_forward:.2f} TFLOP)")
-    logger.info(f"  FLOPs per iteration per GPU (fwd+bwd): {flops_per_iteration_per_gpu:.2e} ({tflops_per_iteration_per_gpu:.2f} TFLOP)")
-    logger.info(f"  Total FLOPs per iteration (all GPUs): {total_flops_per_iteration:.2e} ({tflops_per_iteration_total:.2f} TFLOP)")
-    
-    # GPU peak FLOPS (approximate values for common GPUs in BF16/FP16)
-    # H100 SXM: ~989 TFLOP/s BF16/FP16 Tensor Core
-    # H100 PCIe: ~756 TFLOP/s BF16/FP16 Tensor Core
-    # A100 SXM: ~312 TFLOP/s BF16/FP16 Tensor Core
-    # A100 PCIe: ~312 TFLOP/s BF16/FP16 Tensor Core
-    gpu_name = torch.cuda.get_device_name(0)
-    if "H100" in gpu_name:
-        if "SXM" in gpu_name:
-            gpu_peak_tflops = 989.0
-        else:  # PCIe or other H100 variant
-            gpu_peak_tflops = 756.0
-    elif "A100" in gpu_name:
-        gpu_peak_tflops = 312.0
-    elif "H200" in gpu_name:
-        gpu_peak_tflops = 989.0  # Same compute as H100 SXM
-    else:
-        gpu_peak_tflops = 312.0  # Default conservative estimate
-        logger.warning(f"Unknown GPU '{gpu_name}', using conservative peak FLOPS estimate of {gpu_peak_tflops} TFLOP/s")
-    
-    logger.info(f"  GPU: {gpu_name}")
-    logger.info(f"  GPU peak BF16 TFLOP/s (estimated): {gpu_peak_tflops:.1f}")
-    
-    # For MFU calculation during training:
-    # MFU = (achieved TFLOP/s per GPU) / (peak TFLOP/s per GPU)
-    # achieved TFLOP/s = flops_per_iteration_per_gpu / time_per_iteration
-    logger.info(f"  To compute MFU at runtime: MFU = (TFLOP per iteration / time_sec) / {gpu_peak_tflops:.1f}")
-    logger.info(f"================================")
 
 
 # -----------------------------------------
@@ -996,7 +933,7 @@ from utils.token_monitor import (
 )
 
 # Configure token monitoring (optional - defaults are sensible)
-# set_token_monitor_config(enabled=True, max_tokens_to_decode=200, max_samples_to_log=2)
+set_token_monitor_config(enabled=True, max_tokens_to_decode=200, max_samples_to_log=2)
 
 
 def forward_step(data_iterator, model: GPTModel):
