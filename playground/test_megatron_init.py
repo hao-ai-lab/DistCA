@@ -12,9 +12,7 @@ from utils.logging import (
 )
 from utils.cpu_affinity import set_cpu_affinity
 from utils.hf_config import (
-    get_megatron_args_from_hf_model,
     get_megatron_args_dict_from_hf_model,
-    get_known_model_args,
     get_known_model_config,
     MegatronModelArgs,
     KNOWN_MODEL_CONFIGS,
@@ -141,16 +139,11 @@ KNOWN_MODEL_KEY = "llama-8b"  # Options: "llama-7b", "llama-8b", "llama-70b", "d
 seq_length = 8192
 
 # Compute the number of layers based on pp
-num_layers_override = 8
+num_layers_override = None
 
-# Get model architecture args from HF config or known config
+# Get model architecture config dict from HF config or known config
 if HF_MODEL_NAME is not None:
     logger.info(f"Loading model config from HuggingFace: {HF_MODEL_NAME}")
-    model_arch_args = get_megatron_args_from_hf_model(
-        HF_MODEL_NAME,
-        seq_length=seq_length,
-        num_layers_override=num_layers_override,
-    )
     model_config_dict = get_megatron_args_dict_from_hf_model(
         HF_MODEL_NAME,
         seq_length=seq_length,
@@ -158,11 +151,6 @@ if HF_MODEL_NAME is not None:
     )
 else:
     logger.info(f"Using known model config: {KNOWN_MODEL_KEY}")
-    model_arch_args = get_known_model_args(
-        KNOWN_MODEL_KEY,
-        seq_length=seq_length,
-        num_layers_override=num_layers_override,
-    )
     # Get config object for reference (returns a copy with overrides applied)
     model_config = get_known_model_config(
         KNOWN_MODEL_KEY,
@@ -175,10 +163,16 @@ else:
         "num_attention_heads": model_config.num_attention_heads,
         "num_query_groups": model_config.num_query_groups,
         "ffn_hidden_size": model_config.ffn_hidden_size,
+        "seq_length": model_config.seq_length,
+        "max_position_embeddings": model_config.max_position_embeddings,
         "vocab_size": model_config.vocab_size,
+        "normalization": model_config.normalization,
+        "position_embedding_type": model_config.position_embedding_type,
+        "rotary_base": model_config.rotary_base,
+        "swiglu": model_config.swiglu,
+        "untie_embeddings_and_output_weights": model_config.untie_embeddings_and_output_weights,
     }
 
-logger.info(f"Model architecture args: {model_arch_args}")
 logger.info(f"Model config: {model_config_dict}")
 
 from utils.logging import setup_log_directories
@@ -194,153 +188,139 @@ tensorboard_path = log_paths.tensorboard_path
 
 designated_args = [
     # Minimal required Megatron arguments to pass validation.
-
-    #----------
-    # Logging
-    #----------
-    "--logging-level", "20", # Megatron logging level: INFO = 20
-    # "--log-progress",
-
+    # Organized to match megatron-args.txt ordering.
 
     ####################
-    # model architecture (from HuggingFace config)
+    # 1. Model Architecture
+    ####################
+    "--num-layers", str(model_config_dict["num_layers"]),
+    "--hidden-size", str(model_config_dict["hidden_size"]),
+    "--ffn-hidden-size", str(model_config_dict["ffn_hidden_size"]),
+    "--num-attention-heads", str(model_config_dict["num_attention_heads"]),
+    "--group-query-attention",
+    "--num-query-groups", str(model_config_dict["num_query_groups"]),
+    "--max-position-embeddings", str(model_config_dict["max_position_embeddings"]),
+    "--position-embedding-type", str(model_config_dict["position_embedding_type"]),
+    "--rotary-base", str(model_config_dict["rotary_base"]),
+    "--normalization", str(model_config_dict["normalization"]),
+    "--swiglu" if model_config_dict["swiglu"] else None,
+    "--untie-embeddings-and-output-weights" if model_config_dict["untie_embeddings_and_output_weights"] else None,
+    "--seq-length", str(model_config_dict["seq_length"]),
+    "--vocab-size", str(model_config_dict["vocab_size"]),
+    "--attention-backend", "auto",
+
+    ####################
+    # 2. Training Hyperparameters
     ####################
     "--micro-batch-size", "1",
-    "--attention-backend", "auto",
-    # The following args are dynamically generated from HF config:
-    # --num-layers, --hidden-size, --num-attention-heads, --seq-length,
-    # --max-position-embeddings, --vocab-size, --ffn-hidden-size,
-    # --normalization, --position-embedding-type, --rotary-base,
-    # --group-query-attention, --num-query-groups (if GQA),
-    # --swiglu, --untie-embeddings-and-output-weights
-] + model_arch_args + [
-
-    ####################
-    # initialization
-    ####################
-    # ...
-
-    ####################
-    # mixed-precision
-    ####################
-
-    ####################
-    # fusion
-    ####################
-    # "--bias-activation-fusion", "True",
-    # "--masked-softmax-fusion", "True",
-    # "--persist-layer-norm", "True",
-    # "--memory-efficient-layer-norm", "True",
-    # "--bias-dropout-fusion", "True",
-    # "--apply-rope-fusion", "True",
-
-    ####################
-    # activation recomputation
-    ####################
-    # "--recompute-granularity", "selective",
-    # "--recompute-modules", "mlp",
-    # "--recompute-granularity", "selective",
-    # "--recompute-modules", "core_attn",
-    
-
-    ####################
-    # fp8 related
-    ####################
-
-
-    ####################
-    # MoE related
-    ####################
-
-
-    ##################
-    # Context Parallel
-    ##################
-    "--cp-comm-type", "p2p", # async
-
-    ##################
-    # Cuda Graphs
-    ##################
-    # "--enable-cuda-graph", "True",
-
-
-    ####################
-    # miscellaneous
-    ####################
-
-
-    ####################
-    # _add_data_args
-    # megatron.training.arguments
-    ####################
-    "--mock-data",
-    "--tokenizer-type", "NullTokenizer",
-    # "--tokenizer-type", "GPT2BPETokenizer",
-    # Note: --vocab-size is now provided by model_arch_args from HF config
-    "--data-cache-path", "./data_cache",
-    "--tiktoken-pattern", "v2", 
-    # "--no-create-attention-mask-in-dataloader",
-    # "--no-mmap-bin-files",
-    "--num-workers", "1",
-
-
-    # Checkpointing
-    "--save", str(ckpt_path),
-    "--load", str(ckpt_path),
-    "--save-interval", "30",
-    "--train-iters", "5",
-    "--eval-interval", "30",
-    "--split", "90,5,5",
     "--lr", "1.0e-4",
-    "--log-params-norm", 
-
-
-
-    # --data-path $DATA_PATH 
-    # --vocab-file $VOCAB_FILE 
-    # --merge-file $MERGE_FILE 
+    "--train-iters", "5",
 
     ####################
-    # ModelParallelConfig
+    # 3. Dropout & Regularization
+    ####################
+    # "--no-masked-softmax-fusion",
+    # "--no-bias-gelu-fusion",
+    # "--no-bias-swiglu-fusion",
+    # "--no-bias-dropout-fusion",
+    # "--no-rope-fusion",
+
+    ####################
+    # 4. Mixed Precision
+    ####################
+    # "--bf16",
+    # "--fp16",
+
+    ####################
+    # 5. Parallelism & Distributed Training
     ####################
     "--tensor-model-parallel-size", str(tp),
     "--pipeline-model-parallel-size", str(pp),
     "--context-parallel-size", str(cp),
+    "--cp-comm-type", "p2p",  # async
     "--distributed-backend", "nccl",
     "--distributed-timeout-minutes", "1",
     "--local-rank", str(local_rank),
 
+    ####################
+    # 6. Data/IO
+    ####################
+    "--mock-data",
+    # "--tokenizer-type", "NullTokenizer",
+    "--tokenizer-type", "HuggingFaceTokenizer",
+    "--tokenizer-model", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    # Note: --vocab-size is now provided by model_arch_args from HF config
+    "--data-cache-path", str(data_cache_path),
+    "--tiktoken-pattern", "v2",
+    # "--no-create-attention-mask-in-dataloader",
+    # "--no-mmap-bin-files",
+    "--num-workers", "1",
+    "--split", "90,5,5",
+    # --data-path $DATA_PATH
+    # --vocab-file $VOCAB_FILE
+    # --merge-file $MERGE_FILE
 
+    ####################
+    # 7. Checkpointing & Saving
+    ####################
+    "--save", str(ckpt_path),
+    "--load", str(ckpt_path),
+    "--save-interval", "30",
 
-    # Logging
-    "--wandb-project", "distca",
-    "--wandb-exp-name", "test-megatron-init",
-    "--tensorboard-dir", str(tensorboard_path),  # Required for wandb logging to work!
+    ####################
+    # 8. Logging & Monitoring
+    ####################
+    "--eval-interval", "30",
+    # "--log-progress",
+    "--log-interval", "1",
+    "--log-params-norm",
     "--log-timers-to-tensorboard",
     "--log-memory-to-tensorboard",
+    "--tensorboard-dir", str(tensorboard_path),  # Required for wandb logging to work!
     "--tensorboard-log-interval", "1",
-    "--log-interval", "1",
-
-    # Profiling
-    "--profile",
+    "--wandb-project", "distca",
+    "--wandb-exp-name", "test-megatron-init",
+    "--logging-level", "20",  # Megatron logging level: INFO = 20
+    # "--record-memory-history",
+    # "--profile",
     "--profile-step-start", "2",
     "--profile-step-end", "4",
-    # --profile-step-end
-    # "--profile-ranks"
+    # "--profile-ranks",
 
-    # Others
-    # "--record-memory-history", 
+    ####################
+    # 9. Advanced Features & Extensions
+    ####################
+    # MoE related
+    # fp8 related
+
+    ####################
+    # 10. Special Modes/Debugging
+    ####################
     # "--no-check-for-nan-in-loss-and-grad",
     "--check-for-spiky-loss",
     "--check-for-large-grads",
 
+    ####################
+    # 11. Miscellaneous
+    ####################
+    # Activation Recomputation
+    # "--recompute-granularity", "selective",
+    # "--recompute-modules", "mlp",
+    # "--recompute-granularity", "selective",
+    # "--recompute-modules", "core_attn",
 
-    # Network
-    # --overlap-grad-reduce
-    # --overlap-param-gather
-    # --overlap-param-gather-with-optimizer-step
-    # --tp-comm-overlap
+    # Cuda Graphs
+    # "--enable-cuda-graph", "True",
+
+    # Network/Communication Overlap
+    # "--overlap-grad-reduce",
+    # "--overlap-param-gather",
+    # "--overlap-param-gather-with-optimizer-step",
+    # "--tp-comm-overlap",
 ]
+
+# Filter out None values (from conditional args like --swiglu)
+designated_args = [arg for arg in designated_args if arg is not None]
 
 
 # -----------------------------------------
@@ -737,8 +717,38 @@ if rank == 0:
 logger.info('done with setup ...')
 
 # -----------------------------------------
+# Report theoretical memory usage
+# -----------------------------------------
+from megatron.training.theoretical_memory_usage import (
+    compute_weight_and_optimizer_memory,
+    compute_activation_memory,
+    NUM_BYTES_IN_MEGABYTE,
+)
+from megatron.core.num_microbatches_calculator import get_num_microbatches
+
+if rank == 0:
+    num_microbatches = get_num_microbatches()
+    
+    # Compute weight and optimizer memory (in MB)
+    weight_and_optimizer_memory_mb = (
+        compute_weight_and_optimizer_memory(args, verbose=True) / NUM_BYTES_IN_MEGABYTE
+    )
+    logger.info(f"Theoretical weight + optimizer memory: {weight_and_optimizer_memory_mb:.2f} MB")
+    
+    # Compute activation memory (in MB) - only accurate with sequence_parallel + selective recompute
+    activation_memory_mb = (
+        compute_activation_memory(args, num_microbatches=num_microbatches, verbose=True) 
+        / NUM_BYTES_IN_MEGABYTE
+    )
+    logger.info(f"Theoretical activation memory: {activation_memory_mb:.2f} MB")
+    
+    total_memory_mb = weight_and_optimizer_memory_mb + activation_memory_mb
+    logger.info(f"Theoretical total memory: {total_memory_mb:.2f} MB")
+
+# -----------------------------------------
 # Monkey Patch some training functions
 # -----------------------------------------
+
 # Patch forward_step and backward_step with nvtx markers
 import torch.cuda.nvtx
 import megatron.core.pipeline_parallel.schedules
@@ -751,11 +761,13 @@ def forward_step_with_nvtx(*args, **kwargs):
         return old_forward_step(*args, **kwargs)
 
 def backward_step_with_nvtx(*args, **kwargs):
+    # with torch.autograd.profiler.emit_nvtx(record_shapes=True):
     with torch.cuda.nvtx.range("backward_step"):
         return old_backward_step(*args, **kwargs)
 
 megatron.core.pipeline_parallel.schedules.forward_step = forward_step_with_nvtx
 megatron.core.pipeline_parallel.schedules.backward_step = backward_step_with_nvtx
+
 
 
 # Patch the functions in forward_backward_func
@@ -786,7 +798,6 @@ def optimizer_step_with_nvtx(*args, **kwargs):
 optimizer.step = optimizer_step_with_nvtx
 
 
-
 # Patch a train_step
 import megatron.training.training
 old_train_step = megatron.training.training.train_step
@@ -794,6 +805,18 @@ def train_step_with_nvtx(*args, **kwargs):
     with torch.cuda.nvtx.range("train_step"):
         return old_train_step(*args, **kwargs)
 megatron.training.training.train_step = train_step_with_nvtx
+
+
+# Patch each layer such that I will know when the forward function gets called
+import megatron.core.transformer.transformer_layer
+old_transformer_layer_forward = megatron.core.transformer.transformer_layer.TransformerLayer.forward
+def transformer_layer_forward_with_nvtx(self, *args, **kwargs):
+    with torch.cuda.nvtx.range(f"transformer_layer_forward[{self.layer_number}]"):
+        return old_transformer_layer_forward(self, *args, **kwargs)
+megatron.core.transformer.transformer_layer.TransformerLayer.forward = transformer_layer_forward_with_nvtx
+
+logger.info(f"model: {model}")
+
 
 # -----------------------------------------
 # Start training
@@ -924,6 +947,8 @@ def forward_step(data_iterator, model: GPTModel):
                                 labels=labels, loss_mask=loss_mask)
 
     return output_tensor, partial(loss_func, loss_mask)
+
+
 
 
 process_non_loss_data_func = None
