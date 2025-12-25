@@ -285,6 +285,7 @@ def setup_logging(
     _logger = logging.getLogger(logger_name)
     _logger.handlers = []
     _logger.setLevel(level)
+    _logger.propagate = False  # Prevent duplicate logs from root logger
 
     # Only rank 0 gets console output (if console_only_rank0 is True)
     if not console_only_rank0 or _rank == 0:
