@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Optional
+from typing import IO, List, Optional
 
 # =============================================================================
 # ANSI Colors
@@ -35,6 +35,7 @@ _logger: Optional[logging.Logger] = None
 _original_stdout: Optional[IO] = None
 _original_stderr: Optional[IO] = None
 _rank_log_handle: Optional[IO] = None
+_rank_log_file: Optional[Path] = None  # Path to current rank's log file
 
 
 # =============================================================================
@@ -170,11 +171,14 @@ def setup_log_directories(
     # Wait for rank 0 to finish creating directories
     barrier_fn()
     
+    global _rank_log_file
+    
     # Redirect stdout and stderr to per-rank log files
     # Rank 0: tee to both console and file; Other ranks: file only
     _original_stdout = sys.stdout
     _original_stderr = sys.stderr
     rank_log_file = rank_logs_path / f"rank_{rank}.log"
+    _rank_log_file = rank_log_file  # Store for use by redirect_external_loggers
     _rank_log_handle = open(rank_log_file, 'w', buffering=1)  # line-buffered
     
     if rank == 0:
@@ -230,6 +234,90 @@ def restore_streams():
 restore_stdout = restore_streams
 
 
+def redirect_external_loggers(
+    logger_names: List[str] = None,
+    level: int = logging.INFO,
+    use_rank_format: bool = True,
+) -> List[logging.Logger]:
+    """
+    Redirect external loggers (e.g., Megatron's) to the same rank log file.
+    
+    This function adds a FileHandler to specified loggers so their output
+    goes to the same rank_X.log file as your main logs. It also optionally
+    adds a console handler for rank 0.
+    
+    Call this AFTER setup_log_directories() has been called.
+    
+    Args:
+        logger_names: List of logger names to redirect. If None, defaults to
+            ["megatron"] which captures all megatron.* loggers.
+        level: Logging level to set for these loggers.
+        use_rank_format: Whether to use the RankFormatter (includes rank info).
+    
+    Returns:
+        List of configured loggers.
+    
+    Example:
+        # Redirect all Megatron logs to rank log files
+        redirect_external_loggers(["megatron"])
+        
+        # Redirect specific loggers
+        redirect_external_loggers([
+            "megatron.core",
+            "megatron.core.distributed",
+        ])
+    """
+    if _rank_log_file is None:
+        raise RuntimeError(
+            "Log directories not set up. Call setup_log_directories() first."
+        )
+    
+    if logger_names is None:
+        logger_names = ["megatron"]
+    
+    configured_loggers = []
+    rank = _rank if _rank is not None else 0
+    
+    for name in logger_names:
+        ext_logger = logging.getLogger(name)
+        ext_logger.setLevel(level)
+        
+        # Remove existing handlers to avoid duplicates
+        ext_logger.handlers = []
+        
+        # Don't propagate to root logger (we handle everything explicitly)
+        ext_logger.propagate = False
+        
+        # Add file handler - all ranks write to their respective log files
+        file_handler = logging.FileHandler(_rank_log_file)
+        if use_rank_format:
+            file_handler.setFormatter(RankFormatter(rank=rank, use_color=False))
+        else:
+            file_handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(name)s %(levelname)s %(message)s",
+                datefmt="%H:%M:%S"
+            ))
+        file_handler.setLevel(level)
+        ext_logger.addHandler(file_handler)
+        
+        # Add console handler for rank 0 only (matches your existing pattern)
+        if rank == 0:
+            console_handler = logging.StreamHandler(_original_stdout or sys.stdout)
+            if use_rank_format:
+                console_handler.setFormatter(RankFormatter(rank=rank, use_color=True))
+            else:
+                console_handler.setFormatter(logging.Formatter(
+                    "%(asctime)s %(name)s %(levelname)s %(message)s",
+                    datefmt="%H:%M:%S"
+                ))
+            console_handler.setLevel(level)
+            ext_logger.addHandler(console_handler)
+        
+        configured_loggers.append(ext_logger)
+    
+    return configured_loggers
+
+
 # =============================================================================
 # Python Logging Setup
 # =============================================================================
@@ -263,7 +351,7 @@ def setup_logging(
     level: int = logging.INFO,
     use_color: bool = True,
     logger_name: str = __name__,
-    console_only_rank0: bool = True,
+    console_ranks: Optional[List[int]] = None,
 ) -> logging.Logger:
     """
     Initialize logging with rank-aware formatting.
@@ -274,8 +362,9 @@ def setup_logging(
         level: Logging level (default: INFO).
         use_color: Whether to use ANSI colors in output.
         logger_name: Name for the logger.
-        console_only_rank0: If True, only rank 0 logs to console. Other ranks
-            will have no handlers until setup_log_directories() adds file logging.
+        console_ranks: List of ranks permitted to log to console. If None, all ranks
+            log to console. If an empty list, no ranks log to console. Common usage:
+            [0] for only rank 0, [0, 1] for ranks 0 and 1, etc.
 
     Returns:
         Configured logger instance.
@@ -298,8 +387,10 @@ def setup_logging(
     _logger.setLevel(level)
     _logger.propagate = False  # Prevent duplicate logs from root logger
 
-    # Only rank 0 gets console output (if console_only_rank0 is True)
-    if not console_only_rank0 or _rank == 0:
+    # Determine if this rank should log to console
+    console_ranks = console_ranks or [0]
+    should_log_to_console = (console_ranks is None) or (_rank in console_ranks)
+    if should_log_to_console:
         handler = logging.StreamHandler()
         handler.setFormatter(RankFormatter(rank=_rank, use_color=use_color))
         _logger.addHandler(handler)

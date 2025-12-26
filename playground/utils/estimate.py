@@ -73,6 +73,17 @@ class MemoryEstimate:
     weight_and_optimizer_gb: float
     activation_gb: float
     total_gb: float
+    gpu_max_memory_gb: float = None
+
+    def memory_utilization_pct(self) -> float:
+        if self.gpu_max_memory_gb is None:  
+            return None
+        return (self.total_gb / self.gpu_max_memory_gb) * 100
+
+    def maybe_oom(self) -> bool:
+        if self.gpu_max_memory_gb is None:
+            return False
+        return self.total_gb > self.gpu_max_memory_gb * 0.98
 
 
 def estimate_memory(
@@ -118,6 +129,7 @@ def log_memory_estimate(
     args,
     num_microbatches: int,
     verbose: bool = True,
+    device_id: int = 0,
     logger: Optional[logging.Logger] = None,
 ) -> MemoryEstimate:
     """Compute and log theoretical memory usage estimates.
@@ -126,6 +138,7 @@ def log_memory_estimate(
         args: Megatron arguments object.
         num_microbatches: Number of microbatches.
         verbose: Whether to print verbose output from megatron functions.
+        device_id: CUDA device ID to query for memory info.
         logger: Logger for output. If None, uses module logger.
         
     Returns:
@@ -135,12 +148,28 @@ def log_memory_estimate(
     
     estimate = estimate_memory(args, num_microbatches, verbose=verbose, logger=logger)
     
+    # Get GPU max memory
+    gpu_props = torch.cuda.get_device_properties(device_id)
+    gpu_max_memory_gb = gpu_props.total_memory / NUM_BYTES_IN_GIGABYTE
+    memory_utilization_pct = (estimate.total_gb / gpu_max_memory_gb) * 100
+
+    estimate.gpu_max_memory_gb = gpu_max_memory_gb
+    
     log.info(f"=== Theoretical Memory Report ===")
     log.info(f"  Weight + optimizer memory: {estimate.weight_and_optimizer_gb:.2f} GB")
     log.info(f"  Activation memory: {estimate.activation_gb:.2f} GB")
     log.info(f"  Total memory: {estimate.total_gb:.2f} GB")
+    log.info(f"  GPU max memory: {gpu_max_memory_gb:.2f} GB ({gpu_props.name})")
+    log.info(f"  Estimated utilization: {memory_utilization_pct:.1f}%")
     log.info(f"  Note: Activation memory is only accurate with sequence_parallel + selective recompute")
     log.info(f"=================================")
+    
+    if estimate.total_gb > gpu_max_memory_gb * 0.98:
+        log.error(
+            f"Estimated memory ({estimate.total_gb:.2f} GB) can probably exceeds GPU max memory "
+            f"({gpu_max_memory_gb:.2f} GB) by {estimate.total_gb - gpu_max_memory_gb:.2f} GB. "
+            f"Training will likely OOM!"
+        )
     
     return estimate
 

@@ -6,7 +6,7 @@
 
 from datasets import load_dataset
 
-N = 10000
+N = 100000
 
 train_data = load_dataset(
     'codeparrot/codeparrot-clean-train', split=f'train[:{N}]'

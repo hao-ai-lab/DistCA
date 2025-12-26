@@ -36,8 +36,14 @@ def set_cpu_affinity(
     core_list = list(range(start_core, end_core))
     p.cpu_affinity(core_list)
 
+
+    if len(core_list) > 1 and all(core_list[i] == core_list[i-1]+1 for i in range(1, len(core_list))):
+        core_list_str = f"{core_list[0]}-{core_list[-1]}"
+    else:
+        core_list_str = ",".join(map(str, core_list))
+
     if logger is not None:
-        logger.info(f"Set cpu_affinity (local_rank {local_rank}): {core_list}")
+        logger.info(f"Set cpu_affinity (local_rank {local_rank}): {core_list_str}")
 
     return core_list
 

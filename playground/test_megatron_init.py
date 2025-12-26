@@ -19,6 +19,28 @@ from utils.hf_config import (
 )
 
 # --------------------------------
+# Environment Variables
+# --------------------------------
+"""
+[rank0]:   File "/mnt/weka/home/hao.zhang/jd/distca/playground/test_megatron_init.py", line 427, in <module>
+[rank0]:     initialize_megatron(
+[rank0]:   File "/mnt/weka/home/hao.zhang/jd/Megatron-LM/megatron/training/initialize.py", line 86, in initialize_megatron
+[rank0]:     validate_args(args, args_defaults)
+[rank0]:   File "/mnt/weka/home/hao.zhang/jd/Megatron-LM/megatron/training/arguments.py", line 779, in validate_args
+[rank0]:     assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: AssertionError: Using tensor model parallelism or context parallelism require setting the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1
+"""
+env_vars = dict(
+    CUDA_DEVICE_MAX_CONNECTIONS=1,
+    # TORCH_NCCL_CONNECT_TIMEOUT=60000,
+    # TORCH_NCCL_ASYNC_ERROR_HANDLING=1,
+)
+for k, v in env_vars.items():
+    os.environ[k] = str(v)
+
+
+# --------------------------------
 # Logging
 # --------------------------------
 # Fetch rank early for use in formatter
@@ -27,10 +49,16 @@ world_size = int(os.environ["WORLD_SIZE"])
 local_rank = int(os.environ["LOCAL_RANK"])
 
 # Initialize logging with rank-aware formatting
+# Only specified ranks will log to console; all ranks get file logging later
 logger = setup_logging(
     rank=rank, world_size=world_size,
     level=logging.DEBUG,
+    console_ranks=list(range(0, world_size, 8)),  # Only rank 0 logs to console
 )
+
+
+with time_it("import torch"):
+    import torch
 
 
 # --------------------------------
@@ -40,8 +68,6 @@ with time_it("core-binding"):
     set_cpu_affinity(local_rank, ncpu_per_proc=16, logger=logger)
 
 
-with time_it("import torch"):
-    import torch
 
 logger.info(f"Rank: {rank}, World Size: {world_size}, Local Rank: {local_rank}")
 
@@ -54,7 +80,7 @@ with time_it("init_process_group"):
         backend="cpu:gloo,cuda:nccl", 
         rank=rank, 
         world_size=world_size, 
-        timeout = timedelta(seconds=10),
+        timeout = timedelta(seconds=60),
     )
 
 with time_it("import megatron.core"):
@@ -76,48 +102,100 @@ with time_it("initialize model parallel groups"):
     # 32 gpus: tp = 8, pp = 2, cp = 2
     # more gpus: tp = 8, pp = 2, cp = N where N is the number of gpus divided by 16
 
-    # tp = 1; pp = 1; cp = 1;
-    if world_size == 1:
-        tp = 1; pp = 1; cp = 1;
-    elif world_size == 2:
-        tp = 2; pp = 1; cp = 1;
-    elif world_size == 4:
-        tp = 2; pp = 2; cp = 1;
-        # tp = 4; pp = 1; cp = 1;
-    elif world_size == 8:
-        tp = 2; pp = 2; cp = 2;
-        # tp = 8; pp = 1; cp = 1;
-    elif world_size == 16:
-        tp = 2; pp = 2; cp = 2;
-    elif world_size == 32:
-        tp = 4; pp = 2; cp = 2;
-    else:
-        tp = 8; pp = 2; cp = 2;
+    # # tp = 1; pp = 1; cp = 1;
+    # if world_size == 1:
+    #     tp = 1; pp = 1; cp = 1;
+    # elif world_size == 2:
+    #     tp = 2; pp = 1; cp = 1;
+    # elif world_size == 4:
+    #     tp = 2; pp = 2; cp = 1;
+    #     # tp = 4; pp = 1; cp = 1;
+    # elif world_size == 8:
+    #     tp = 2; pp = 2; cp = 2;
+    #     # tp = 8; pp = 1; cp = 1;
+    # elif world_size == 16:
+    #     tp = 2; pp = 2; cp = 2;
+    # elif world_size == 32:
+    #     tp = 4; pp = 2; cp = 2;
+    # else:
+    #     tp = 8; pp = 2; cp = 2;
+    
+    tp = 1; pp = 1; cp = 1;
+    # tp = min(8, world_size);
+    # pp = world_size // tp;
+    cp = 1;
+    # tp = 1; pp = 2; cp = 1;
 
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=tp, 
         pipeline_model_parallel_size=pp,
         context_parallel_size=cp,
-        distributed_timeout_minutes=1,
+        distributed_timeout_minutes=2,
         # nccl_communicator_config_path=None, # default
         order = "tp-cp-ep-dp-pp", # default
     )
 
     # get the tp,pp,cp,dp,ep rank of this process
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     cp_rank = parallel_state.get_context_parallel_rank()
+    cp_size = parallel_state.get_context_parallel_world_size()
     dp_rank = parallel_state.get_data_parallel_rank()
+    dp_size = parallel_state.get_data_parallel_world_size()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
-    logger.info(f"TP Rank: {tp_rank}, PP Rank: {pp_rank}, CP Rank: {cp_rank}, DP Rank: {dp_rank}, EP Rank: {ep_rank}")
+    ep_size = parallel_state.get_expert_model_parallel_world_size()
+    logger.info(f"TP: {tp_rank} / {tp_size}, PP: {pp_rank} / {pp_size}, CP: {cp_rank} / {cp_size}, DP: {dp_rank} / {dp_size}, EP: {ep_rank} / {ep_size}")
+
+    # Print all of the tp/pp/cp/dp ranks
+    def print_ranks(group):
+        ranks = torch.distributed.get_process_group_ranks(group)
+        return ranks
+    logger.info(f"TP Ranks: {print_ranks(parallel_state.get_tensor_model_parallel_group())}")
+    logger.info(f"PP Ranks: {print_ranks(parallel_state.get_pipeline_model_parallel_group())}")
+    logger.info(f"CP Ranks: {print_ranks(parallel_state.get_context_parallel_group())}")
+    logger.info(f"DP Ranks: {print_ranks(parallel_state.get_data_parallel_group())}")
+    logger.info(f"EP Ranks: {print_ranks(parallel_state.get_expert_model_parallel_group())}")
 
 
+tp_groups = parallel_state.get_tensor_model_parallel_group()
+if isinstance(tp_groups, list):
+    # If multiple groups (for multi-TP), allreduce on each group separately
+    for group in tp_groups:
+        t = torch.tensor([tp_rank], device="cuda")
+        torch.distributed.all_reduce(t, group=group)
+        logger.info(f"Allreduced value in tp_group {group}: {t.item()}")
+else:
+    # Single group (typical for Megatron-LM)
+    t = torch.tensor([tp_rank], device="cuda")
+    torch.distributed.all_reduce(t, group=tp_groups)
+    logger.info(f"Allreduced value in tp_group: {t.item()}")
 
-env_vars = dict(
-    CUDA_DEVICE_MAX_CONNECTIONS=1
+
+torch.distributed.barrier()
+logger.info(f"Finish initializing megatron parallel groups.")
+
+from utils.logging import setup_log_directories, redirect_external_loggers
+from pathlib import Path
+
+log_paths = setup_log_directories(
+    rank=rank,
+    barrier_fn=torch.distributed.barrier,
 )
-for k, v in env_vars.items():
-    os.environ[k] = str(v)
+
+# Redirect Megatron logs to the same rank log files
+redirect_external_loggers(["megatron"], level=logging.INFO)
+
+log_root_dir = log_paths.log_root_dir
+data_cache_path = log_paths.data_cache_path
+ckpt_path = log_paths.ckpt_path
+tensorboard_path = log_paths.tensorboard_path
+
+data_path = Path(__file__).parent / 'data_process' / 'code_content_document'
+data_path = data_path.resolve().absolute()
+logger.info(f"Data path: {data_path}")
+
 
 
 # --------------------------------
@@ -136,10 +214,13 @@ HF_MODEL_NAME = None  # Set to None to use KNOWN_MODEL_KEY
 KNOWN_MODEL_KEY = "llama-8b"  # Options: "llama-7b", "llama-8b", "llama-70b", "deepseek-llama-8b"
 
 # Sequence length for training (can be shorter than model's max)
-seq_length = 8192
+k = 1024
+seq_length = k * 4
+# seq_length = k * 128
 
 # Compute the number of layers based on pp
-num_layers_override = None
+# num_layers_override = None
+num_layers_override = 2
 
 # Get model architecture config dict from HF config or known config
 if HF_MODEL_NAME is not None:
@@ -163,8 +244,8 @@ else:
         "num_attention_heads": model_config.num_attention_heads,
         "num_query_groups": model_config.num_query_groups,
         "ffn_hidden_size": model_config.ffn_hidden_size,
-        "seq_length": model_config.seq_length,
-        "max_position_embeddings": model_config.max_position_embeddings,
+        "seq_length": seq_length,
+        "max_position_embeddings": seq_length,
         "vocab_size": model_config.vocab_size,
         "normalization": model_config.normalization,
         "position_embedding_type": model_config.position_embedding_type,
@@ -175,25 +256,12 @@ else:
 
 logger.info(f"Model config: {model_config_dict}")
 
-from utils.logging import setup_log_directories
-
-log_paths = setup_log_directories(
-    rank=rank,
-    barrier_fn=torch.distributed.barrier,
-)
-log_root_dir = log_paths.log_root_dir
-data_cache_path = log_paths.data_cache_path
-ckpt_path = log_paths.ckpt_path
-tensorboard_path = log_paths.tensorboard_path
-
-from pathlib import Path
-data_path = Path(__file__).parent / 'data_process' / 'code_content_document'
-data_path = data_path.resolve().absolute()
-logger.info(f"Data path: {data_path}")
 
 designated_args = [
     # Minimal required Megatron arguments to pass validation.
     # Organized to match megatron-args.txt ordering.
+
+    "--seed", "42",
 
     ####################
     # 1. Model Architecture
@@ -218,8 +286,22 @@ designated_args = [
     # 2. Training Hyperparameters
     ####################
     "--micro-batch-size", "1",
-    "--lr", "1.0e-4",
-    "--train-iters", "5",
+    "--lr", "1.0e-5",
+    # "--train-samples", "100000",
+    # "--train-iters", "100000",
+    "--train-iters", "1",
+    "--lr-warmup-init", "1e-5",
+    "--lr-decay-iters", "1000000",
+    "--lr-decay-style", "constant",
+    # "--lr-warmup-iters", "1000",
+    # "--lr-warmup-fraction", "0.0",
+    "--min-lr", "1e-6",
+    # "--min-lr-ratio", None,
+    # "--warmup-style", "constant",
+    "--weight-decay", "0.01",
+    "--weight-decay-incr-style", "constant",
+    # "--use-checkpoint-opt-param-scheduler",
+    "--lr-wsd-decay-style", "linear",
 
     ####################
     # 3. Dropout & Regularization
@@ -242,7 +324,7 @@ designated_args = [
     "--pipeline-model-parallel-size", str(pp),
     "--context-parallel-size", str(cp),
     "--cp-comm-type", "p2p",  # async
-    "--distributed-backend", "nccl",
+    # "--distributed-backend", "nccl",
     "--distributed-timeout-minutes", "1",
     "--local-rank", str(local_rank),
 
@@ -270,17 +352,18 @@ designated_args = [
     ####################
     "--save", str(ckpt_path),
     "--load", str(ckpt_path),
-    "--save-interval", "30",
+    "--save-interval", "0",
 
     ####################
     # 8. Logging & Monitoring
     ####################
-    "--eval-interval", "30",
+    # "--eval-interval", "10",
     # "--log-progress",
     "--log-interval", "1",
     "--log-params-norm",
     "--log-timers-to-tensorboard",
     "--log-memory-to-tensorboard",
+    "--log-throughput",
     "--tensorboard-dir", str(tensorboard_path),  # Required for wandb logging to work!
     "--tensorboard-log-interval", "1",
     "--wandb-project", "distca",
@@ -311,8 +394,8 @@ designated_args = [
     # Activation Recomputation
     # "--recompute-granularity", "selective",
     # "--recompute-modules", "mlp",
-    # "--recompute-granularity", "selective",
-    # "--recompute-modules", "core_attn",
+    "--recompute-granularity", "selective",
+    "--recompute-modules", "core_attn",
 
     # Cuda Graphs
     # "--enable-cuda-graph", "True",
@@ -322,6 +405,7 @@ designated_args = [
     # "--overlap-param-gather",
     # "--overlap-param-gather-with-optimizer-step",
     # "--tp-comm-overlap",
+    "--distca-quit-if-maybe-oom",
 ]
 
 # Filter out None values (from conditional args like --swiglu)
@@ -341,6 +425,10 @@ class DistCAConfig(TransformerConfig):
     """Set the NVSHMEM buffer size (in GB). 
     TODO: By default, we want to make it configurable by the planner."""
 
+
+    distca_quit_if_maybe_oom: bool = False
+    """If True, the program will quit if the estimated memory can probably exceeds the GPU max memory."""
+
     pass
 
 def replace_parser_and_parse_args(parser: argparse.ArgumentParser):    
@@ -348,8 +436,12 @@ def replace_parser_and_parse_args(parser: argparse.ArgumentParser):
 
     # Define the extra arguments for DistCA
     group = parser.add_argument_group(title='distca')
+    
     group.add_argument("--distca-nvshmem-buffer-size-gb", type=int, default=2, 
     help="Set the NVSHMEM buffer size (in GB)")
+
+    group.add_argument("--distca-quit-if-maybe-oom", action="store_true", default=False, 
+    help="If True, the program will quit if the estimated memory can probably exceeds the GPU max memory.")
 
     old_parser_parse_args = parser.parse_args
     old_parser_parse_known_args = parser.parse_known_args
@@ -384,6 +476,41 @@ if args.yaml_cfg is not None:
 else:
     config = core_transformer_config_from_args(args, config_class=DistCAConfig)
 assert isinstance(config, TransformerConfig)
+
+
+# -----------------------------------------
+# Report theoretical memory and FLOPS estimates
+# -----------------------------------------
+from megatron.core.num_microbatches_calculator import get_num_microbatches
+from utils.estimate import log_memory_estimate, log_flops_estimate
+
+
+num_microbatches = get_num_microbatches()
+
+# Log memory estimates
+memory_estimate = log_memory_estimate(
+    args, 
+    num_microbatches=num_microbatches, 
+    verbose=True, 
+    logger=logger
+)
+
+if memory_estimate.maybe_oom() and args.distca_quit_if_maybe_oom:
+    logger.error(f"Estimated memory ({memory_estimate.total_gb:.2f} GB) can probably exceeds GPU max memory ({memory_estimate.gpu_max_memory_gb:.2f} GB). Training will likely OOM!")
+    raise RuntimeError(f"Estimated memory {memory_estimate.total_gb:.2f} GB can probably exceeds GPU max memory {memory_estimate.gpu_max_memory_gb:.2f} GB. Training will likely OOM! Quit the program.")
+
+# Log FLOPS estimates
+flops_estimate = log_flops_estimate(
+    args,
+    num_microbatches=num_microbatches,
+    micro_batch_size=args.micro_batch_size,
+    dp_world_size=parallel_state.get_data_parallel_world_size(),
+    tp=tp,
+    pp=pp,
+    cp=cp,
+    logger=logger,
+)
+
 
 # -----------------------------------------
 # Set pytorch JIT layer fusion options and warmup JIT functions.
@@ -718,37 +845,8 @@ if rank == 0:
     #     if i > 5:
     #         break
 
-
 logger.info('done with setup ...')
 
-# -----------------------------------------
-# Report theoretical memory and FLOPS estimates
-# -----------------------------------------
-from megatron.core.num_microbatches_calculator import get_num_microbatches
-from utils.estimate import log_memory_estimate, log_flops_estimate
-
-if rank == 0:
-    num_microbatches = get_num_microbatches()
-    
-    # Log memory estimates
-    memory_estimate = log_memory_estimate(
-        args, 
-        num_microbatches=num_microbatches, 
-        verbose=True, 
-        logger=logger
-    )
-    
-    # Log FLOPS estimates
-    flops_estimate = log_flops_estimate(
-        args,
-        num_microbatches=num_microbatches,
-        micro_batch_size=args.micro_batch_size,
-        dp_world_size=parallel_state.get_data_parallel_world_size(),
-        tp=tp,
-        pp=pp,
-        cp=cp,
-        logger=logger,
-    )
 
 
 # -----------------------------------------
@@ -808,6 +906,7 @@ optimizer.step = optimizer_step_with_nvtx
 import megatron.training.training
 old_train_step = megatron.training.training.train_step
 def train_step_with_nvtx(*args, **kwargs):
+    logger.debug(f"Start train_step")
     with torch.cuda.nvtx.range("train_step"):
         return old_train_step(*args, **kwargs)
 megatron.training.training.train_step = train_step_with_nvtx
@@ -817,8 +916,11 @@ megatron.training.training.train_step = train_step_with_nvtx
 import megatron.core.transformer.transformer_layer
 old_transformer_layer_forward = megatron.core.transformer.transformer_layer.TransformerLayer.forward
 def transformer_layer_forward_with_nvtx(self, *args, **kwargs):
+    # logger.debug(f"Start transformer_layer_forward[{self.layer_number}]")
     with torch.cuda.nvtx.range(f"transformer_layer_forward[{self.layer_number}]"):
-        return old_transformer_layer_forward(self, *args, **kwargs)
+        r = old_transformer_layer_forward(self, *args, **kwargs)
+    # logger.debug(f"End transformer_layer_forward[{self.layer_number}]")
+    return r
 megatron.core.transformer.transformer_layer.TransformerLayer.forward = transformer_layer_forward_with_nvtx
 
 logger.info(f"model: {model}")
@@ -837,11 +939,18 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
+    # logger.debug(f"Get batch on this TP rank")
     batch = get_batch_on_this_tp_rank(data_iterator)
+    # logger.debug(f"Finished get batch on this TP rank.")
+    # logger.debug(f"Batch: {batch}")
 
     # slice batch along sequence dimension for context parallelism
+    # logger.debug(f"Slice batch along sequence dimension for context parallelism")
     batch = get_batch_on_this_cp_rank(batch)
+    # logger.debug(f"Finished slice batch along sequence dimension for context parallelism.")
+    # logger.debug(f"Batch: {batch}")
 
+    # logger.debug(f"Return batch")
     return batch.values()
 
 
@@ -955,9 +1064,16 @@ def forward_step(data_iterator, model: GPTModel):
     
     # Monitor tokens - log decoded text for debugging
     # Only log on first pipeline stage and TP rank 0 to avoid duplicate logs
-    if tokens is not None and mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
-        tokenizer = get_tokenizer()
-        monitor_batch_tokens(tokens, tokenizer, logger=logger)
+    # if tokens is not None and mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+    tokenizer = get_tokenizer()
+    monitor_batch_tokens(
+        tokens, 
+        tokenizer,
+        loss_mask=loss_mask,
+        # attention_mask=attention_mask,
+        position_ids=position_ids,
+        logger=logger,
+    )
 
     timers('batch-generator').stop()
 
@@ -977,7 +1093,39 @@ def forward_step(data_iterator, model: GPTModel):
 process_non_loss_data_func = None
 non_loss_data_func = None
 
-logger.info('Start training')
+
+# %%
+# # Add additional safe guard to ensure everyone is here.
+# # Then do a broadcast and an allreduce to ensure everyone is here.
+# torch.distributed.barrier()
+
+# logger.info(f"Rank {rank} starting safe guard...")
+# t = torch.tensor([rank], device="cuda")
+# torch.distributed.all_reduce(t)
+# logger.info(f"Allreduced value: {t.item()}")
+
+# logger.info(f"Rank {rank} preparing to broadcast or receive value...")
+# t = torch.tensor([0], device="cuda")
+# if rank == 0:
+#     t.fill_(42)
+# torch.distributed.broadcast(t, src=0)
+# logger.info(f"Rank {rank} received broadcast value: {t.item()}")
+
+# torch.distributed.barrier()
+
+# logger.info(f"Rank {rank} finished safe guard. Now starting training...")
+
+
+memory_estimate = log_memory_estimate(
+    args, 
+    num_microbatches=num_microbatches, 
+    verbose=True, 
+    logger=logger
+)
+logger.info(f"Memory estimate: {memory_estimate}")
+
+
+# %%
 iteration = 0
 iteration, num_floating_point_operations_so_far = train(
     forward_step,
@@ -989,7 +1137,7 @@ iteration, num_floating_point_operations_so_far = train(
 
 
 
-
+# %%
 # -----------------------------------------
 # Finish training
 # -----------------------------------------
@@ -1007,12 +1155,6 @@ if wandb_writer:
 # -----------------------------------------
 # from test_vocab import test_vocab
 # test_vocab()
-
-
-
-
-
-
 
 
 logger.info(f"Rank {rank} is exiting")
