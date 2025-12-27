@@ -17,8 +17,11 @@ Example usage:
 
 import os
 import logging
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, TYPE_CHECKING
 from dataclasses import dataclass, field
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +103,7 @@ class MegatronModelArgs:
         return args
 
 
-def get_hf_config(model_name_or_path: str, trust_remote_code: bool = True, cache_dir: Optional[str] = None):
+def get_hf_config(model_name_or_path: str, trust_remote_code: bool = True, cache_dir: Optional[str] = None) -> 'PretrainedConfig':
     """
     Load HuggingFace model config, with fallback to download if not cached.
     
@@ -257,6 +260,7 @@ def get_megatron_args_dict_from_hf_model(
     model_name_or_path: str,
     seq_length: Optional[int] = None,
     num_layers_override: Optional[int] = None,
+    max_position_embeddings_override: Optional[int] = None,
     trust_remote_code: bool = True,
     cache_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -265,13 +269,62 @@ def get_megatron_args_dict_from_hf_model(
     
     Useful when you need to access individual config values.
     
+    Args:
+        model_name_or_path: HuggingFace model name or local path
+        seq_length: Training sequence length (can be shorter than max_position_embeddings).
+                    For RoPE models, you can train with seq_length < max_position_embeddings
+                    for efficiency while keeping the model capable of longer sequences.
+        num_layers_override: Override number of layers (useful for testing with fewer layers)
+        max_position_embeddings_override: Override max_position_embeddings separately.
+                                         If None and seq_length is provided, defaults to seq_length.
+                                         If None and seq_length is None, uses model's original value.
+        trust_remote_code: Whether to trust remote code
+        cache_dir: Optional cache directory
+    
     Returns:
         Dictionary with Megatron configuration values
-    """
-    hf_config = get_hf_config(model_name_or_path, trust_remote_code, cache_dir)
-    megatron_args = hf_config_to_megatron_args(hf_config, seq_length, num_layers_override)
     
-    return {
+    Note on seq_length vs max_position_embeddings:
+        - seq_length: Actual sequence length used during training (affects memory, speed)
+        - max_position_embeddings: Maximum sequence length the model can handle (architectural limit)
+        - For RoPE models, you can train with seq_length < max_position_embeddings for efficiency
+        - For learned absolute embeddings, max_position_embeddings determines embedding table size
+    """
+    hf_config = get_hf_config(
+        model_name_or_path=model_name_or_path,
+        trust_remote_code=trust_remote_code,
+        cache_dir=cache_dir,
+    )
+    # Override hf_config attributes for specific logics.
+    # This ensures the hf_config object itself reflects the overrides,
+    # which is useful when the hf_config is accessed later.
+    # Only override if values are provided (not None)
+    if num_layers_override is not None:
+        hf_config.num_hidden_layers = num_layers_override
+        logger.info(f"Overriding hf_config.num_hidden_layers to {num_layers_override}")
+    
+    # Handle max_position_embeddings override
+    # By default, if seq_length is provided, we match max_position_embeddings to it (backward compatibility).
+    # However, you can explicitly set max_position_embeddings_override to keep the original value
+    # or set a different value, allowing seq_length < max_position_embeddings.
+    # This is useful for training efficiency while keeping the model capable of longer sequences.
+    if max_position_embeddings_override is not None:
+        hf_config.max_position_embeddings = max_position_embeddings_override
+        logger.info(f"Overriding hf_config.max_position_embeddings to {max_position_embeddings_override}")
+    elif seq_length is not None:
+        # Default: match max_position_embeddings to seq_length for backward compatibility
+        hf_config.max_position_embeddings = seq_length
+        logger.info(f"Setting hf_config.max_position_embeddings to {seq_length} (matching seq_length)")
+        logger.info(f"  To train with seq_length < max_position_embeddings, set max_position_embeddings_override "
+                   f"to the desired value (e.g., model's original max_position_embeddings)")
+
+    megatron_args = hf_config_to_megatron_args(
+        hf_config=hf_config,
+        seq_length=seq_length,
+        num_layers_override=num_layers_override,
+    )
+    
+    model_config_dict = {
         "num_layers": megatron_args.num_layers,
         "hidden_size": megatron_args.hidden_size,
         "num_attention_heads": megatron_args.num_attention_heads,
@@ -286,6 +339,11 @@ def get_megatron_args_dict_from_hf_model(
         "swiglu": megatron_args.swiglu,
         "untie_embeddings_and_output_weights": megatron_args.untie_embeddings_and_output_weights,
     }
+    return dict(
+        hf_config=hf_config,
+        megatron_args=megatron_args,
+        model_config_dict=model_config_dict,
+    )
 
 
 # Pre-defined model configurations for common models

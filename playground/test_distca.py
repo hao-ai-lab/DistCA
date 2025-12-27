@@ -14,6 +14,7 @@ from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple, List, Union
+from pickle import dump
 
 from utils.logging import (
     setup_logging,
@@ -29,6 +30,7 @@ from utils.hf_config import (
     get_known_model_config,
     MegatronModelArgs,
     KNOWN_MODEL_CONFIGS,
+    get_hf_config,
 )
 from utils.estimate import log_memory_estimate, log_flops_estimate
 from utils.token_monitor import (
@@ -249,17 +251,10 @@ logger.info(f"Data path: {data_path}")
 # ================================
 # Model Configuration from HuggingFace
 # ================================
-# You can either:
-# 1. Use a HuggingFace model name/path to auto-load config
-# 2. Use a known model config key (works offline)
 
-# Option 1: Load from HuggingFace (requires network or cached model)
-# HF_MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+# Only support: Use a HuggingFace model name/path to auto-load config
+HF_MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 # HF_MODEL_NAME = "meta-llama/Llama-3.1-8B"
-
-# Option 2: Use known config (works offline)
-HF_MODEL_NAME = None  # Set to None to use KNOWN_MODEL_KEY
-KNOWN_MODEL_KEY = "llama-8b"  # Options: "llama-7b", "llama-8b", "llama-70b", "deepseek-llama-8b"
 
 # Sequence length for training (can be shorter than model's max)
 k = 1024
@@ -270,39 +265,26 @@ seq_length = k * 4
 # num_layers_override = None
 num_layers_override = 2
 
-# Get model architecture config dict from HF config or known config
-if HF_MODEL_NAME is not None:
-    logger.info(f"Loading model config from HuggingFace: {HF_MODEL_NAME}")
-    model_config_dict = get_megatron_args_dict_from_hf_model(
-        HF_MODEL_NAME,
-        seq_length=seq_length,
-        num_layers_override=num_layers_override,
-    )
-else:
-    logger.info(f"Using known model config: {KNOWN_MODEL_KEY}")
-    # Get config object for reference (returns a copy with overrides applied)
-    model_config = get_known_model_config(
-        KNOWN_MODEL_KEY,
-        seq_length=seq_length,
-        num_layers_override=num_layers_override,
-    )
-    model_config_dict = {
-        "num_layers": model_config.num_layers,
-        "hidden_size": model_config.hidden_size,
-        "num_attention_heads": model_config.num_attention_heads,
-        "num_query_groups": model_config.num_query_groups,
-        "ffn_hidden_size": model_config.ffn_hidden_size,
-        "seq_length": seq_length,
-        "max_position_embeddings": seq_length,
-        "vocab_size": model_config.vocab_size,
-        "normalization": model_config.normalization,
-        "position_embedding_type": model_config.position_embedding_type,
-        "rotary_base": model_config.rotary_base,
-        "swiglu": model_config.swiglu,
-        "untie_embeddings_and_output_weights": model_config.untie_embeddings_and_output_weights,
-    }
+# TODO: Overriding logic is a little too awkward. We should find a better way to do this.
+logger.info(f"Loading model config from HuggingFace: {HF_MODEL_NAME}")
+all_config_dict = get_megatron_args_dict_from_hf_model(
+    HF_MODEL_NAME,
+    seq_length=seq_length,
+    num_layers_override=num_layers_override,
+)
+hf_config = all_config_dict["hf_config"]
+megatron_args = all_config_dict["megatron_args"]
+model_config_dict = all_config_dict["model_config_dict"]
+logger.info(f"HF config: {type(hf_config) = }, {hf_config = }")
+logger.info(f"Megatron args: {type(megatron_args) = }, {megatron_args = }")
+logger.info(f"Model config: {type(model_config_dict) = }, {model_config_dict = }")
 
-logger.info(f"Model config: {model_config_dict}")
+
+
+
+# ======================================
+# Megatron LM Designated CLI Arguments
+# ======================================
 
 
 designated_args = [
@@ -581,7 +563,7 @@ def monitor_oom():
 # ================================
 # Model, optimizer, and learning rate.
 # ================================
-from pickle import dump
+
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'megatron.legacy.model.GPTModel']:
     # TODO: Simplified model provider for DistCA.
     """Builds the model.
@@ -630,8 +612,48 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'mega
     return model
 
 
-def distca_model_provider(pre_process=True, post_process=True) -> Union['DistCAModel']:
-    pass
+from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
+from distca.utils.megatron_test_utils import init_mcore_model
+
+def distca_model_provider(hf_config: 'PretrainedConfig', pre_process=True, post_process=True) -> Union['PingPongGPTModel']:
+    """Builds the DistCA model using init_mcore_model (similar to _build_model_optimizer approach).
+    
+    This function is parallel to model_provider but uses init_mcore_model which automatically
+    creates a PingPongGPTModel through the model registry system.
+    
+    Args:
+        pre_process (bool, optional): Set to true if you need to compute embeddings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to compute output logits/loss. Defaults to True.
+    
+    Returns:
+        PingPongGPTModel: The returned model
+    """
+    args = get_args()
+    use_te = args.transformer_impl == "transformer_engine"
+    assert use_te, "Transformer Engine is required for DistCA."
+    
+    if args.record_memory_history:
+        monitor_oom()
+    logger.info(f"Building DistCA model for rank {torch.distributed.get_rank()}")
+    
+    # Get share_embeddings_and_output_weights from args (mirrors model_provider)
+    share_embeddings_and_output_weights = not args.untie_embeddings_and_output_weights
+    
+    # Initialize model using init_mcore_model (this returns PingPongGPTModel via registry)
+    freeze_moe_router=False # TODO: Find this configuration in the args
+    parallel_model = init_mcore_model(
+        config,  # tf_config (TransformerConfig) - already available as 'config'
+        hf_config,
+        pre_process,
+        post_process,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+        value=False,
+        freeze_moe_router=freeze_moe_router,
+    )
+    parallel_model.to("cuda")
+    
+    return parallel_model
+
 
 with time_it("setup_model_and_optimizer()"):
     model_type = ModelType.encoder_or_decoder
@@ -717,6 +739,7 @@ def __original_train_valid_test_datasets_provider(train_val_test_num_samples):
 
     return train_ds, valid_ds, test_ds
 
+
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build the train test and validation datasets.
     Only build the dataset on the first rank. 
@@ -746,8 +769,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     logger.info("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
-
-
 
 
 def cyclic_iter(iter):
