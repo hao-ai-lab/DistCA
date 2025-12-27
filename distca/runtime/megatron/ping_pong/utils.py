@@ -6,7 +6,16 @@ import torch
 def _split_tensor(x: Optional[torch.Tensor], num_splits: int):
     if x is None:
         return (None,) * num_splits
-    return x.split(x.shape[0] // num_splits, dim=0)
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"_split_tensor expected Tensor or None, got {type(x)}: {x}")
+    if x.dim() == 0:
+        # Scalar tensor - return num_splits copies
+        return (x,) * num_splits
+    if x.shape[0] < num_splits:
+        raise ValueError(f"Cannot split tensor with shape[0]={x.shape[0]} into {num_splits} parts")
+    # Use chunk to guarantee exactly num_splits chunks
+    chunks = x.chunk(num_splits, dim=0)
+    return tuple(chunks)
 
 def repack_args(args: List[List[torch.Tensor]], num_splits: int):
     assert all(len(a) == num_splits for a in args)
@@ -16,7 +25,14 @@ def repack_args(args: List[List[torch.Tensor]], num_splits: int):
     ]
 
 def _repack_dicts(args: Dict[str, List[torch.Tensor]], num_splits: int):
-    assert all(len(a) == num_splits for a in args.values()), f"Length of args must be {num_splits}, but got {len(args.values())}"
+    # Check which values don't have the expected length
+    bad_keys = [k for k, v in args.items() if len(v) != num_splits]
+    if bad_keys:
+        bad_info = {k: (len(args[k]), type(args[k])) for k in bad_keys}
+        raise AssertionError(
+            f"Length of args must be {num_splits}, but got mismatched lengths. "
+            f"Problematic keys: {bad_info}"
+        )
     return [
         {k: a[i] for k, a in args.items()}
         for i in range(num_splits)

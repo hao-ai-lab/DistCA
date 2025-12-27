@@ -24,6 +24,11 @@ from distca.runtime.megatron.ping_pong.tick_ops import (
 from distca.runtime.megatron.ping_pong.transformer_layer import TransformerLayer
 from distca.runtime.megatron.ping_pong.utils import split_all_dict, gather_tensor
 
+# Module-level flags to ensure print statements only execute once
+_printed_single_sided = False
+_printed_orig_reimpl = False
+_printed_ping_pong = False
+
 
 class _debug_monkey_patch:
     """
@@ -343,11 +348,19 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
         """
         For Pipeline Parallel debugging, we use single-sided to ease debugging.
         """
+        global _printed_single_sided, _printed_orig_reimpl, _printed_ping_pong
+        
         if self._ping_pong_debug:
             assert self._debug_forward_impl in ["orig", "single_sided", "orig_reimpl"], self._debug_forward_impl
             if self._debug_forward_impl == "single_sided":
+                if not _printed_single_sided:
+                    print(f"Using single-sided forward implementation for debugging")
+                    _printed_single_sided = True
                 ctx = _debug_monkey_patch(TransformerLayer.forward_ping_pong_single_sided)
             elif self._debug_forward_impl == "orig_reimpl":
+                if not _printed_orig_reimpl:
+                    print(f"Using original reimplementation for debugging")
+                    _printed_orig_reimpl = True
                 ctx = _debug_monkey_patch(TransformerLayer.forward_orig_impl)
             else:
                 ctx = nullcontext()
@@ -355,10 +368,15 @@ class PingPongTransformerBlockInterface(MegatronTransformerBlock):
                 return self._normal_forward(*args, **kwargs)
 
         assert self.ping_pong_comm_initialized
+        if not _printed_ping_pong:
+            print(f"Using ping-pong forward implementation")
+            _printed_ping_pong = True
         return self.ping_pong_forward(*args, **kwargs)
 
 
 def add_ping_pong_forward(block: MegatronTransformerBlock) -> PingPongTransformerBlockInterface:
+
+    print(f"Patching various ping-pong forward to transformer block")
 
     block._normal_forward = block.forward
     block.init_value = types.MethodType(
