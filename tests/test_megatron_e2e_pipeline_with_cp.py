@@ -23,6 +23,7 @@ import os
 import time
 import json
 from global_batch_provider import setup_global_batch, get_next_batch
+from distca.utils import training_utils as _training_utils
 import megatron.core.parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
@@ -473,6 +474,21 @@ def test(args):
         sample_name=args.sample_name,
         balance_ping_pong_batch_size=balance_ping_pong_batch_size,
     )
+    # When use_planner=True, test_util.py uses _training_utils.get_next_batch
+    # which requires _training_utils.GLOBAL_BATCH to be initialized
+    if args.use_planner:
+        _training_utils.setup_global_batch(
+            total_seq_len=num_tokens,
+            up_sample_factor=args.up_sample_factor,
+            elongate_factor=args.elongate_factor,
+            filter_threshold=args.filter_threshold,
+            filter_ratio=args.filter_ratio,
+            should_add_debug_cases=args.should_add_debug_cases,
+            change_long_doc_ratio=args.change_long_doc_ratio,
+            sample_name=args.sample_name,
+            tokenizer=None,  # Not needed for synthetic data
+            max_total_tokens=None,
+        )
     # for _ in range(20):
     #     print(f"🟡 get_next_batch: {get_next_batch(int(num_microbatch * num_batches * 2))}")
     # exit(0)
