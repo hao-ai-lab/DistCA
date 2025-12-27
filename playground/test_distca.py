@@ -43,6 +43,9 @@ from utils.token_monitor import (
 from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
 from distca.utils.megatron_test_utils import init_mcore_model
 
+from distca.utils.traceback import enable_clickable_excepthook, enable_trace_calls
+enable_clickable_excepthook()
+
 if typing.TYPE_CHECKING:
     from transformers import PretrainedConfig
 
@@ -157,6 +160,7 @@ with time_it("import megatron.core"):
     )
     from megatron.core.rerun_state_machine import RerunDataIterator, get_rerun_state_machine
     from megatron.core.utils import StragglerDetector
+    from megatron.training.utils import unwrap_model
 
 
 
@@ -620,7 +624,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'mega
 
 
 
-def distca_model_provider(hf_config: 'PretrainedConfig', pre_process=True, post_process=True) -> Union['PingPongGPTModel']:
+def distca_model_provider(
+    pre_process=True, post_process=True, 
+    hf_config_: 'PretrainedConfig'= hf_config, # bound argument
+) -> Union['PingPongGPTModel']:
     """Builds the DistCA model using init_mcore_model (similar to _build_model_optimizer approach).
     
     This function is parallel to model_provider but uses init_mcore_model which automatically
@@ -648,7 +655,7 @@ def distca_model_provider(hf_config: 'PretrainedConfig', pre_process=True, post_
     # Initialize model using init_mcore_model (this returns PingPongGPTModel via registry)
     parallel_model = init_mcore_model(
         config,  # tf_config (TransformerConfig) - already available as 'config'
-        hf_config,
+        hf_config_,
         pre_process,
         post_process,
         share_embeddings_and_output_weights=share_embeddings_and_output_weights,
@@ -663,9 +670,18 @@ def distca_model_provider(hf_config: 'PretrainedConfig', pre_process=True, post_
 with time_it("setup_model_and_optimizer()"):
     model_type = ModelType.encoder_or_decoder
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        # model_provider,
+        distca_model_provider,
+        model_type, checkpointing_context=checkpointing_context
     )
-    logger.info(f"Successfully setup model and optimizer for rank {torch.distributed.get_rank()}")
+    
+    
+
+    train_module = unwrap_model(model)
+    device = torch.cuda.current_device()
+    for module in train_module:
+        unwrap_model(module).init_ping_pong_communication_ctx(device)
+    logger.info(f"Successfully setup model and optimizer for rank {rank}")
 
     logger.info('after model, optimizer, and learning rate scheduler are built')
 
@@ -938,7 +954,7 @@ stimer = StragglerDetector()
 # Configure token monitoring (optional - defaults are sensible)
 set_token_monitor_config(enabled=True, max_tokens_to_decode=200, max_samples_to_log=2)
 
-def __get_batch_original(data_iterator):
+def __original_get_batch(data_iterator):
     """Generate a batch."""
     # TODO: this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
@@ -1177,12 +1193,69 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     )
 
 
-def forward_step(data_iterator, model: GPTModel):
+def original_forward_step(data_iterator, model: GPTModel):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
+    """
+    args = get_args()
+    timers = get_timers()
+
+    # Get the batch.
+    timers('batch-generator', log_level=2).start()
+    global stimer
+    with stimer(bdata=True):
+        batch = distca_get_batch(data_iterator)
+        tokens = batch['tokens']
+        labels = batch['labels']
+        loss_mask = batch['loss_mask']
+        attention_mask = batch['attention_mask']
+        position_ids = batch['position_ids']
+
+        logger.debug(f"tokens: {tokens.shape}")
+        logger.debug(f"labels: {labels.shape}")
+        logger.debug(f"loss_mask: {loss_mask.shape}")
+        logger.debug(f"attention_mask: {attention_mask.shape}")
+        logger.debug(f"position_ids: {position_ids.shape}")
+
+        # batch = __get_batch_original(data_iterator)
+        # tokens, labels, loss_mask, attention_mask, position_ids = batch
+    
+    # Monitor tokens - log decoded text for debugging
+    # Only log on first pipeline stage and TP rank 0 to avoid duplicate logs
+    # if tokens is not None and mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+    tokenizer = get_tokenizer()
+    monitor_batch_tokens(
+        tokens, 
+        tokenizer,
+        loss_mask=loss_mask,
+        # attention_mask=attention_mask,
+        position_ids=position_ids,
+        logger=logger,
+    )
+
+    timers('batch-generator').stop()
+
+    with stimer:
+        if args.use_legacy_models:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels)
+        else:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels, loss_mask=loss_mask)
+
+    return output_tensor, partial(loss_func, loss_mask)
+
+
+
+def distca_forward_step(data_iterator, model: 'PingPongGPTModel'):
+    """Forward training step.
+
+    Args:
+        data_iterator : Input data iterator
+        model (PingPongGPTModel): The PingPongGPTModel
     """
     args = get_args()
     timers = get_timers()
@@ -1243,7 +1316,8 @@ memory_estimate = log_memory_estimate(args, num_microbatches=num_microbatches, v
 logger.info(f"Memory estimate: {memory_estimate}")
 
 iteration, num_floating_point_operations_so_far = train(
-    forward_step,
+    # original_forward_step,
+    distca_forward_step,
     model, optimizer, opt_param_scheduler,
     train_data_iterator, valid_data_iterator,
     process_non_loss_data_func, config, checkpointing_context,
