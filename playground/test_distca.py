@@ -15,6 +15,8 @@ from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple, List, Union
 from pickle import dump
+import typing
+from typing import Dict
 
 from utils.logging import (
     setup_logging,
@@ -38,6 +40,11 @@ from utils.token_monitor import (
     set_token_monitor_config,
 )
 
+from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
+from distca.utils.megatron_test_utils import init_mcore_model
+
+if typing.TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
@@ -612,8 +619,6 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'mega
     return model
 
 
-from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
-from distca.utils.megatron_test_utils import init_mcore_model
 
 def distca_model_provider(hf_config: 'PretrainedConfig', pre_process=True, post_process=True) -> Union['PingPongGPTModel']:
     """Builds the DistCA model using init_mcore_model (similar to _build_model_optimizer approach).
@@ -638,9 +643,9 @@ def distca_model_provider(hf_config: 'PretrainedConfig', pre_process=True, post_
     
     # Get share_embeddings_and_output_weights from args (mirrors model_provider)
     share_embeddings_and_output_weights = not args.untie_embeddings_and_output_weights
+    freeze_moe_router=False # TODO: Find this configuration in the args
     
     # Initialize model using init_mcore_model (this returns PingPongGPTModel via registry)
-    freeze_moe_router=False # TODO: Find this configuration in the args
     parallel_model = init_mcore_model(
         config,  # tf_config (TransformerConfig) - already available as 'config'
         hf_config,
@@ -713,33 +718,6 @@ def core_gpt_dataset_config_from_args(args):
     )
 
 
-def __original_train_valid_test_datasets_provider(train_val_test_num_samples):
-    """Build the train test and validation datasets.
-
-    Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
-    """
-    args = get_args()
-
-    config = core_gpt_dataset_config_from_args(args)
-    logger.info(f"> GPTDatasetConfig: {config}")
-
-    dataset_type = GPTDataset # NOTE: Add DistCAMockGPTDataset and stuff
-
-    logger.info("> building train, validation, and test datasets for GPT ...")
-
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type,
-        train_val_test_num_samples,
-        is_dataset_built_on_rank,
-        config
-    ).build()
-
-    logger.info("> finished creating GPT datasets ...")
-
-    return train_ds, valid_ds, test_ds
-
-
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build the train test and validation datasets.
     Only build the dataset on the first rank. 
@@ -776,12 +754,10 @@ def cyclic_iter(iter):
         for x in iter:
             yield x
 
+old_args_dataloader_type = args.dataloader_type
+args.dataloader_type = "external" # TODO: Set to "single" for the normal data parallel data loader.
 
-with time_it("setup data iterators"):
-
-    old_args_dataloader_type = args.dataloader_type
-    args.dataloader_type = "external"
-    
+with time_it("setup data iterators"):    
     train_valid_test_datasets_provider.is_distributed = True
 
     # Build loaders.
@@ -939,10 +915,12 @@ def monkey_patch_nvtx_markers():
     # Patch each layer such that I will know when the forward function gets called
     old_transformer_layer_forward = megatron.core.transformer.transformer_layer.TransformerLayer.forward
     def transformer_layer_forward_with_nvtx(self, *args, **kwargs):
-        # logger.debug(f"Start transformer_layer_forward[{self.layer_number}]")
+        if self.layer_number in [0, 1]:
+            logger.debug(f"Start transformer_layer_forward[{self.layer_number}]")
         with torch.cuda.nvtx.range(f"transformer_layer_forward[{self.layer_number}]"):
             r = old_transformer_layer_forward(self, *args, **kwargs)
-        # logger.debug(f"End transformer_layer_forward[{self.layer_number}]")
+        if self.layer_number == model_config_dict["num_layers"] - 1:
+            logger.debug(f"End transformer_layer_forward[{self.layer_number}]")
         return r
     megatron.core.transformer.transformer_layer.TransformerLayer.forward = transformer_layer_forward_with_nvtx
 
@@ -972,19 +950,160 @@ def __get_batch_original(data_iterator):
     return batch.values()
 
 
-def distca_get_batch(data_iterator):
-    # TODO: Make the data loader actually good.
+def distca_get_batch(data_iterator) -> Dict[str, torch.Tensor]:
+    """
+    DistCA-specific get_batch function.
+    This function will:
+    1. Fetch dp_size number of batches from data_iterator.
+    2. Send each batch to the corresponding dp_rank's tp_rank=0.
+    3. Broadcast within each tp_group (similar to get_batch_on_this_tp_rank).
+    4. Return the batch.
+    """
     # TODO: this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
-    # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator)
-    # batch = get_batch_on_this_cp_rank(batch)
-
-    # Gather each batch from all ranks and check the consistency
+    args = get_args()
+    
+    # Step 1: Rank 0 fetches dp_size batches from data_iterator
+    if rank == 0:
+        # Fetch dp_size number of batches
+        batches_for_all_dp = []
+        for _ in range(dp_size):
+            if data_iterator is not None:
+                data = next(data_iterator)
+                batch_dict = {
+                    'tokens': data["tokens"].cuda(non_blocking=True),
+                    'labels': data["labels"].cuda(non_blocking=True),
+                    'loss_mask': data["loss_mask"].cuda(non_blocking=True),
+                    'attention_mask': None if "attention_mask" not in data else data["attention_mask"].cuda(non_blocking=True),
+                    'position_ids': data["position_ids"].cuda(non_blocking=True)
+                }
+                batches_for_all_dp.append(batch_dict)
+            else:
+                batches_for_all_dp.append(None)
+    
+    # Step 2: Rank 0 sends each batch to the corresponding dp_rank's tp_rank=0
+    # Each dp_rank receives its batch (on tp_rank=0)
+    if tp_rank == 0:
+        # Allocate tensors for receiving
+        tokens = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64, device=torch.cuda.current_device())
+        labels = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64, device=torch.cuda.current_device())
+        loss_mask = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.float32, device=torch.cuda.current_device())
+        if args.create_attention_mask_in_dataloader:
+            attention_mask = torch.empty((args.micro_batch_size, 1, args.seq_length, args.seq_length), dtype=torch.bool, device=torch.cuda.current_device())
+        else:
+            attention_mask = None
+        position_ids = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64, device=torch.cuda.current_device())
+        
+        if rank == 0:
+            # Rank 0 is the source, it already has the batch for dp_rank=0
+            batch = batches_for_all_dp[0]
+            tokens = batch['tokens']
+            labels = batch['labels']
+            loss_mask = batch['loss_mask']
+            attention_mask = batch['attention_mask']
+            position_ids = batch['position_ids']
+            
+            # Send batches to other dp_ranks (at their tp_rank=0)
+            dp_group_ranks = torch.distributed.get_process_group_ranks(mpu.get_data_parallel_group())
+            for i in range(1, dp_size):
+                target_dp_rank = i
+                # Find the global rank for dp_rank=i, tp_rank=0
+                target_global_rank = dp_group_ranks[target_dp_rank]
+                
+                batch = batches_for_all_dp[i]
+                torch.distributed.send(batch['tokens'], dst=target_global_rank)
+                torch.distributed.send(batch['labels'], dst=target_global_rank)
+                torch.distributed.send(batch['loss_mask'], dst=target_global_rank)
+                
+                # Send flag to indicate if attention_mask is None
+                has_attention_mask = torch.tensor([1 if batch['attention_mask'] is not None else 0], 
+                                                   dtype=torch.int64, device=torch.cuda.current_device())
+                torch.distributed.send(has_attention_mask, dst=target_global_rank)
+                # Only send attention_mask if it's not None
+                if batch['attention_mask'] is not None:
+                    torch.distributed.send(batch['attention_mask'], dst=target_global_rank)
+                
+                torch.distributed.send(batch['position_ids'], dst=target_global_rank)
+        else:
+            # Other dp_ranks (with tp_rank=0) receive from rank 0
+            torch.distributed.recv(tokens, src=0)
+            torch.distributed.recv(labels, src=0)
+            torch.distributed.recv(loss_mask, src=0)
+            
+            # Receive flag to check if attention_mask is None
+            has_attention_mask = torch.tensor([0], dtype=torch.int64, device=torch.cuda.current_device())
+            torch.distributed.recv(has_attention_mask, src=0)
+            # Only receive attention_mask if it's not None
+            if has_attention_mask.item() == 1:
+                torch.distributed.recv(attention_mask, src=0)
+            else:
+                attention_mask = None
+            
+            torch.distributed.recv(position_ids, src=0)
+        
+        batch = {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids
+        }
+    else:
+        # tp_rank != 0: allocate empty tensors
+        tokens = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64, device=torch.cuda.current_device())
+        labels = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64, device=torch.cuda.current_device())
+        loss_mask = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.float32, device=torch.cuda.current_device())
+        if args.create_attention_mask_in_dataloader:
+            attention_mask = torch.empty((args.micro_batch_size, 1, args.seq_length, args.seq_length), dtype=torch.bool, device=torch.cuda.current_device())
+        else:
+            attention_mask = None
+        position_ids = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64, device=torch.cuda.current_device())
+        
+        batch = {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids
+        }
+    
+    # Step 3: Broadcast within each tp_group (similar to get_batch_on_this_tp_rank)
+    def _broadcast(item):
+        if item is not None:
+            torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+    
+    # Handle different pipeline stages
+    if args.pipeline_model_parallel_size == 1:
+        _broadcast(batch['tokens'])
+        _broadcast(batch['labels'])
+        _broadcast(batch['loss_mask'])
+        _broadcast(batch['attention_mask'])
+        _broadcast(batch['position_ids'])
+    elif mpu.is_pipeline_first_stage():
+        _broadcast(batch['tokens'])
+        _broadcast(batch['attention_mask'])
+        _broadcast(batch['position_ids'])
+        # First stage doesn't need labels and loss_mask
+        if tp_rank != 0:
+            batch['labels'] = None
+            batch['loss_mask'] = None
+    elif mpu.is_pipeline_last_stage():
+        # Multi-Token Prediction (MTP) layers need tokens and position_ids
+        if args.mtp_num_layers is not None:
+            _broadcast(batch['tokens'])
+            _broadcast(batch['position_ids'])
+        else:
+            if tp_rank != 0:
+                batch['tokens'] = None
+                batch['position_ids'] = None
+        
+        _broadcast(batch['labels'])
+        _broadcast(batch['loss_mask'])
+        _broadcast(batch['attention_mask'])
+    
     return batch
-
     
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
@@ -1147,3 +1266,4 @@ if wandb_writer:
 
 logger.info(f"Rank {rank} is exiting")
 torch.distributed.destroy_process_group()
+
