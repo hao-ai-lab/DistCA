@@ -38,21 +38,23 @@ def _log_tensor_shapes(layer: "TransformerLayer", where: str, **named_values: An
         if v is None:
             return
         if torch.is_tensor(v):
-            should_print = False
             
+            num_zeros = (v == 0).sum().item() if torch.is_floating_point(v) or torch.is_complex(v) else 'u'
+            num_nans = torch.isnan(v).sum().item() if torch.is_floating_point(v) else 'u'
+            
+            # print num_nans in red if num_nans > 0
+            should_print = False
+            if num_nans > 0:
+                num_nans = f"\033[31m{num_nans}\033[0m"
+                should_print = True
+
+            num_nans = str(num_nans)
+            msg = (
+                f"[L{layer.layer_number}] {where}: {name} "
+                f"shape={tuple(v.shape)} dtype={v.dtype} device={v.device} "
+                f"#zeros={num_zeros} #nans={num_nans}"
+            )
             if should_print:
-                num_zeros = (v == 0).sum().item() if torch.is_floating_point(v) or torch.is_complex(v) else 'u'
-                num_nans = torch.isnan(v).sum().item() if torch.is_floating_point(v) else 'u'
-                # print num_nans in red if num_nans > 0
-                if num_nans > 0:
-                    num_nans = f"\033[31m{num_nans}\033[0m"
-                    should_print = True
-                num_nans = str(num_nans)
-                msg = (
-                    f"[L{layer.layer_number}] {where}: {name} "
-                    f"shape={tuple(v.shape)} dtype={v.dtype} device={v.device} "
-                    f"#zeros={num_zeros} #nans={num_nans}"
-                )
                 print(msg)
             return
         if isinstance(v, (tuple, list)):

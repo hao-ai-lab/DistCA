@@ -11,11 +11,14 @@
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
 
-JOBID=$SLURM_JOB_ID
+JOBID=${JOBID:-$SLURM_JOB_ID}
 NNODES=${SLURM_NNODES:-1}
 # TODO: Get the head node IP from the job ID.
 # HEAD_NODE_IP=$(scontrol show hostnames $(scontrol show job $JOBID | awk -F= '/NodeList=fs/ {print $2}') | head -n 1)
 # echo HEAD_NODE_IP=$HEAD_NODE_IP
+
+# export CUDA_DEVICE_MAX_CONNECTIONS=1
+unset CUDA_DEVICE_MAX_CONNECTIONS
 
 
 # ------------------------------------------------------
@@ -26,7 +29,8 @@ NNODES=${SLURM_NNODES:-1}
 # MODEL_PATH=${MODEL_PATH:-codellama/CodeLlama-34b-hf}
 MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 MODEL_PATH_normalized=$(echo $MODEL_PATH | sed 's/\//_/g')
-NUM_LAYERS=32
+NUM_LAYERS=4
+# NUM_LAYERS=1
 
 # Parallelism settings
 TP_SIZE=8
@@ -38,9 +42,9 @@ NUM_MICROBATCH=1
 MODE=distca               # Experiment mode (baseline, dynamic, etc.)
 BATCH_SIZE=1          # Batch size for training
 NUM_TOKENS=16384     # Number of tokens to process
-MAX_SAMPLE_ID=3   # Maximum sample ID
-VAL_EVERY_N_STEPS=1  # Validate every N training steps
-CKPT_EVERY_N_STEPS=1 # Checkpoint every N training steps (0=disable)
+MAX_SAMPLE_ID=15      # Maximum sample ID
+VAL_EVERY_N_STEPS=0  # Validate every N training steps
+CKPT_EVERY_N_STEPS=0 # Checkpoint every N training steps (0=disable)
 # SAMPLE_EXPR=${SAMPLE_EXPR:-""}   # Sample expression
 SAMPLE_NAME=wlbllm
 CHANGE_LONG_DOC_RATIO=0.0
@@ -51,13 +55,13 @@ ELONGATE_FACTOR=1
 FILTER_THRESHOLD=65536
 FILTER_RATIO=0.50
 SHOULD_ADD_DEBUG_CASES=0
-PROFILE_MEMORY_PATH=${PROFILE_MEMORY_PATH:"${OUTPUT_DIR}/"}
 
 
 # EXPERIMENT_ENABLE_CUDA_GRAPHS=1
 export EXPERIMENT_ENABLE_CUDA_GRAPHS=0
-export EXPERIMENT_DISABLE_ROPE=1
-
+export EXPERIMENT_DISABLE_ROPE=0
+export D2_LOG_TENSOR_SHAPES=1
+export D2_DEBUG_PRINT=0
 
 # ------------------------------------------------------
 # Setup loggings and artifact directories
@@ -65,11 +69,17 @@ export EXPERIMENT_DISABLE_ROPE=1
 TS=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)
 SHORT_TS=$(TZ=America/Los_Angeles date +%d_%H%M%S)
 CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTPUT_LATEST="${CURDIR}/logs-latest"
 OUTPUT_DIR_PREFIX="${CURDIR}/logs"
 OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-"$SHORT_TS.${MODE}-n${NNODES}-t${NUM_TOKENS}-b${BATCH_SIZE}-mb${NUM_MICROBATCH}-cp${CP_SIZE}tp${TP_SIZE}pp${PP_SIZE}-${MODEL_PATH_normalized}-L${NUM_LAYERS}-${SAMPLE_NAME}_${CHANGE_LONG_DOC_RATIO}"}
 OUTPUT_DIR_SUFFIX_ADDON=${OUTPUT_DIR_SUFFIX_ADDON:-""}
 OUTPUT_DIR="$OUTPUT_DIR_PREFIX/$OUTPUT_DIR_SUFFIX$OUTPUT_DIR_SUFFIX_ADDON"
 mkdir -p "$OUTPUT_DIR"
+
+if [ -d $OUTPUT_LATEST ]; then
+    rm $OUTPUT_LATEST
+fi
+ln -s $OUTPUT_DIR $OUTPUT_LATEST
 
 # Redirect the output of this script to the output directory
 exec > >(tee "$OUTPUT_DIR/slurm.stdout") 2>&1
@@ -79,13 +89,13 @@ mkdir -p "$LOG_DIR"
 export CKPT_DIR="${CKPT_DIR:-${OUTPUT_DIR}/ckpts}"
 mkdir -p "$CKPT_DIR"
 
+PROFILE_MEMORY_PATH=${PROFILE_MEMORY_PATH:"${OUTPUT_DIR}/"}
 # ---------------------------
 # Environment variables
 # ---------------------------
 # export NVSHMEM_BOOTSTRAP=mpi
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 # otherwise (if set to 0) attention kernels may get horrible performance
 export NVSHMEM_IB_ENABLE_IBGDA=true
-export MAX_SAMPLE_ID=5
 export ENABLE_NSYS=0
 export EXPERIMENT_LOG_MEMORY_USAGE=0
 export EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2
@@ -128,11 +138,15 @@ COMMON_STEM="mode${MODE}.nnodes${NNODES}.bs${BATCH_SIZE}.maxid${MAX_SAMPLE_ID}.t
 touch ${OUTPUT_DIR}/desc.${COMMON_STEM} # just a description of this experiment, in its file name
 
 # Define missing variables with defaults
-NPROC_PER_NODE=${NPROC_PER_NODE:-$GPUS_PER_NODE}
+TOTAL_GPUS=$((TP_SIZE * PP_SIZE * CP_SIZE))
+echo TOTAL_GPUS=$TOTAL_GPUS
+NPROC_PER_NODE=$(( GPUS_PER_NODE < TOTAL_GPUS ? GPUS_PER_NODE : TOTAL_GPUS ))
+NPROC_PER_NODE=$(( NPROC_PER_NODE < 8 ? NPROC_PER_NODE : 8 ))
+echo NPROC_PER_NODE=$NPROC_PER_NODE
 RZV_ID=${RZV_ID:-$head_node_ip-${TS}}
 REPLAN_ITER=${REPLAN_ITER:-0}
 SHOULD_PROFILE_MEMORY=${SHOULD_PROFILE_MEMORY:-0}
-
+EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP=${EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP:-0}
 
 # ------------------------------------------------------
 # Construct command
@@ -194,18 +208,12 @@ TORCHRUN_CMD=(
     --output-dir ${OUTPUT_DIR}
 )
 
-# if [ ${USE_PLANNER} -eq 1 ]; then
-#     TORCHRUN_CMD+=(--use-planner)
-# fi
-
 if [ ${SHOULD_ADD_DEBUG_CASES} -eq 1 ]; then
     TORCHRUN_CMD+=(--should-add-debug-cases)
 fi
 
-
 # Serialize TORCHRUN_CMD array so we can pass it through bash -lc cleanly
 TORCHRUN_STR=$(printf " %q" "${TORCHRUN_CMD[@]}")
-
 
 # ---- Per-node logs + per-node NSYS outputs ----
 # %N and %j are expanded by Slurm *only* in --output/--error.
@@ -223,64 +231,6 @@ echo_and_tee() {
     echo "$@" | tee -a "$file"
 }
 
-EXP_README="$OUTPUT_DIR/README.md"
-echo_and_tee "$EXP_README" "Running experiment with the following parameters:"
-
-echo_and_tee "$EXP_README" "## Model settings"
-echo_and_tee "$EXP_README" "- MODE: $MODE"
-echo_and_tee "$EXP_README" "- MODEL_PATH: $MODEL_PATH"
-echo_and_tee "$EXP_README" "- NNODES: $NNODES"
-echo_and_tee "$EXP_README" "- NUM_LAYERS: $NUM_LAYERS"
-echo_and_tee "$EXP_README" "- TP_SIZE: $TP_SIZE"
-echo_and_tee "$EXP_README" "- PP_SIZE: $PP_SIZE"
-echo_and_tee "$EXP_README" "- CP_SIZE: $CP_SIZE"
-echo_and_tee "$EXP_README" "- NUM_MICROBATCH: $NUM_MICROBATCH"
-echo_and_tee "$EXP_README" "- VAL_EVERY_N_STEPS: $VAL_EVERY_N_STEPS"
-echo_and_tee "$EXP_README" "- CKPT_EVERY_N_STEPS: $CKPT_EVERY_N_STEPS"
-echo_and_tee "$EXP_README" "- BATCH_SIZE: $BATCH_SIZE"
-echo_and_tee "$EXP_README" "- NUM_TOKENS: $NUM_TOKENS"
-echo_and_tee "$EXP_README" "- MAX_SAMPLE_ID: $MAX_SAMPLE_ID"
-echo_and_tee "$EXP_README" "- UP_SAMPLE_FACTOR: $UP_SAMPLE_FACTOR"
-echo_and_tee "$EXP_README" "- ELONGATE_FACTOR: $ELONGATE_FACTOR"
-echo_and_tee "$EXP_README" "- FILTER_THRESHOLD: $FILTER_THRESHOLD"
-echo_and_tee "$EXP_README" "- FILTER_RATIO: $FILTER_RATIO"
-echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
-echo_and_tee "$EXP_README" "- SAMPLE_START_IDX: $SAMPLE_START_IDX"
-echo_and_tee "$EXP_README" "- SAMPLE_NAME: $SAMPLE_NAME"
-
-echo_and_tee "$EXP_README" "## Experiment Flags"
-echo_and_tee "$EXP_README" "- ENABLE_NSYS: $ENABLE_NSYS"
-echo_and_tee "$EXP_README" "- WLBLLM_SYNC_TIME_AG: $WLBLLM_SYNC_TIME_AG"
-echo_and_tee "$EXP_README" "- EXPERIMENT_REPEAT_TIMES: $EXPERIMENT_REPEAT_TIMES"
-echo_and_tee "$EXP_README" "- EXPERIMENT_WARMUP_TIMES: $EXPERIMENT_WARMUP_TIMES"
-echo_and_tee "$EXP_README" "- EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB: $EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_FORCE_EXIT: $EXPERIMENT_SHOULD_FORCE_EXIT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_EMIT_BACKWARD_NVTX: $EXPERIMENT_EMIT_BACKWARD_NVTX"
-echo_and_tee "$EXP_README" "- EXPERIMENT_WARMUP_TIMEOUT_SEC: $EXPERIMENT_WARMUP_TIMEOUT_SEC"
-echo_and_tee "$EXP_README" "- D2_SHOULD_REPLAN: $D2_SHOULD_REPLAN"
-echo_and_tee "$EXP_README" "- SHOULD_PROFILE_MEMORY: $SHOULD_PROFILE_MEMORY"
-echo_and_tee "$EXP_README" "- SHOULD_ADD_DEBUG_CASES: $SHOULD_ADD_DEBUG_CASES"
-echo_and_tee "$EXP_README" "- EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0: $EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0"
-echo_and_tee "$EXP_README" "- EXPERIMENT_LOG_MEMORY_USAGE: $EXPERIMENT_LOG_MEMORY_USAGE"
-echo_and_tee "$EXP_README" "- EXPERIMENT_ADD_SELECTIVE_CKPT: $EXPERIMENT_ADD_SELECTIVE_CKPT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_RESEND_QKV: $EXPERIMENT_SHOULD_RESEND_QKV"
-echo_and_tee "$EXP_README" "- D2_SKIP_FLOAT_CONVERSION: $D2_SKIP_FLOAT_CONVERSION"
-echo_and_tee "$EXP_README" "- EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND: $EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SKIP_OPTIMIZER_STEP: $EXPERIMENT_SKIP_OPTIMIZER_STEP"
-echo_and_tee "$EXP_README" "- EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP: $EXPERIMENT_OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP"
-echo_and_tee "$EXP_README" "- EXPERIMENT_D2_BALANCE_PING_PONG: $EXPERIMENT_D2_BALANCE_PING_PONG"
-echo_and_tee "$EXP_README" "- EXPERIMENT_SHOULD_DUMP_TRACEBACK: $EXPERIMENT_SHOULD_DUMP_TRACEBACK"
-echo_and_tee "$EXP_README" "- EXPERIMENT_TORCH_DIST_TIMEOUT: $EXPERIMENT_TORCH_DIST_TIMEOUT"
-echo_and_tee "$EXP_README" "- EXPERIMENT_ENABLE_BENCHMARK_SAVING: $EXPERIMENT_ENABLE_BENCHMARK_SAVING"
-
-
-echo_and_tee "$EXP_README" "## Other Variables"
-echo_and_tee "$EXP_README" "- TS: $TS"
-echo_and_tee "$EXP_README" "- JOBID: $JOBID"
-echo_and_tee "$EXP_README" "- OUTPUT_DIR: $OUTPUT_DIR"
-echo_and_tee "$EXP_README" "- CKPT_DIR: $CKPT_DIR"
-
-
 # ---------------------------
 # Run the experiment
 # ---------------------------
@@ -289,8 +239,6 @@ echo "Start running sbatch at $(TZ='America/Los_Angeles' date)"
 
 NSYS_PATH="${OUTPUT_DIR}/nsys-reps"
 mkdir -p ${NSYS_PATH}
-
-
 
 nsys_str=""
 if [ ${ENABLE_NSYS} -eq 1 ]; then

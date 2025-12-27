@@ -51,6 +51,11 @@ print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
 aff, mems = check_cpu_binding.check_cpu_binding()
 print(f"CPUS={aff} MEMS={mems}")
 
+def debug_print(*args, **kwargs):
+    # Existing repo-wide debug knob used elsewhere.
+    if os.getenv("D2_DEBUG_PRINT", "0") == "1":
+        print(*args, **kwargs)
+
 
 def extract_scalar_loss(losses_reduced):
     """Best-effort extraction of a scalar loss from Megatron schedule outputs."""
@@ -354,16 +359,16 @@ def create_pp_microbatches(
     bwd_metadata = []
     microbatches = []
     if use_planner:
-        print("Enable planner. Get real batch.")
+        debug_print("Enable planner. Get real batch.")
     else:
-        print("No planner. Use random batch.")
+        debug_print("No planner. Use random batch.")
 
     all_original_seq_lens = []
     for i in range(num_microbatch + pp_degree - 1):
         # For the last few ticks (drain-out ticks)
         # add a dummy forward microbatch at PP rank 0.
         add_dummy_forward = i >= num_microbatch
-        print(f"🟡 tick_per_rank_doc_lens: {tick_per_rank_doc_lens}")
+        debug_print(f"🟡 tick_per_rank_doc_lens: {tick_per_rank_doc_lens}")
         (
             fa_fwd_params, fa_bwd_params,
             qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
@@ -382,7 +387,7 @@ def create_pp_microbatches(
             return_original_doclen=return_seq_lens,
         )
         if rank == 1:
-            print(f"🟡 fa_fwd_params: {fa_fwd_params}")
+            debug_print(f"🟡 fa_fwd_params: {fa_fwd_params}")
         all_original_seq_lens.append(original_tick_per_rank_doc_lens)
 
         # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, so each rank knows its number of tokens.
@@ -392,8 +397,9 @@ def create_pp_microbatches(
         #   Example2 CP case:
         # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 768],[512, 10, 502] ]
         # tick_per_rank_doc_lens mlp list: [[8], [8], [8], [8], [256, 128, 128], [256, 256], [512], [10, 502]]
-        tick_per_rank_doc_lens_after_cp_transfer = cp_list_to_mlp_list(tick_per_rank_doc_lens, as_world_size,
-                                                                       num_token_per_rank)
+        tick_per_rank_doc_lens_after_cp_transfer = cp_list_to_mlp_list(
+            tick_per_rank_doc_lens, as_world_size, num_token_per_rank
+        )
 
         this_rank_num_tokens = sum(tick_per_rank_doc_lens_after_cp_transfer[as_rank])
         bwd_packed_seq_params = PackedSeqParams(
@@ -427,6 +433,11 @@ def create_pp_microbatches(
             (qkv_bwd_fa2a_metadata.get_slice(as_rank), attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank),
              bwd_packed_seq_params)
         )
+        # ping_pang_params
+        print(f"🟡 [Rank {as_rank}] position_ids_local = {position_ids_local.shape}")
+        print(f"🟡 [Rank {as_rank}] this_rank_num_tokens = {this_rank_num_tokens}")
+        print(f"🟡 [Rank {as_rank}] tensor_doc_lens = {tensor_doc_lens}")
+        print(f"🟡 [Rank {as_rank}] ping_pang_params = {ping_pang_params.max_seqlen_q = }, {ping_pang_params.max_seqlen_kv = }")
 
     pp_rank = as_rank // dp_size
     dp_rank = as_rank % dp_size
@@ -503,6 +514,7 @@ def main(args):
     # If None, we use MLP-DP. will get DP number of new batches per tick.
     # If set, num_batches < dp_size && dp_size % num_batches == 0, Will get num_batches number of List per tick.
     num_token_per_rank = num_tokens * num_batches // dpcp_size
+    print(f"{num_tokens = }, {num_batches = }, {dpcp_size = }, {num_token_per_rank = }")
     total_seq_len = num_tokens
 
     dtype = torch.bfloat16
@@ -519,7 +531,7 @@ def main(args):
     print(f"🟡 allow_all_ranks_loss = {allow_all_ranks_loss}")
 
     should_log_memory_during_warmup = (
-            os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP", "1") == "1"
+        os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP", "0") == "1"
     )
 
     print(
@@ -684,6 +696,8 @@ def main(args):
             if rank == 0:
                 print(f"⚠️ [Rank {rank}] Failed to save checkpoint: {e}")
 
+
+    loss_values = []
     for sample_idx in range(max_sample_id):
         os.environ["__PRG__INTERNAL__EXPERIMENT_SAMPLE_ID"] = str(sample_idx)
         # this total_seq_len is token per rank.
@@ -721,13 +735,18 @@ def main(args):
             mb_1_mlp_psp = mb_1_psp.mlp_packed_seq_params
             mb_0_psp.dispatcher_id = 0
             mb_1_psp.dispatcher_id = 1
+            # TODO: The RoPE metadata is corrected to be kinda correct. Not sure if this is correct yet.
+            # NOTE: max_seqlen_q/kv for RoPE should be the total number of tokens
+            # (or max position index + 1), NOT the max individual document length.
+            # This is because _apply_rotary_pos_emb_thd iterates through cu_seqlens
+            # segments and needs freqs[:segment_len] for each segment.
+            num_tokens = sum(mb["position_ids"].numel() for mb in [mb_0, mb_1])
             ping_pong_params = PingPangPackedSeqParams(
                 seq_params=[mb_0_psp, mb_1_psp],
                 mlp_layout_seq_params=[mb_0_mlp_psp, mb_1_mlp_psp],
-                max_seqlen_q=max(mb_0_mlp_psp.max_seqlen_q, mb_1_mlp_psp.max_seqlen_q),
-                max_seqlen_kv=max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
+                max_seqlen_q=num_tokens,
+                max_seqlen_kv=num_tokens,
             )
-            num_tokens = sum(mb["position_ids"].numel() for mb in [mb_0, mb_1])
             input_ids = torch.randint(10, 1000, (num_tokens,))
             mb = {
                 "input_ids": input_ids,
@@ -825,10 +844,13 @@ def main(args):
             val_duration_ms=float(val_duration_ms) if val_duration_ms is not None else None,
         )
 
+        loss_values.append(loss_value)
+        debug_print(f"📉 loss values: {loss_values}")
+
         if ckpt_every_n_steps > 0 and ((sample_idx + 1) % ckpt_every_n_steps == 0):
             save_checkpoint(f"step{sample_idx+1}")
 
-    save_checkpoint("final")
+    # save_checkpoint("final")
 
     # Finish wandb run if enabled
     wandb_driver.finish(rank=rank)
