@@ -143,7 +143,7 @@ with time_it("import megatron.core"):
     from megatron.training.training import (
         setup_model_and_optimizer,
         build_train_valid_test_data_iterators,
-        train,
+        train as megatron_original_train,
         get_timers,
     )
     from megatron.core.enums import ModelType
@@ -947,7 +947,7 @@ monkey_patch_nvtx_markers()
 
 
 # ================================
-# Training Functions
+# Get batch functions
 # ================================
 stimer = StragglerDetector()
 
@@ -1124,6 +1124,10 @@ def distca_get_batch(data_iterator) -> Dict[str, torch.Tensor]:
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
+# ================================
+# Define loss function
+# ================================
+
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
@@ -1193,6 +1197,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     )
 
 
+# ================================
+# Define forward step function
+# forward_step(data_iterator, model)
+# ================================
+
+
 def original_forward_step(data_iterator, model: GPTModel):
     """Forward training step.
 
@@ -1252,11 +1262,62 @@ def original_forward_step(data_iterator, model: GPTModel):
 
 def distca_forward_step(data_iterator, model: 'PingPongGPTModel'):
     """Forward training step.
+    Correspond to `MegatronE2eWorker.forward_step()`
 
     Args:
         data_iterator : Input data iterator
         model (PingPongGPTModel): The PingPongGPTModel
+
+    Call stack
+    ==========
+    - PingPongGPTModel.forward(input_ids, *args, **kwargs) 
+        that calls `super().forward(input_ids, *args, **kwargs)`
+    -> megatron.core.models.gpt.gpt_model.GPTModel.forward(input_ids, *args, **kwargs) 
+        note that the GPTModel.forward has a strict signature about what to pass in (see below)
+    -> PingPongTransformerBlockInterface.ping_pong_forward()
+    
+    
+    Signatures
+    ==========
+    ```python
+    > megatron.core.models.gpt.gpt_model.GPTModel
+    GPTModel.forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+    ) -> Tensor:...
+
+
+    > distca.runtime.megatron.ping_pong.transformer_block.PingPongTransformerBlockInterface
+    PingPongTransformerBlockInterface.ping_pong_forward(
+        self,
+        hidden_states: Union[Tensor, WrappedTensor],
+        attention_mask: Optional[Tensor],
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PingPangPackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+    ):
+    ```
     """
+
     args = get_args()
     timers = get_timers()
 
@@ -1279,22 +1340,65 @@ def distca_forward_step(data_iterator, model: 'PingPongGPTModel'):
 
         # batch = __get_batch_original(data_iterator)
         # tokens, labels, loss_mask, attention_mask, position_ids = batch
+        timers('batch-generator').stop()
     
-    # Monitor tokens - log decoded text for debugging
-    # Only log on first pipeline stage and TP rank 0 to avoid duplicate logs
-    # if tokens is not None and mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
-    tokenizer = get_tokenizer()
-    monitor_batch_tokens(
-        tokens, 
-        tokenizer,
-        loss_mask=loss_mask,
-        # attention_mask=attention_mask,
-        position_ids=position_ids,
-        logger=logger,
+        # Monitor tokens - log decoded text for debugging
+        # Only log on first pipeline stage and TP rank 0 to avoid duplicate logs
+        # if tokens is not None and mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+        tokenizer = get_tokenizer()
+        monitor_batch_tokens(
+            tokens, 
+            tokenizer,
+            loss_mask=loss_mask,
+            # attention_mask=attention_mask,
+            position_ids=position_ids,
+            logger=logger,
+        )
+
+
+    # Build the DistCA Specific metadata
+    from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams
+    ping_pong_params = PingPangPackedSeqParams(
+        seq_params = [mb_0_psp, mb_1_psp],
+        mlp_layout_seq_params = [mb_0_mlp_psp, mb_1_mlp_psp],
+        max_seqlen_q = max(mb_0_mlp_psp.max_seqlen_q, mb_1_mlp_psp.max_seqlen_q),
+        max_seqlen_kv = max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
     )
 
-    timers('batch-generator').stop()
 
+    def gptmodel_forward(
+        model, input_ids, attention_mask, position_ids, sequence_parallel, packed_seq_params,
+        labels=None, logits_processor=None, logits_processor_kwargs=None,
+    ):
+        """Migrated from distca.utils.megatron_test_utils. 
+        Entry point to call the model.forward()"""
+        pre_process = unwrap_model(model).pre_process
+        if pre_process:
+            input_ids = input_ids.unsqueeze(0)
+        post_process = unwrap_model(model).post_process
+        output_orig = model(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=None,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+        )
+        if post_process and logits_processor is not None:
+            # FIXME(yonghao): add logits processor logic, if needed
+            pass
+        return output_orig
+
+    
+    # TODO: <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< DistCA patch
+    output_tensor = gptmodel_forward(
+        model, tokens, attention_mask, position_ids, 
+        args.sequence_parallel,
+        ping_pong_params,
+        labels=labels, loss_mask=loss_mask,
+    )
+
+
+    # TODO: ================================
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask,
@@ -1302,6 +1406,7 @@ def distca_forward_step(data_iterator, model: 'PingPongGPTModel'):
         else:
             output_tensor = model(tokens, position_ids, attention_mask,
                                 labels=labels, loss_mask=loss_mask)
+    # TODO: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> megatron original code
 
     return output_tensor, partial(loss_func, loss_mask)
 
@@ -1309,20 +1414,38 @@ process_non_loss_data_func = None
 non_loss_data_func = None
 
 # ================================
-# Start Training
+# Main training function
 # ================================
 
 memory_estimate = log_memory_estimate(args, num_microbatches=num_microbatches, verbose=True, logger=logger)
 logger.info(f"Memory estimate: {memory_estimate}")
 
-iteration, num_floating_point_operations_so_far = train(
+# from megatron.training.training import train as megatron_original_train
+from megatron_alter.training import train as distca_train
+
+"""
+distca_train
+|- train_step(forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config)
+  |- forward_backward_func = get_distca_forward_backward_func()
+  |- forward_backward_func(
+            forward_step_func=forward_step_func, data_iterator=data_iterator, model=model, num_microbatches=get_num_microbatches(), seq_length=args.seq_length, micro_batch_size=args.micro_batch_size, decoder_seq_length=args.decoder_seq_length, forward_only=False)
+"""
+# TODO: This can be stuck in the `config` or `args` variable.
+distca_kwargs = {
+    "with_dummy": True,
+}
+# TODO: Simplify this logic such that we don't have to deal with the giant train function provided by Megatron.
+iteration, num_floating_point_operations_so_far = distca_train(
     # original_forward_step,
-    distca_forward_step,
+    distca_forward_step, 
     model, optimizer, opt_param_scheduler,
     train_data_iterator, valid_data_iterator,
     process_non_loss_data_func, config, checkpointing_context,
-    non_loss_data_func
+    non_loss_data_func,
+    distca_kwargs=distca_kwargs,
 )
+logger.info(f"Iteration {iteration} finished")
+logger.info(f"Number of floating point operations so far: {num_floating_point_operations_so_far} FLOPS")
 
 # ================================
 # Finish Training

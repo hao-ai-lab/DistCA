@@ -1,3 +1,8 @@
+"""
+Modified version of megatron.training.training.py to support DistCA.
+- train(): main training loop
+- train_step(): single training step
+"""
 import dataclasses
 from datetime import datetime
 import functools
@@ -9,10 +14,10 @@ import sys
 from typing import List
 
 import torch.distributed
-from .log_handler import CustomHandler
+from megatron.training.log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
-from .theoretical_memory_usage import report_theoretical_memory
+from megatron.training.theoretical_memory_usage import report_theoretical_memory
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -67,7 +72,7 @@ from megatron.core.parallel_state import (
     get_amax_reduction_group,
     model_parallel_is_initialized,
 )
-from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel import get_forward_backward_func as get_original_forward_backward_func
 from megatron.core.pipeline_parallel.schedules import (
     convert_schedule_table_to_order,
     get_pp_rank_microbatches,
@@ -145,11 +150,17 @@ def get_batch_size() -> int:
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
-          process_non_loss_data_func, config, checkpointing_context, non_loss_data_func):
-    """Training function: run train_step desired number of times, run validation, checkpoint."""
+          process_non_loss_data_func, config, checkpointing_context, non_loss_data_func,
+          distca_kwargs: dict = None,
+          ):
+    """Training function: run train_step desired number of times, run validation, checkpoint.
+    
+    Find `train_step()`.
+    """
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
+    distca_kwargs = distca_kwargs or {}
 
     if args.run_workload_inspector_server:
         try:
@@ -354,7 +365,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config)
+                       config,
+                       distca_kwargs=distca_kwargs,
+                       )
         print_rank_0(f"<< Training Step End")
         ft_integration.on_training_step_end()
         if should_checkpoint:
@@ -520,11 +533,33 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     return iteration, num_floating_point_operations_so_far
 
 
+
+def get_distca_forward_backward_func(distca_kwargs=None):
+    """Adapt from megatron.core.pipeline_parallel.schedules.get_forward_backward_func() to support DistCA.
+    This function gets called every training iteration. 
+    """
+    distca_kwargs = distca_kwargs or {}
+    with_dummy = distca_kwargs.get("with_dummy", False)
+    if with_dummy:
+        from distca.runtime.megatron.forward_backward_func import forward_backward_pipelining_without_interleaving
+        func = forward_backward_pipelining_without_interleaving
+        # if "dummy_bwd_func" in distca_kwargs:
+        #     func = partial(func, dummy_bwd_func=distca_kwargs["dummy_bwd_func"])
+        return func
+
+    # Otherwise, get the megatron original forward-backward function
+    from megatron.core.pipeline_parallel import get_forward_backward_func as get_original_forward_backward_func
+    return get_original_forward_backward_func()
+
+
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config):
+               model, optimizer, opt_param_scheduler, config,
+               distca_kwargs: dict = None,
+               ):
     """Single training step."""
     args = get_args()
     timers = get_timers()
+    distca_kwargs = distca_kwargs or {}
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
@@ -547,7 +582,11 @@ def train_step(forward_step_func, data_iterator,
         optimizer.zero_grad()
 
         # Forward pass.
-        forward_backward_func = get_forward_backward_func()
+        # TODO: <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< distca patch
+        forward_backward_func = get_distca_forward_backward_func(distca_kwargs=distca_kwargs)
+        # TODO: ================================
+        # forward_backward_func = get_original_forward_backward_func()
+        # TODO: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> megatron original code
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
