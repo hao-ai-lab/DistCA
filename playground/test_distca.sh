@@ -15,7 +15,7 @@
 NNODES=1
 NPROC_PER_NODE=8
 JOBID=1390200
-HEAD_NODE_IP=fs-mbz-gpu-044
+HEAD_NODE_IP=${HEAD_NODE_IP:-"fs-mbz-gpu-044"}
 
 source .env.sh
 

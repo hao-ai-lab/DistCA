@@ -115,48 +115,46 @@ logger.info(f"Rank: {rank}, World Size: {world_size}, Local Rank: {local_rank}")
 # ================================
 with time_it("import megatron.core"):
     import megatron.core
-with time_it("import megatron.core.tensor_parallel"):
     from megatron.core import tensor_parallel
-with time_it("import megatron.core.parallel_state"):
     from megatron.core import parallel_state
     mpu = parallel_state
 
-# Additional Megatron imports (after core is loaded)
-import megatron.core.pipeline_parallel.schedules
-import megatron.core.transformer.transformer_layer
-import megatron.training.training
-from megatron.training.global_vars import get_args, get_wandb_writer
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.yaml_arguments import core_transformer_config_from_yaml
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training.training import (
-    setup_model_and_optimizer,
-    build_train_valid_test_data_iterators,
-    train,
-    get_timers,
-)
-from megatron.core.enums import ModelType
-from megatron.core.models.gpt import GPTModel
-from megatron.training.tokenizer.tokenizer import MegatronTokenizer
-from megatron.core.datasets.utils import Split
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset, GPTDatasetConfig
-from megatron.training import get_tokenizer
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    get_blend_and_blend_per_split,
-)
-from megatron.core.rerun_state_machine import RerunDataIterator, get_rerun_state_machine
-from megatron.core.utils import StragglerDetector
+    # Additional Megatron imports (after core is loaded)
+    import megatron.core.pipeline_parallel.schedules
+    import megatron.core.transformer.transformer_layer
+    import megatron.training.training
+    from megatron.training.global_vars import get_args, get_wandb_writer
+    from megatron.training.arguments import core_transformer_config_from_args
+    from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.num_microbatches_calculator import get_num_microbatches
+    from megatron.training.training import (
+        setup_model_and_optimizer,
+        build_train_valid_test_data_iterators,
+        train,
+        get_timers,
+    )
+    from megatron.core.enums import ModelType
+    from megatron.core.models.gpt import GPTModel
+    from megatron.training.tokenizer.tokenizer import MegatronTokenizer
+    from megatron.core.datasets.utils import Split
+    from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+    from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset, GPTDatasetConfig
+    from megatron.training import get_tokenizer
+    from megatron.training.utils import (
+        get_batch_on_this_cp_rank,
+        get_batch_on_this_tp_rank,
+        get_blend_and_blend_per_split,
+    )
+    from megatron.core.rerun_state_machine import RerunDataIterator, get_rerun_state_machine
+    from megatron.core.utils import StragglerDetector
 
 
 
 # ====================================
 # Initialize Megatron Parallel Groups
 # ====================================
-tp = 8; pp = 1; cp = 1;
+tp = 1; pp = 1; cp = 1;
 
 with time_it("initialize model parallel groups"):
     # tp = min(8, world_size);
@@ -204,24 +202,25 @@ from distca.runtime.megatron.create_group import (
     initialize_attention_server_comm
 )
 
-initialize_attention_server_comm()
-as_group = get_attn_server_group_gloo()
-as_world_size = torch.distributed.get_world_size(group=as_group)
-as_rank = get_attn_server_rank()
-as_src_rank = get_attn_server_group_src_rank()
+with time_it("initialize nvshmem"):
+    initialize_attention_server_comm()
+    as_group = get_attn_server_group_gloo()
+    as_world_size = torch.distributed.get_world_size(group=as_group)
+    as_rank = get_attn_server_rank()
+    as_src_rank = get_attn_server_group_src_rank()
 
-if as_rank == 0:
-    uid = nvshmem_get_unique_id()
-else:
-    uid = nvshmem_alloc_empty_unique_id()
-torch.distributed.broadcast(uid, src=0)
+    if as_rank == 0:
+        uid = nvshmem_get_unique_id()
+    else:
+        uid = nvshmem_alloc_empty_unique_id()
+    torch.distributed.broadcast(uid, src=0)
 
-buffer_size = 1 * 1024 ** 3 # 1 GB
-DispatcherWrapper.init(
-    rank, local_rank, world_size, buffer_size, uid
-)
+    buffer_size = 1 * 1024 ** 3 # 1 GB
+    DispatcherWrapper.init(
+        rank, local_rank, world_size, buffer_size, uid
+    )
 
-logger.info(f"Successfully initialized NVSHMEM comm group")
+    logger.info(f"Successfully initialized NVSHMEM comm group")
 
 # ================================
 # Setup logging directories
@@ -337,7 +336,7 @@ designated_args = [
     "--lr", "1.0e-5",
     # "--train-samples", "100000",
     # "--train-iters", "100000",
-    "--train-iters", "1",
+    "--train-iters", "2",
     "--lr-warmup-init", "1e-5",
     "--lr-decay-iters", "1000000",
     "--lr-decay-style", "constant",
@@ -630,6 +629,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'mega
 
     return model
 
+
+def distca_model_provider(pre_process=True, post_process=True) -> Union['DistCAModel']:
+    pass
+
 with time_it("setup_model_and_optimizer()"):
     model_type = ModelType.encoder_or_decoder
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -637,22 +640,28 @@ with time_it("setup_model_and_optimizer()"):
     )
     logger.info(f"Successfully setup model and optimizer for rank {torch.distributed.get_rank()}")
 
-logger.info('after model, optimizer, and learning rate '
-            'scheduler are built')
+    logger.info('after model, optimizer, and learning rate scheduler are built')
 
-logger.debug(f"Model: {model}")
-logger.debug(f"Optimizer: {optimizer}")
-logger.debug(f"Learning Rate Scheduler: {opt_param_scheduler}")
+    logger.debug(f"Model: {model}")
+    logger.debug(f"Optimizer: {optimizer}")
+    logger.debug(f"Learning Rate Scheduler: {opt_param_scheduler}")
 
 # ================================
 # DataLoader Setup
 # ================================
 
 
-def is_dataset_built_on_rank():
+def __original_is_dataset_built_on_rank():
     return (
         mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
     ) and mpu.get_tensor_model_parallel_rank() == 0
+
+
+def is_dataset_built_on_rank() -> bool:
+    """DistCA: Only build the dataset on Rank 0. 
+    Rank 0 will be the only rank that will build the dataset and plan.
+    """
+    return mpu.get_data_parallel_rank() == 0    
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -682,7 +691,7 @@ def core_gpt_dataset_config_from_args(args):
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def __original_train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build the train test and validation datasets.
 
     Args:
@@ -693,7 +702,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     config = core_gpt_dataset_config_from_args(args)
     logger.info(f"> GPTDatasetConfig: {config}")
 
-    dataset_type = GPTDataset # TODO: Add DistCAMockGPTDataset and stuff
+    dataset_type = GPTDataset # NOTE: Add DistCAMockGPTDataset and stuff
 
     logger.info("> building train, validation, and test datasets for GPT ...")
 
@@ -708,82 +717,218 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     return train_ds, valid_ds, test_ds
 
-train_valid_test_datasets_provider.is_distributed = True
-train_data_iterator, valid_data_iterator, test_data_iterator \
-    = build_train_valid_test_data_iterators(
-        train_valid_test_datasets_provider)
+def train_valid_test_datasets_provider(train_val_test_num_samples):
+    """Build the train test and validation datasets.
+    Only build the dataset on the first rank. 
+    
+    This way, we will only return the dataset on the first rank, 
+    and then build the dataset on the other ranks.
+
+    Args:
+        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+    """
+    args = get_args()
+
+    config = core_gpt_dataset_config_from_args(args)
+    logger.info(f"> GPTDatasetConfig: {config}")
+
+    dataset_type = GPTDataset # NOTE: Add DistCAMockGPTDataset and stuff
+
+    logger.info("> building train, validation, and test datasets for GPT ...")
+
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        dataset_type,
+        train_val_test_num_samples,
+        is_dataset_built_on_rank,
+        config
+    ).build()
+
+    logger.info("> finished creating GPT datasets ...")
+
+    return train_ds, valid_ds, test_ds
+
+
+
+
+def cyclic_iter(iter):
+    while True:
+        for x in iter:
+            yield x
+
+
+with time_it("setup data iterators"):
+
+    old_args_dataloader_type = args.dataloader_type
+    args.dataloader_type = "external"
+    
+    train_valid_test_datasets_provider.is_distributed = True
+
+    # Build loaders.
+    # NOTE: (Hack) This hack will make sure the dataset only builds on Rank 0
+    # such that all of the decisions are made on Rank 0.
+    # This will be useful when we get to `get_batch()` function.
+    # Expected Call stack:
+    # - build_train_valid_test_data_iterators
+    #   |- build_train_valid_test_data_loaders
+    #      |- build_pretraining_data_loader
+    #        (if normal path is chosen, then you will get a torch.utils.data.DataLoader back)
+    #        |- torch.utils.data.DataLoader
+    #           |- MegatronPretrainingSampler (contains in the torch DataLoader)
+    #        (if "external" is specified, then you only get back the GPTDataset dataset object)
+    from megatron.training.training import build_train_valid_test_data_loaders
+    train_dataloader, valid_dataloader, test_dataloader = \
+        build_train_valid_test_data_loaders(
+            train_valid_test_datasets_provider)
+
+    # Build iterators.
+    dl_type = args.dataloader_type
+    assert dl_type in ['single', 'cyclic', 'external'], f"Expected dl_type is one of 'single', 'cyclic', or 'external', but got {dl_type}"
+
+    def _get_iterator(dataloader_type, dataloader, is_train=False):
+        """Return dataset iterator."""
+
+        # Build the MegatronPretrainingSampler and torch dataloader here.
+        if dl_type == 'external':
+            dataset = dataloader
+            assert isinstance(dataset, GPTDataset), f"Expected GPTDataset, but got {type(dataset)}"
+            # Actually build the MegatronPretrainingSampler and torch dataloader here.
+            from megatron.legacy.data.data_samplers import MegatronPretrainingSampler
+            consumed_samples = 0
+            if is_train:
+                consumed_samples = args.consumed_train_samples
+            
+            micro_batch_size = args.micro_batch_size
+            batch_sampler = MegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=micro_batch_size,
+                # data_parallel_rank=mpu.get_data_parallel_rank(),
+                # data_parallel_size=mpu.get_data_parallel_world_size(),
+                data_parallel_rank=0,
+                data_parallel_size=1
+            )
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                persistent_workers=True if args.num_workers > 0 else False,
+            )
+            pass
+    
+        # Return the RerunDataIterator here.
+        if dataloader_type == "single":
+            return RerunDataIterator(iter(dataloader))
+        elif dataloader_type == "cyclic":
+            return RerunDataIterator(iter(cyclic_iter(dataloader)))
+        elif dataloader_type == "external":
+            # External dataloader is passed through. User is expected to define how to iterate.
+            if isinstance(dataloader, list):
+                return [RerunDataIterator(iter(d)) for d in dataloader]
+            else:
+                return RerunDataIterator(iter(dataloader))
+        else:
+            raise RuntimeError("unexpected dataloader type")
+
+    if train_dataloader is not None:
+        train_data_iterator = _get_iterator(dl_type, train_dataloader, is_train=True)
+    else:
+        train_data_iterator = None
+
+    if valid_dataloader is not None:
+        valid_data_iterator = _get_iterator(dl_type, valid_dataloader)
+    else:
+        valid_data_iterator = None
+
+    if test_dataloader is not None:
+        test_data_iterator = _get_iterator(dl_type, test_dataloader)
+    else:
+        test_data_iterator = None
+
+    print(f"train_data_iterator: {train_data_iterator}")
+    print(f"valid_data_iterator: {valid_data_iterator}")
+    print(f"test_data_iterator: {test_data_iterator}")
+
+    # item = next(train_data_iterator)
+    # print(f"item: {item}")
+    args.dataloader_type = old_args_dataloader_type
 
 logger.info('done with setup ...')
+# exit(0)
+
 # ==========================================================
 # Monkey Patch training functions with NVTX markers
 # ==========================================================
-
-# Patch forward_step and backward_step with nvtx markers
-old_forward_step = megatron.core.pipeline_parallel.schedules.forward_step
-old_backward_step = megatron.core.pipeline_parallel.schedules.backward_step
-
-
-def forward_step_with_nvtx(*args, **kwargs):
-    with torch.cuda.nvtx.range("forward_step"):
-        return old_forward_step(*args, **kwargs)
-
-def backward_step_with_nvtx(*args, **kwargs):
-    # with torch.autograd.profiler.emit_nvtx(record_shapes=True):
-    with torch.cuda.nvtx.range("backward_step"):
-        return old_backward_step(*args, **kwargs)
-
-megatron.core.pipeline_parallel.schedules.forward_step = forward_step_with_nvtx
-megatron.core.pipeline_parallel.schedules.backward_step = backward_step_with_nvtx
+def monkey_patch_nvtx_markers():
+    # Patch forward_step and backward_step with nvtx markers
+    old_forward_step = megatron.core.pipeline_parallel.schedules.forward_step
+    old_backward_step = megatron.core.pipeline_parallel.schedules.backward_step
 
 
+    def forward_step_with_nvtx(*args, **kwargs):
+        with torch.cuda.nvtx.range("forward_step"):
+            return old_forward_step(*args, **kwargs)
 
-# Patch the functions in forward_backward_func
-old_forward_backward_pipelining_with_interleaving = megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving
-old_forward_backward_pipelining_without_interleaving = megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving
-old_forward_backward_no_pipelining = megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining
+    def backward_step_with_nvtx(*args, **kwargs):
+        # with torch.autograd.profiler.emit_nvtx(record_shapes=True):
+        with torch.cuda.nvtx.range("backward_step"):
+            return old_backward_step(*args, **kwargs)
 
-def forward_backward_pipelining_with_interleaving_with_nvtx(*args, **kwargs):
-    with torch.cuda.nvtx.range("forward_backward_pipelining_with_interleaving"):
-        return old_forward_backward_pipelining_with_interleaving(*args, **kwargs)
-def forward_backward_pipelining_without_interleaving_with_nvtx(*args, **kwargs):
-    with torch.cuda.nvtx.range("forward_backward_pipelining_without_interleaving"):
-        return old_forward_backward_pipelining_without_interleaving(*args, **kwargs)
-def forward_backward_no_pipelining_with_nvtx(*args, **kwargs):
-    with torch.cuda.nvtx.range("forward_backward_no_pipelining"):
-        return old_forward_backward_no_pipelining(*args, **kwargs)
-megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving = forward_backward_pipelining_with_interleaving_with_nvtx
-megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving = forward_backward_pipelining_without_interleaving_with_nvtx
-megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining = forward_backward_no_pipelining_with_nvtx
+    megatron.core.pipeline_parallel.schedules.forward_step = forward_step_with_nvtx
+    megatron.core.pipeline_parallel.schedules.backward_step = backward_step_with_nvtx
 
 
-# Patch optimizer.step with nvtx markers
-old_optimizer_step = optimizer.step
-def optimizer_step_with_nvtx(*args, **kwargs):
-    with torch.cuda.nvtx.range("optimizer_step"):
-        return old_optimizer_step(*args, **kwargs)
-optimizer.step = optimizer_step_with_nvtx
+
+    # Patch the functions in forward_backward_func
+    old_forward_backward_pipelining_with_interleaving = megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving
+    old_forward_backward_pipelining_without_interleaving = megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving
+    old_forward_backward_no_pipelining = megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining
+
+    def forward_backward_pipelining_with_interleaving_with_nvtx(*args, **kwargs):
+        with torch.cuda.nvtx.range("forward_backward_pipelining_with_interleaving"):
+            return old_forward_backward_pipelining_with_interleaving(*args, **kwargs)
+    def forward_backward_pipelining_without_interleaving_with_nvtx(*args, **kwargs):
+        with torch.cuda.nvtx.range("forward_backward_pipelining_without_interleaving"):
+            return old_forward_backward_pipelining_without_interleaving(*args, **kwargs)
+    def forward_backward_no_pipelining_with_nvtx(*args, **kwargs):
+        with torch.cuda.nvtx.range("forward_backward_no_pipelining"):
+            return old_forward_backward_no_pipelining(*args, **kwargs)
+    megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving = forward_backward_pipelining_with_interleaving_with_nvtx
+    megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving = forward_backward_pipelining_without_interleaving_with_nvtx
+    megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining = forward_backward_no_pipelining_with_nvtx
 
 
-# Patch a train_step
-old_train_step = megatron.training.training.train_step
-def train_step_with_nvtx(*args, **kwargs):
-    logger.debug(f"Start train_step")
-    with torch.cuda.nvtx.range("train_step"):
-        return old_train_step(*args, **kwargs)
-megatron.training.training.train_step = train_step_with_nvtx
+    # Patch optimizer.step with nvtx markers
+    old_optimizer_step = optimizer.step
+    def optimizer_step_with_nvtx(*args, **kwargs):
+        with torch.cuda.nvtx.range("optimizer_step"):
+            return old_optimizer_step(*args, **kwargs)
+    optimizer.step = optimizer_step_with_nvtx
 
 
-# Patch each layer such that I will know when the forward function gets called
-old_transformer_layer_forward = megatron.core.transformer.transformer_layer.TransformerLayer.forward
-def transformer_layer_forward_with_nvtx(self, *args, **kwargs):
-    # logger.debug(f"Start transformer_layer_forward[{self.layer_number}]")
-    with torch.cuda.nvtx.range(f"transformer_layer_forward[{self.layer_number}]"):
-        r = old_transformer_layer_forward(self, *args, **kwargs)
-    # logger.debug(f"End transformer_layer_forward[{self.layer_number}]")
-    return r
-megatron.core.transformer.transformer_layer.TransformerLayer.forward = transformer_layer_forward_with_nvtx
+    # Patch a train_step
+    old_train_step = megatron.training.training.train_step
+    def train_step_with_nvtx(*args, **kwargs):
+        logger.debug(f"Start train_step")
+        with torch.cuda.nvtx.range("train_step"):
+            return old_train_step(*args, **kwargs)
+    megatron.training.training.train_step = train_step_with_nvtx
 
-logger.info(f"model: {model}")
+
+    # Patch each layer such that I will know when the forward function gets called
+    old_transformer_layer_forward = megatron.core.transformer.transformer_layer.TransformerLayer.forward
+    def transformer_layer_forward_with_nvtx(self, *args, **kwargs):
+        # logger.debug(f"Start transformer_layer_forward[{self.layer_number}]")
+        with torch.cuda.nvtx.range(f"transformer_layer_forward[{self.layer_number}]"):
+            r = old_transformer_layer_forward(self, *args, **kwargs)
+        # logger.debug(f"End transformer_layer_forward[{self.layer_number}]")
+        return r
+    megatron.core.transformer.transformer_layer.TransformerLayer.forward = transformer_layer_forward_with_nvtx
+
+    logger.info(f"model: {model}")
+    return
+
+monkey_patch_nvtx_markers()
 
 
 # ================================
@@ -794,8 +939,7 @@ stimer = StragglerDetector()
 # Configure token monitoring (optional - defaults are sensible)
 set_token_monitor_config(enabled=True, max_tokens_to_decode=200, max_samples_to_log=2)
 
-
-def get_batch(data_iterator):
+def __get_batch_original(data_iterator):
     """Generate a batch."""
     # TODO: this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
@@ -807,6 +951,20 @@ def get_batch(data_iterator):
     return batch.values()
 
 
+def distca_get_batch(data_iterator):
+    # TODO: Make the data loader actually good.
+    # TODO: this is pretty hacky, find a better way
+    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
+        return None, None, None, None, None
+
+    # get batches based on the TP rank you are on
+    batch = get_batch_on_this_tp_rank(data_iterator)
+    # batch = get_batch_on_this_cp_rank(batch)
+
+    # Gather each batch from all ranks and check the consistency
+    return batch
+
+    
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
@@ -893,8 +1051,21 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
+        batch = distca_get_batch(data_iterator)
+        tokens = batch['tokens']
+        labels = batch['labels']
+        loss_mask = batch['loss_mask']
+        attention_mask = batch['attention_mask']
+        position_ids = batch['position_ids']
+
+        logger.debug(f"tokens: {tokens.shape}")
+        logger.debug(f"labels: {labels.shape}")
+        logger.debug(f"loss_mask: {loss_mask.shape}")
+        logger.debug(f"attention_mask: {attention_mask.shape}")
+        logger.debug(f"position_ids: {position_ids.shape}")
+
+        # batch = __get_batch_original(data_iterator)
+        # tokens, labels, loss_mask, attention_mask, position_ids = batch
     
     # Monitor tokens - log decoded text for debugging
     # Only log on first pipeline stage and TP rank 0 to avoid duplicate logs
@@ -921,12 +1092,8 @@ def forward_step(data_iterator, model: GPTModel):
 
     return output_tensor, partial(loss_func, loss_mask)
 
-
-
-
 process_non_loss_data_func = None
 non_loss_data_func = None
-
 
 # ================================
 # Start Training
