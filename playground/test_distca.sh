@@ -3,9 +3,9 @@
 #SBATCH --job-name=distca-debug
 #SBATCH --output=logs/slurm/stdout.%j.log
 #SBATCH --error=logs/slurm/stderr.%j.log
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=128
 #SBATCH --time=01:00:00
 
@@ -23,7 +23,11 @@ echo TP=$TP, PP=$PP, CP=$CP, DP=$DP, NUM_GPUS=$NUM_GPUS, NPROC_PER_NODE=$NPROC_P
 
 source .env.sh
 
-# Detect if we are in a SLURM environment using a variety of SLURM variables
+# ================================
+# Setup SLURM environment variables
+# - JOBID: SLURM job ID
+# - HEAD_NODE_IP: IP of head node
+# ================================
 if [ -n "$SLURM_JOB_ID" ] || [ -n "$SLURM_NODELIST" ] || [ -n "$SLURM_NNODES" ]; then
     is_in_slurm_env=1
 else
@@ -67,7 +71,9 @@ fi
 echo JOBID=$JOBID
 echo HEAD_NODE_IP=$HEAD_NODE_IP
 
+# =====================================
 # NCCL debug flags for troubleshooting
+# =====================================
 # export NCCL_DEBUG=INFO
 unset NCCL_DEBUG
 # export NCCL_DEBUG_SUBSYS=ALL
@@ -90,10 +96,13 @@ mkdir -p "$TORCH_EXTENSIONS_DIR" "$TRITON_CACHE_DIR"
 export PYTHONPYCACHEPREFIX=/tmp/$USER/pycache
 mkdir -p "$PYTHONPYCACHEPREFIX"
 
-# --------------------------------
+# ==============================================================
 # Logging directory setup
-# Generate timestamp once and share between nsys and Python
-# --------------------------------
+# - DISTCA_LOG_TIMESTAMP: Timestamp of the log
+# - DISTCA_LOG_BASE_DIR: Base directory of the logs
+# - DISTCA_LOG_ROOT_DIR: Root directory of the logs
+# - DISTCA_LOG_LATEST_LINK: Link to the latest log directory
+# ==============================================================
 CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export DISTCA_LOG_TIMESTAMP=$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)
 export DISTCA_LOG_BASE_DIR="${CURDIR}/logs"
@@ -111,10 +120,31 @@ mkdir -p "${DISTCA_LOG_ROOT_DIR}/data_cache"
 ln -sfn "${DISTCA_LOG_ROOT_DIR}" "${DISTCA_LOG_LATEST_LINK}"
 
 set -x
-# nsys profile --trace=cuda,nvtx --force-overwrite=true -o "${DISTCA_LOG_ROOT_DIR}/nsys/nsys-rep.%h.nsys-rep" --sample=none --capture-range=cudaProfilerApi --capture-range-end=stop \
 
-srun -w ${HEAD_NODE_IP} -N ${NNODES} --gres=gpu:${NPROC_PER_NODE} --jobid=${JOBID} \
-torchrun --nnodes=${NNODES} --nproc_per_node=${NPROC_PER_NODE} --rdzv_backend=c10d --rdzv_endpoint=${HEAD_NODE_IP}:29800 --rdzv_id=0000 --max_restarts=0 \
-    test_distca.py 
+# ==============================================================
+# Run the test using SLURM
+# ==============================================================
+
+# TORCHRUN_DISTARGS=(
+#     --nnodes=${NNODES}
+#     --nproc_per_node=${NPROC_PER_NODE}
+#     --rdzv_backend=c10d
+#     --rdzv_endpoint=${HEAD_NODE_IP}:29800
+#     --rdzv_id=0000
+#     --max_restarts=0
+# )
+
+if [ -n "$ENABLE_NSYS" ]; then
+    # Run with nsys profiling
+    srun -w ${HEAD_NODE_IP} -N ${NNODES} --gres=gpu:${NPROC_PER_NODE} --jobid=${JOBID} \
+    nsys profile --trace=cuda,nvtx --force-overwrite=true -o "${DISTCA_LOG_ROOT_DIR}/nsys/nsys-rep.%h.nsys-rep" --sample=none --capture-range=cudaProfilerApi --capture-range-end=stop \
+    torchrun --nnodes=${NNODES} --nproc_per_node=${NPROC_PER_NODE} --rdzv_backend=c10d --rdzv_endpoint=${HEAD_NODE_IP}:29800 --rdzv_id=0000 --max_restarts=0 \
+        test_distca.py
+else
+    # Run without nsys profiling
+    srun -w ${HEAD_NODE_IP} -N ${NNODES} --gres=gpu:${NPROC_PER_NODE} --jobid=${JOBID} \
+    torchrun --nnodes=${NNODES} --nproc_per_node=${NPROC_PER_NODE} --rdzv_backend=c10d --rdzv_endpoint=${HEAD_NODE_IP}:29800 --rdzv_id=0000 --max_restarts=0 \
+        test_distca.py
+fi
 
 set +x
