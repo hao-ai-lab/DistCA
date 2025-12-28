@@ -56,6 +56,50 @@ logger = setup_logging(
     # console_ranks=list(range(0, world_size, 8)),  # Only rank 0 logs to console
 )
 
+# Create a dedicated logger for batch_to_items_with_dummy
+# This allows independent control via standard logging configuration:
+#   logging.getLogger(__name__ + ".batch_to_items_with_dummy").setLevel(logging.DEBUG)
+# The logger name forms a hierarchy: __main__ -> __main__.batch_to_items_with_dummy
+logger_batch_to_items = logging.getLogger(__name__ + ".batch_to_items_with_dummy")
+# By default, inherit level from parent (logger), but can be overridden
+# The level will be set later based on args.distca_debug_batch_to_items if needed
+
+# Update logger formatters to include function:lineno
+# This adds funcName:lineno to all log messages for better debugging
+# Also add a filter to optionally filter by category (e.g., 'batch_to_items')
+class CategoryFilter(logging.Filter):
+    """Filter logs by category if specified in extra dict."""
+    def __init__(self, allowed_categories=None):
+        super().__init__()
+        self.allowed_categories = allowed_categories or set()
+    
+    def filter(self, record):
+        # If no category filtering is set, allow all
+        if not self.allowed_categories:
+            return True
+        # Check if record has a category in extra
+        category = getattr(record, 'category', None)
+        return category in self.allowed_categories if category else True
+
+# Update all handlers to include funcName:lineno in format
+for handler in logger.handlers:
+    formatter = handler.formatter
+    if formatter:
+        # Check if it's a RankFormatter (has rank attribute) or standard Formatter
+        if hasattr(formatter, 'fmt') or hasattr(formatter, '_fmt'):
+            # Get the current format string
+            current_fmt = getattr(formatter, 'fmt', None) or getattr(formatter, '_fmt', None)
+            if current_fmt and '%(funcName)s' not in current_fmt:
+                # Insert funcName:lineno before the message
+                new_fmt = current_fmt.replace('%(message)s', '%(funcName)s:%(lineno)d %(message)s')
+                # Preserve rank formatting if it's a RankFormatter
+                if hasattr(formatter, 'rank'):
+                    from utils.logging import RankFormatter
+                    handler.setFormatter(RankFormatter(fmt=new_fmt, datefmt=formatter.datefmt, 
+                                                       rank=formatter.rank, use_color=getattr(formatter, 'use_color', True)))
+                else:
+                    handler.setFormatter(logging.Formatter(new_fmt, formatter.datefmt))
+
 with time_it("import torch"):
     import torch
     import torch.cuda.nvtx
@@ -320,7 +364,7 @@ designated_args = [
     "--lr", "1.0e-5",
     # "--train-samples", "100000",
     # "--train-iters", "100000",
-    "--train-iters", "2",
+    "--train-iters", "10",
     "--lr-warmup-init", "1e-5",
     "--lr-decay-iters", "1000000",
     "--lr-decay-style", "constant",
@@ -438,7 +482,13 @@ designated_args = [
     # "--overlap-param-gather",
     # "--overlap-param-gather-with-optimizer-step",
     # "--tp-comm-overlap",
+    
+    
+    
+    # DistCA arguments
     "--distca-quit-if-maybe-oom",
+    # "--distca-debug-nan-detector",
+    # "--distca-debug-batch-to-items",
 ]
 
 # Filter out None values (from conditional args like --swiglu)
@@ -462,6 +512,17 @@ with time_it("initialize megatron"):
         distca_quit_if_maybe_oom: bool = False
         """If True, the program will quit if the estimated memory can probably exceeds the GPU max memory."""
 
+
+        distca_debug_nan_detector: bool = False
+        """If True, the program will debug the nan detector."""
+
+        distca_debug_batch_to_items: bool = False
+        """If True, enable detailed debug logging in batch_to_items_with_dummy function.
+        This sets the logger level for __main__.batch_to_items_with_dummy to DEBUG.
+        Alternatively, use standard logging configuration:
+        logging.getLogger('__main__.batch_to_items_with_dummy').setLevel(logging.DEBUG)
+        """
+
         pass
 
     def replace_parser_and_parse_args(parser: argparse.ArgumentParser):    
@@ -475,6 +536,9 @@ with time_it("initialize megatron"):
 
         group.add_argument("--distca-quit-if-maybe-oom", action="store_true", default=False, 
         help="If True, the program will quit if the estimated memory can probably exceeds the GPU max memory.")
+
+        group.add_argument("--distca-debug-batch-to-items", action="store_true", default=False,
+        help="If True, enable detailed debug logging in batch_to_items_with_dummy function.")
 
         old_parser_parse_args = parser.parse_args
         old_parser_parse_known_args = parser.parse_known_args
@@ -502,6 +566,16 @@ with time_it("initialize megatron"):
     else:
         config = core_transformer_config_from_args(args, config_class=DistCAConfig)
     assert isinstance(config, TransformerConfig)
+    
+    # Configure logger for batch_to_items_with_dummy based on flag
+    # This provides backward compatibility with --distca-debug-batch-to-items
+    # Standard way: logging.getLogger(__name__ + ".batch_to_items_with_dummy").setLevel(logging.DEBUG)
+    if hasattr(args, 'distca_debug_batch_to_items') and args.distca_debug_batch_to_items:
+        logger_batch_to_items.setLevel(logging.DEBUG)
+        logger.info(f"Enabled debug logging for batch_to_items_with_dummy (logger: {logger_batch_to_items.name})")
+    else:
+        # Inherit from parent logger (default behavior)
+        logger_batch_to_items.setLevel(logging.NOTSET)  # NOTSET means inherit from parent
 
 
 # ================================
@@ -1494,6 +1568,7 @@ def create_pipeline_doclens(
 # from distca.planner.planner import (
 #     batch_to_items_with_dummy,
 # )
+
 def batch_to_items_with_dummy(
     batches: List[List[int]], 
     num_tokens_per_rank: int, 
@@ -1510,27 +1585,27 @@ def batch_to_items_with_dummy(
     assert len(batches) == len(dummy_mask), \
         f"Length mismatch: batches={len(batches)}, dummy_mask={len(dummy_mask)}"
     
-    logger.debug(f"[batch_to_items_with_dummy] START: batches={batches}, num_tokens_per_rank={num_tokens_per_rank}, as_world_size={as_world_size}")
-    logger.debug(f"[batch_to_items_with_dummy] dummy_mask={dummy_mask}")
-    logger.debug(f"[batch_to_items_with_dummy] INITIAL STATE: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
+    logger_batch_to_items.debug(f"START: batches={batches}, num_tokens_per_rank={num_tokens_per_rank}, as_world_size={as_world_size}")
+    logger_batch_to_items.debug(f"dummy_mask={dummy_mask}")
+    logger_batch_to_items.debug(f"INITIAL STATE: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
 
     for batch_idx, batch in enumerate(batches):
-        logger.debug(f"\n[batch_to_items_with_dummy] Processing batch[{batch_idx}]={batch}")
-        logger.debug(f"[batch_to_items_with_dummy] BEFORE batch: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
+        logger_batch_to_items.debug(f"\nProcessing batch[{batch_idx}]={batch}")
+        logger_batch_to_items.debug(f"BEFORE batch: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
         
         # Use explicit dummy_mask instead of inference
         is_dummy = dummy_mask[batch_idx]
         
         if is_dummy:
-            logger.debug(f"[batch_to_items_with_dummy] DUMMY BATCH detected: len={len(batch)}, doc_len={batch[0]}")
-            logger.debug(f"[batch_to_items_with_dummy] BEFORE finding rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
+            logger_batch_to_items.debug(f"DUMMY BATCH detected: len={len(batch)}, doc_len={batch[0]}")
+            logger_batch_to_items.debug(f"BEFORE finding rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
             
             while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
                 old_idx = current_rank_idx
                 current_rank_idx += 1
-                logger.debug(f"[batch_to_items_with_dummy] Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}")
+                logger_batch_to_items.debug(f"Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}")
             
-            logger.debug(f"[batch_to_items_with_dummy] Selected rank_idx={current_rank_idx} for dummy doc, rank_budget={rank_budgets[current_rank_idx]}")
+            logger_batch_to_items.debug(f"Selected rank_idx={current_rank_idx} for dummy doc, rank_budget={rank_budgets[current_rank_idx]}")
             assert rank_budgets[current_rank_idx] == num_tokens_per_rank, "dummy doc should put on a empty rank"
             # dummy doc, this rank only put this dummy item.
             doc_len = batch[0]
@@ -1538,13 +1613,13 @@ def batch_to_items_with_dummy(
             new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
                             item_dict, is_original=True)
             items.append(new_item)
-            logger.debug(f"[batch_to_items_with_dummy] Created dummy item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}")
-            logger.debug(f"[batch_to_items_with_dummy] BEFORE increment: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
+            logger_batch_to_items.debug(f"Created dummy item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}")
+            logger_batch_to_items.debug(f"BEFORE increment: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
             current_rank_idx += 1
             seqid += 1
-            logger.debug(f"[batch_to_items_with_dummy] AFTER dummy processing: current_rank_idx={current_rank_idx}, seqid={seqid}, rank_budgets={rank_budgets} (NOTE: budget NOT decremented!)")
+            logger_batch_to_items.debug(f"AFTER dummy processing: current_rank_idx={current_rank_idx}, seqid={seqid}, rank_budgets={rank_budgets} (NOTE: budget NOT decremented!)")
         else:
-            logger.debug(f"[batch_to_items_with_dummy] REGULAR BATCH: len={len(batch)}, docs={batch}")
+            logger_batch_to_items.debug(f"REGULAR BATCH: len={len(batch)}, docs={batch}")
             for doc_idx, doc_length in enumerate(batch):
                 doc_len = doc_length
                 remaining_len = doc_len
@@ -1552,26 +1627,26 @@ def batch_to_items_with_dummy(
                 tail_suffix_start_pos = doc_len
                 is_original_flag = True
 
-                logger.debug(f"[batch_to_items_with_dummy] Processing doc[{doc_idx}]: doc_len={doc_len}, remaining_len={remaining_len}")
-                logger.debug(f"[batch_to_items_with_dummy] BEFORE doc loop: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}, seqid={seqid}")
+                logger_batch_to_items.debug(f"Processing doc[{doc_idx}]: doc_len={doc_len}, remaining_len={remaining_len}")
+                logger_batch_to_items.debug(f"BEFORE doc loop: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}, seqid={seqid}")
 
                 while remaining_len > 0:
-                    logger.debug(f"[batch_to_items_with_dummy] WHILE remaining_len={remaining_len} > 0")
-                    logger.debug(f"[batch_to_items_with_dummy] BEFORE finding available rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
+                    logger_batch_to_items.debug(f"WHILE remaining_len={remaining_len} > 0")
+                    logger_batch_to_items.debug(f"BEFORE finding available rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
                     
                     while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
                         old_idx = current_rank_idx
                         current_rank_idx += 1
-                        logger.debug(f"[batch_to_items_with_dummy] Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}")
+                        logger_batch_to_items.debug(f"Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}")
                     
-                    logger.debug(f"[batch_to_items_with_dummy] AFTER finding rank: current_rank_idx={current_rank_idx}, as_world_size={as_world_size}")
+                    logger_batch_to_items.debug(f"AFTER finding rank: current_rank_idx={current_rank_idx}, as_world_size={as_world_size}")
                     
                     if current_rank_idx >= as_world_size:
                         total_capacity = as_world_size * num_tokens_per_rank
                         total_allocated = total_capacity - sum(rank_budgets)
                         total_remaining = sum(rank_budgets)
-                        logger.debug(f"[batch_to_items_with_dummy] ERROR: current_rank_idx={current_rank_idx} >= as_world_size={as_world_size}")
-                        logger.debug(f"[batch_to_items_with_dummy] ERROR: total_remaining={total_remaining}, rank_budgets={rank_budgets}")
+                        logger_batch_to_items.debug(f"ERROR: current_rank_idx={current_rank_idx} >= as_world_size={as_world_size}")
+                        logger_batch_to_items.debug(f"ERROR: total_remaining={total_remaining}, rank_budgets={rank_budgets}")
                         raise ValueError(
                             f"Not enough space to allocate document. \n"
                             f"seqid={seqid}, original_doc_len={doc_len}, remaining_len={remaining_len}. \n"
@@ -1583,14 +1658,14 @@ def batch_to_items_with_dummy(
                         )
                     
                     chunk_size = min(remaining_len, rank_budgets[current_rank_idx])
-                    logger.debug(f"[batch_to_items_with_dummy] Allocating chunk: chunk_size={chunk_size} (min of remaining_len={remaining_len}, rank_budget={rank_budgets[current_rank_idx]})")
+                    logger_batch_to_items.debug(f"Allocating chunk: chunk_size={chunk_size} (min of remaining_len={remaining_len}, rank_budget={rank_budgets[current_rank_idx]})")
                     
                     if remaining_len == doc_len and chunk_size == doc_len:
                         item_dict = {'q': doc_len, 'kv': doc_len}
                         new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
                                         item_dict, is_original=True)
                         items.append(new_item)
-                        logger.debug(f"[batch_to_items_with_dummy] Created single-chunk item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}")
+                        logger_batch_to_items.debug(f"Created single-chunk item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}")
                     else:
                         q_len_head = chunk_size // 2
                         q_len_tail = chunk_size - q_len_head
@@ -1602,24 +1677,24 @@ def batch_to_items_with_dummy(
                         new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
                                         head_item, tail_item, is_original=is_original_flag)
                         items.append(new_item)
-                        logger.debug(f"[batch_to_items_with_dummy] Created split-chunk item: seqid={seqid}, rank={current_rank_idx}, chunk_size={chunk_size}, head={head_item}, tail={tail_item}, items_count={len(items)}")
+                        logger_batch_to_items.debug(f"Created split-chunk item: seqid={seqid}, rank={current_rank_idx}, chunk_size={chunk_size}, head={head_item}, tail={tail_item}, items_count={len(items)}")
 
                         head_prefix_len = new_head_kv
                         tail_suffix_start_pos -= q_len_tail
                         is_original_flag = False
-                        logger.debug(f"[batch_to_items_with_dummy] Updated split state: head_prefix_len={head_prefix_len}, tail_suffix_start_pos={tail_suffix_start_pos}")
+                        logger_batch_to_items.debug(f"Updated split state: head_prefix_len={head_prefix_len}, tail_suffix_start_pos={tail_suffix_start_pos}")
 
                     old_budget = rank_budgets[current_rank_idx]
                     rank_budgets[current_rank_idx] -= chunk_size
                     remaining_len -= chunk_size
-                    logger.debug(f"[batch_to_items_with_dummy] Updated budgets: rank[{current_rank_idx}] {old_budget} -> {rank_budgets[current_rank_idx]}, remaining_len: {remaining_len + chunk_size} -> {remaining_len}")
+                    logger_batch_to_items.debug(f"Updated budgets: rank[{current_rank_idx}] {old_budget} -> {rank_budgets[current_rank_idx]}, remaining_len: {remaining_len + chunk_size} -> {remaining_len}")
 
                 seqid += 1
-                logger.debug(f"[batch_to_items_with_dummy] Finished doc[{doc_idx}]: seqid incremented to {seqid}")
+                logger_batch_to_items.debug(f"Finished doc[{doc_idx}]: seqid incremented to {seqid}")
         
-        logger.debug(f"[batch_to_items_with_dummy] AFTER batch[{batch_idx}]: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}, items_count={len(items)}")
+        logger_batch_to_items.debug(f"AFTER batch[{batch_idx}]: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}, items_count={len(items)}")
     
-    logger.debug(f"\n[batch_to_items_with_dummy] FINAL: items_count={len(items)}, rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
+    logger_batch_to_items.debug(f"\nFINAL: items_count={len(items)}, rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
     return items
 
 
@@ -1959,15 +2034,16 @@ iteration = 0
 max_iterations = args.train_iters if hasattr(args, 'train_iters') else 1
 
 # Register NaN detection hooks (uncomment to enable)
-nan_hooks, nan_detected = register_nan_detection_hooks(
-    model, 
-    logger=logger, 
-    raise_on_nan=True,  # Set to True to stop on first NaN
-    check_inputs=True,    # Set to True to also check inputs
-    log_all_modules=True,
-    log_tensor_stats=True,
-    tensor_stats_elements=10,
-)
+if args.distca_debug_nan_detector:
+    nan_hooks, nan_detected = register_nan_detection_hooks(
+        model, 
+        logger=logger, 
+        raise_on_nan=True,  # Set to True to stop on first NaN
+        check_inputs=True,    # Set to True to also check inputs
+        log_all_modules=True,
+        log_tensor_stats=True,
+        tensor_stats_elements=10,
+    )
 
 for iteration in range(max_iterations):
     logger.info(f"Starting iteration {iteration}")
