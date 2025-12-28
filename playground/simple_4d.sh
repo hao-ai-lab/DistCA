@@ -5,7 +5,7 @@
 #SBATCH --error=logs/slurm/stderr.%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=128
 #SBATCH --time=01:00:00
 
@@ -16,6 +16,7 @@ export PP=1
 export CP=1
 export DP=1
 export MICRO_BATCH_SIZE=4
+export GLOBAL_BATCH_SIZE=8
 export SEQ_LENGTH=4096
 export NUM_GPUS=$((TP * PP * CP * DP))
 NPROC_PER_NODE=$((NUM_GPUS < 8 ? NUM_GPUS : 8))

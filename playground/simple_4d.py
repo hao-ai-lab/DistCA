@@ -42,6 +42,7 @@ rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 local_rank = int(os.environ["LOCAL_RANK"])
 micro_batch_size = int(os.environ["MICRO_BATCH_SIZE"])
+global_batch_size = int(os.environ["GLOBAL_BATCH_SIZE"])
 seq_length = int(os.environ["SEQ_LENGTH"])
 
 logger = setup_logging(
@@ -311,6 +312,7 @@ designated_args = [
     # 2. Training Hyperparameters
     ####################
     "--micro-batch-size", str(micro_batch_size),
+    "--global-batch-size", str(global_batch_size),
     "--lr", "1.0e-5",
     # "--train-samples", "100000",
     # "--train-iters", "100000",
@@ -503,6 +505,8 @@ with time_it("initialize megatron"):
 # ================================
 with time_it("report theoretical memory and FLOPS estimates"):
     num_microbatches = get_num_microbatches()
+    logger.info(f"Num microbatches: {num_microbatches}")
+    logger.info(f"micro batch size: {args.micro_batch_size}")
 
     # Log memory estimates
     memory_estimate = log_memory_estimate(
@@ -794,7 +798,8 @@ with time_it("setup data iterators"):
             batch_sampler = MegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
-                micro_batch_size=micro_batch_size,
+                # micro_batch_size=micro_batch_size,
+                micro_batch_size=1,
                 # data_parallel_rank=mpu.get_data_parallel_rank(),
                 # data_parallel_size=mpu.get_data_parallel_world_size(),
                 data_parallel_rank=0,
@@ -1034,6 +1039,39 @@ logger.info(f"Memory estimate: {memory_estimate}")
 # This replaces the distca_train call with a simpler approach similar to
 # test_megatron_e2e_pipeline_with_cp.py
 
+# Define forward_step function
+args = get_args()
+sequence_parallel = args.sequence_parallel
+
+def forward_step(batch_iter, model):
+    batch = next(batch_iter)
+
+    input_ids = batch['input_ids']
+    position_ids = batch['position_ids']
+    loss_mask = batch['loss_mask']
+    labels = batch['labels']
+    attention_mask = None
+    packed_seq_params = batch['packed_seq_params']
+    
+    # Use gptmodel_forward utility function
+    with torch.cuda.nvtx.range("forward_step"):
+        output = gptmodel_forward(
+            model, input_ids, attention_mask, position_ids, sequence_parallel,
+            packed_seq_params, labels=labels,
+        )
+    return output, partial(loss_func, loss_mask)
+
+# Define dummy backward step function
+def dummy_backward_step(model, dummy_bwd_iter, skip: bool):
+    try:
+        next_iter_args = next(dummy_bwd_iter)
+        if skip:
+            return
+        unwrap_model(model).dummy_backward(next_iter_args)
+    except StopIteration:
+        # No more dummy backward batches
+        pass
+
 def forward_backward_batch(
     microbatches: list[dict],
     model,
@@ -1050,13 +1088,14 @@ def forward_backward_batch(
     
     This is a simplified version of the pattern from test_megatron_e2e_pipeline_with_cp.py
     """
-    args = get_args()
-    sequence_parallel = args.sequence_parallel
+    
+    
     # Move microbatches to CUDA
     microbatches = [{
         k: arg_to_cuda(v) 
         for k, v in microbatch.items()
     } for microbatch in microbatches]
+    # logger.debug(f"forward_backward_batch: {microbatches = }")
     
     # Get pipeline parallel info
     pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -1068,42 +1107,9 @@ def forward_backward_batch(
         else None
     )
     
-    # Define forward_step function
-    def forward_step(batch_iter, model):
-        batch = next(batch_iter)
-        
-        input_ids = batch['input_ids']
-        position_ids = batch['position_ids']
-        loss_mask = batch['loss_mask']
-        labels = batch['labels']
-        attention_mask = None
-        packed_seq_params = batch['packed_seq_params']
-        
-        # Use gptmodel_forward utility function
-        with torch.cuda.nvtx.range("forward_step"):
-            output = gptmodel_forward(
-                model, input_ids, attention_mask, position_ids, sequence_parallel,
-                packed_seq_params, labels=labels,
-            )
-        return output, partial(loss_func, loss_mask)
-    
-    # Define dummy backward step function
-    def dummy_backward_step(model, dummy_bwd_iter, skip: bool):
-        try:
-            next_iter_args = next(dummy_bwd_iter)
-            if skip:
-                return
-            unwrap_model(model).dummy_backward(next_iter_args)
-        except StopIteration:
-            # No more dummy backward batches
-            pass
-    
     # Prepare model for training
     # Note: model might be a list in case of virtual pipeline parallelism
-    if isinstance(model, list):
-        train_module = model
-    else:
-        train_module = [model]
+    train_module = model if isinstance(model, list) else [model]
     assert len(train_module) == 1, "only support one module"
     
     # Prepare dummy backward metadata
@@ -1155,7 +1161,14 @@ def forward_backward_batch(
             skip="orig" in mode,
         )
         losses_reduced = forward_backward_pipelining_without_interleaving(
-            **kwargs, dummy_bwd_func=dummy_bwd_func,
+            forward_step_func=forward_step,
+            data_iterator=batch_generator,
+            model=train_module,
+            num_microbatches=n_micro_batch,
+            seq_length=total_seqlen,  # no use, since variable_seq_lengths=True
+            micro_batch_size=1,  # no use when input_shapes was set
+            forward_only=forward_only,
+            dummy_bwd_func=dummy_bwd_func,
         )
     else:
         from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
@@ -1183,21 +1196,30 @@ from types import SimpleNamespace
 
 @dataclass
 class MicrobatchCreateConfig:
-    num_microbatch: int
     pp_size: int
     tp_size: int    
     dp_size: int
     as_rank: int
     as_world_size: int
-    total_seq_len: int
-    num_seqs: int
+
     hidden_size_q_tp: int
     hidden_size_k_tp: int
     element_size: int
     num_head_in_dtype: int
+    
+    # num_token_per_rank = num_tokens * num_batches // dpcp_size
+    # represent the the number of batch per tick we need to get.
     num_token_per_rank: int
+    # context length after document packing of one batch
+    total_seq_len: int
+    num_seqs: int # deprecate
+
+    # num_microbatch = pp micro batches
+    num_microbatch: int
+    # num_batches = dp micro batch number
     num_batches: int
     softmax_lse_size: float
+    # softmax_lse_size = num_heads_local * fp32.itemsize // element_size
 
 with time_it("create_pp_microbatches"):
     from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams
@@ -1225,7 +1247,6 @@ with time_it("create_pp_microbatches"):
     softmax_lse_size = (hf_config.num_attention_heads // tp_size) * torch.float32.itemsize // element_size
 
     mbc_config = MicrobatchCreateConfig(
-        num_microbatch=num_microbatch,
         pp_size=pp_size,
         tp_size=tp_size,
         dp_size=dp_size,
@@ -1238,17 +1259,142 @@ with time_it("create_pp_microbatches"):
         element_size=element_size,
         num_head_in_dtype=num_head_in_dtype,
         num_token_per_rank=num_token_per_rank,
+        num_microbatch=num_microbatch,
         num_batches=num_batches,
         softmax_lse_size=softmax_lse_size,
     )
 
 
 # TODO: Need to implement this function to fetch the data iterator.
+# Temporary storage for the batches.
+batch_registry = []
+doclength_registry = []
+tokenizer = get_tokenizer()
+
+def clear_registry():
+    batch_registry.clear()
+    doclength_registry.clear()
+
+def get_registry():
+    return batch_registry, doclength_registry
+
+def get_doc_lengths_from_item(item: dict, tokenizer) -> list[int]:
+    """
+    Get document lengths within a batch item.
+    
+    Documents are separated by EOD (end-of-document) tokens. This function
+    finds document boundaries and calculates per-document token counts.
+    
+    Args:
+        item: Dictionary containing 'tokens' tensor with shape [1, seq_length]
+        tokenizer: Tokenizer with an 'eod' property that returns the EOD token ID
+        
+    Returns:
+        List of document lengths (number of tokens per document)
+    """
+    # TODO: Support multiple sequences.
+
+    # Get the tokens from the item.
+    assert 'tokens' in item, f"item: {item} does not contain 'tokens'"
+    tokens_tensor = item['tokens']
+    
+    # Extract tokens from item - shape is [1, seq_length]
+    # assert it only has 1 sequence.
+    assert tokens_tensor.shape[0] == 1, f"tokens_tensor: {tokens_tensor.shape} should have 1 sequence"
+
+    if tokens_tensor.dim() == 2:
+        # Extract the first (and only) sequence
+        tokens = tokens_tensor[0].cpu().tolist()
+    else:
+        # Already 1D
+        tokens = tokens_tensor.cpu().tolist()
+    
+    # Get EOD token ID from tokenizer
+    eod_token_id = tokenizer.eod
+    
+    # Find EOD positions
+    eod_positions = [i for i, tok in enumerate(tokens) if tok == eod_token_id]
+    
+    if not eod_positions:
+        # No EOD found - treat entire sequence as one document
+        return [len(tokens)]
+    
+    # Calculate tokens per document
+    # Documents are: [0:eod_0+1], [eod_0+1:eod_1+1], ...
+    doc_lengths = []
+    prev_end = 0
+    for eod_pos in eod_positions:
+        doc_length = eod_pos - prev_end + 1  # Include the EOD token
+        doc_lengths.append(doc_length)
+        prev_end = eod_pos + 1
+    
+    # If there are tokens after the last EOD, count them as a partial document
+    if prev_end < len(tokens):
+        doc_lengths.append(len(tokens) - prev_end)
+    
+    return doc_lengths
+
+
+
+def modify_train_data_iterator(
+    mbc_config: MicrobatchCreateConfig,
+    data_iterator: 'Iterator[dict]',
+):
+    """
+    Return a modified data iterator that yields items with `num_token_per_rank` tokens.
+    Dictionary item has keys (tokens, labels, loss_mask, position_ids).
+    """
+    num_token_per_rank = mbc_config.num_token_per_rank
+    while True:
+        item = next(data_iterator)
+        # Reorganize the item such that each tensor will have `num_token_per_rank` tokens.
+        
+        # Only assume the batch has keys (tokens, labels, loss_mask, position_ids)
+        original_tokens = item['tokens']
+        original_labels = item['labels']
+        original_loss_mask = item['loss_mask']
+        original_position_ids = item['position_ids']
+        
+        # Reorganize the item such that each tensor will have `num_token_per_rank` tokens.
+        splitted_tokens = torch.split(original_tokens, num_token_per_rank, dim=1)
+        splitted_labels = torch.split(original_labels, num_token_per_rank, dim=1)
+        splitted_loss_mask = torch.split(original_loss_mask, num_token_per_rank, dim=1)
+        splitted_position_ids = torch.split(original_position_ids, num_token_per_rank, dim=1)
+
+        # Now we loop over the items in each split, and yield the item.
+        num_splits = len(splitted_tokens)
+        for i in range(num_splits):
+            new_item = {
+                'tokens': splitted_tokens[i],
+                'labels': splitted_labels[i],
+                'loss_mask': splitted_loss_mask[i],
+                'position_ids': splitted_position_ids[i],
+            }
+            yield new_item
+
+    pass
+
+train_data_iterator__modified = modify_train_data_iterator(mbc_config, train_data_iterator)
+
 def get_next_batch(num_batches: int) -> list[list[int]]:
     """
     Get the next batch from the global batch.
     """
-    return [[seq_length] for _ in range(num_batches)]
+
+    this_batch: list[dict] = []
+    doc_lengths: list[list[int]] = []
+    for _ in range(num_batches):
+        item = next(train_data_iterator__modified)
+        # logger.debug(f'item: {item}')
+        doc_len: list[int] = get_doc_lengths_from_item(item, tokenizer)
+        # logger.debug(f'doc_len: {doc_len}')
+        this_batch.append(item)
+        doc_lengths.append(doc_len)
+
+    batch_registry.append(this_batch)
+    doclength_registry.append(doc_lengths)
+    # return [[seq_length] for _ in range(num_batches)]
+    return doc_lengths
 
 
 def _block_reverse_list(l: list, d: int):
@@ -1339,9 +1485,10 @@ def create_qkv_dispatch_pipeline_tick(
     """
     from distca.planner.planner import (
         batch_to_items_with_dummy,
-        backward_from_planner_output
     )
-    from distca.runtime.compute_metadata import from_planner_output
+    from distca.runtime.compute_metadata import (
+        from_planner_output, backward_from_planner_output
+    )
     
     create_pp_doclen_kwargs = dict(
         world_size=mbc_config.as_world_size,
@@ -1419,7 +1566,8 @@ def create_qkv_dispatch_pipeline_tick(
         batches=bwd_tick_per_rank_doc_lens, 
         num_tokens_per_rank=mbc_config.num_token_per_rank,
         as_world_size=mbc_config.as_world_size,
-        model_config=temp_model_config)
+        model_config=temp_model_config
+    )
     bwd_planner_out = planner.items_to_shardinfo(items)
     
     (
@@ -1440,10 +1588,16 @@ def create_qkv_dispatch_pipeline_tick(
 
 def create_pp_microbatches(
     mbc_config: MicrobatchCreateConfig,
-):
+) -> 'List[MicroBatchItem]':
+    # MicroBatchItem = Dict[str, Thing]
+    #     "tokens": torch.Tensor,
+    #     "labels": torch.Tensor,
+    #     "loss_mask": torch.Tensor,
+    #     "position_ids": torch.Tensor,
+    #     "packed_seq_params": PingPangSingleStepPackedSeqParams,
 
     num_microbatch = mbc_config.num_microbatch
-    pp_degree = mbc_config.pp_size
+    pp_degree = mbc_config.pp_size # this is just pp-size, not pp-rank.
     as_rank = mbc_config.as_rank
     as_world_size = mbc_config.as_world_size
     num_token_per_rank = mbc_config.num_token_per_rank
@@ -1506,12 +1660,30 @@ def create_pp_microbatches(
         # NOTE: we init input_ids at the end after creating dispatching strategy
         # and seq lens of each iteration. This is to ensure that each
         # rank has the same randomly initialized strategy.
-        position_ids_local = torch.arange(this_rank_num_tokens)
+        batch_registry, doclength_registry = get_registry()
+        # assert len(batch_registry) == 1, f"batch_registry: {len(batch_registry)}"
+        # tokens, labels, loss_mask, position_ids
+
+        # Concatenate the different tokens, labels, loss_mask, and position_ids
+        tokens = torch.cat([b['tokens'] for b in batch_registry[0]], dim=0)
+        labels = torch.cat([b['labels'] for b in batch_registry[0]], dim=0)
+        loss_mask = torch.cat([b['loss_mask'] for b in batch_registry[0]], dim=0)
+        position_ids = torch.cat([b['position_ids'] for b in batch_registry[0]], dim=0)
+
+        logger.debug(f'create_pp_microbatches[{i}] batch_registry: {len(batch_registry)}, doclength_registry: {len(doclength_registry)}')
+
+        # position_ids_local = torch.arange(this_rank_num_tokens)
         microbatch = {
-            "position_ids": position_ids_local,
+            "tokens": tokens,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
             "packed_seq_params": ping_pang_params,
         }
+        print(f"{microbatch = }")
         microbatches.append(microbatch)
+
+        clear_registry()
 
         # store the corresponding bwd metadata (for later ticks)
         bwd_metadata.append(
@@ -1559,7 +1731,9 @@ def create_combined_ping_pong_microbatches(
     
     # Create microbatches for ping-pong (two dispatchers)
     microbatches_0 = create_pp_microbatches(mbc_config)
+    # assert len(microbatches_0) == mbc_config.num_microbatch + mbc_config.pp_size - 1, f"microbatches_0: {len(microbatches_0)}"
     microbatches_1 = create_pp_microbatches(mbc_config)
+    # assert len(microbatches_1) == mbc_config.num_microbatch + mbc_config.pp_size - 1, f"microbatches_1: {len(microbatches_1)}"
 
     # Combine microbatches for ping-pong (similar to test_megatron_e2e_pipeline_with_cp.py)
     combined_microbatches = []
@@ -1578,13 +1752,32 @@ def create_combined_ping_pong_microbatches(
             max_seqlen_kv=max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
         )
         num_tokens = sum(mb["position_ids"].numel() for mb in [mb_0, mb_1])
-        position_ids = torch.concat([mb_0["position_ids"], mb_1["position_ids"]])
         
         # TODO: Need to implement the input_ids as the token ids from the data loader.
-        input_ids = torch.randint(10, 1000, (num_tokens,), device=torch.cuda.current_device())
+        # # For ping-pong mode, input_ids should be 1D (num_tokens,) not 2D (1, num_tokens)
+        # # because gptmodel_forward will unsqueeze(0) if pre_process is True, and ping-pong
+        # # needs to split hidden_states along batch dimension into 2 parts for the 2 dispatchers.
+        # # The actual splitting happens based on packed_seq_params which contains metadata
+        # # for both dispatchers (mb_0 and mb_1).
+        
+        # # This is the reference shape of the input_ids, labels, loss_mask, and position_ids tensors
+        # input_ids = torch.randint(10, 1000, (num_tokens,), device=torch.cuda.current_device())
+        # labels = torch.randint(10, 1000, (num_tokens,), device=torch.cuda.current_device())
+        # loss_mask = torch.randint(0, 2, (num_tokens,), device=torch.cuda.current_device())
+        # position_ids = torch.concat([mb_0["position_ids"], mb_1["position_ids"]])
+        # labels = labels.unsqueeze(0)
+        
+        dim = 1
+        input_ids = torch.cat([mb_0["tokens"], mb_1["tokens"]], dim=dim).reshape(-1)
+        labels = torch.cat([mb_0["labels"], mb_1["labels"]], dim=dim).reshape(-1).unsqueeze(0)
+        loss_mask = torch.cat([mb_0["loss_mask"], mb_1["loss_mask"]], dim=dim).reshape(-1)
+        position_ids = torch.cat([mb_0["position_ids"], mb_1["position_ids"]], dim=dim).reshape(-1)
+        logger.info(f"{input_ids.shape = }, {labels.shape = }, {loss_mask.shape = }, {position_ids.shape = }")
 
         combined_mb = dict(
             input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
             position_ids=position_ids,
             packed_seq_params=ping_pong_params,
         )
@@ -1609,9 +1802,17 @@ max_iterations = args.train_iters if hasattr(args, 'train_iters') else 1
 
 for iteration in range(max_iterations):
     logger.info(f"Starting iteration {iteration}")
-    
-    # Create combined microbatches for this iteration
-    combined_microbatches = create_combined_ping_pong_microbatches(mbc_config)
+
+    if rank == 0:
+        # Create combined microbatches for this iteration
+        combined_microbatches = create_combined_ping_pong_microbatches(mbc_config)
+    torch.distributed.barrier()
+
+    # Broadcast the microbatches to the different ranks after planning.
+    if rank == 0:
+        pass
+    else:
+        pass
     
     # Run forward_backward_batch
     losses_reduced = forward_backward_batch(
