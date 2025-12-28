@@ -33,6 +33,10 @@ from utils.token_monitor import (
     monitor_batch_tokens,
     set_token_monitor_config,
 )
+from utils.nan_detector import (
+    register_nan_detection_hooks,
+    remove_hooks,
+)
 
 
 if typing.TYPE_CHECKING:
@@ -1680,7 +1684,7 @@ def create_pp_microbatches(
             "position_ids": position_ids,
             "packed_seq_params": ping_pang_params,
         }
-        print(f"{microbatch = }")
+        # logger.debug(f"{microbatch = }")
         microbatches.append(microbatch)
 
         clear_registry()
@@ -1799,6 +1803,17 @@ logger.info(f"Creating microbatches: num_microbatch={num_microbatch}, pp_size={p
 
 iteration = 0
 max_iterations = args.train_iters if hasattr(args, 'train_iters') else 1
+
+# Register NaN detection hooks (uncomment to enable)
+nan_hooks, nan_detected = register_nan_detection_hooks(
+    model, 
+    logger=logger, 
+    raise_on_nan=True,  # Set to True to stop on first NaN
+    check_inputs=True,    # Set to True to also check inputs
+    log_all_modules=True,
+    log_tensor_stats=True,
+    tensor_stats_elements=10,
+)
 
 for iteration in range(max_iterations):
     logger.info(f"Starting iteration {iteration}")
