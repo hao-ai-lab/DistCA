@@ -185,3 +185,4 @@ slurm/
 env.sh
 logs/
 # playground/
+logs-latest
