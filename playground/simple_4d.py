@@ -1195,7 +1195,7 @@ def forward_backward_batch(
 from distca.runtime.compute_metadata import get_attn_metadata
 from distca.planner.planner import cp_list_to_mlp_list
 # from distca.utils.test_util import create_qkv_dispatch_pipeline_tick
-from distca.planner.planner import Planner
+from distca.planner.planner import Planner, Item
 from types import SimpleNamespace
 
 @dataclass
@@ -1241,10 +1241,9 @@ with time_it("create_pp_microbatches"):
     num_head_in_dtype = (hf_config.num_attention_heads * torch.float32.itemsize // element_size // tp_size)
 
     # Calculate token distribution
-    num_token_per_rank = args.seq_length * args.micro_batch_size // dp_size
+    num_token_per_rank = args.seq_length * num_microbatches // dp_size
     total_seq_len = args.seq_length
     num_seqs = args.micro_batch_size
-    num_microbatch = num_microbatches
     max_cp_degree = cp_size if cp_size > 1 else dp_size
     # TODO: Properly check what is the affect of num_batches 
     # num_batches = None  # Use MLP-DP by default
@@ -1265,11 +1264,12 @@ with time_it("create_pp_microbatches"):
         element_size=element_size,
         num_head_in_dtype=num_head_in_dtype,
         num_token_per_rank=num_token_per_rank,
-        num_microbatch=num_microbatch,
+        num_microbatch=num_microbatches,
         num_batches=num_batches,
         softmax_lse_size=softmax_lse_size,
     )
 
+logger.info(f"[mbc_config] {mbc_config}")
 
 # TODO: Need to implement this function to fetch the data iterator.
 # Temporary storage for the batches.
@@ -1386,6 +1386,7 @@ def get_next_batch(num_batches: int) -> list[list[int]]:
     """
     Get the next batch from the global batch.
     """
+    global mbc_config
 
     this_batch: list[dict] = []
     doc_lengths: list[list[int]] = []
@@ -1399,6 +1400,7 @@ def get_next_batch(num_batches: int) -> list[list[int]]:
 
     batch_registry.append(this_batch)
     doclength_registry.append(doc_lengths)
+    logger.info(f"[get_next_batch] [as_rank = {mbc_config.as_rank}] doc_lengths: {doc_lengths}, num_batches: {num_batches}, total_seq_len: {mbc_config.total_seq_len}")
     # return [[seq_length] for _ in range(num_batches)]
     return doc_lengths
 
@@ -1422,7 +1424,7 @@ def create_pipeline_doclens(
     tp_size: int,
     dp_size: int,
     num_batches: int = None,
-) -> list[list[int]]: # list of batch[int]
+) -> tuple[list[list[int]], list[bool]]: # list of batch[int], list of dummy mask
     """
     Create `num_batches` batch for a microbatch (one pp-tick).
     - Take a batch from get_next_batch (or random) and also handle some padding logic.
@@ -1441,19 +1443,27 @@ def create_pipeline_doclens(
         is_backward: this is a backward seqlens. In this case, it directly flips the seqlens of a corresponding forward
     """
     if is_backward:
-        return _block_reverse_list(ref_doc_lens, dp_size)
+        result = _block_reverse_list(ref_doc_lens, dp_size)
+        # For backward, we don't have dummy markers from forward, so create all False
+        # (backward batches are typically not dummy)
+        dummy_mask = [False] * len(result)
+        return result, dummy_mask
     
+    dummy_length = total_token_on_rank // dp_size
     # Create new microbatches for the first PP stage
+    dummy_mask = []
     if add_dummy:
         # Each rank only gets one dummy document, which is of `tp_size`
         # to avoid Sequence Parallel having an issue.
 
         # FIXME: using total_token_on_rank for cudagraph to work out-of-box, can be tp_size when cudagraph is disabled.
-        pp_head_new_doc_len = [[total_token_on_rank // dp_size] for _ in range(dp_size)]  
+        pp_head_new_doc_len = [[dummy_length] for _ in range(dp_size)]  
+        dummy_mask = [True] * dp_size
     else:
         assert total_token_on_rank % tp_size == 0, "Sequence Parallel requires total token divisible by tp_size"
         num_batches = num_batches or dp_size 
         pp_head_new_doc_len = get_next_batch(num_batches)
+        dummy_mask = [False] * num_batches
 
     # pp_head_new_doc_len : shape : [dp, num_seqs]  
     # We should sample seq_len here.
@@ -1472,10 +1482,145 @@ def create_pipeline_doclens(
         dummy_fwd_num = world_size - dp_size
         # FIXME: using total_token_on_rank for cudagraph to work out-of-box, 
         # can be tp_size when cudagraph is disabled.
-        other_pp_doc_len = [[total_token_on_rank // dp_size] for _ in range(dummy_fwd_num)]  
+        other_pp_doc_len = [[dummy_length] for _ in range(dummy_fwd_num)]  
     tick_per_rank_doc_len = pp_head_new_doc_len + other_pp_doc_len
+    dummy_mask += [False] * len(other_pp_doc_len)
 
-    return tick_per_rank_doc_len
+    return tick_per_rank_doc_len, dummy_mask
+
+
+# Can handle MLP DPCP and dummy doc.
+# Copied from distca.planner.planner for debugging and adjustment
+# from distca.planner.planner import (
+#     batch_to_items_with_dummy,
+# )
+def batch_to_items_with_dummy(
+    batches: List[List[int]], 
+    num_tokens_per_rank: int, 
+    as_world_size: int, 
+    model_config: dict,
+    dummy_mask: List[bool],
+):
+
+    items = []
+    seqid = 0
+    rank_budgets = [num_tokens_per_rank] * as_world_size
+    current_rank_idx = 0
+
+    assert len(batches) == len(dummy_mask), \
+        f"Length mismatch: batches={len(batches)}, dummy_mask={len(dummy_mask)}"
+    
+    logger.debug(f"[batch_to_items_with_dummy] START: batches={batches}, num_tokens_per_rank={num_tokens_per_rank}, as_world_size={as_world_size}")
+    logger.debug(f"[batch_to_items_with_dummy] dummy_mask={dummy_mask}")
+    logger.debug(f"[batch_to_items_with_dummy] INITIAL STATE: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
+
+    for batch_idx, batch in enumerate(batches):
+        logger.debug(f"\n[batch_to_items_with_dummy] Processing batch[{batch_idx}]={batch}")
+        logger.debug(f"[batch_to_items_with_dummy] BEFORE batch: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
+        
+        # Use explicit dummy_mask instead of inference
+        is_dummy = dummy_mask[batch_idx]
+        
+        if is_dummy:
+            logger.debug(f"[batch_to_items_with_dummy] DUMMY BATCH detected: len={len(batch)}, doc_len={batch[0]}")
+            logger.debug(f"[batch_to_items_with_dummy] BEFORE finding rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
+            
+            while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
+                old_idx = current_rank_idx
+                current_rank_idx += 1
+                logger.debug(f"[batch_to_items_with_dummy] Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}")
+            
+            logger.debug(f"[batch_to_items_with_dummy] Selected rank_idx={current_rank_idx} for dummy doc, rank_budget={rank_budgets[current_rank_idx]}")
+            assert rank_budgets[current_rank_idx] == num_tokens_per_rank, "dummy doc should put on a empty rank"
+            # dummy doc, this rank only put this dummy item.
+            doc_len = batch[0]
+            item_dict = {'q': doc_len, 'kv': doc_len}
+            new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                            item_dict, is_original=True)
+            items.append(new_item)
+            logger.debug(f"[batch_to_items_with_dummy] Created dummy item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}")
+            logger.debug(f"[batch_to_items_with_dummy] BEFORE increment: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
+            current_rank_idx += 1
+            seqid += 1
+            logger.debug(f"[batch_to_items_with_dummy] AFTER dummy processing: current_rank_idx={current_rank_idx}, seqid={seqid}, rank_budgets={rank_budgets} (NOTE: budget NOT decremented!)")
+        else:
+            logger.debug(f"[batch_to_items_with_dummy] REGULAR BATCH: len={len(batch)}, docs={batch}")
+            for doc_idx, doc_length in enumerate(batch):
+                doc_len = doc_length
+                remaining_len = doc_len
+                head_prefix_len = 0
+                tail_suffix_start_pos = doc_len
+                is_original_flag = True
+
+                logger.debug(f"[batch_to_items_with_dummy] Processing doc[{doc_idx}]: doc_len={doc_len}, remaining_len={remaining_len}")
+                logger.debug(f"[batch_to_items_with_dummy] BEFORE doc loop: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}, seqid={seqid}")
+
+                while remaining_len > 0:
+                    logger.debug(f"[batch_to_items_with_dummy] WHILE remaining_len={remaining_len} > 0")
+                    logger.debug(f"[batch_to_items_with_dummy] BEFORE finding available rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
+                    
+                    while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
+                        old_idx = current_rank_idx
+                        current_rank_idx += 1
+                        logger.debug(f"[batch_to_items_with_dummy] Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}")
+                    
+                    logger.debug(f"[batch_to_items_with_dummy] AFTER finding rank: current_rank_idx={current_rank_idx}, as_world_size={as_world_size}")
+                    
+                    if current_rank_idx >= as_world_size:
+                        total_capacity = as_world_size * num_tokens_per_rank
+                        total_allocated = total_capacity - sum(rank_budgets)
+                        total_remaining = sum(rank_budgets)
+                        logger.debug(f"[batch_to_items_with_dummy] ERROR: current_rank_idx={current_rank_idx} >= as_world_size={as_world_size}")
+                        logger.debug(f"[batch_to_items_with_dummy] ERROR: total_remaining={total_remaining}, rank_budgets={rank_budgets}")
+                        raise ValueError(
+                            f"Not enough space to allocate document. \n"
+                            f"seqid={seqid}, original_doc_len={doc_len}, remaining_len={remaining_len}. \n"
+                            f"Configuration: as_world_size={as_world_size}, num_tokens_per_rank={num_tokens_per_rank}, total_capacity={total_capacity}. \n"
+                            f"Current state: total_allocated={total_allocated}, total_remaining={total_remaining}, rank_budgets={rank_budgets}. \n"
+                            f"Current batch being processed: {batch}. \n"
+                            f"All batches: {batches}. \n"
+                            f"Current rank index: {current_rank_idx}. \n"
+                        )
+                    
+                    chunk_size = min(remaining_len, rank_budgets[current_rank_idx])
+                    logger.debug(f"[batch_to_items_with_dummy] Allocating chunk: chunk_size={chunk_size} (min of remaining_len={remaining_len}, rank_budget={rank_budgets[current_rank_idx]})")
+                    
+                    if remaining_len == doc_len and chunk_size == doc_len:
+                        item_dict = {'q': doc_len, 'kv': doc_len}
+                        new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                                        item_dict, is_original=True)
+                        items.append(new_item)
+                        logger.debug(f"[batch_to_items_with_dummy] Created single-chunk item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}")
+                    else:
+                        q_len_head = chunk_size // 2
+                        q_len_tail = chunk_size - q_len_head
+                        
+                        new_head_kv = head_prefix_len + q_len_head
+                        head_item = {'q': q_len_head, 'kv': new_head_kv}
+                        tail_item = {'q': q_len_tail, 'kv': tail_suffix_start_pos}
+
+                        new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
+                                        head_item, tail_item, is_original=is_original_flag)
+                        items.append(new_item)
+                        logger.debug(f"[batch_to_items_with_dummy] Created split-chunk item: seqid={seqid}, rank={current_rank_idx}, chunk_size={chunk_size}, head={head_item}, tail={tail_item}, items_count={len(items)}")
+
+                        head_prefix_len = new_head_kv
+                        tail_suffix_start_pos -= q_len_tail
+                        is_original_flag = False
+                        logger.debug(f"[batch_to_items_with_dummy] Updated split state: head_prefix_len={head_prefix_len}, tail_suffix_start_pos={tail_suffix_start_pos}")
+
+                    old_budget = rank_budgets[current_rank_idx]
+                    rank_budgets[current_rank_idx] -= chunk_size
+                    remaining_len -= chunk_size
+                    logger.debug(f"[batch_to_items_with_dummy] Updated budgets: rank[{current_rank_idx}] {old_budget} -> {rank_budgets[current_rank_idx]}, remaining_len: {remaining_len + chunk_size} -> {remaining_len}")
+
+                seqid += 1
+                logger.debug(f"[batch_to_items_with_dummy] Finished doc[{doc_idx}]: seqid incremented to {seqid}")
+        
+        logger.debug(f"[batch_to_items_with_dummy] AFTER batch[{batch_idx}]: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}, items_count={len(items)}")
+    
+    logger.debug(f"\n[batch_to_items_with_dummy] FINAL: items_count={len(items)}, rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
+    return items
 
 
 # In this function, world size is actually as_world_size.
@@ -1489,9 +1634,9 @@ def create_qkv_dispatch_pipeline_tick(
     softmax_lse_size (int): size of the softmax_lse tensor when viewed as the dtype,
         should be num_heads_local * fp32.itemsize // element_size.
     """
-    from distca.planner.planner import (
-        batch_to_items_with_dummy,
-    )
+    # from distca.planner.planner import (
+    #     batch_to_items_with_dummy,
+    # )
     from distca.runtime.compute_metadata import (
         from_planner_output, backward_from_planner_output
     )
@@ -1504,7 +1649,7 @@ def create_qkv_dispatch_pipeline_tick(
     )
 
     # Get the new sequence lens from get_next_batch.
-    cur_tick_per_rank_doc_lens = create_pipeline_doclens(
+    cur_tick_per_rank_doc_lens, cur_tick_dummy_mask = create_pipeline_doclens(
         ref_doc_lens, 
         add_dummy, 
         is_backward=False, 
@@ -1515,6 +1660,8 @@ def create_qkv_dispatch_pipeline_tick(
         num_batches = mbc_config.num_batches, 
     )
     assert isinstance(cur_tick_per_rank_doc_lens, list), f"cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens} is not a list"
+    assert len(cur_tick_per_rank_doc_lens) == len(cur_tick_dummy_mask), \
+        f"Length mismatch: batches={len(cur_tick_per_rank_doc_lens)}, dummy_mask={len(cur_tick_dummy_mask)}"
 
 
     world_size = mbc_config.tp_size * mbc_config.pp_size * mbc_config.dp_size
@@ -1540,7 +1687,8 @@ def create_qkv_dispatch_pipeline_tick(
         batches=cur_tick_per_rank_doc_lens, 
         num_tokens_per_rank = mbc_config.num_token_per_rank,
         as_world_size=mbc_config.as_world_size,
-        model_config=temp_model_config)
+        model_config=temp_model_config,
+        dummy_mask=cur_tick_dummy_mask)
     
     fwd_planner_out = planner.items_to_shardinfo(items)
     
@@ -1561,9 +1709,11 @@ def create_qkv_dispatch_pipeline_tick(
     # CP flip logic.
     if len(cur_tick_per_rank_doc_lens) < mbc_config.as_world_size:
         bwd_tick_per_rank_doc_lens = _block_reverse_list(cur_tick_per_rank_doc_lens, mbc_config.num_batches)
+        # Reverse dummy_mask in the same way as batches
+        bwd_tick_dummy_mask = _block_reverse_list(cur_tick_dummy_mask, mbc_config.num_batches)
     else:
         # None CP flip logic.
-        bwd_tick_per_rank_doc_lens = create_pipeline_doclens(
+        bwd_tick_per_rank_doc_lens, bwd_tick_dummy_mask = create_pipeline_doclens(
             cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
             **create_pp_doclen_kwargs,
         )
@@ -1572,7 +1722,8 @@ def create_qkv_dispatch_pipeline_tick(
         batches=bwd_tick_per_rank_doc_lens, 
         num_tokens_per_rank=mbc_config.num_token_per_rank,
         as_world_size=mbc_config.as_world_size,
-        model_config=temp_model_config
+        model_config=temp_model_config,
+        dummy_mask=bwd_tick_dummy_mask,
     )
     bwd_planner_out = planner.items_to_shardinfo(items)
     
@@ -1650,6 +1801,7 @@ def create_pp_microbatches(
             tick_per_rank_doc_lens, as_world_size, num_token_per_rank
         )
         this_rank_num_tokens = sum(tick_per_rank_doc_lens_after_cp_transfer[as_rank])
+        logger.info(f"[create_pp_microbatches] [as_rank = {as_rank}] this_rank_num_tokens: {this_rank_num_tokens}, tick_per_rank_doc_lens_after_cp_transfer: {tick_per_rank_doc_lens_after_cp_transfer}, num_token_per_rank: {num_token_per_rank}")
         bwd_packed_seq_params = PackedSeqParams(qkv_format="thd", **fa_bwd_params[as_rank])
         tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens_after_cp_transfer[as_rank], dtype=torch.int32)
         mlp_packed_seq_params = get_attn_metadata(tensor_doc_lens, get_packed_seq_params=True)
@@ -1792,7 +1944,7 @@ def create_combined_ping_pong_microbatches(
     return combined_microbatches
 
 
-logger.info(f"Creating microbatches: num_microbatch={num_microbatch}, pp_size={pp_size}, "
+logger.info(f"Creating microbatches: num_microbatch={num_microbatches}, pp_size={pp_size}, "
             f"as_rank={as_rank}, as_world_size={as_world_size}")
 
 # combined_microbatches = create_combined_ping_pong_microbatches(mbc_config)
