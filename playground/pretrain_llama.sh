@@ -107,7 +107,8 @@ export EXPERIMENT_ENABLE_CUDA_GRAPHS=0
 # Setup Logging
 # ---------------------------
 # Source the `env.sh` file from project root
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+echo PROJECT_ROOT=$PROJECT_ROOT
 
 if [ -f "$PROJECT_ROOT/env.sh" ]; then
   # shellcheck disable=SC1091
@@ -179,7 +180,7 @@ TORCHRUN_CMD=(
   --rdzv_endpoint=${RZV_ENDPOINT}
   --rdzv_id=${RZV_ID}
   --max_restarts=0
-  --no-python bash ./utils/bind_and_exec.sh 
+  --no-python bash $PROJECT_ROOT/utils/bind_and_exec.sh 
     python pretrain_llama.py
     --num-tokens ${NUM_TOKENS}
     --num-batches ${BATCH_SIZE}

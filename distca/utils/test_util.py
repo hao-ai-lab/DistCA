@@ -28,6 +28,11 @@ from distca.planner.planner import batch_to_items_with_dummy, cp_list_to_mlp_lis
 
 logger = logging.getLogger(__name__)
 
+def debug_print(*args, **kwargs):
+    # Existing repo-wide debug knob used elsewhere.
+    if os.getenv("D2_DEBUG_PRINT", "0") == "1":
+        print(*args, **kwargs)
+
 
 ######## MISC
 def get_device_name() -> str:
@@ -521,10 +526,10 @@ def create_pipeline_doclens(
         else:
             # we need to use GLOBAL_BATCH to get dp number of list.
             #from test_megatron_e2e_pipeline_planner import GLOBAL_BATCH, get_next_batch
-            print(f"In util.py, before calling get_next_batch: GLOBAL_BATCH is: {GLOBAL_BATCH}")
+            debug_print(f"In util.py, before calling get_next_batch: GLOBAL_BATCH is: {GLOBAL_BATCH}")
             num_batches = num_batches or dp_size 
             pp_head_new_doc_len = get_next_batch(num_batches)
-    print(f"In util.py, after calling get_next_batch: pp_head_new_doc_len is: {pp_head_new_doc_len}")
+    debug_print(f"In util.py, after calling get_next_batch: pp_head_new_doc_len is: {pp_head_new_doc_len}")
 
     #  pp_head_new_doc_len : shape : [dp, num_seqs]  We should sample seq_len here.
     # And add the sampled seq_len to the batch. 
@@ -542,10 +547,10 @@ def create_pipeline_doclens(
         dummy_fwd_num = world_size - dp_size
         other_pp_doc_len = [[total_token_on_rank // dp_size] for _ in range(dummy_fwd_num)]  # FIXME: using total_token_on_rank for cudagraph to work out-of-box, can be tp_size when cudagraph is disabled.
     tick_per_rank_doc_len = pp_head_new_doc_len + other_pp_doc_len
-    print(f"In util.py, finally tick_per_rank_doc_len is: {tick_per_rank_doc_len}")
+    debug_print(f"In util.py, finally tick_per_rank_doc_len is: {tick_per_rank_doc_len}")
 
     if return_original_doclen:
-        print("In util.py, return_original_doclen is True, returning (tick_per_rank_doc_len, pp_head_new_doc_len)")
+        debug_print("In util.py, return_original_doclen is True, returning (tick_per_rank_doc_len, pp_head_new_doc_len)")
         return (tick_per_rank_doc_len, pp_head_new_doc_len)
     # exit(0)
     return tick_per_rank_doc_len
@@ -591,7 +596,7 @@ def create_qkv_dispatch_pipeline_tick(
     softmax_lse_size (int): size of the softmax_lse tensor when viewed as the dtype,
         should be num_heads_local * fp32.itemsize // element_size.
     """
-    print(f"🟡 Inside create_qkv_dispatch_pipeline_tick: {world_size = }. Please check the world size as this is acutlaly should just be dp * pp.")
+    debug_print(f"🟡 Inside create_qkv_dispatch_pipeline_tick: {world_size = }. Please check the world size as this is acutlaly should just be dp * pp.")
     create_pp_doclen_kwargs = dict(
         world_size=world_size,
         total_token_on_rank=total_num_token,
@@ -606,8 +611,8 @@ def create_qkv_dispatch_pipeline_tick(
         **create_pp_doclen_kwargs, return_original_doclen=True,
     )
     assert isinstance(cur_tick_per_rank_doc_lens, list), f"cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens} is not a list"
-    print(f"🟡 cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}, len(cur_tick_per_rank_doc_lens): {len(cur_tick_per_rank_doc_lens)}")
-    print(f"🟡 original_cur_tick_per_rank_doc_lens: {original_cur_tick_per_rank_doc_lens}, len(original_cur_tick_per_rank_doc_lens): {len(original_cur_tick_per_rank_doc_lens)}")
+    debug_print(f"🟡 cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}, len(cur_tick_per_rank_doc_lens): {len(cur_tick_per_rank_doc_lens)}")
+    debug_print(f"🟡 original_cur_tick_per_rank_doc_lens: {original_cur_tick_per_rank_doc_lens}, len(original_cur_tick_per_rank_doc_lens): {len(original_cur_tick_per_rank_doc_lens)}")
 
 
     # Try different tolerance_factor values to find one that passes the buffer size check
@@ -618,7 +623,7 @@ def create_qkv_dispatch_pipeline_tick(
         MIN_TOLERANCE_FACTOR = float(MIN_TOLERANCE_FACTOR)
     except ValueError:
         pass
-    print(f"🟡 MIN_TOLERANCE_FACTOR = {MIN_TOLERANCE_FACTOR}")
+    debug_print(f"🟡 MIN_TOLERANCE_FACTOR = {MIN_TOLERANCE_FACTOR}")
 
     tolerance_factors_to_try.append(MIN_TOLERANCE_FACTOR)
     tolerance_factors_to_try = set(tolerance_factors_to_try)
@@ -628,7 +633,7 @@ def create_qkv_dispatch_pipeline_tick(
     for tolerance_factor in tolerance_factors_to_try:
         if tolerance_factor < MIN_TOLERANCE_FACTOR:
             continue
-        print(f"🟡 Trying tolerance_factor: {tolerance_factor}")
+        debug_print(f"🟡 Trying tolerance_factor: {tolerance_factor}")
         
         start_time = time.time()
         if use_planner:
@@ -669,23 +674,23 @@ def create_qkv_dispatch_pipeline_tick(
         )
         (qkv_linear_to_attn_fa2a, _, out_attn_to_linear_fa2a, _, fwd_attn_metadata) = fa2a_metadata
         end_time = time.time()
-        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - fwd_planner_out duration: {(end_time - start_time):.2f} sec", flush=True)
+        debug_print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - fwd_planner_out duration: {(end_time - start_time):.2f} sec", flush=True)
 
         
         # CP flip logic.
         start_time = time.time()
-        print(f"🟡 fwd_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
+        debug_print(f"🟡 fwd_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens}")
         if len(cur_tick_per_rank_doc_lens) < world_size:
-            print("🟡 CP flip logic.")
+            debug_print("🟡 CP flip logic.")
             bwd_tick_per_rank_doc_lens = _block_reverse_list(cur_tick_per_rank_doc_lens, num_batches)
         else:
             # None CP flip logic.
-            print("🟡 None CP flip logic.")
+            debug_print("🟡 None CP flip logic.")
             bwd_tick_per_rank_doc_lens = create_pipeline_doclens(
                 cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
                 **create_pp_doclen_kwargs,
             )
-        print(f"🟡 bwd_tick_per_rank_doc_lens: {bwd_tick_per_rank_doc_lens}")
+        debug_print(f"🟡 bwd_tick_per_rank_doc_lens: {bwd_tick_per_rank_doc_lens}")
         
         if use_planner:
             items = batch_to_items_with_dummy(batches=bwd_tick_per_rank_doc_lens, 
@@ -712,7 +717,7 @@ def create_qkv_dispatch_pipeline_tick(
             ret += (original_cur_tick_per_rank_doc_lens,)
 
         end_time = time.time()
-        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - cp flip duration: {(end_time - start_time):.2f} sec")
+        debug_print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - cp flip duration: {(end_time - start_time):.2f} sec")
 
         # FIXME: Properly pass the output dir down here.
         start_time = time.time()
@@ -740,7 +745,7 @@ def create_qkv_dispatch_pipeline_tick(
             seq_len=cur_tick_per_rank_doc_lens,
         )
         end_time = time.time()
-        print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - network_inspect duration: {(end_time - start_time):.2f} sec")
+        debug_print(f"🟡 🟡 create_qkv_dispatch_pipeline_tick - network_inspect duration: {(end_time - start_time):.2f} sec")
 
         def debug_set_metadata_transfer_size_to_0(
             qkv_fwd_metadata,
@@ -770,7 +775,7 @@ def create_qkv_dispatch_pipeline_tick(
 
         def is_buffer_size_enough(buffer_size, network_buffer_requirements):
             max_buffer_budget_all_rank = network_buffer_requirements["max_buffer_budget_all_rank"]
-            print(f"🟡 Got max_buffer_budget_all_rank = {max_buffer_budget_all_rank / 1024 ** 3} GB ({max_buffer_budget_all_rank}), buffer_size = {buffer_size / 1024 ** 3} GB ({buffer_size}). Is enough: {(buffer_size >= max_buffer_budget_all_rank) = }")
+            debug_print(f"🟡 Got max_buffer_budget_all_rank = {max_buffer_budget_all_rank / 1024 ** 3} GB ({max_buffer_budget_all_rank}), buffer_size = {buffer_size / 1024 ** 3} GB ({buffer_size}). Is enough: {(buffer_size >= max_buffer_budget_all_rank) = }")
 
             return buffer_size >= max_buffer_budget_all_rank
 
@@ -779,10 +784,10 @@ def create_qkv_dispatch_pipeline_tick(
         
         # Check if current tolerance_factor works
         if is_buffer_size_enough(buffer_size, network_buffer_requirements):
-            print(f"🟡 Found working tolerance_factor: {tolerance_factor}")
+            debug_print(f"🟡 Found working tolerance_factor: {tolerance_factor}")
             return ret
         else:
-            print(f"🟡 tolerance_factor {tolerance_factor} failed: buffer_size={buffer_size}, required={network_buffer_requirements['max_buffer_budget_all_rank']}")
+            debug_print(f"🟡 tolerance_factor {tolerance_factor} failed: buffer_size={buffer_size}, required={network_buffer_requirements['max_buffer_budget_all_rank']}")
     
     # If we reach here, none of the tolerance_factors worked
     raise ValueError(f"None of the tolerance factors {tolerance_factors_to_try} resulted in sufficient buffer size. "

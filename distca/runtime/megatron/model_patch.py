@@ -118,7 +118,9 @@ def get_gpt_decoder_block_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
 ) -> TransformerBlockSubmodules:
-    """GPT block spec."""
+    """GPT block spec.
+    Adapted from `megatron.core.models.gpt.gpt_layer_specs.get_gpt_decoder_block_spec`
+    """
     assert use_transformer_engine
     layer_norm_impl = TENorm
 

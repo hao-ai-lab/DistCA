@@ -7,7 +7,10 @@ from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
 )
-from distca.runtime.megatron.distca_rope import apply_rotary_pos_emb_distca, apply_rotary_pos_emb_distca_triton
+from distca.runtime.megatron.distca_rope import (
+    apply_rotary_pos_emb_distca,
+    apply_rotary_pos_emb_distca_triton,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -18,6 +21,7 @@ from megatron.core import parallel_state
 
 from distca.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams, MLPLayoutPackedSeqParams
 import rich
+import numpy as np
 
 
 def log_memory_usage(message: str, comment: str = None):
@@ -34,10 +38,24 @@ def _log_tensor_shapes(layer: "TransformerLayer", where: str, **named_values: An
         if v is None:
             return
         if torch.is_tensor(v):
-            print(
+            
+            num_zeros = (v == 0).sum().item() if torch.is_floating_point(v) or torch.is_complex(v) else 'u'
+            num_nans = torch.isnan(v).sum().item() if torch.is_floating_point(v) else 'u'
+            
+            # print num_nans in red if num_nans > 0
+            should_print = False
+            if num_nans > 0:
+                num_nans = f"\033[31m{num_nans}\033[0m"
+                should_print = True
+
+            num_nans = str(num_nans)
+            msg = (
                 f"[L{layer.layer_number}] {where}: {name} "
-                f"shape={tuple(v.shape)} dtype={v.dtype} device={v.device} req_grad={getattr(v, 'requires_grad', False)}"
+                f"shape={tuple(v.shape)} dtype={v.dtype} device={v.device} "
+                f"#zeros={num_zeros} #nans={num_nans}"
             )
+            if should_print:
+                print(msg)
             return
         if isinstance(v, (tuple, list)):
             for i, vv in enumerate(v):
@@ -396,14 +414,18 @@ class TransformerLayer(MegatronTransformerLayer):
                         cu_seqlens_q = mlp_seq_param.cu_seqlens_q_padded
                     else:
                         cu_seqlens_q = mlp_seq_param.cu_seqlens_q
+                    
+                    _log_tensor_shapes(self, "_forward_pre_core_attn.cu_seqlens_q", cu_seqlens_q=cu_seqlens_q)
                     if mlp_seq_param.cu_seqlens_kv_padded is not None:
                         cu_seqlens_kv = mlp_seq_param.cu_seqlens_kv_padded
                     else:
                         cu_seqlens_kv = mlp_seq_param.cu_seqlens_kv
+                    _log_tensor_shapes(self, "_forward_pre_core_attn.cu_seqlens_kv", cu_seqlens_kv=cu_seqlens_kv)
                     shard_logical_range = packed_seq_params.shard_logical_range[0]
                     # Get max_seqlen from mlp_seq_param
                     max_seqlen_q = mlp_seq_param.max_seqlen_q
                     max_seqlen_kv = mlp_seq_param.max_seqlen_kv
+                    print(f"max_seqlen_q = {max_seqlen_q}, max_seqlen_kv = {max_seqlen_kv}", flush=True)
                     
                     if os.getenv("D2_LOG_ROPE_METADATA", "0") == "1":
                         seqlens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]

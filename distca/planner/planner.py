@@ -11,6 +11,12 @@ from distca.runtime.shard_info import (ShardInfo, handle_planner_metadata,
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+import os
+
+def debug_print(*args, **kwargs):
+    # Existing repo-wide debug knob used elsewhere.
+    if os.getenv("D2_DEBUG_PRINT", "0") == "1":
+        print(*args, **kwargs)
 
 K = 1024
 
@@ -533,7 +539,7 @@ class Planner:
         self.data_parallel = world_size // (parallel_config.pipeline_model_parallel_size * parallel_config.tensor_model_parallel_size)
         self.attention_server_world_size = self.data_parallel * parallel_config.pipeline_model_parallel_size
         self.dtype = dtype
-        rich.print(f"[bold green] world_size: {self.world_size}, DP: {self.data_parallel}[/bold green], PP: {parallel_config.pipeline_model_parallel_size}, TP: {parallel_config.tensor_model_parallel_size}, attention_server_world_size: {self.attention_server_world_size}")
+        debug_print(f"world_size: {self.world_size}, DP: {self.data_parallel}, PP: {parallel_config.pipeline_model_parallel_size}, TP: {parallel_config.tensor_model_parallel_size}, attention_server_world_size: {self.attention_server_world_size}")
         
         self.tolerance_factor = tolerance_factor
 

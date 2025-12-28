@@ -8,7 +8,8 @@ EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun 
 
 
 Debug example:
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
+EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 1 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 1 --pp-size 1 --tp-size 1 --cp-size 1 --num-microbatch 1 --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --num-layers 2
+
 
 Planner example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 4 --pp-size 2 --num-microbatch 2 --use-planner
@@ -30,6 +31,7 @@ import os
 import time
 import json
 from global_batch_provider import setup_global_batch, get_next_batch
+from distca.utils import training_utils as _training_utils
 import megatron.core.parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
@@ -116,7 +118,8 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
             attention_mask = None
             packed_seq_params = batch['packed_seq_params']
             # returns "hidden_states" if not model.post_process (not the last layer)
-            # returns "logits" when label is None.
+            # returns "logits" when label is None.)
+            print(f"🟡 forward_step: {input_ids.shape=}, {self.tf_config.sequence_parallel = }")
             output = gptmodel_forward(
                 model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel,
                 packed_seq_params, labels=input_ids.unsqueeze(0),

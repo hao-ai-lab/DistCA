@@ -37,6 +37,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
         override_model_config = OmegaConf.create()
         override_transformer_config = OmegaConf.create({
             "apply_rope_fusion": True,
+            # "apply_rope_fusion": False,
             # bias-act fusion
             "bias_activation_fusion": True,
             # no layer norm so no need for that fusion

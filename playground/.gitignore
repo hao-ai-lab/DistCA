@@ -1,0 +1,7 @@
+logs
+logs-latest
+data_cache
+*.pickle
+megatron-args.txt
+.env.sh
+data_process/
