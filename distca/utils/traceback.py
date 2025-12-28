@@ -32,7 +32,6 @@ def clickable_excepthook(exc_type, exc_value, tb, file=None):
     print(f"{RED}{prefix}{exc_type.__name__}: {exc_value}{RESET}", file=file)
 
 def enable_clickable_excepthook():
-    print("🟡 Enabling clickable excepthook.")
     sys.excepthook = clickable_excepthook
 
 import sys

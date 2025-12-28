@@ -1246,7 +1246,9 @@ with time_it("create_pp_microbatches"):
     num_seqs = args.micro_batch_size
     num_microbatch = num_microbatches
     max_cp_degree = cp_size if cp_size > 1 else dp_size
-    num_batches = None  # Use MLP-DP by default
+    # TODO: Properly check what is the affect of num_batches 
+    # num_batches = None  # Use MLP-DP by default
+    num_batches = global_batch_size // micro_batch_size
 
     softmax_lse_size = (hf_config.num_attention_heads // tp_size) * torch.float32.itemsize // element_size
 

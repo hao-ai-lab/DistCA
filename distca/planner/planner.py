@@ -87,7 +87,18 @@ def batch_to_items_with_dummy(batches: List[List[int]], num_tokens_per_rank: int
                     while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
                         current_rank_idx += 1
                     if current_rank_idx >= as_world_size:
-                        raise ValueError(f"Not enough space for seqid {seqid}, remaining_len {remaining_len}.")
+                        total_capacity = as_world_size * num_tokens_per_rank
+                        total_allocated = total_capacity - sum(rank_budgets)
+                        total_remaining = sum(rank_budgets)
+                        raise ValueError(
+                            f"Not enough space to allocate document. "
+                            f"seqid={seqid}, original_doc_len={doc_len}, remaining_len={remaining_len}. "
+                            f"Configuration: as_world_size={as_world_size}, num_tokens_per_rank={num_tokens_per_rank}, "
+                            f"total_capacity={total_capacity}. "
+                            f"Current state: total_allocated={total_allocated}, total_remaining={total_remaining}, "
+                            f"rank_budgets={rank_budgets}. "
+                            f"Current batch being processed: {batch}."
+                        )
                     
                     chunk_size = min(remaining_len, rank_budgets[current_rank_idx])
                     
@@ -217,7 +228,17 @@ def batch_to_items_general(batches: List[List[int]], num_tokens_per_rank: int, D
             while current_rank_idx < DP_degree and rank_budgets[current_rank_idx] == 0:
                 current_rank_idx += 1
             if current_rank_idx >= DP_degree:
-                raise ValueError(f"Not enough space for seqid {seqid}, remaining_len {remaining_len}.")
+                total_capacity = DP_degree * num_tokens_per_rank
+                total_allocated = total_capacity - sum(rank_budgets)
+                total_remaining = sum(rank_budgets)
+                raise ValueError(
+                    f"Not enough space to allocate document. "
+                    f"seqid={seqid}, original_doc_len={doc_len}, remaining_len={remaining_len}. "
+                    f"Configuration: DP_degree={DP_degree}, num_tokens_per_rank={num_tokens_per_rank}, "
+                    f"total_capacity={total_capacity}. "
+                    f"Current state: total_allocated={total_allocated}, total_remaining={total_remaining}, "
+                    f"rank_budgets={rank_budgets}."
+                )
             
             chunk_size = min(remaining_len, rank_budgets[current_rank_idx])
             
