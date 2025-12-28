@@ -19,6 +19,9 @@ from distca.runtime.attn_kernels.dispatch import (
 )
 from distca.runtime.metadata import AlltoAllMetadata
 
+# Module-level flag to ensure warning is only printed once
+_deterministic_warning_printed = False
+
 # is_deterministic = (os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0") == "0")
 # if is_deterministic:
 #     print("🟡 Using deterministic = True as default value in FusedCommAttn! This is not recommended for production use! Forcefully set it back to False. If you need to test, come to FusedCommAttn.py to modify this logic.")
@@ -46,7 +49,10 @@ class FlashAttnArgs:
             self.deterministic = env_val != "1"
             # print(f"[FlashAttnArgs] Set deterministic to {self.deterministic} (NVTE_ALLOW_NONDETERMINISTIC_ALGO={env_val})")
         if self.deterministic:
-            print("⚠️⚠️⚠️ Using deterministic = True! This is not recommended when profiling for performance as it will degrade backward pass performance!")
+            global _deterministic_warning_printed
+            if not _deterministic_warning_printed:
+                print("⚠️⚠️⚠️ Using deterministic = True! This is not recommended when profiling for performance as it will degrade backward pass performance!")
+                _deterministic_warning_printed = True
 
 
 

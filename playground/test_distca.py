@@ -20,8 +20,6 @@ from typing import Dict
 
 from utils.logging import (
     setup_logging,
-    log_tensor_stats,
-    log_module,
     time_it,
     setup_log_directories,
     redirect_external_loggers,
@@ -29,10 +27,6 @@ from utils.logging import (
 from utils.cpu_affinity import set_cpu_affinity
 from utils.hf_config import (
     get_megatron_args_dict_from_hf_model,
-    get_known_model_config,
-    MegatronModelArgs,
-    KNOWN_MODEL_CONFIGS,
-    get_hf_config,
 )
 from utils.estimate import log_memory_estimate, log_flops_estimate
 from utils.token_monitor import (
@@ -40,11 +34,6 @@ from utils.token_monitor import (
     set_token_monitor_config,
 )
 
-from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
-from distca.utils.megatron_test_utils import init_mcore_model
-
-from distca.utils.traceback import enable_clickable_excepthook, enable_trace_calls
-enable_clickable_excepthook()
 
 if typing.TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -161,6 +150,7 @@ with time_it("import megatron.core"):
     from megatron.core.rerun_state_machine import RerunDataIterator, get_rerun_state_machine
     from megatron.core.utils import StragglerDetector
     from megatron.training.utils import unwrap_model
+    from megatron.core.packed_seq_params import PackedSeqParams
 
 
 
@@ -214,6 +204,17 @@ from distca.runtime.megatron.create_group import (
     get_attn_server_group_src_rank,
     initialize_attention_server_comm
 )
+from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
+from distca.utils.megatron_test_utils import init_mcore_model
+from distca.utils.megatron_test_utils import (
+    gptmodel_forward, make_batch_generator, unwrap_model,
+)
+from distca.runtime.megatron.packed_seq_params import (
+    arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams,
+)
+# Additional imports for create_pp_microbatches
+from distca.utils.traceback import enable_clickable_excepthook, enable_trace_calls
+enable_clickable_excepthook()
 
 with time_it("initialize nvshmem"):
     initialize_attention_server_comm()
@@ -1317,6 +1318,7 @@ def distca_forward_step(data_iterator, model: 'PingPongGPTModel'):
     ):
     ```
     """
+    raise NotImplementedError("DistCA forward step is not implemented yet")
 
     args = get_args()
     timers = get_timers()
@@ -1420,32 +1422,397 @@ non_loss_data_func = None
 memory_estimate = log_memory_estimate(args, num_microbatches=num_microbatches, verbose=True, logger=logger)
 logger.info(f"Memory estimate: {memory_estimate}")
 
-# from megatron.training.training import train as megatron_original_train
-from megatron_alter.training import train as distca_train
+# ================================
+# Simple forward_backward_batch demonstration
+# ================================
+# This replaces the distca_train call with a simpler approach similar to
+# test_megatron_e2e_pipeline_with_cp.py
 
-"""
-distca_train
-|- train_step(forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config)
-  |- forward_backward_func = get_distca_forward_backward_func()
-  |- forward_backward_func(
-            forward_step_func=forward_step_func, data_iterator=data_iterator, model=model, num_microbatches=get_num_microbatches(), seq_length=args.seq_length, micro_batch_size=args.micro_batch_size, decoder_seq_length=args.decoder_seq_length, forward_only=False)
-"""
-# TODO: This can be stuck in the `config` or `args` variable.
-distca_kwargs = {
-    "with_dummy": True,
-}
-# TODO: Simplify this logic such that we don't have to deal with the giant train function provided by Megatron.
-iteration, num_floating_point_operations_so_far = distca_train(
-    # original_forward_step,
-    distca_forward_step, 
-    model, optimizer, opt_param_scheduler,
-    train_data_iterator, valid_data_iterator,
-    process_non_loss_data_func, config, checkpointing_context,
-    non_loss_data_func,
-    distca_kwargs=distca_kwargs,
+def forward_backward_batch(
+    microbatches: list[dict],
+    model,
+    forward_only: bool = False,
+    mode: str = "ping_pong",
+    with_dummy: bool = True,
+):
+    """
+    Simple forward_backward_batch function that:
+    1. Takes pre-created microbatches
+    2. Defines a forward_step function
+    3. Handles dummy backward batches
+    4. Uses forward_backward_func with dummy_bwd_func
+    
+    This is a simplified version of the pattern from test_megatron_e2e_pipeline_with_cp.py
+    """
+    # Move microbatches to CUDA
+    microbatches = [{
+        k: arg_to_cuda(v) for k, v in microbatch.items()
+    } for microbatch in microbatches]
+    
+    # Get pipeline parallel info
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    n_micro_batch = len(microbatches) - pp_size + 1
+    total_seqlen = microbatches[0]['input_ids'].shape[0] if 'input_ids' in microbatches[0] else None
+    
+    # Define forward_step function
+    def forward_step(batch_iter, model):
+        batch = next(batch_iter)
+        
+        input_ids = batch['input_ids']
+        position_ids = batch['position_ids']
+        attention_mask = None
+        packed_seq_params = batch.get('packed_seq_params', None)
+        
+        sequence_parallel = get_args().sequence_parallel
+        logger.debug(f"forward_step: {input_ids.shape=}, {sequence_parallel = }")
+        
+        # Use gptmodel_forward utility function
+        with torch.cuda.nvtx.range("forward_step"):
+            output = gptmodel_forward(
+                model, input_ids, attention_mask, position_ids, sequence_parallel,
+                packed_seq_params, labels=input_ids.unsqueeze(0) if 'input_ids' in batch else None,
+            )
+        # Mock the loss_mask: set to ones with same number of tokens as input_ids
+        # (Reasonable stand-in for a mask meaning all tokens contribute to loss)
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+        return output, partial(loss_func, loss_mask)
+    
+    # Define dummy backward step function
+    def dummy_backward_step(model, dummy_bwd_iter, skip: bool):
+        try:
+            next_iter_args = next(dummy_bwd_iter)
+            if skip:
+                return
+            unwrap_model(model).dummy_backward(next_iter_args)
+        except StopIteration:
+            # No more dummy backward batches
+            pass
+    
+    # Prepare model for training
+    # Note: model might be a list in case of virtual pipeline parallelism
+    if isinstance(model, list):
+        train_module = model
+    else:
+        train_module = [model]
+    
+    assert len(train_module) == 1, "only support one module"
+    
+    # Prepare dummy backward metadata
+    # Shift bwd metadata since the order it runs is different from the
+    # corresponding dummy forward's.
+    dummy_bwd_packed_seq_params = [
+        microbatch.get('packed_seq_params') for microbatch in
+        (microbatches[-pp_size + pp_rank + 1:][:pp_size - pp_rank - 1] + microbatches[:pp_rank])
+    ]
+    dummy_bwd_packed_seq_params = dummy_bwd_packed_seq_params[pp_rank:] + dummy_bwd_packed_seq_params[:pp_rank]
+    
+    assert mode in ["ping_pong", "orig_reimpl", "single_sided"]
+    
+    # Set debug mode for modules
+    for module in train_module:
+        debug = (mode != "ping_pong")
+        debug_fwd_impl = mode if debug else None
+        unwrap_model(module).set_debug(debug=debug, debug_fwd_impl=debug_fwd_impl)
+        unwrap_model(module).train()
+    
+    # Create batch generator and dummy backward iterator
+    dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
+    batch_generator = make_batch_generator(
+        microbatches if with_dummy else microbatches[pp_rank:],
+        vpp_size=len(train_module)
+    )
+    
+    # Synchronize before starting
+    torch.cuda.synchronize()
+    from distca.runtime.attn_kernels.ops import nvshmem_barrier_all
+    nvshmem_barrier_all()
+    
+    # Call forward_backward_func
+    from distca.runtime.megatron.forward_backward_func import forward_backward_pipelining_without_interleaving
+    if with_dummy:
+        losses_reduced = forward_backward_pipelining_without_interleaving(
+            forward_step_func=forward_step,
+            data_iterator=batch_generator,
+            model=train_module,
+            num_microbatches=n_micro_batch,
+            seq_length=total_seqlen,  # no use, since variable_seq_lengths=True
+            micro_batch_size=1,  # no use when input_shapes was set
+            forward_only=forward_only,
+            dummy_bwd_func=partial(
+                dummy_backward_step,
+                dummy_bwd_iter=dummy_bwd_packed_seq_params_iter,
+                skip="orig" in mode,
+            ),
+        )
+    else:
+        from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+        losses_reduced = get_forward_backward_func()(
+            forward_step_func=forward_step,
+            data_iterator=batch_generator,
+            model=train_module,
+            num_microbatches=n_micro_batch,
+            seq_length=total_seqlen,
+            micro_batch_size=1,
+            forward_only=forward_only,
+        )
+    
+    for tm in train_module:
+        for param in unwrap_model(tm).parameters():
+            param.main_grad.zero_()
+    return losses_reduced
+
+
+# ================================
+# create_pp_microbatches function
+# ================================
+# Copied from test_megatron_e2e_pipeline_with_cp.py
+from distca.runtime.compute_metadata import get_attn_metadata
+from distca.planner.planner import cp_list_to_mlp_list
+from distca.utils.test_util import create_qkv_dispatch_pipeline_tick
+
+def create_pp_microbatches(
+    num_microbatch: int, pp_degree: int, as_rank: int,
+    as_world_size: int, total_seq_len: int, num_seqs: int,
+    max_cp_degree: int, hidden_size_q_tp: int,
+    hidden_size_k_tp: int, element_size: int,
+    num_head_in_dtype: int, tp_size: int, dp_size: int,
+    num_token_per_rank: int,
+    num_batches: int = None,
+    use_planner: bool = False,
+    return_seq_lens: bool = False
+):
+    # print("Create pp microbatches")
+    tick_per_rank_doc_lens = None
+    bwd_metadata = []
+    microbatches = []
+
+    all_original_seq_lens = []
+    for i in range(num_microbatch + pp_degree - 1):
+        # For the last few ticks (drain-out ticks)
+        # add a dummy forward microbatch at PP rank 0.
+        add_dummy_forward = i >= num_microbatch
+        (
+            fa_fwd_params, 
+            fa_bwd_params,
+            qkv_fwd_fa2a_metadata, 
+            qkv_bwd_fa2a_metadata,
+            attn_out_fwd_fa2a_metadata, 
+            attn_out_qkv_bwd_fa2a_metadata,
+            tick_per_rank_doc_lens, 
+            original_tick_per_rank_doc_lens,
+        ) = create_qkv_dispatch_pipeline_tick(
+            as_world_size, total_seq_len, num_seqs, max_cp_degree,
+            hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
+            ref_doc_lens=tick_per_rank_doc_lens,
+            add_dummy=add_dummy_forward,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            num_token_per_rank=num_token_per_rank,
+            num_batches=num_batches,
+            use_planner=use_planner,
+            return_original_doclen=return_seq_lens,
+        )
+        all_original_seq_lens.append(original_tick_per_rank_doc_lens)
+        
+        # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, so each rank knows its number of tokens.
+        #   Example1 DP case:
+        # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 256],[128, 384],[512], [10, 502] ]
+        # tick_per_rank_doc_lens mlp list : [[8], [8], [8], [8], [256, 256],[128, 384],[512], [10, 502] ]
+        #   Example2 CP case:
+        # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 768],[512, 10, 502] ]
+        # tick_per_rank_doc_lens mlp list: [[8], [8], [8], [8], [256, 128, 128], [256, 256], [512], [10, 502]]
+        tick_per_rank_doc_lens_after_cp_transfer = cp_list_to_mlp_list(tick_per_rank_doc_lens, as_world_size, num_token_per_rank)
+        this_rank_num_tokens = sum(tick_per_rank_doc_lens_after_cp_transfer[as_rank])
+        bwd_packed_seq_params = PackedSeqParams(qkv_format="thd", **fa_bwd_params[as_rank])
+        tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens_after_cp_transfer[as_rank], dtype=torch.int32)
+        mlp_packed_seq_params = get_attn_metadata(tensor_doc_lens, get_packed_seq_params=True)
+
+        # Create packed_params. Note that we do not add backward params here.
+        ping_pang_params = PingPangSingleStepPackedSeqParams(
+            qkv_format="thd",
+            **fa_fwd_params[as_rank],
+            qkv_fwd_metadata=qkv_fwd_fa2a_metadata.get_slice(as_rank),
+            attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(as_rank),
+            mlp_packed_seq_params=mlp_packed_seq_params,
+        )
+
+        # NOTE: we init input_ids at the end after creating dispatching strategy
+        # and seq lens of each iteration. This is to ensure that each
+        # rank has the same randomly initialized strategy.
+        position_ids_local = torch.arange(this_rank_num_tokens)
+        microbatch = {
+            "position_ids": position_ids_local,
+            "packed_seq_params": ping_pang_params,
+        }
+        microbatches.append(microbatch)
+
+        # store the corresponding bwd metadata (for later ticks)
+        bwd_metadata.append(
+            (
+                qkv_bwd_fa2a_metadata.get_slice(as_rank), 
+                attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank), 
+                bwd_packed_seq_params
+            )
+        )
+
+    start_time = time.time()
+    # put bwd metadata to the corresponding side
+    for i, microbatch in enumerate(microbatches):
+        # When mb_i is computed on pp_rank at forward tick t, assume the backward right after this forward is at tick t'.
+        # mb_i requires another (pp_degree - 1 - pp_rank) forward steps to start mb_i backward,
+        # and another (pp_degree - 1 - pp_rank) backward steps to compute mb_i backward on this pp_rank.
+        # Since in 1F1B, every forward follows a backward, so backward tick
+        # t' + 2 * (pp_degree - 1 - pp_rank) is the one to compute mb_i on this pp_rank.
+        # Note that at the end of PP warmup, forward tick is pp_degree - 1, while backward tick
+        # is 0. Therefore, t - t' = pp_degree - 1, and thus
+        # t' + 2 * (pp_degree - 1 - pp_rank) == t + pp_degree - 1 - pp_rank * 2
+        bwd_metadata_idx = (i + pp_degree - 1 - pp_rank * 2) % len(bwd_metadata)
+        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[bwd_metadata_idx]
+        packed_seq_params = microbatch["packed_seq_params"]
+        packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
+        packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
+        packed_seq_params.bwd_packed_seq_params = bwd_packed_seq_params
+    end_time = time.time()
+    ret = microbatches
+    if return_seq_lens:
+        ret = (microbatches, all_original_seq_lens)
+    return ret
+
+
+# ================================
+# Example usage: Replace distca_train with forward_backward_batch
+# ================================
+
+# ================================
+# Training Loop using forward_backward_batch
+# ================================
+# This replaces distca_train with a simpler approach using forward_backward_batch
+from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams
+
+# Check if we should use forward_backward_batch instead of distca_train
+logger.info("Using forward_backward_batch instead of distca_train")
+
+# Calculate attention server parameters
+# as_world_size and as_rank are already defined above (lines 240-241)
+
+# Get model dimensions from config
+hidden_size_q = config.hidden_size
+hidden_size_kv = hidden_size_q
+if hasattr(hf_config, "num_key_value_heads"):
+    hidden_size_kv = (hidden_size_q * hf_config.num_key_value_heads //
+                        hf_config.num_attention_heads)
+
+hidden_size_q_tp = hidden_size_q // tp_size
+hidden_size_k_tp = hidden_size_kv // tp_size
+element_size = args.params_dtype.itemsize
+num_head_in_dtype = (hf_config.num_attention_heads *
+                        torch.float32.itemsize // element_size // tp_size)
+
+# Calculate token distribution
+num_token_per_rank = args.seq_length * args.micro_batch_size // dp_size
+total_seq_len = args.seq_length
+num_seqs = args.micro_batch_size
+num_microbatch = num_microbatches
+max_cp_degree = cp_size if cp_size > 1 else dp_size
+num_batches = None  # Use MLP-DP by default
+
+logger.info(f"Creating microbatches: num_microbatch={num_microbatch}, pp_size={pp_size}, "
+            f"as_rank={as_rank}, as_world_size={as_world_size}")
+
+# Create microbatches for ping-pong (two dispatchers)
+microbatches_0, tick_per_rank_doc_lens_0 = create_pp_microbatches(
+    num_microbatch, pp_size, as_rank,
+    as_world_size, total_seq_len, num_seqs, max_cp_degree,
+    hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
+    tp_size, dp_size,
+    num_token_per_rank, num_batches, use_planner=False,
+    return_seq_lens=True,
 )
-logger.info(f"Iteration {iteration} finished")
-logger.info(f"Number of floating point operations so far: {num_floating_point_operations_so_far} FLOPS")
+
+microbatches_1, tick_per_rank_doc_lens_1 = create_pp_microbatches(
+    num_microbatch, pp_size, as_rank,
+    as_world_size, total_seq_len, num_seqs, max_cp_degree,
+    hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
+    tp_size, dp_size,
+    num_token_per_rank, num_batches, use_planner=False,
+    return_seq_lens=True,
+)
+
+# Combine microbatches for ping-pong (similar to test_megatron_e2e_pipeline_with_cp.py)
+combined_microbatches = []
+for mb_0, mb_1 in zip(microbatches_0, microbatches_1):
+    mb_0_psp = mb_0["packed_seq_params"]
+    mb_1_psp = mb_1["packed_seq_params"]
+    mb_0_mlp_psp = mb_0_psp.mlp_packed_seq_params
+    mb_1_mlp_psp = mb_1_psp.mlp_packed_seq_params
+    mb_0_psp.dispatcher_id = 0
+    mb_1_psp.dispatcher_id = 1
+    ping_pong_params = PingPangPackedSeqParams(
+        seq_params=[mb_0_psp, mb_1_psp],
+        mlp_layout_seq_params=[mb_0_mlp_psp, mb_1_mlp_psp],
+        max_seqlen_q=max(mb_0_mlp_psp.max_seqlen_q, mb_1_mlp_psp.max_seqlen_q),
+        max_seqlen_kv=max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
+    )
+    num_tokens = sum(mb["position_ids"].numel() for mb in [mb_0, mb_1])
+    input_ids = torch.randint(10, 1000, (num_tokens,), device=torch.cuda.current_device())
+    combined_mb = {
+        "input_ids": input_ids,
+        "position_ids": torch.concat([mb_0["position_ids"], mb_1["position_ids"]]),
+        "packed_seq_params": ping_pong_params,
+    }
+    combined_microbatches.append(combined_mb)
+
+logger.info(f"Created {len(combined_microbatches)} combined microbatches")
+
+# Training loop
+iteration = 0
+max_iterations = args.train_iters if hasattr(args, 'train_iters') else 1
+
+for iteration in range(max_iterations):
+    logger.info(f"Starting iteration {iteration}")
+    
+    # Run forward_backward_batch
+    losses_reduced = forward_backward_batch(
+        microbatches=combined_microbatches,
+        model=model,
+        forward_only=False,
+        mode="ping_pong",
+        with_dummy=True,
+    )
+    
+    # Reduce losses across data parallel groups
+    print(f"losses_reduced: {losses_reduced}")
+    if losses_reduced:
+        # losses_reduced is a list of dicts, each dict has 'lm loss': (loss_tensor, count_tensor)
+        # losses_reduced: [{'lm loss': (tensor(103096.1875, device='cuda:0'), tensor(8192., device='cuda:0'))}]
+        numerator = 0
+        denominator = 0
+        for loss_dict in losses_reduced:
+            if 'lm loss' in loss_dict:
+                val = loss_dict['lm loss']
+                if isinstance(val, (tuple, list)) and len(val) == 2:
+                    numerator += val[0]  # sum of losses
+                    denominator += val[1]  # sum of token counts
+        if denominator > 0:
+            reduced_loss = numerator / denominator
+            logger.info(f"Iteration {iteration}, reduced loss: {reduced_loss.item()}")
+        else:
+            logger.warning(f"Iteration {iteration}, no valid loss found")
+    
+    # Optimizer step
+    optimizer.step()
+    
+    # TODO: Some logic including increment the opt_param_scheduler step should be included here.
+
+    # Zero gradients (handled by optimizer, but can be explicit)
+    optimizer.zero_grad()
+    
+    logger.info(f"Completed iteration {iteration}")
+
+num_floating_point_operations_so_far = 0  # Calculate if needed
+logger.info(f"Training completed. Total iterations: {iteration + 1}")
+
 
 # ================================
 # Finish Training
