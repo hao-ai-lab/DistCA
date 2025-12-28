@@ -1,4 +1,12 @@
 """
+Test metadata:
+
+EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 1 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 1 --pp-size 1 --tp-size 1 --cp-size 1 --num-microbatch 1 --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --num-layers 2
+
+EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 2 --pp-size 2 --tp-size 1 --cp-size 1 --num-microbatch 2 --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --num-layers 2
+
+
+
 Debug example:
 EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB=2 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 1 test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 1 --pp-size 1 --tp-size 1 --cp-size 1 --num-microbatch 1 --model-path deepseek-ai/DeepSeek-R1-Distill-Llama-8B --num-layers 2
 
@@ -474,6 +482,7 @@ def test(args):
         sample_name=args.sample_name,
         balance_ping_pong_batch_size=balance_ping_pong_batch_size,
     )
+    from distca.utils import training_utils as _training_utils
     # When use_planner=True, test_util.py uses _training_utils.get_next_batch
     # which requires _training_utils.GLOBAL_BATCH to be initialized
     if args.use_planner:
