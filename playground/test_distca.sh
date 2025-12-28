@@ -1,23 +1,71 @@
-#! /bin/bash
+#!/bin/bash
 
 #SBATCH --job-name=distca-debug
-#SBATCH --nodes=4
 #SBATCH --output=logs/slurm/stdout.%j.log
 #SBATCH --error=logs/slurm/stderr.%j.log
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=128
-#SBATCH --mem=512G
-#SBATCH --exclusive
 #SBATCH --time=01:00:00
 
 
-NNODES=1
-NPROC_PER_NODE=1
-JOBID=1390200
-HEAD_NODE_IP=${HEAD_NODE_IP:-"fs-mbz-gpu-044"}
+
+TP=1
+PP=1
+CP=1
+DP=1
+NUM_GPUS=$((TP * PP * CP * DP))
+NPROC_PER_NODE=$((NUM_GPUS < 8 ? NUM_GPUS : 8))
+NNODES=$((NUM_GPUS / NPROC_PER_NODE))
+echo TP=$TP, PP=$PP, CP=$CP, DP=$DP, NUM_GPUS=$NUM_GPUS, NPROC_PER_NODE=$NPROC_PER_NODE, NNODES=$NNODES
+
 
 source .env.sh
+
+# Detect if we are in a SLURM environment using a variety of SLURM variables
+if [ -n "$SLURM_JOB_ID" ] || [ -n "$SLURM_NODELIST" ] || [ -n "$SLURM_NNODES" ]; then
+    is_in_slurm_env=1
+else
+    is_in_slurm_env=0
+fi
+
+if [ "$is_in_slurm_env" -eq 1 ]; then
+    # Use SLURM variables when present
+    JOBID=$SLURM_JOB_ID
+    # Set HEAD_NODE_IP from SLURM_NODELIST if not already set
+    echo SLURM_NODELIST=$SLURM_NODELIST
+    SCONTROL_NODES=$(scontrol show hostnames "$SLURM_NODELIST")
+    HEAD_NODE_IP=$(echo "$SCONTROL_NODES" | head -n 1)
+    export JOBID
+    export HEAD_NODE_IP
+else
+    # Not in SLURM: rely on whatever was set in .env.sh or environment
+    JOBID="${JOBID}"
+    
+    # If JOBID is provided, query SLURM to get the node list
+    if [ -n "$JOBID" ]; then
+        echo "Querying SLURM for job $JOBID node list..."
+        # Get the node list from scontrol show job
+        NODELIST=$(scontrol show job "$JOBID" | grep -oP '^[\s]+NodeList=\K[^\s]+' || echo "")
+        
+        if [ -n "$NODELIST" ]; then
+            echo "Found node list: $NODELIST"
+            # Convert node list to hostnames and get the first one
+            SCONTROL_NODES=$(scontrol show hostnames "$NODELIST")
+            HEAD_NODE_IP=$(echo "$SCONTROL_NODES" | head -n 1)
+            echo "Using head node: $HEAD_NODE_IP"
+        else
+            echo "Warning: Could not retrieve node list for job $JOBID"
+            exit 1
+        fi
+    else
+        HEAD_NODE_IP="${HEAD_NODE_IP}"
+    fi
+fi
+
+echo JOBID=$JOBID
+echo HEAD_NODE_IP=$HEAD_NODE_IP
 
 # NCCL debug flags for troubleshooting
 # export NCCL_DEBUG=INFO

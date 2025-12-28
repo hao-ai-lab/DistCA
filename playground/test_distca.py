@@ -157,7 +157,12 @@ with time_it("import megatron.core"):
 # ====================================
 # Initialize Megatron Parallel Groups
 # ====================================
-tp = 1; pp = 1; cp = 1;
+tp = int(os.environ["TP"]); 
+pp = int(os.environ["PP"]); 
+cp = int(os.environ["CP"]);
+dp = int(os.environ["DP"]);
+# ensure that tp * pp * cp * dp == world_size
+assert tp * pp * cp * dp == world_size, f"{tp = }, {pp = }, {cp = }, {dp = }: tp * pp * cp * dp = {tp * pp * cp * dp} != world_size: {world_size}"
 
 with time_it("initialize model parallel groups"):
     # tp = min(8, world_size);
