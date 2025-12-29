@@ -537,6 +537,9 @@ with time_it("initialize megatron"):
         group.add_argument("--distca-quit-if-maybe-oom", action="store_true", default=False, 
         help="If True, the program will quit if the estimated memory can probably exceeds the GPU max memory.")
 
+        group.add_argument("--distca-debug-nan-detector", action="store_true", default=False,
+        help="If True, enable detailed debug logging in nan detector.")
+
         group.add_argument("--distca-debug-batch-to-items", action="store_true", default=False,
         help="If True, enable detailed debug logging in batch_to_items_with_dummy function.")
 
@@ -570,13 +573,16 @@ with time_it("initialize megatron"):
     # Configure logger for batch_to_items_with_dummy based on flag
     # This provides backward compatibility with --distca-debug-batch-to-items
     # Standard way: logging.getLogger(__name__ + ".batch_to_items_with_dummy").setLevel(logging.DEBUG)
-    if hasattr(args, 'distca_debug_batch_to_items') and args.distca_debug_batch_to_items:
+    if args.distca_debug_batch_to_items:
         logger_batch_to_items.setLevel(logging.DEBUG)
         logger.info(f"Enabled debug logging for batch_to_items_with_dummy (logger: {logger_batch_to_items.name})")
     else:
         # Inherit from parent logger (default behavior)
         logger_batch_to_items.setLevel(logging.NOTSET)  # NOTSET means inherit from parent
 
+
+
+logger.info(f"args: {args}")
 
 # ================================
 # Report theoretical memory and FLOPS estimates
@@ -762,11 +768,19 @@ def __original_is_dataset_built_on_rank():
     ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
+# def is_dataset_built_on_rank() -> bool:
+#     """DistCA: Only build the dataset on Rank 0. 
+#     Rank 0 will be the only rank that will build the dataset and plan.
+#     """
+#     return mpu.get_data_parallel_rank() == 0    
+
+# TODO: (Refactor) Dataset should only build on rank 0 and broadcast to other ranks.
+# We didn't have a very good abstraction to create microbatches for PP just yet.
 def is_dataset_built_on_rank() -> bool:
     """DistCA: Only build the dataset on Rank 0. 
     Rank 0 will be the only rank that will build the dataset and plan.
     """
-    return mpu.get_data_parallel_rank() == 0    
+    return True
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -2000,12 +2014,26 @@ def create_combined_ping_pong_microbatches(
         # position_ids = torch.concat([mb_0["position_ids"], mb_1["position_ids"]])
         # labels = labels.unsqueeze(0)
         
+        
+        as_rank = mbc_config.as_rank
+
         dim = 1
         input_ids = torch.cat([mb_0["tokens"], mb_1["tokens"]], dim=dim).reshape(-1)
-        labels = torch.cat([mb_0["labels"], mb_1["labels"]], dim=dim).reshape(-1).unsqueeze(0)
+        labels = torch.cat([mb_0["labels"], mb_1["labels"]], dim=dim).reshape(-1)
         loss_mask = torch.cat([mb_0["loss_mask"], mb_1["loss_mask"]], dim=dim).reshape(-1)
         position_ids = torch.cat([mb_0["position_ids"], mb_1["position_ids"]], dim=dim).reshape(-1)
-        logger.info(f"{input_ids.shape = }, {labels.shape = }, {loss_mask.shape = }, {position_ids.shape = }")
+        logger.info(f"[create_combined_ping_pong_microbatches] Before slicing: {input_ids.shape = }, {labels.shape = }, {loss_mask.shape = }, {position_ids.shape = }")
+
+        # Only take the as_rank portion of the tensor
+        my_rank_slice = slice(as_rank * num_token_per_rank, (as_rank + 1) * num_token_per_rank)
+        input_ids = input_ids[my_rank_slice]
+        labels = labels[my_rank_slice]
+        loss_mask = loss_mask[my_rank_slice]
+        position_ids = position_ids[my_rank_slice]
+        logger.info(f"[create_combined_ping_pong_microbatches] [as_rank = {as_rank}] After slicing: {input_ids.shape = }, {labels.shape = }, {loss_mask.shape = }, {position_ids.shape = }")
+
+        labels = labels.unsqueeze(0)
+        logger.info(f"[create_combined_ping_pong_microbatches] [as_rank = {as_rank}] After unsqueezing: {labels.shape = }")
 
         combined_mb = dict(
             input_ids=input_ids,
@@ -2048,18 +2076,17 @@ if args.distca_debug_nan_detector:
 for iteration in range(max_iterations):
     logger.info(f"Starting iteration {iteration}")
 
-    if rank == 0:
-        # Create combined microbatches for this iteration
-        combined_microbatches = create_combined_ping_pong_microbatches(mbc_config)
-    torch.distributed.barrier()
 
-    # Broadcast the microbatches to the different ranks after planning.
-    if rank == 0:
-        pass
-    else:
-        pass
+    # TODO: (Refactor) Every rank will fetch the dataset. This is not so good! 
+    # In theory, we should let Rank 0 fetch the dataset and broadcast to the other ranks.
+    combined_microbatches = create_combined_ping_pong_microbatches(mbc_config)
+    logger.info(f"Created {len(combined_microbatches)} combined microbatches")
+    torch.distributed.barrier()
     
+    logger.info(f"Barrier passed")
+
     # Run forward_backward_batch
+    logger.info(f"Running forward_backward_batch")
     losses_reduced = forward_backward_batch(
         microbatches=combined_microbatches,
         model=model,

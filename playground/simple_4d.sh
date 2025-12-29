@@ -14,7 +14,7 @@
 export TP=1
 export PP=1
 export CP=1
-export DP=1
+export DP=2
 export MICRO_BATCH_SIZE=1
 export GLOBAL_BATCH_SIZE=2
 export SEQ_LENGTH=4096
