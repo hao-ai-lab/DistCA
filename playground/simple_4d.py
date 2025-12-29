@@ -18,7 +18,7 @@ from pickle import dump
 import typing
 from typing import Dict
 
-from utils.logging import (
+from distca.utils.logging import (
     setup_logging,
     time_it,
     setup_log_directories,
@@ -94,7 +94,7 @@ for handler in logger.handlers:
                 new_fmt = current_fmt.replace('%(message)s', '%(funcName)s:%(lineno)d %(message)s')
                 # Preserve rank formatting if it's a RankFormatter
                 if hasattr(formatter, 'rank'):
-                    from utils.logging import RankFormatter
+                    from distca.utils.logging import RankFormatter
                     handler.setFormatter(RankFormatter(fmt=new_fmt, datefmt=formatter.datefmt, 
                                                        rank=formatter.rank, use_color=getattr(formatter, 'use_color', True)))
                 else:

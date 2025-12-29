@@ -16,7 +16,7 @@ with contextlib.nullcontext():
     from pathlib import Path
     from typing import Optional, Tuple, List
 
-    from utils.logging import (
+    from distca.utils.logging import (
         setup_logging,
         time_it,
         setup_log_directories,
