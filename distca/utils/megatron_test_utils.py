@@ -552,6 +552,9 @@ def init_mcore_model(
 ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
+    """Directly copy from megatron/training/utils.py.
+    Unwrap the model from the module wrappers.
+    """
     return_list = True
     if not isinstance(model, list):
         model = [model]

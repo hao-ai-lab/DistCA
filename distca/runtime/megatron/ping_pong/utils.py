@@ -43,7 +43,13 @@ def splits_all(tensors: List[torch.Tensor], num_splits: int):
     return repack_args(splits, num_splits)
 
 def split_all_dict(tensors: Dict[str, torch.Tensor], num_splits: int):
-    splits = {k: _split_tensor(v, num_splits) for k, v in tensors.items()}
+    splits = {}
+    for k, v in tensors.items():
+        try:
+            splits[k] = _split_tensor(v, num_splits)
+        except Exception as e:
+            raise ValueError(f"Error splitting tensor {k}: {e}") from e
+    # splits = {k: _split_tensor(v, num_splits) for k, v in tensors.items()}
     return _repack_dicts(splits, num_splits)
 
 def gather_tensor(tensors: List[torch.Tensor], num_splits: int):
