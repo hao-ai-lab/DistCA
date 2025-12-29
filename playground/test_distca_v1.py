@@ -18,7 +18,7 @@ from pickle import dump
 import typing
 from typing import Dict
 
-from utils.logging import (
+from distca.utils.logging import (
     setup_logging,
     log_tensor_stats,
     log_module,

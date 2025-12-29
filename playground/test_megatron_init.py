@@ -4,7 +4,7 @@ import logging
 
 from datetime import timedelta
 
-from utils.logging import (
+from distca.utils.logging import (
     setup_logging,
     log_tensor_stats,
     log_module,
@@ -176,7 +176,7 @@ else:
 torch.distributed.barrier()
 logger.info(f"Finish initializing megatron parallel groups.")
 
-from utils.logging import setup_log_directories, redirect_external_loggers
+from distca.utils.logging import setup_log_directories, redirect_external_loggers
 from pathlib import Path
 
 log_paths = setup_log_directories(
