@@ -7,5 +7,7 @@ transformers
 rich
 omegaconf
 
+third-party-docs
+
 # scikit-learn
 # numpy

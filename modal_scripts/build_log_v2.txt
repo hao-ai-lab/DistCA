@@ -1,0 +1,276 @@
+✓ Initialized. View run at 
+https://modal.com/apps/hao-ai-lab/main/ap-QiwTdplEPRIhiNQOjyDBnf
+Building image im-XsnDdFxwo3X2TH0Z0kSCAo
+
+Using legacy Image Builder version. We suggest upgrading at https://modal.com/settings/image-config.
+
+=> Step 0: FROM base
+
+=> Step 1: RUN python -m pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+Looking in indexes: https://download.pytorch.org/whl/cu124
+Collecting torch==2.6.0
+  Downloading https://download.pytorch.org/whl/cu124/torch-2.6.0%2Bcu124-cp312-cp312-linux_x86_64.whl.metadata (28 kB)
+Collecting torchaudio==2.6.0
+  Downloading https://download.pytorch.org/whl/cu124/torchaudio-2.6.0%2Bcu124-cp312-cp312-linux_x86_64.whl.metadata (6.6 kB)
+Collecting torchvision==0.21.0
+  Downloading https://download.pytorch.org/whl/cu124/torchvision-0.21.0%2Bcu124-cp312-cp312-linux_x86_64.whl.metadata (6.1 kB)
+Collecting filelock (from torch==2.6.0)
+  Downloading filelock-3.20.0-py3-none-any.whl.metadata (2.1 kB)
+Requirement already satisfied: typing-extensions>=4.10.0 in /usr/local/lib/python3.12/site-packages (from torch==2.6.0) (4.15.0)
+Collecting networkx (from torch==2.6.0)
+  Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+Collecting jinja2 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec (from torch==2.6.0)
+  Downloading fsspec-2025.12.0-py3-none-any.whl.metadata (10 kB)
+Collecting nvidia-cuda-nvrtc-cu12==12.4.127 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cuda_nvrtc_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl (24.6 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 24.6/24.6 MB 122.4 MB/s  0:00:00
+Collecting nvidia-cuda-runtime-cu12==12.4.127 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cuda_runtime_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl (883 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 883.7/883.7 kB 112.4 MB/s  0:00:00
+Collecting nvidia-cuda-cupti-cu12==12.4.127 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cuda_cupti_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl (13.8 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 13.8/13.8 MB 118.9 MB/s  0:00:00
+Collecting nvidia-cudnn-cu12==9.1.0.70 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cudnn_cu12-9.1.0.70-py3-none-manylinux2014_x86_64.whl (664.8 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 664.8/664.8 MB 112.6 MB/s  0:00:05
+Collecting nvidia-cublas-cu12==12.4.5.8 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl (363.4 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 363.4/363.4 MB 110.8 MB/s  0:00:03
+Collecting nvidia-cufft-cu12==11.2.1.3 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cufft_cu12-11.2.1.3-py3-none-manylinux2014_x86_64.whl (211.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 211.5/211.5 MB 113.0 MB/s  0:00:01
+Collecting nvidia-curand-cu12==10.3.5.147 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_curand_cu12-10.3.5.147-py3-none-manylinux2014_x86_64.whl (56.3 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 56.3/56.3 MB 83.9 MB/s  0:00:00
+Collecting nvidia-cusolver-cu12==11.6.1.9 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cusolver_cu12-11.6.1.9-py3-none-manylinux2014_x86_64.whl (127.9 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 127.9/127.9 MB 111.7 MB/s  0:00:01
+Collecting nvidia-cusparse-cu12==12.3.1.170 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cusparse_cu12-12.3.1.170-py3-none-manylinux2014_x86_64.whl (207.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 207.5/207.5 MB 113.3 MB/s  0:00:01
+Collecting nvidia-cusparselt-cu12==0.6.2 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_cusparselt_cu12-0.6.2-py3-none-manylinux2014_x86_64.whl.metadata (6.8 kB)
+Collecting nvidia-nccl-cu12==2.21.5 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/nvidia_nccl_cu12-2.21.5-py3-none-manylinux2014_x86_64.whl (188.7 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 188.7/188.7 MB 114.6 MB/s  0:00:01
+Collecting nvidia-nvtx-cu12==12.4.127 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_nvtx_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl (99 kB)
+Collecting nvidia-nvjitlink-cu12==12.4.127 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/cu124/nvidia_nvjitlink_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl (21.1 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 21.1/21.1 MB 110.2 MB/s  0:00:00
+Collecting triton==3.2.0 (from torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/triton-3.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (1.4 kB)
+Requirement already satisfied: setuptools in /usr/local/lib/python3.12/site-packages (from torch==2.6.0) (69.0.3)
+Collecting sympy==1.13.1 (from torch==2.6.0)
+  Downloading sympy-1.13.1-py3-none-any.whl.metadata (12 kB)
+Requirement already satisfied: numpy in /usr/local/lib/python3.12/site-packages (from torchvision==0.21.0) (2.4.1)
+Collecting pillow!=8.3.*,>=5.3.0 (from torchvision==0.21.0)
+  Downloading pillow-12.0.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (8.8 kB)
+Collecting mpmath<1.4,>=1.1.0 (from sympy==1.13.1->torch==2.6.0)
+  Downloading mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch==2.6.0)
+  Downloading https://download.pytorch.org/whl/MarkupSafe-2.1.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (28 kB)
+Downloading https://download.pytorch.org/whl/cu124/torch-2.6.0%2Bcu124-cp312-cp312-linux_x86_64.whl (768.4 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 768.4/768.4 MB 111.4 MB/s  0:00:06
+Downloading https://download.pytorch.org/whl/cu124/torchaudio-2.6.0%2Bcu124-cp312-cp312-linux_x86_64.whl (3.4 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.4/3.4 MB 131.8 MB/s  0:00:00
+Downloading https://download.pytorch.org/whl/cu124/torchvision-0.21.0%2Bcu124-cp312-cp312-linux_x86_64.whl (7.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7.3/7.3 MB 115.4 MB/s  0:00:00
+Downloading https://download.pytorch.org/whl/cu124/nvidia_cusparselt_cu12-0.6.2-py3-none-manylinux2014_x86_64.whl (150.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 150.1/150.1 MB 108.5 MB/s  0:00:01
+Downloading sympy-1.13.1-py3-none-any.whl (6.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.2/6.2 MB 67.9 MB/s  0:00:00
+Downloading https://download.pytorch.org/whl/triton-3.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (166.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 166.7/166.7 MB 108.1 MB/s  0:00:01
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 157.2 MB/s  0:00:00
+Downloading pillow-12.0.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (7.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7.0/7.0 MB 109.9 MB/s  0:00:00
+Downloading filelock-3.20.0-py3-none-any.whl (16 kB)
+Downloading fsspec-2025.12.0-py3-none-any.whl (201 kB)
+Downloading https://download.pytorch.org/whl/jinja2-3.1.6-py3-none-any.whl (134 kB)
+Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 126.9 MB/s  0:00:00
+Installing collected packages: triton, nvidia-cusparselt-cu12, mpmath, sympy, pillow, nvidia-nvtx-cu12, nvidia-nvjitlink-cu12, nvidia-nccl-cu12, nvidia-curand-cu12, nvidia-cufft-cu12, nvidia-cuda-runtime-cu12, nvidia-cuda-nvrtc-cu12, nvidia-cuda-cupti-cu12, nvidia-cublas-cu12, networkx, MarkupSafe, fsspec, filelock, nvidia-cusparse-cu12, nvidia-cudnn-cu12, jinja2, nvidia-cusolver-cu12, torch, torchvision, torchaudio
+
+Successfully installed MarkupSafe-2.1.5 filelock-3.20.0 fsspec-2025.12.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 nvidia-cublas-cu12-12.4.5.8 nvidia-cuda-cupti-cu12-12.4.127 nvidia-cuda-nvrtc-cu12-12.4.127 nvidia-cuda-runtime-cu12-12.4.127 nvidia-cudnn-cu12-9.1.0.70 nvidia-cufft-cu12-11.2.1.3 nvidia-curand-cu12-10.3.5.147 nvidia-cusolver-cu12-11.6.1.9 nvidia-cusparse-cu12-12.3.1.170 nvidia-cusparselt-cu12-0.6.2 nvidia-nccl-cu12-2.21.5 nvidia-nvjitlink-cu12-12.4.127 nvidia-nvtx-cu12-12.4.127 pillow-12.0.0 sympy-1.13.1 torch-2.6.0+cu124 torchaudio-2.6.0+cu124 torchvision-0.21.0+cu124 triton-3.2.0
+Saving image...
+Image saved, took 4.61s
+
+Built image im-XsnDdFxwo3X2TH0Z0kSCAo in 136.36s
+
+
+Building image im-o5PLyhaGE0GCi2leRbdDj6
+
+Using legacy Image Builder version. We suggest upgrading at https://modal.com/settings/image-config.
+
+=> Step 0: FROM base
+
+=> Step 1: RUN python -m pip install einops ninja packaging pybind11 regex tensorboard
+Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+Collecting einops
+  Downloading http://pypi-mirror.modal.local:5555/simple/einops/einops-0.8.2-py3-none-any.whl.metadata (13 kB)
+Collecting ninja
+  Downloading http://pypi-mirror.modal.local:5555/simple/ninja/ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (5.1 kB)
+Collecting packaging
+  Downloading http://pypi-mirror.modal.local:5555/simple/packaging/packaging-26.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting pybind11
+  Downloading http://pypi-mirror.modal.local:5555/simple/pybind11/pybind11-3.0.1-py3-none-any.whl.metadata (10.0 kB)
+Collecting regex
+  Downloading http://pypi-mirror.modal.local:5555/simple/regex/regex-2026.1.15-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (40 kB)
+Collecting tensorboard
+  Downloading http://pypi-mirror.modal.local:5555/simple/tensorboard/tensorboard-2.20.0-py3-none-any.whl.metadata (1.8 kB)
+Collecting absl-py>=0.4 (from tensorboard)
+  Downloading http://pypi-mirror.modal.local:5555/simple/absl-py/absl_py-2.4.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting grpcio>=1.48.2 (from tensorboard)
+  Downloading http://pypi-mirror.modal.local:5555/simple/grpcio/grpcio-1.76.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (3.7 kB)
+Collecting markdown>=2.6.8 (from tensorboard)
+  Downloading http://pypi-mirror.modal.local:5555/simple/markdown/markdown-3.10.1-py3-none-any.whl.metadata (5.1 kB)
+Requirement already satisfied: numpy>=1.12.0 in /usr/local/lib/python3.12/site-packages (from tensorboard) (2.4.1)
+Requirement already satisfied: pillow in /usr/local/lib/python3.12/site-packages (from tensorboard) (12.0.0)
+Requirement already satisfied: protobuf!=4.24.0,>=3.19.6 in /usr/local/lib/python3.12/site-packages (from tensorboard) (6.33.4)
+Requirement already satisfied: setuptools>=41.0.0 in /usr/local/lib/python3.12/site-packages (from tensorboard) (69.0.3)
+Collecting tensorboard-data-server<0.8.0,>=0.7.0 (from tensorboard)
+  Downloading http://pypi-mirror.modal.local:5555/simple/tensorboard-data-server/tensorboard_data_server-0.7.2-py3-none-manylinux_2_31_x86_64.whl.metadata (1.1 kB)
+Collecting werkzeug>=1.0.1 (from tensorboard)
+  Downloading http://pypi-mirror.modal.local:5555/simple/werkzeug/werkzeug-3.1.5-py3-none-any.whl.metadata (4.0 kB)
+Requirement already satisfied: typing-extensions~=4.12 in /usr/local/lib/python3.12/site-packages (from grpcio>=1.48.2->tensorboard) (4.15.0)
+Requirement already satisfied: markupsafe>=2.1.1 in /usr/local/lib/python3.12/site-packages (from werkzeug>=1.0.1->tensorboard) (2.1.5)
+Downloading http://pypi-mirror.modal.local:5555/simple/einops/einops-0.8.2-py3-none-any.whl (65 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/ninja/ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (180 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/packaging/packaging-26.0-py3-none-any.whl (74 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/pybind11/pybind11-3.0.1-py3-none-any.whl (293 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/regex/regex-2026.1.15-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (803 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 803.6/803.6 kB 891.6 MB/s  0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/tensorboard/tensorboard-2.20.0-py3-none-any.whl (5.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5.5/5.5 MB 678.7 MB/s  0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/tensorboard-data-server/tensorboard_data_server-0.7.2-py3-none-manylinux_2_31_x86_64.whl (6.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.6/6.6 MB 570.6 MB/s  0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/absl-py/absl_py-2.4.0-py3-none-any.whl (135 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/grpcio/grpcio-1.76.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (6.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.6/6.6 MB 566.2 MB/s  0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/markdown/markdown-3.10.1-py3-none-any.whl (107 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/werkzeug/werkzeug-3.1.5-py3-none-any.whl (225 kB)
+Installing collected packages: werkzeug, tensorboard-data-server, regex, pybind11, packaging, ninja, markdown, grpcio, einops, absl-py, tensorboard
+
+Successfully installed absl-py-2.4.0 einops-0.8.2 grpcio-1.76.0 markdown-3.10.1 ninja-1.13.0 packaging-26.0 pybind11-3.0.1 regex-2026.1.15 tensorboard-2.20.0 tensorboard-data-server-0.7.2 werkzeug-3.1.5
+Saving image...
+Image saved, took 850.93ms
+
+Built image im-o5PLyhaGE0GCi2leRbdDj6 in 6.99s
+
+
+Building image im-SdxEbpTCaVysDbeTkWflxM
+
+Using legacy Image Builder version. We suggest upgrading at https://modal.com/settings/image-config.
+
+=> Step 0: FROM base
+
+=> Step 1: RUN cd /root && git clone https://github.com/NVIDIA/TransformerEngine.git
+Cloning into 'TransformerEngine'...
+
+=> Step 2: RUN cd /root/TransformerEngine && git checkout v2.4
+Note: switching to 'v2.4'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 3cd6870c Bump cuDNN FE (#1842)
+
+=> Step 3: RUN cd /root/TransformerEngine && git submodule update --init --recursive
+Submodule '3rdparty/cudnn-frontend' (https://github.com/NVIDIA/cudnn-frontend.git) registered for path '3rdparty/cudnn-frontend'
+Submodule '3rdparty/googletest' (https://github.com/google/googletest.git) registered for path '3rdparty/googletest'
+Cloning into '/root/TransformerEngine/3rdparty/cudnn-frontend'...
+Cloning into '/root/TransformerEngine/3rdparty/googletest'...
+Submodule path '3rdparty/cudnn-frontend': checked out '724f0ec8ce06027feada51f2d948cd3313e63720'
+Submodule path '3rdparty/googletest': checked out 'f8d7d77c06936315286eb55f8de22cd23c188571'
+Saving image...
+Image saved, took 1.69s
+
+Built image im-SdxEbpTCaVysDbeTkWflxM in 12.20s
+
+
+Building image im-DY016DlmBdNBSAKBkr0rkR
+
+Using legacy Image Builder version. We suggest upgrading at https://modal.com/settings/image-config.
+
+=> Step 0: FROM base
+
+=> Step 1: ENV NVTE_FRAMEWORK=pytorch
+
+=> Step 2: ENV MAX_JOBS=8
+
+=> Step 3: ENV NVTE_BUILD_THREADS_PER_JOB=4
+Saving image...
+Image saved, took 1.11s
+
+Built image im-DY016DlmBdNBSAKBkr0rkR in 3.30s
+
+
+Building image im-K8tV9rDOdwvZpJWTINy9QV
+
+Using legacy Image Builder version. We suggest upgrading at https://modal.com/settings/image-config.
+
+=> Step 0: FROM base
+
+=> Step 1: RUN cd /root/TransformerEngine && pip install --no-build-isolation -v '.[pytorch]'
+Using pip 25.3 from /usr/local/lib/python3.12/site-packages/pip (python 3.12)
+Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+Processing /root/TransformerEngine
+  Preparing metadata (pyproject.toml): started
+  Running command Preparing metadata (pyproject.toml)
+  Traceback (most recent call last):
+    File "/usr/local/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>
+      main()
+    File "/usr/local/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 373, in main
+      json_out["return_val"] = hook(**hook_input["kwargs"])
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "/usr/local/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 175, in prepare_metadata_for_build_wheel
+      return hook(metadata_directory, config_settings)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "/usr/local/lib/python3.12/site-packages/setuptools/build_meta.py", line 366, in prepare_metadata_for_build_wheel
+      self.run_setup()
+    File "/usr/local/lib/python3.12/site-packages/setuptools/build_meta.py", line 480, in run_setup
+      super(_BuildMetaLegacyBackend, self).run_setup(setup_script=setup_script)
+    File "/usr/local/lib/python3.12/site-packages/setuptools/build_meta.py", line 311, in run_setup
+      exec(code, locals())
+    File "<string>", line 13, in <module>
+  ModuleNotFoundError: No module named 'wheel'
+  error: subprocess-exited-with-error
+  
+  × Preparing metadata (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> No available output.
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  full command: /usr/local/bin/python /usr/local/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py prepare_metadata_for_build_wheel /tmp/tmpsqfeaz8u
+  cwd: /root/TransformerEngine
+  Preparing metadata (pyproject.toml): finished with status 'error'
+error: metadata-generation-failed
+
+× Encountered error while generating package metadata.
+╰─> from file:///root/TransformerEngine
+
+note: This is an issue with the package mentioned above, not pip.
+hint: See above for details.
+Terminating task due to error: failed to run builder command "cd /root/TransformerEngine && pip install --no-build-isolation -v '.[pytorch]'": container exit status: 1
+Runner failed with exit code: -1
+Stopping app - uncaught exception raised locally: RemoteError('Image build for im-K8tV9rDOdwvZpJWTINy9QV failed. See build logs for more details.').
+╭─ Error ──────────────────────────────────────────────────────────────────────╮
+│ Image build for im-K8tV9rDOdwvZpJWTINy9QV failed. See build logs for more    │
+│ details.                                                                     │
+╰──────────────────────────────────────────────────────────────────────────────╯

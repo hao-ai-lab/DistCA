@@ -1,0 +1,264 @@
+=============================================================================
+MODAL DEPLOYMENT PROGRESS LOG - DistCA on Modal
+=============================================================================
+Goal: Deploy Megatron-LM with DistCA-compatible versions on Modal H100 GPUs
+Started: 2026-01-29
+=============================================================================
+
+PHASE 1: MEGATRON SETUP ON MODAL H100
+Status: IN PROGRESS ⏳
+Estimated Time: 30-40 minutes
+Estimated Cost: ~$1.00
+
+-----------------------------------------------------------------------------
+ATTEMPT #1: Initial Build (FAILED)
+-----------------------------------------------------------------------------
+Date: 2026-01-29
+Script: megatron_full_stack.py (initial version)
+Build Time: ~5 minutes
+Status: ❌ FAILED
+
+Configuration:
+- Base Image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+- Python: 3.12
+- PyTorch: 2.7.0 (CUDA 12.4)
+- Transformer Engine: v2.4
+- Megatron-LM: core_v0.12.1
+- Apex: latest
+- FlashAttention: 2.7.4
+- GPU: H100
+
+Error:
+  ModuleNotFoundError: No module named 'wheel'
+  Location: During Transformer Engine installation
+
+Root Cause:
+  TransformerEngine's setup.py requires the 'wheel' package to be installed,
+  but it wasn't included in our pip dependencies.
+
+Fix Applied:
+  Added "wheel" to pip_install step:
+  ```python
+  .pip_install(
+      "pybind11",
+      "packaging",
+      "ninja",
+      "einops",
+      "regex",
+      "tensorboard",
+      "wheel",  # Required for Transformer Engine build
+  )
+  ```
+
+Lesson Learned:
+  Always include 'wheel' when building packages from source with setup.py
+
+-----------------------------------------------------------------------------
+ATTEMPT #2: Added wheel dependency (FAILED)
+-----------------------------------------------------------------------------
+Date: 2026-01-29
+Script: megatron_full_stack.py (v2)
+Build Time: ~8 minutes
+Status: ❌ FAILED
+
+Error:
+  CMake Error: Could not find CUDNN_INCLUDE_DIR using the following files: cudnn.h
+  Location: Transformer Engine CMake configuration
+
+Root Cause:
+  PyTorch installs cuDNN as a Python package (nvidia-cudnn-cu12==9.1.0.70)
+  in site-packages, but CMake build system looks for system-level cuDNN
+  headers in standard locations like /usr/include or /usr/local/cuda/include.
+
+Fix Applied:
+  Set CUDNN environment variables to point to PyTorch's cuDNN location:
+  ```python
+  .env({
+      "NVTE_FRAMEWORK": "pytorch",
+      "MAX_JOBS": "8",
+      "NVTE_BUILD_THREADS_PER_JOB": "4",
+      "CUDNN_PATH": "/usr/local/lib/python3.12/site-packages/nvidia/cudnn",
+      "CUDNN_INCLUDE_DIR": "/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include",
+      "CUDNN_LIBRARY": "/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib",
+  })
+  ```
+
+Lesson Learned:
+  When using PyTorch's bundled cuDNN, need to explicitly tell build systems
+  where to find it via environment variables.
+
+-----------------------------------------------------------------------------
+ATTEMPT #3: Added CUDNN_PATH environment variables (FAILED)
+-----------------------------------------------------------------------------
+Date: 2026-01-29
+Script: megatron_full_stack.py (v3)
+Build Time: ~12 minutes
+Status: ❌ FAILED (partial success)
+
+Progress:
+  ✅ CMake configuration succeeded - found cuDNN libraries
+  ✅ Started compiling Transformer Engine (8/54 files)
+  ❌ C++ compiler failed to find cudnn.h header
+
+Error:
+  Multiple compilation failures:
+  - fatal error: cudnn.h: No such file or directory
+  - Location: /root/TransformerEngine/transformer_engine/common/./util/logging.h:12:10
+  - Location: /usr/local/lib/python3.12/site-packages/torch/include/ATen/cudnn/cudnn-wrapper.h:3:10
+
+Root Cause:
+  CMake found cuDNN libraries via CUDNN_PATH/CUDNN_LIBRARY environment variables,
+  but the C++ compiler (g++/nvcc) doesn't automatically include CUDNN_INCLUDE_DIR
+  in its header search paths during the PyTorch extension build phase.
+
+  The build has two phases:
+  1. CMake build (for transformer_engine C++ library) - ✅ This worked
+  2. setuptools extension build (for PyTorch bindings) - ❌ This failed
+
+  Phase 2 doesn't inherit the include paths from CMake.
+
+Fix Needed:
+  Add cuDNN include path to compiler flags (CFLAGS, CXXFLAGS, NVCCFLAGS)
+  or create symlinks to make cudnn.h available in standard locations.
+
+Lesson Learned:
+  Setting environment variables isn't enough - need to explicitly add include
+  paths to compiler flags for multi-stage builds.
+
+-----------------------------------------------------------------------------
+ATTEMPT #4: (NEXT STEP - IN PLANNING)
+-----------------------------------------------------------------------------
+Date: 2026-01-29
+Status: ⏳ PLANNING
+
+Options to Try (in order of preference):
+
+Option 1: Add compiler include flags
+  Add CFLAGS/CXXFLAGS/NVCCFLAGS to include cuDNN headers:
+  ```python
+  .env({
+      "CFLAGS": "-I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include",
+      "CXXFLAGS": "-I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include",
+      "CUDNN_PATH": "/usr/local/lib/python3.12/site-packages/nvidia/cudnn",
+  })
+  ```
+  Pros: Clean, standard approach
+  Cons: May conflict with existing flags
+
+Option 2: Create symlinks for cuDNN headers
+  ```python
+  .run_commands(
+      "ln -s /usr/local/lib/python3.12/site-packages/nvidia/cudnn/include/cudnn*.h /usr/local/cuda/include/",
+  )
+  ```
+  Pros: Makes cuDNN available in standard location
+  Cons: Modifies system directories, less clean
+
+Option 3: Use Transformer Engine stable version
+  Try an older or newer version of Transformer Engine that might have
+  better compatibility with PyTorch's bundled cuDNN.
+  Pros: Might avoid the issue entirely
+  Cons: May not be DistCA-compatible version (v2.4 required)
+
+Option 4: Switch to megatron_stable.py
+  Use the fallback script with more conservative versions that are
+  known to work together.
+  Pros: Higher success rate
+  Cons: Not exact DistCA versions, will need NVSHMEM work anyway
+
+Recommended: Try Option 1 first, then Option 2 if that fails.
+
+=============================================================================
+KEY INSIGHTS & PATTERNS
+=============================================================================
+
+1. PyTorch's cuDNN Distribution:
+   - PyTorch 2.6+ bundles cuDNN as nvidia-cudnn-cu12 Python package
+   - Located in: /usr/local/lib/python3.12/site-packages/nvidia/cudnn/
+   - Has separate include/ and lib/ directories
+   - Not installed in system paths (/usr/local/cuda/)
+
+2. Multi-Stage Build Complexity:
+   - Transformer Engine has complex build with CMake + setuptools
+   - Environment variables don't always propagate between stages
+   - Need to set both CMake vars AND compiler flags
+
+3. Modal Image Caching:
+   - First build takes 15-20 minutes
+   - Subsequent builds cache successful layers
+   - Failed layers are rebuilt from that point
+   - Current cache: up to PyTorch installation (saves ~5 min)
+
+4. Version Compatibility Matrix:
+   Target (DistCA requirements):
+   - PyTorch: 2.7.0 (not available yet → using 2.6.0)
+   - CUDA: 12.4 ✅
+   - Transformer Engine: v2.4 ✅
+   - Megatron-LM: core_v0.12.1 ✅
+
+   Challenges:
+   - PyTorch 2.7.0 not released yet (using 2.6.0)
+   - FlashAttention 2.7.4 built from source (slow)
+   - NVSHMEM 3.2.5 not yet attempted
+
+=============================================================================
+COST & TIME TRACKING
+=============================================================================
+
+Build Attempts:
+- Attempt #1: ~5 min, $0 (failed during image build)
+- Attempt #2: ~8 min, $0 (failed during image build)
+- Attempt #3: ~12 min, $0 (failed during image build)
+- Total spent: ~25 min, $0
+
+Note: Image building doesn't use GPU on Modal, so cost is $0.
+      GPU costs only apply when running functions.
+
+Expected Remaining:
+- Fix & rebuild: ~15 min, $0
+- Installation test: ~3 min, $0.10
+- 1 GPU training: ~5 min, $0.30
+- 2 GPU training: ~5 min, $0.60
+- Total estimate: ~28 min, ~$1.00
+
+=============================================================================
+NEXT ACTIONS
+=============================================================================
+
+Immediate (Next 5 minutes):
+1. Update megatron_full_stack.py with compiler include flags
+2. Restart build with modal run megatron_full_stack.py --test-only
+3. Monitor build progress (check every 5 minutes)
+
+If successful:
+4. Run installation test (verify all 6 components)
+5. Run 1 GPU training (10 steps)
+6. Run 2 GPU training (10 steps)
+7. Mark Phase 1 complete ✅
+
+If failed:
+4. Try Option 2 (symlinks)
+5. If still failing, investigate alternative approaches
+6. Consider using megatron_stable.py as fallback
+
+=============================================================================
+REFERENCES
+=============================================================================
+
+Files:
+- megatron_full_stack.py - Main script with exact DistCA versions
+- megatron_stable.py - Fallback with conservative versions
+- BABY_STEPS_PLAN.md - 4-phase plan (Megatron → NVSHMEM → Extensions → DistCA)
+- MEGATRON_TRAINING_GUIDE.md - Usage guide
+
+Build Logs:
+- build_log_v2.txt - Attempt #1 (missing wheel)
+- build_log_v3.txt - Attempt #2 (CMake cuDNN error)
+- build_log_v4.txt - Attempt #3 (compiler cuDNN header error)
+
+Documentation:
+- DistCA README.Installation.md - Version requirements
+- Transformer Engine GitHub - Build instructions
+- PyTorch cuDNN bundling - https://pytorch.org/docs/stable/notes/cuda.html
+
+=============================================================================
