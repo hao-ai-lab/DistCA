@@ -55,6 +55,10 @@ DistCA treats core attention (CA, the $\text{softmax}(QK^T)V$ operation) as an i
 
 ## Installation
 
+```bash
+git clone --depth 1 https://github.com/hao-ai-lab/DistCA
+```
+
 See the [installation guide](./README.Installation.md) for detailed instructions.
 
 
