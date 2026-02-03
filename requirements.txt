@@ -3,9 +3,24 @@ pandas
 ray
 plotly
 seaborn
-transformers
+
+# Transformers:
+# - Pinned to avoid using newer versions that depend on internal torch._dynamo
+#   symbols (e.g. TransformGetItemToIndex) not present in NGC torch 2.6.0a0,
+#   which caused ImportError during pretrain_llama.py.
+# - This range has been empirically verified to work with:
+#   - NGC PyTorch 24.12 (torch 2.6.0a0+df5bbc09d1.nv24.12) in Docker
+#   - Local venv with torch 2.10 + flash-attn 2.6.3 wheel
+transformers>=4.40,<4.46
+
 rich
 omegaconf
+
+# Do NOT pin torch or flash-attn here:
+# - torch comes from the base environment (NGC container / local venv) and must
+#   match prebuilt CUDA extensions (TransformerEngine, flash-attn, etc.).
+# - flash-attn is installed separately (wheel for local venv, or from source /
+#   constrained install inside Docker). See RUN_STATUS.md §3.1 #11–12.
 
 # scikit-learn
 # numpy

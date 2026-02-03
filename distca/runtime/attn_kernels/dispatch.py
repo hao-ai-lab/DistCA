@@ -210,7 +210,10 @@ def pre_a2a_attn_out_with_lse(
     attn_out: Tensor, softmax_lse: Tensor,
     send_seqlens: Tensor, send_memcpy_metadata: Tensor, dispatcher_id: int
 ):
-    assert softmax_lse.shape[0] == attn_out.shape[0]
+    assert softmax_lse.shape[0] == attn_out.shape[0], (
+        f"softmax_lse.shape[0] ({softmax_lse.shape[0]}) != attn_out.shape[0] ({attn_out.shape[0]}); "
+        f"softmax_lse.shape={softmax_lse.shape}, attn_out.shape={attn_out.shape}"
+    )
     merged_attn_out = _concat_with_uint8_and_pad([attn_out, softmax_lse], dim=1)
     return pre_a2a_attn_out(
         merged_attn_out, send_seqlens, send_memcpy_metadata,

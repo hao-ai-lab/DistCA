@@ -412,12 +412,13 @@ class BaseModelInitializer(ABC):
         pass
 
     def get_rope_scaling_args(self) -> dict:
-        """Get rope scaling args."""
+        """Get rope scaling args. hf_config is a PretrainedConfig (e.g. LlamaConfig), not a dict."""
         rope_scaling_args = {}
-        if "rope_scaling" in self.hf_config:
-            if self.hf_config.rope_scaling is not None:
-                # assert self.hf_config.rope_scaling["type"] == "linear", "only linear scaling is supported for now"
-                rope_scaling_args["seq_len_interpolation_factor"] = self.hf_config.rope_scaling["factor"]
+        rope_scaling = getattr(self.hf_config, "rope_scaling", None)
+        if rope_scaling is not None:
+            factor = rope_scaling.get("factor") if isinstance(rope_scaling, dict) else getattr(rope_scaling, "factor", None)
+            if factor is not None:
+                rope_scaling_args["seq_len_interpolation_factor"] = factor
         return rope_scaling_args
 
     def initialize(
