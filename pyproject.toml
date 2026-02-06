@@ -1,0 +1,70 @@
+# DistCA: project metadata and tool config
+# Packaging still via setup.py; this file drives Ruff and optional tooling.
+
+[project]
+name = "distca"
+version = "0.1"
+description = "Core Attention Disaggregation (CAD) for long-context LLM training"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [
+    ".build",
+    "Megatron-LM",
+    "TransformerEngine",
+    "build",
+    "dist",
+    ".git",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+]
+
+# Per-file-ignores: best practice is "strict source, relaxed tests only".
+# Goal: reduce distca/** ignores over time so the
+# main package stays strict; keep tests/playground/baseline relaxed by convention.
+# Refs: https://docs.astral.sh/ruff/configuration/ , per-file-ignores for gradual adoption.
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "E402", "E722", "E741", "F403", "F821", "B007", "B905", "C408", "F841",
+    "B018",   # useless attribute access (test fixtures)
+    "F811",   # redefinition (set_random_seed from test_util)
+    "B006",   # mutable default (gradient_checkpointing_kwargs={})
+    "F401",   # unused import (wlbllm.utils for availability check)
+    "B023",   # loop variable in closure
+]
+"playground/**" = [
+    "E402", "E722", "E741", "F403", "F821", "B007", "B905", "C408", "F841",
+    "B011", "UP028", "E712", "E711", "F401", "F811",
+]
+"distca/**" = [
+    "E402", "E722", "E741", "F403", "F821", "B007", "B905", "C408", "F841",
+    "B011", "B018", "B023", "B006", "F631", "UP031", "E712", "E711",
+    "B020", "C401", "C416", "F401", "F811", "B028", "UP007",
+]
+"baseline/**" = [
+    "E402", "E722", "E741", "F821", "B905", "F841", "E712", "B007", "B011",
+    "C408", "B008", "B028", "B023",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# Optional: mypy can be enabled in CI later
+# [tool.mypy]
+# python_version = "3.12"
+# ignore_missing_imports = true

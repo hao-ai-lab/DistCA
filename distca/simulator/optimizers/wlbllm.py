@@ -1,31 +1,33 @@
 # wlb_llm_solver.py
 # Re-implementation of the PuLP demo in the same style as the AttnServer example
-import numpy as np
-from ortools.sat.python import cp_model
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Any
+from typing import Any
+
+from ortools.sat.python import cp_model
 
 import distca.timemodule as tm
 
 INF = tm.INF
+
+
 # ————————————————————————————————————————————————————————————
 #  Dataclass to hold the results
 # ————————————————————————————————————————————————————————————
 @dataclass
 class WlbLlmSolution:
     # document → worker assignment
-    doc2worker: Dict[int, int]
+    doc2worker: dict[int, int]
     # worker → docs actually served
-    batches: List[List[int]]
+    batches: list[list[int]]
     # latency per worker and objective
-    lat_worker: List[int]
+    lat_worker: list[int]
     lat_max: int
     parallel_plan: tuple[int, int]
 
     # raw artefacts (optional – handy for debugging / tweaking)
     model: cp_model.CpModel
     solver: cp_model.CpSolver
-    variables: Dict[str, object]
+    variables: dict[str, object]
 
     def print_solution(self) -> None:  # noqa: D401 (simple “Print …”)
         print("WLB-LLM ILP Solution")
@@ -39,7 +41,7 @@ class WlbLlmSolution:
     def get_batch_assignment(self):
         return self.batches
 
-    def dump_object(self) -> Dict[str, Any]:
+    def dump_object(self) -> dict[str, Any]:
         return dict(
             batches=self.batches,
             lat_max=self.lat_max,
@@ -67,7 +69,7 @@ class WlbLlmSolver:
         allgather_time = tm.get_allgather_time(allgather_perdevice_nelem, cp)
         # return allreduce_time + allgather_time
         return allgather_time
-    
+
     def get_attn_time(self, x: int, tp: int, cp: int) -> float:
 
         hqo = 64
@@ -84,14 +86,14 @@ class WlbLlmSolver:
         # return attn + allreduce_time + allgather_time
         return attn
 
-    
     def get_mlp_time(self, x: int, tp: int, cp: int) -> float:
         import distca.timemodule.compute as tm
+
         return tm.get_mlp_time(x, tp, cp)
 
     def solve(
         self,
-        doc_lengths: List[int],
+        doc_lengths: list[int],
         max_length: int,
         num_workers: int,
         parallel_plan: tuple[int, int],
@@ -106,23 +108,25 @@ class WlbLlmSolver:
         network_time = self.get_network_time
 
         for d in doc_lengths:
-            _attn_time = self.get_attn_time(d, tp = tp, cp = cp)
-            _mlp_time = self.get_mlp_time(d, tp = tp, cp = cp)
-            _network_time = self.get_network_time(d, tp = tp, cp = cp)
+            _attn_time = self.get_attn_time(d, tp=tp, cp=cp)
+            _mlp_time = self.get_mlp_time(d, tp=tp, cp=cp)
+            _network_time = self.get_network_time(d, tp=tp, cp=cp)
             # _lat = _attn_time + _mlp_time + _network_time
             _lat = _attn_time + _mlp_time
 
-            print(f"[WLB-LLM] [{tp=}, {cp=}] d: {d}, latency: {(_lat * 1000):.1f} us, attn_time: {(_attn_time * 1000):.2f} us, mlp_time: {(_mlp_time * 1000):.2f} us")
+            print(
+                f"[WLB-LLM] [{tp=}, {cp=}] d: {d}, latency: {(_lat * 1000):.1f} us, attn_time: {(_attn_time * 1000):.2f} us, mlp_time: {(_mlp_time * 1000):.2f} us"
+            )
             pass
 
         costs = [
             int(
                 (
-                attn_time(d, tp = tp, cp = cp) 
-                + mlp_time(d, tp = tp, cp = cp) 
-                # + network_time(d, tp = tp, cp = cp)
-                ) * 1000
-            ) 
+                    attn_time(d, tp=tp, cp=cp) + mlp_time(d, tp=tp, cp=cp)
+                    # + network_time(d, tp = tp, cp = cp)
+                )
+                * 1000
+            )
             for d in doc_lengths
         ]
 
@@ -144,20 +148,13 @@ class WlbLlmSolver:
 
         # 2. Per-worker length budget  Σ len_d * x[d,w] ≤ L_max
         for w in range(num_workers):
-            model.Add(
-                sum(doc_lengths[d] * x[d, w] for d in range(n_docs)) <= max_length
-            )
+            model.Add(sum(doc_lengths[d] * x[d, w] for d in range(n_docs)) <= max_length)
 
         # 3. Latency per worker  lat_w = Σ cost_d * x[d,w]
-        lat_worker = [
-            model.NewIntVar(0, INF, f"lat_{w}") for w in range(num_workers)
-        ]
+        lat_worker = [model.NewIntVar(0, INF, f"lat_{w}") for w in range(num_workers)]
         for w in range(num_workers):
             # TODO: The cost of MLP is subject to the parallel plan to split the MLP.
-            model.Add(
-                lat_worker[w]
-                == sum(costs[d] * x[d, w] for d in range(n_docs))
-            )
+            model.Add(lat_worker[w] == sum(costs[d] * x[d, w] for d in range(n_docs)))
 
         # 4. Objective  —  minimise the maximum worker latency
         lat_max = model.NewIntVar(0, INF, "lat_max")
@@ -176,8 +173,8 @@ class WlbLlmSolver:
             raise RuntimeError("No feasible solution found")
 
         # ——— Extract assignment ————————————————————————————
-        doc2worker: Dict[int, int] = {}
-        batches: List[List[int]] = [[] for _ in range(num_workers)]
+        doc2worker: dict[int, int] = {}
+        batches: list[list[int]] = [[] for _ in range(num_workers)]
         for d in range(n_docs):
             for w in range(num_workers):
                 if solver.Value(x[d, w]):
@@ -204,12 +201,13 @@ class WlbLlmSolver:
 #  tiny smoke-test
 # ————————————————————————————————————————————————————————————
 
+
 def test_solver():
     solver = WlbLlmSolver()
     doc_lengths = [1, 2, 3, 4]
     sol = solver.solve(doc_lengths, max_length=16, num_workers=4)
     sol.print_solution()
 
+
 if __name__ == "__main__":
     test_solver()
-

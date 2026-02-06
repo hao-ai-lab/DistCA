@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 D2_FA2A_DISABLE_SEND_RECV=0 NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 \
 torchrun \
   --nnodes=4:4 \
@@ -15,4 +16,3 @@ torchrun \
     --num-layers 4 \
     --max-sample-id 10 \
     --num-tokens 32768
-

@@ -1,5 +1,6 @@
 /*
-Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT License.
+Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT
+License.
 */
 
 #include <torch/library.h>

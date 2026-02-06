@@ -3,60 +3,43 @@
 # See LICENSE for license information.
 
 """Attention Backends."""
-from contextlib import nullcontext
-from importlib.metadata import version as get_pkg_version
-from importlib.metadata import PackageNotFoundError
-import os
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-import warnings
-import logging
-from packaging.version import Version as PkgVersion
-import rich
-import time
 
+import os
+import time
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as get_pkg_version
+from typing import Any
+
+import rich
 import torch
+
+# Import attention utils
+import transformer_engine.pytorch.attention.dot_product_attention.utils as dpa_utils
 import transformer_engine_torch as tex
-from transformer_engine.pytorch.utils import (
-    SplitAlongDim,
-    get_device_compute_capability,
-    combine_tensors,
-    split_tensor_along_dim,
+from packaging.version import Version as PkgVersion
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+    attn_forward_func_with_cp,
 )
-from transformer_engine.pytorch.utils import attention_mask_func
-from transformer_engine.pytorch.tensor.quantized_tensor import (
-    QuantizedTensor,
-    prepare_for_saving,
-    restore_from_saved,
+from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+    AttentionLogging as attn_log,
 )
-from transformer_engine.pytorch.float8_tensor import Float8Tensor
+from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+    FlashAttentionUtils as fa_utils,
+)
+from transformer_engine.pytorch.attention.inference import InferenceParams
 from transformer_engine.pytorch.constants import (
-    TE_DType,
     QKVLayouts,
     dist_group_type,
 )
 from transformer_engine.pytorch.cpp_extensions.fused_attn import (
-    fused_attn_fwd,
-    fused_attn_bwd,
-    FusedAttnBackend,
     META_O,
     META_QKV,
 )
-from transformer_engine.pytorch.fp8 import get_fp8_torch_dtype
 from transformer_engine.pytorch.distributed import get_distributed_world_size
-from transformer_engine.pytorch.jit import no_torch_dynamo
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
-    attn_forward_func_with_cp,
-)
-from transformer_engine.pytorch.attention.dot_product_attention.softmax import FusedScaleMaskSoftmax
-from transformer_engine.pytorch.attention.inference import InferenceParams
-
-# Import attention utils
-import transformer_engine.pytorch.attention.dot_product_attention.utils as dpa_utils
-from transformer_engine.pytorch.attention.dot_product_attention.utils import (
-    FlashAttentionUtils as fa_utils,
-)
-from transformer_engine.pytorch.attention.dot_product_attention.utils import (
-    AttentionLogging as attn_log,
+from transformer_engine.pytorch.float8_tensor import Float8Tensor
+from transformer_engine.pytorch.fp8 import get_fp8_torch_dtype
+from transformer_engine.pytorch.utils import (
+    get_device_compute_capability,
 )
 
 # Global vars for flash attn v2 and v3 imports
@@ -79,16 +62,7 @@ else:
         fa_utils.is_installed = True
 
     if fa_utils.is_installed:
-        from flash_attn_2_cuda import varlen_bwd as flash_attn_cuda_bwd
         from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
-        from flash_attn.flash_attn_interface import _flash_attn_forward as _flash_attn_fwd
-        from flash_attn.flash_attn_interface import _flash_attn_backward as _flash_attn_bwd
-        from flash_attn.flash_attn_interface import (
-            _flash_attn_varlen_forward as _flash_attn_varlen_fwd,
-        )
-        from flash_attn.flash_attn_interface import (
-            _flash_attn_varlen_backward as _flash_attn_varlen_bwd,
-        )
 
         # Setup Flash attention utils
         fa_utils.set_flash_attention_version()
@@ -124,15 +98,14 @@ else:
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn_with_kvcache_v3,
     )
-    from flash_attn_3.flash_attn_interface import _flash_attn_forward as _flash_attn_fwd_v3
-    from flash_attn_3.flash_attn_interface import _flash_attn_backward as _flash_attn_bwd_v3
 
     fa_utils.set_flash_attention_3_params()
 
 
-from transformer_engine.pytorch.utils import nvtx_range_push, nvtx_range_pop
+from transformer_engine.pytorch.utils import nvtx_range_pop, nvtx_range_push
 
 attention_durations = []
+
 
 def debug_print(*args, **kwargs):
     if os.getenv("D2_DEBUG_PRINT", "0") == "1":
@@ -148,24 +121,24 @@ def forward(
     query_layer: torch.Tensor,
     key_layer: torch.Tensor,
     value_layer: torch.Tensor,
-    attention_mask: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    attention_mask: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
     qkv_layout: str = "sbh3d",
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_kv: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_kv: Optional[int] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_kv: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_kv: int | None = None,
     attn_mask_type: str = "causal",
-    window_size: Optional[Tuple[int, int]] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    cp_group: Optional[Union[dist_group_type, List[dist_group_type]]] = None,
-    cp_global_ranks: List[int] = None,
+    window_size: tuple[int, int] | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    cp_group: dist_group_type | list[dist_group_type] | None = None,
+    cp_global_ranks: list[int] = None,
     cp_stream: torch.cuda.Stream = None,
     cp_comm_type: str = "p2p",
     fp8: bool = False,
-    fp8_meta: Optional[Dict[str, Any]] = None,
+    fp8_meta: dict[str, Any] | None = None,
     quantizers=None,
-    inference_params: Optional[InferenceParams] = None,
-    flash_attention_backend: Optional[PkgVersion] = PkgVersion("0"),
+    inference_params: InferenceParams | None = None,
+    flash_attention_backend: PkgVersion | None = PkgVersion("0"),
 ) -> torch.Tensor:
     """flash-attn fprop"""
 
@@ -174,17 +147,14 @@ def forward(
 
     nvtx_range_push("te.FlashAttention.asserts")
 
-
     assert all(
         x.dtype in [torch.float16, torch.bfloat16] or isinstance(x, Float8Tensor)
         for x in [query_layer, key_layer, value_layer]
     ), "FlashAttention only supports FP16 and BF16 data types, or Float8Tensors."
-    assert (
-        query_layer.is_cuda and key_layer.is_cuda and value_layer.is_cuda
-    ), "FlashAttention currently only supports CUDA tensors."
-    assert (
-        qkv_layout in QKVLayouts
-    ), f"FlashAttention does not support qkv_layout = {qkv_layout}!"
+    assert query_layer.is_cuda and key_layer.is_cuda and value_layer.is_cuda, (
+        "FlashAttention currently only supports CUDA tensors."
+    )
+    assert qkv_layout in QKVLayouts, f"FlashAttention does not support qkv_layout = {qkv_layout}!"
 
     cp_size = 1
     if isinstance(cp_group, dist_group_type):
@@ -211,8 +181,7 @@ def forward(
                 )
             else:
                 query_layer, key_layer, value_layer = [
-                    x.transpose(0, 1).contiguous()
-                    for x in (query_layer, key_layer, value_layer)
+                    x.transpose(0, 1).contiguous() for x in (query_layer, key_layer, value_layer)
                 ]
         elif q_format == "sbhd" and kv_format == "bshd":
             query_layer = query_layer.transpose(0, 1).contiguous()
@@ -242,7 +211,6 @@ def forward(
 
     nvtx_range_pop()
 
-    
     nvtx_range_push("te.FlashAttention.get_cu_lens")
     # get batch_size, max_seqlen and cu_seqlens
     batch_size, context_len = None, None
@@ -254,9 +222,7 @@ def forward(
             max_seqlen_kv *= cp_size
 
             if "padding" in attn_mask_type:
-                assert (
-                    not context_parallel
-                ), "Padding mask not supported with context parallelism!"
+                assert not context_parallel, "Padding mask not supported with context parallelism!"
 
                 # [b * s, h, d]
                 query_layer, key_layer, value_layer = [
@@ -265,13 +231,13 @@ def forward(
                 ]
 
                 if self.attention_type == "self":
-                    assert (
-                        max_seqlen_q == max_seqlen_kv
-                    ), "Maximum sequence length for Q and KV should be the same."
+                    assert max_seqlen_q == max_seqlen_kv, (
+                        "Maximum sequence length for Q and KV should be the same."
+                    )
                     if cu_seqlens_q is None:
-                        assert (
-                            attention_mask is not None
-                        ), "Please provide attention_mask for padding!"
+                        assert attention_mask is not None, (
+                            "Please provide attention_mask for padding!"
+                        )
                         cu_seqlens_q, indices_q = dpa_utils.get_cu_seqlens_and_indices(
                             attention_mask
                         )
@@ -283,9 +249,9 @@ def forward(
                     )
                 else:
                     if cu_seqlens_q is None or cu_seqlens_kv is None:
-                        assert (
-                            attention_mask is not None
-                        ), "Please provide attention_mask for padding!"
+                        assert attention_mask is not None, (
+                            "Please provide attention_mask for padding!"
+                        )
                         cu_seqlens_q, indices_q = dpa_utils.get_cu_seqlens_and_indices(
                             attention_mask[0]
                         )
@@ -314,9 +280,9 @@ def forward(
                         key_layer.device,
                     )
         elif qkv_format == "thd":
-            assert (
-                cu_seqlens_q is not None and cu_seqlens_kv is not None
-            ), "cu_seqlens_q and cu_seqlens_kv can not be None when qkv_format = thd!"
+            assert cu_seqlens_q is not None and cu_seqlens_kv is not None, (
+                "cu_seqlens_q and cu_seqlens_kv can not be None when qkv_format = thd!"
+            )
             if max_seqlen_q is None:
                 seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
                 max_seqlen_q = seqlens_q.max().item()
@@ -347,9 +313,7 @@ def forward(
                     batch_size * context_len,
                 )
 
-
     nvtx_range_pop()
-
 
     nvtx_range_push("te.FlashAttention.run_attention")
     use_flash_attn_3 = False
@@ -358,9 +322,9 @@ def forward(
     if context_parallel and all(
         not isinstance(x, Float8Tensor) for x in [query_layer, key_layer, value_layer]
     ):
-        assert (
-            alibi_slopes is None
-        ), "Alibi slope bias addition is not supported with context parallelism."
+        assert alibi_slopes is None, (
+            "Alibi slope bias addition is not supported with context parallelism."
+        )
         with self.attention_dropout_ctx():
             # debug_print("💜 Inside FlashAttention.forward: attn_forward_func_with_cp")
             output = attn_forward_func_with_cp(
@@ -414,9 +378,7 @@ def forward(
             #       |                         |     bshd/sbhd/thd + padding
             fa_optional_forward_args_thd = []
             if qkv_format in ["bshd", "sbhd"] and "padding" not in attn_mask_type:
-                func = (
-                    flash_attn_func if not use_flash_attn_3 else flash_attn_func_v3
-                )  # pylint: disable=possibly-used-before-assignment
+                func = flash_attn_func if not use_flash_attn_3 else flash_attn_func_v3  # pylint: disable=possibly-used-before-assignment
             else:
                 if not use_flash_attn_3:
                     # debug_print("💜 Inside FlashAttention.forward: using func = flash_attn_varlen_func")
@@ -433,13 +395,12 @@ def forward(
                     fa_optional_forward_args_thd.append(max_seqlen_q)
                     fa_optional_forward_args_thd.append(max_seqlen_kv)
 
-
             if getattr(self, "rank", None) is None:
                 self.rank = torch.distributed.get_rank()
 
-
             my_func = func
             global attention_durations
+
             def baseline_func(*args, **kwargs):
                 # debug_print(f"🤍 Calling inside FlashAttention: {func}.")
                 # debug_print(f"args[0] = ", args[0].shape)
@@ -461,19 +422,20 @@ def forward(
                 return r
 
             from wlbllm.megatron_patch.te_flash_attn import wlbllm_func
-            
+
             # print(f"🟢 Calling inside the patched version of FlashAttention: {func}.")
-            is_wlbllm_mode = (os.environ["WLBLLM_MODE"] == "1")
+            is_wlbllm_mode = os.environ["WLBLLM_MODE"] == "1"
             if is_wlbllm_mode:
+
                 def wlbllm_func_add_metadata(*args, **kwargs):
                     # metadata = ...
                     r = wlbllm_func(*args, **kwargs)
                     return r
+
                 func = wlbllm_func_add_metadata
             else:
                 func = baseline_func
-            
-            
+
             if not use_flash_attn_3:
                 fa_optional_forward_kwargs = {}
                 if fa_utils.v2_3_plus:
@@ -487,9 +449,9 @@ def forward(
                     fa_optional_forward_kwargs["block_table"] = (
                         inference_params.cache_manager.page_table[:batch_size]
                         if inference_params.is_paged
-                        else inference_params.cache_manager.batch_indices_post_step.unsqueeze(
-                            1
-                        )[:batch_size]
+                        else inference_params.cache_manager.batch_indices_post_step.unsqueeze(1)[
+                            :batch_size
+                        ]
                     )
                 # debug_print(f"💜 Inside FlashAttention.forward: using func = {func}")
                 output = func(
@@ -543,15 +505,15 @@ def forward(
                         )
                     batch_size = cu_seqlens_q.shape[0] - 1
                     num_heads_k = key_layer.shape[-2]
-                    fa_3_optional_forward_kwargs["q_descale"] = (
-                        query_layer._scale_inv.unsqueeze(0).repeat(batch_size, num_heads_k)
-                    )
+                    fa_3_optional_forward_kwargs["q_descale"] = query_layer._scale_inv.unsqueeze(
+                        0
+                    ).repeat(batch_size, num_heads_k)
                     fa_3_optional_forward_kwargs["k_descale"] = key_layer._scale_inv.unsqueeze(
                         0
                     ).repeat(batch_size, num_heads_k)
-                    fa_3_optional_forward_kwargs["v_descale"] = (
-                        value_layer._scale_inv.unsqueeze(0).repeat(batch_size, num_heads_k)
-                    )
+                    fa_3_optional_forward_kwargs["v_descale"] = value_layer._scale_inv.unsqueeze(
+                        0
+                    ).repeat(batch_size, num_heads_k)
                     query_layer, key_layer, value_layer = (
                         convert_to_torch_float8(x, torch_dtype)
                         for x in [query_layer, key_layer, value_layer]
@@ -567,7 +529,7 @@ def forward(
                         causal="causal" in attn_mask_type,
                         **fa_3_optional_forward_kwargs,
                     )
-                    if isinstance(output, (List, Tuple)):
+                    if isinstance(output, (list, tuple)):
                         output = output[0]
                 except TypeError as e:
                     if fa_utils.v3_0_0_beta:
@@ -586,7 +548,6 @@ def forward(
                     output = O_quantizer(output)
 
     nvtx_range_pop()
-
 
     nvtx_range_push("te.FlashAttention.convert_output_layout")
     if inference_params is None:
@@ -634,7 +595,7 @@ def forward(
         output = output.reshape(output.shape[0], -1)
 
     nvtx_range_pop()
-    
+
     nvtx_range_pop()
     return output.contiguous()
 
@@ -644,17 +605,28 @@ def forward(
 # ------------
 def monkey_patch():
     import transformer_engine.pytorch.attention.dot_product_attention.backends as tex_backends
+
     tex_backends.FlashAttention.forward = forward
 
-    print("Monkey patching wlbllm.megatron_patch.backends.forward() into transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()")
+    print(
+        "Monkey patching wlbllm.megatron_patch.backends.forward() into transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()"
+    )
+
 
 from contextlib import contextmanager
+
+
 @contextmanager
 def monkey_patch_context():
     import transformer_engine.pytorch.attention.dot_product_attention.backends as tex_backends
+
     old_forward = tex_backends.FlashAttention.forward
     tex_backends.FlashAttention.forward = forward
-    print("Monkey patching wlbllm.megatron_patch.backends.forward() into transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()")
+    print(
+        "Monkey patching wlbllm.megatron_patch.backends.forward() into transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()"
+    )
     yield
     tex_backends.FlashAttention.forward = old_forward
-    print("Unmonkey patching wlbllm.megatron_patch.backends.forward() from transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()")
+    print(
+        "Unmonkey patching wlbllm.megatron_patch.backends.forward() from transformer_engine.pytorch.attention.dot_product_attention.backends.FlashAttention.forward()"
+    )

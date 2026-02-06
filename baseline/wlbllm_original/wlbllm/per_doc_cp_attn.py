@@ -1,44 +1,37 @@
-import time
-import torch
-from itertools import accumulate
 import os
+import time
+
 import rich
+import torch
 import torch.distributed as dist
-import warnings
-from torch.distributed import (
-    get_world_size,
-    get_rank,
-)
-
+from torch.cuda.nvtx import range as nvtx_range
+from torch.cuda.nvtx import range_pop as nvtx_range_pop
 from torch.cuda.nvtx import range_push as nvtx_range_push
-from torch.cuda.nvtx import range_pop  as nvtx_range_pop
-from torch.cuda.nvtx import range  as nvtx_range
-
-
-from wlbllm.attn_module import (
-    flash_attn_varlen_func,
-    _flash_attn_varlen_forward,
-    _flash_attn_varlen_backward,
+from torch.distributed import (
+    get_rank,
+    get_world_size,
 )
-
-from wlbllm.utils import (
-    kv_shuffle_for_per_doc_cp,
-    kv_unshuffle_for_per_doc_cp,
-    compute_per_doc_cp_shard_doc_len,
-)
-from wlbllm.fastmemcpy.fast_memcpy import kv_shuffle_for_per_doc_cp_fast, kv_unshuffle_for_per_doc_cp_fast
 
 import wlbllm.registry
+from wlbllm.attn_module import (
+    _flash_attn_varlen_backward,
+    flash_attn_varlen_func,
+)
+from wlbllm.fastmemcpy.fast_memcpy import (
+    kv_shuffle_for_per_doc_cp_fast,
+    kv_unshuffle_for_per_doc_cp_fast,
+)
+
 
 def cat_slices(tensor, starts, lens):
-            if starts.numel() == 1:
-                s, l = int(starts[0]), int(lens[0])
-                return tensor[s:s+l]
-            return torch.cat([tensor[int(s):int(s)+int(l)]
-                              for s, l in zip(starts.tolist(), lens.tolist())],
-                             dim=0)   
+    if starts.numel() == 1:
+        s, l = int(starts[0]), int(lens[0])
+        return tensor[s : s + l]
+    return torch.cat(
+        [tensor[int(s) : int(s) + int(l)] for s, l in zip(starts.tolist(), lens.tolist())], dim=0
+    )
 
-import rich
+
 def debug_print(*args, **kwargs):
     if os.getenv("D2_DEBUG_PRINT", "0") == "1":
         if torch.distributed.is_initialized():
@@ -49,9 +42,12 @@ def debug_print(*args, **kwargs):
 
 fake_lse = None
 
+
 def log_memory_usage(message: str):
     import distca.mem
+
     distca.mem.log_memory_usage(message)
+
 
 class PerDocumentCPAttention(torch.autograd.Function):
     """
@@ -67,20 +63,24 @@ class PerDocumentCPAttention(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        local_q, local_k, local_v,
-        cu_seqlens_q_list, cu_seqlens_kv_list,
-        max_seqlen_q_list, max_seqlen_kv_list,
+        local_q,
+        local_k,
+        local_v,
+        cu_seqlens_q_list,
+        cu_seqlens_kv_list,
+        max_seqlen_q_list,
+        max_seqlen_kv_list,
         doc_lens,
         doc_shards,
-        kv_idx_list,                 # global offsets of the K shards after shuffle
+        kv_idx_list,  # global offsets of the K shards after shuffle
         dropout_p,
         softmax_scale,
         attn_mask_type,
         cp_group,
         cp_stream,
-        allgather_events: 'Optional[List[torch.cuda.Event]]',
-        allreduce_events: 'Optional[List[torch.cuda.Event]]',
-        attn_events: 'Optional[List[torch.cuda.Event]]',
+        allgather_events: "Optional[List[torch.cuda.Event]]",
+        allreduce_events: "Optional[List[torch.cuda.Event]]",
+        attn_events: "Optional[List[torch.cuda.Event]]",
     ):
         log_memory_usage("PerDocumentCPAttention.forward(init)")
         # TODO(HACK): obviously cursor don't know how to use warning to do log the first time...
@@ -89,7 +89,9 @@ class PerDocumentCPAttention(torch.autograd.Function):
         should_sync_time_perdocattn = os.getenv("WLBLLM_SYNC_TIME_PERDOC_ATTN", "0") == "1"
         should_sync_time_ag = os.getenv("WLBLLM_SYNC_TIME_AG", "0") == "1"
         should_empty_cache = os.getenv("WLBLLM_EMPTY_CACHE", "0") == "1"
-        if should_empty_cache and not hasattr(PerDocumentCPAttention, '_empty_cache_warning_printed'):
+        if should_empty_cache and not hasattr(
+            PerDocumentCPAttention, "_empty_cache_warning_printed"
+        ):
             print("🟡 WLBLLM_EMPTY_CACHE is enabled. May have performance impact.")
             PerDocumentCPAttention._empty_cache_warning_printed = True
         ENABLE_SHUFFLE = os.getenv("WLBLLM_ENABLE_SHUFFLE", "0") == "1"
@@ -113,7 +115,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
         context_length = local_q.shape[0] * cp_size
         nkvheads = local_k.shape[1]
         d_head = local_k.shape[2]
-        
+
         # allgather kv, then shuffle back to global order
         if allgather_events is not None:
             allgather_events[0].record()
@@ -152,25 +154,33 @@ class PerDocumentCPAttention(torch.autograd.Function):
                     print(f"🟡 PerDocumentCPAttention allgather-v time: {duration_ms__ag} ms")
             log_memory_usage("PerDocumentCPAttention.forward(after kv allgather)")
 
-                # print("🟡 All gather local_k.shape =", local_k.shape)
+            # print("🟡 All gather local_k.shape =", local_k.shape)
 
             start_time__shuffle = time.time()
-            
-            with nvtx_range("wlbllm.PerDocumentCPAttention.fwd.shuffle"):
 
+            with nvtx_range("wlbllm.PerDocumentCPAttention.fwd.shuffle"):
                 if ENABLE_SHUFFLE:
                     start_time__shuffle = time.time()
 
                     log_memory_usage("PerDocumentCPAttention.forward(before kv shuffle)")
-                    chunk_shard_lens, shard_src_offset, num_tokens = wlbllm.registry.get("memcpy_args")
+                    chunk_shard_lens, shard_src_offset, num_tokens = wlbllm.registry.get(
+                        "memcpy_args"
+                    )
                     k_global, v_global = kv_shuffle_for_per_doc_cp_fast(
-                        context_length, gather_k_list, gather_v_list, cp_size,
-                        chunk_shard_lens, shard_src_offset, num_tokens
+                        context_length,
+                        gather_k_list,
+                        gather_v_list,
+                        cp_size,
+                        chunk_shard_lens,
+                        shard_src_offset,
+                        num_tokens,
                     )
                     log_memory_usage("PerDocumentCPAttention.forward(after kv shuffle)")
                     end_time__shuffle = time.time()
                     duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
-                    debug_print(f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms")
+                    debug_print(
+                        f"🟡 PerDocumentCPAttention kv_shuffle_for_per_doc_cp time: {duration_ms__shuffle} ms"
+                    )
                     print("(shuffle) k_global.shape =", k_global.shape)
                     print("(shuffle) v_global.shape =", v_global.shape)
                     # context_length = max(max(i) for i in cu_seqlens_kv_list)
@@ -180,20 +190,27 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 else:
                     # Simply using a random global tensor for testing. This avoids a significant performance issue introduced by the shuffle logic.
                     log_memory_usage("PerDocumentCPAttention.forward(before kv create)")
-                    k_global = torch.randn(context_length, nkvheads, d_head, device=local_k.device, dtype=local_k.dtype)
-                    v_global = torch.randn(context_length, nkvheads, d_head, device=local_v.device, dtype=local_v.dtype)
+                    k_global = torch.randn(
+                        context_length, nkvheads, d_head, device=local_k.device, dtype=local_k.dtype
+                    )
+                    v_global = torch.randn(
+                        context_length, nkvheads, d_head, device=local_v.device, dtype=local_v.dtype
+                    )
                     log_memory_usage("PerDocumentCPAttention.forward(after kv create)")
-                    print(f"(no shuffle) k_global.shape =", k_global.shape)
-                    print(f"(no shuffle) v_global.shape =", v_global.shape)
+                    print("(no shuffle) k_global.shape =", k_global.shape)
+                    print("(no shuffle) v_global.shape =", v_global.shape)
 
-                print(f"(no shuffle) k_global.shape =", (context_length, nkvheads, d_head))
-                print(f"(no shuffle) v_global.shape =", (context_length, nkvheads, d_head))
+                print("(no shuffle) k_global.shape =", (context_length, nkvheads, d_head))
+                print("(no shuffle) v_global.shape =", (context_length, nkvheads, d_head))
 
                 if ENABLE_SHUFFLE:
-                    assert k_global.shape[0] == context_length, f"k_global.shape[0] = {k_global.shape[0]} must equals context length {context_length}."
-            
-            
-            log_memory_usage("PerDocumentCPAttention.forward(finish kv shuffle or create and before release gather_k_list and gather_v_list)")
+                    assert k_global.shape[0] == context_length, (
+                        f"k_global.shape[0] = {k_global.shape[0]} must equals context length {context_length}."
+                    )
+
+            log_memory_usage(
+                "PerDocumentCPAttention.forward(finish kv shuffle or create and before release gather_k_list and gather_v_list)"
+            )
             # Release gather_k_list and gather_v_list
             # More aggressive cleanup to free CUDA memory
             for tensor in gather_k_list:
@@ -202,15 +219,16 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 del tensor
             del gather_k_list
             del gather_v_list
-            
+
             # Force PyTorch to release CUDA memory back to the system
             # This has a small latency cost (~1-10ms) but prevents OOM errors
             if should_empty_cache:
                 torch.cuda.empty_cache()
-            
-            log_memory_usage("PerDocumentCPAttention.forward(after release gather_k_list and gather_v_list)")
-            # exit(0)
 
+            log_memory_usage(
+                "PerDocumentCPAttention.forward(after release gather_k_list and gather_v_list)"
+            )
+            # exit(0)
 
             end_time__shuffle = time.time()
             duration_ms__shuffle = (end_time__shuffle - start_time__shuffle) * 1000
@@ -230,11 +248,11 @@ class PerDocumentCPAttention(torch.autograd.Function):
             # torch.distributed.barrier()
             end_time__gather = time.time()
             duration_ms__gather = (end_time__gather - start_time__gather) * 1000
-            debug_print(f"🟡 PerDocumentCPAttention allgather time (with barrier): {duration_ms__gather} ms")
-        
-        
-        nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.flash_attn")
+            debug_print(
+                f"🟡 PerDocumentCPAttention allgather time (with barrier): {duration_ms__gather} ms"
+            )
 
+        nvtx_range_push("wlbllm.PerDocumentCPAttention.fwd.flash_attn")
 
         if attn_events is not None:
             attn_events[0].record()
@@ -256,7 +274,6 @@ class PerDocumentCPAttention(torch.autograd.Function):
             local_vs.append(local_v)
             log_memory_usage(f"PerDocumentCPAttention after cats[{chunk_id}]")
 
-            
             # rank = torch.distributed.get_rank()
             # if rank % 8 == 0:
             #     debug_print("🟡 Inside WLBLLM's PerDocumentCPAttention.forward(). Printing this may mean we have performance issue.")
@@ -268,11 +285,9 @@ class PerDocumentCPAttention(torch.autograd.Function):
             #     debug_print(f"  - max_seqlen_q_list[chunk_id] = {max_seqlen_q_list[chunk_id]}")
             #     debug_print(f"  - max_seqlen_kv_list[chunk_id] = {max_seqlen_kv_list[chunk_id]}")
 
-            
             # TODO:(Hack) PerDocumentCPAttention performance degrade significantly when returning LSE.
             # We create an env var to disable it only for performance testing.
-            
-            
+
             if should_sync_time_flash_attn:
                 torch.cuda.synchronize()
                 start_time = time.time()
@@ -282,24 +297,26 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 q=q_chunks[chunk_id],
                 k=local_k,
                 v=local_v,
-                cu_seqlens_q=cu_seqlens_q_list [chunk_id],
+                cu_seqlens_q=cu_seqlens_q_list[chunk_id],
                 cu_seqlens_k=cu_seqlens_kv_list[chunk_id],
-                max_seqlen_q=max_seqlen_q_list [chunk_id],
+                max_seqlen_q=max_seqlen_q_list[chunk_id],
                 max_seqlen_k=max_seqlen_kv_list[chunk_id],
                 dropout_p=0.0,
                 softmax_scale=softmax_scale,
                 causal=True,
                 return_attn_probs=True,
-                deterministic=False, # do not turn on this flag - performance will degrade!
+                deterministic=False,  # do not turn on this flag - performance will degrade!
             )
             log_memory_usage("PerDocumentCPAttention after flash_attn_varlen_func")
-            
+
             if should_sync_time_flash_attn:
                 torch.cuda.synchronize()
                 end_time = time.time()
                 duration_ms = (end_time - start_time) * 1000
                 if world_rank % 8 == 0:
-                    debug_print(f"🟡 PerDocumentCPAttention FlashAttnVarlenFunc time: {duration_ms} ms")
+                    debug_print(
+                        f"🟡 PerDocumentCPAttention FlashAttnVarlenFunc time: {duration_ms} ms"
+                    )
             outputs.append(out)
             lses.append(lse)
 
@@ -315,7 +332,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         if os.getenv("D2_DEBUG_PRINT", "0") == "1":
             if torch.distributed.get_rank() % 8 == 0:
-                debug_print(f"🟡 PerDocumentCPAttention shapes:")
+                debug_print("🟡 PerDocumentCPAttention shapes:")
                 debug_print(f"  - local_q.shape = {local_q.shape}")
                 debug_print(f"  - local_ks = {[k.shape for k in local_ks]}")
                 debug_print(f"  - local_vs = {[v.shape for v in local_vs]}")
@@ -325,23 +342,26 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         ctx.save_for_backward(
             local_q,
-            k_global, v_global,
-            *outputs,       
+            k_global,
+            v_global,
+            *outputs,
             *lses,
             *local_ks,
-            *local_vs,   
-            *cu_seqlens_q_list, *cu_seqlens_kv_list,
-            *max_seqlen_q_list, *max_seqlen_kv_list,
+            *local_vs,
+            *cu_seqlens_q_list,
+            *cu_seqlens_kv_list,
+            *max_seqlen_q_list,
+            *max_seqlen_kv_list,
         )
-        ctx.kv_idx_list      = kv_idx_list
-        ctx.q_chunk_sizes  = [c.shape[0] for c in q_chunks]
-        ctx.dropout_p      = dropout_p
-        ctx.doc_lens       = doc_lens
-        ctx.doc_shards     = doc_shards
-        ctx.softmax_scale  = softmax_scale
+        ctx.kv_idx_list = kv_idx_list
+        ctx.q_chunk_sizes = [c.shape[0] for c in q_chunks]
+        ctx.dropout_p = dropout_p
+        ctx.doc_lens = doc_lens
+        ctx.doc_shards = doc_shards
+        ctx.softmax_scale = softmax_scale
         ctx.attn_mask_type = attn_mask_type
-        ctx.cp_group       = cp_group
-        ctx.cp_stream      = cp_stream
+        ctx.cp_group = cp_group
+        ctx.cp_stream = cp_stream
 
         nvtx_range_pop()
 
@@ -351,8 +371,10 @@ class PerDocumentCPAttention(torch.autograd.Function):
             # torch.distributed.barrier()
             end_time__fwd = time.time()
             duration_ms__fwd = (end_time__fwd - start_time__fwd) * 1000
-            debug_print(f"🟡 PerDocumentCPAttention total forward time (with barrier): {duration_ms__fwd} ms")
-            
+            debug_print(
+                f"🟡 PerDocumentCPAttention total forward time (with barrier): {duration_ms__fwd} ms"
+            )
+
         log_memory_usage("PerDocumentCPAttention after save_for_backward")
         log_memory_usage("PerDocumentCPAttention.forward(end)")
         return final_out
@@ -370,22 +392,33 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         (
             local_q,
-            gathered_k, gathered_v,
-            out_L, out_R, 
-            lse_L, lse_R,
-            k_L, k_R,
-            v_L, v_R,
-            cu_q_L, cu_q_R, cu_k_L, cu_k_R,
-            maxq_L, maxq_R, maxk_L, maxk_R,
-            ) = ctx.saved_tensors
+            gathered_k,
+            gathered_v,
+            out_L,
+            out_R,
+            lse_L,
+            lse_R,
+            k_L,
+            k_R,
+            v_L,
+            v_R,
+            cu_q_L,
+            cu_q_R,
+            cu_k_L,
+            cu_k_R,
+            maxq_L,
+            maxq_R,
+            maxk_L,
+            maxk_R,
+        ) = ctx.saved_tensors
 
-        cp_group   = ctx.cp_group
-        kv_idx_list = ctx.kv_idx_list 
+        cp_group = ctx.cp_group
+        kv_idx_list = ctx.kv_idx_list
         doc_lens = ctx.doc_lens
         doc_shards = ctx.doc_shards
         (qlen_L, qlen_R) = ctx.q_chunk_sizes
         world_size = get_world_size(cp_group)
-        rank    = get_rank(cp_group)
+        rank = get_rank(cp_group)
 
         # split grad_out into two chunks
         dq_local = torch.zeros_like(local_q)
@@ -396,16 +429,18 @@ class PerDocumentCPAttention(torch.autograd.Function):
         # debug_print(f"💜 dv_global = {dv_global.shape}")
 
         # split incoming d_out into the two logical chunks
-        d_out_L, d_out_R   = d_out_cat.split([qlen_L, qlen_R], dim=0)
+        d_out_L, d_out_R = d_out_cat.split([qlen_L, qlen_R], dim=0)
 
         cp_size = get_world_size(cp_group)
         chunk_size = d_out_L.size(0)
         context_length = chunk_size * 2 * cp_size
 
-        for i, (d_out, q_len, out, lse, kv_k, kv_v, cu_q, cu_k, max_q, max_k) in enumerate([
-            (d_out_L, qlen_L, out_L, lse_L, k_L, v_L, cu_q_L, cu_k_L, maxq_L, maxk_L),
-            (d_out_R, qlen_R, out_R, lse_R, k_R, v_R, cu_q_R, cu_k_R, maxq_R, maxk_R),
-        ]):
+        for i, (d_out, q_len, out, lse, kv_k, kv_v, cu_q, cu_k, max_q, max_k) in enumerate(
+            [
+                (d_out_L, qlen_L, out_L, lse_L, k_L, v_L, cu_q_L, cu_k_L, maxq_L, maxk_L),
+                (d_out_R, qlen_R, out_R, lse_R, k_R, v_R, cu_q_R, cu_k_R, maxq_R, maxk_R),
+            ]
+        ):
             if i == 0:
                 chunk_index = rank
             else:
@@ -420,21 +455,35 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
             _ = _flash_attn_varlen_backward(
                 d_out,
-                local_q[ sum(ctx.q_chunk_sizes[:i]) : sum(ctx.q_chunk_sizes[:i+1]) ],
-                kv_k, kv_v,
+                local_q[sum(ctx.q_chunk_sizes[:i]) : sum(ctx.q_chunk_sizes[: i + 1])],
+                kv_k,
+                kv_v,
                 out,
                 lse,
-                dq_chunk, dk_chunk, dv_chunk,
-                cu_q, cu_k, int(max_q), int(max_k),
-                0.0, ctx.softmax_scale, True, -1, -1, 0.0, None, False, None
+                dq_chunk,
+                dk_chunk,
+                dv_chunk,
+                cu_q,
+                cu_k,
+                int(max_q),
+                int(max_k),
+                0.0,
+                ctx.softmax_scale,
+                True,
+                -1,
+                -1,
+                0.0,
+                None,
+                False,
+                None,
             )
 
-            dq_local[ sum(ctx.q_chunk_sizes[:i]) : sum(ctx.q_chunk_sizes[:i+1]) ] = dq_chunk
+            dq_local[sum(ctx.q_chunk_sizes[:i]) : sum(ctx.q_chunk_sizes[: i + 1])] = dq_chunk
             local_idx = 0
             for start, end in kv_idx_list[i]:
                 chunk_len = end - start
-                dk_global[start:end] += dk_chunk[local_idx:local_idx + chunk_len] 
-                dv_global[start:end] += dv_chunk[local_idx:local_idx + chunk_len] 
+                dk_global[start:end] += dk_chunk[local_idx : local_idx + chunk_len]
+                dv_global[start:end] += dv_chunk[local_idx : local_idx + chunk_len]
                 local_idx += chunk_len
 
         if ENABLE_SHUFFLE:
@@ -442,14 +491,13 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
             chunk_shard_lens, shard_src_offset, num_tokens = wlbllm.registry.get("memcpy_args")
             dk_global, dv_global = kv_unshuffle_for_per_doc_cp_fast(
-                context_length, dk_global, dv_global, cp_size,
-                chunk_shard_lens, shard_src_offset
+                context_length, dk_global, dv_global, cp_size, chunk_shard_lens, shard_src_offset
             )
             # dk_global, dv_global = kv_unshuffle_for_per_doc_cp(context_length, dk_global, dv_global, doc_lens, doc_shards, cp_size)
             end_time__unshuffle = time.time()
             duration_ms__unshuffle = (end_time__unshuffle - start_time__unshuffle) * 1000
             # debug_print(f"🟡 PerDocumentCPAttention kv_unshuffle_for_per_doc_cp time: {duration_ms__unshuffle} ms")
- 
+
         # TODO: Fix GQA here...
         # now do reduce_scatter for dk/dv
         shape = list(dk_global.shape)
@@ -469,18 +517,16 @@ class PerDocumentCPAttention(torch.autograd.Function):
             dk_global = dk_global.contiguous()
             dv_global = dv_global.contiguous()
 
-            dist.reduce_scatter_tensor(dk_local, dk_global,
-                                    op=dist.ReduceOp.SUM, group=cp_group)
-            dist.reduce_scatter_tensor(dv_local, dv_global,
-                                    op=dist.ReduceOp.SUM, group=cp_group)
+            dist.reduce_scatter_tensor(dk_local, dk_global, op=dist.ReduceOp.SUM, group=cp_group)
+            dist.reduce_scatter_tensor(dv_local, dv_global, op=dist.ReduceOp.SUM, group=cp_group)
 
         nvtx_range_pop()
         log_memory_usage("PerDocumentCPAttention.backward(end)")
 
         return (
-            dq_local,        # grad w.r.t. local_q
-            dk_local,        # grad w.r.t. local_k
-            dv_local,        # grad w.r.t. local_v
+            dq_local,  # grad w.r.t. local_q
+            dk_local,  # grad w.r.t. local_k
+            dv_local,  # grad w.r.t. local_v
             None,  # cu_seqlens_q_list
             None,  # cu_seqlens_kv_list
             None,  # max_seqlen_q_list

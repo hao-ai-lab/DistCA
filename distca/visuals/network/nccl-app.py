@@ -11,10 +11,8 @@ This revision adds:
 
 from __future__ import annotations
 
-import math
 import re
 from pathlib import Path
-from typing import Tuple
 
 import altair as alt
 import numpy as np
@@ -47,6 +45,7 @@ def fmt_qty(x: int) -> str:
             return f"{x / mul:.2f}{suf.upper()}"
     return str(x)
 
+
 def fmt_qty_byte(x: int) -> str:
     for suf, mul in reversed(_SUFFIX.items()):
         if x >= mul and mul != 1:
@@ -54,7 +53,7 @@ def fmt_qty_byte(x: int) -> str:
     return str(x) + "B"
 
 
-def interp_latency(size_req: int, sizes: np.ndarray, times: np.ndarray) -> Tuple[float, str]:
+def interp_latency(size_req: int, sizes: np.ndarray, times: np.ndarray) -> tuple[float, str]:
     """Linear interpolation / extrapolation (µs). Returns (lat, equation str)."""
     idx = np.searchsorted(sizes, size_req)
     if idx == 0:
@@ -71,23 +70,31 @@ def interp_latency(size_req: int, sizes: np.ndarray, times: np.ndarray) -> Tuple
     eq = f"t = {y0:.1f} + ({slope:.6f})*(bytes-{x0})"
     return est, eq
 
+
 DTYPE_B = {"half": 2, "float": 4}
-
-
 
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Sidebar inputs
 # ────────────────────────────────────────────────────────────────────────────────
-st.set_page_config(layout="wide", initial_sidebar_state="expanded", page_title="NCCL Latency Estimator", page_icon="📊")
+st.set_page_config(
+    layout="wide",
+    initial_sidebar_state="expanded",
+    page_title="NCCL Latency Estimator",
+    page_icon="📊",
+)
 st.markdown("<style>body{padding-top: 0px;}</style>", unsafe_allow_html=True)
 
 
 with st.sidebar:
     st.header("NCCL Latency estimator")
 
-    ops_sel = st.multiselect("Collective ops", sorted(df.op.unique()), default=sorted(df.op.unique()))
-    gpus_sel = st.multiselect("GPU counts", sorted(df.ngpu.unique()), default=sorted(df.ngpu.unique()))
+    ops_sel = st.multiselect(
+        "Collective ops", sorted(df.op.unique()), default=sorted(df.op.unique())
+    )
+    gpus_sel = st.multiselect(
+        "GPU counts", sorted(df.ngpu.unique()), default=sorted(df.ngpu.unique())
+    )
 
     dtype_key = st.selectbox("Data type", list(DTYPE_B.keys()), index=0)
     bpe = DTYPE_B[dtype_key]
@@ -103,7 +110,7 @@ with st.sidebar:
         total_elems = parse_qty(tok_txt) * parse_qty(hid_txt)
         total_size = total_elems * bpe
         st.text_input("Total elements", value=fmt_qty(total_elems), disabled=True)
-        st.text_input("Total size", value=fmt_qty(total_size)+"B", disabled=True)
+        st.text_input("Total size", value=fmt_qty(total_size) + "B", disabled=True)
 
     per_gpu = st.radio("Elements are", ["Total", "Per‑GPU"], horizontal=True)
 
@@ -133,9 +140,7 @@ st.metric("Total Size", f"{fmt_qty(total_size)}B", help="Total size of the data 
 
 num_ops = len(ops_sel)
 num_gpus = len(gpus_sel)
-metric_grid = [
-    st.columns(num_ops) for _ in range(num_gpus)
-]
+metric_grid = [st.columns(num_ops) for _ in range(num_gpus)]
 
 # Prepare a grid for metrics display
 for j, ngpu in enumerate(gpus_sel):
@@ -147,9 +152,9 @@ for j, ngpu in enumerate(gpus_sel):
             est_us, equation = interp_latency(req_bytes, sizes, latencies)
             with metric_grid[j][i]:
                 st.metric(
-                    f"{op} GPU={ngpu} (µs)", 
-                    f"{est_us:.2f} µs", 
-                    help=f"Bytes per element = {bpe} for {dtype_key}"
+                    f"{op} GPU={ngpu} (µs)",
+                    f"{est_us:.2f} µs",
+                    help=f"Bytes per element = {bpe} for {dtype_key}",
                 )
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -195,17 +200,26 @@ with st.expander("Column Details"):
 # Add sequence length column if in tokens × hidden mode
 if mode == "tokens × hidden":
     hidden_size = parse_qty(hid_txt)
-    view['seq_len'] = (view['size_bytes'] / (hidden_size * bpe)).astype(int)
+    view["seq_len"] = (view["size_bytes"] / (hidden_size * bpe)).astype(int)
 
 fmt = {
     "size_bytes": lambda x: str(fmt_qty_byte(x)),
     "count_elems": lambda x: str(fmt_qty(x)),
     "seq_len": lambda x: str(fmt_qty(x)),
 }
-fmt.update({
-    col: "{:,.2f}"
-    for col in ["algbw_out_gbs", "busbw_out_gbs", "algbw_in_gbs", "busbw_in_gbs", "t_out (µs)", "t_in (µs)"]
-})
+fmt.update(
+    dict.fromkeys(
+        [
+            "algbw_out_gbs",
+            "busbw_out_gbs",
+            "algbw_in_gbs",
+            "busbw_in_gbs",
+            "t_out (µs)",
+            "t_in (µs)",
+        ],
+        "{:,.2f}",
+    )
+)
 view = view.style.format(fmt)
 st.dataframe(view, use_container_width=True)
 
@@ -217,7 +231,9 @@ chart_df["size_MiB"] = chart_df.size_bytes / (1 << 20)
 chart_df["label"] = chart_df.op + "‑" + chart_df.ngpu.astype(str) + "GPU"
 
 base = alt.Chart(chart_df).encode(
-    x=alt.X("size_MiB", title="Bytes per GPU (MiB)", scale=alt.Scale(type="log" if log_x else "linear")),
+    x=alt.X(
+        "size_MiB", title="Bytes per GPU (MiB)", scale=alt.Scale(type="log" if log_x else "linear")
+    ),
     y=alt.Y("lat_ms_out", title="Latency (ms)", scale=alt.Scale(type="log" if log_y else "linear")),
     color="label",
     tooltip=["label", "size_MiB", "lat_ms_out"],
@@ -231,4 +247,7 @@ else:
 st.subheader("Latency curves")
 st.altair_chart(chart, use_container_width=True)
 
-st.caption("Linear interpolation/extrapolation is used between benchmark points to estimate latency. Bytes per element = %d for %s." % (bpe, dtype_key))
+st.caption(
+    "Linear interpolation/extrapolation is used between benchmark points to estimate latency. Bytes per element = %d for %s."
+    % (bpe, dtype_key)
+)

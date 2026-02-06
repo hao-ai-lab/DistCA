@@ -1,5 +1,6 @@
 /*
-Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT License.
+Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT
+License.
 */
 
 #include <ATen/ATen.h>
@@ -33,14 +34,8 @@ int64_t init(at::Tensor uid, int64_t rank, int64_t world_size, int64_t local_ran
   }
   TORCH_CHECK(uid.device().is_cpu(), "uid must be a CPU tensor");
   TORCH_CHECK(uid.scalar_type() == at::kByte, "uid must be a byte tensor");
-  TORCH_CHECK(
-    uid.numel() == sizeof(nvshmemx_uniqueid_t),
-    "Invalid unique id size (expected ",
-    sizeof(nvshmemx_uniqueid_t),
-    ", got ",
-    uid.numel(),
-    ")"
-  );
+  TORCH_CHECK(uid.numel() == sizeof(nvshmemx_uniqueid_t), "Invalid unique id size (expected ",
+              sizeof(nvshmemx_uniqueid_t), ", got ", uid.numel(), ")");
   nvshmemx_uniqueid_t id;
   std::memcpy(&id, uid.data_ptr(), sizeof(id));
   nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
@@ -54,19 +49,16 @@ int64_t my_pe() { return nvshmem_my_pe(); }
 
 int64_t n_pes() { return nvshmem_n_pes(); }
 
-at::Tensor
-malloc_tensor(const std::vector<int64_t> &shape, c10::ScalarType dtype, const c10::Device &device) {
+at::Tensor malloc_tensor(const std::vector<int64_t> &shape, c10::ScalarType dtype,
+                         const c10::Device &device) {
   size_t size = c10::elementSize(dtype) * c10::multiply_integers(shape);
   void *ptr = nvshmem_malloc(size);
   if (ptr == nullptr) {
     AT_ERROR("nvshmem_malloc failed. size: ", size);
   }
   return at::from_blob(
-      ptr,
-      shape,
-      [](void *ptr) { nvshmem_free(ptr); },
-      at::TensorOptions().dtype(dtype).device(device)
-  );
+      ptr, shape, [](void *ptr) { nvshmem_free(ptr); },
+      at::TensorOptions().dtype(dtype).device(device));
 }
 
 void barrier_all() { nvshmem_barrier_all(); }
@@ -82,9 +74,8 @@ void alltoall(at::Tensor dest, at::Tensor source) {
 
   size_t nbytes = dest.numel() * dest.itemsize() / dest.size(0);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  NVSHMEMCHECK(nvshmemx_alltoallmem_on_stream(
-    NVSHMEM_TEAM_WORLD, (uint8_t *)dest.data_ptr(), (uint8_t *)source.data_ptr(), nbytes, stream
-  ));
+  NVSHMEMCHECK(nvshmemx_alltoallmem_on_stream(NVSHMEM_TEAM_WORLD, (uint8_t *)dest.data_ptr(),
+                                              (uint8_t *)source.data_ptr(), nbytes, stream));
 }
 
 } // namespace

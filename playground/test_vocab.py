@@ -3,8 +3,9 @@
 # -----------------------------------------
 
 import torch
-from distca.utils.logging import time_it, log_module, log_tensor_stats, get_logger
 from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+
+from distca.utils.logging import get_logger, log_module, log_tensor_stats, time_it
 
 logger = get_logger()
 

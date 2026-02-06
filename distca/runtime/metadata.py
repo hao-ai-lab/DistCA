@@ -1,10 +1,10 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Union
 
 import torch
 
 from distca.runtime.utils import slice_or_none
-
 
 _Tensor_Or_Tensor_List = Union[torch.Tensor, Sequence[torch.Tensor]]
 
@@ -16,18 +16,19 @@ class SeqLens:
 
     def get_slice(self, rank):
         return SeqLens(
-            self.send_seqlens[rank], self.recv_seqlens[rank],
+            self.send_seqlens[rank],
+            self.recv_seqlens[rank],
         )
 
     def normalize(self):
         if isinstance(self.send_seqlens, torch.Tensor):
             return SeqLens(
                 self.send_seqlens.cuda().to(torch.int64).contiguous(),
-                self.recv_seqlens.cuda().to(torch.int64).contiguous()
+                self.recv_seqlens.cuda().to(torch.int64).contiguous(),
             )
         return SeqLens(
             tuple(t.cuda().to(torch.int64).contiguous() for t in self.send_seqlens),
-            tuple(t.cuda().to(torch.int64).contiguous() for t in self.recv_seqlens)
+            tuple(t.cuda().to(torch.int64).contiguous() for t in self.recv_seqlens),
         )
 
 
@@ -39,11 +40,14 @@ class LogicalShape:
     Other tensors have the same shape as physical shape.
     This shape is used to construct empty buffers for recv.
     """
-    send_shape: Union[torch.Size, Sequence[torch.Size]]
-    recv_shape: Union[torch.Size, Sequence[torch.Size]]
+
+    send_shape: torch.Size | Sequence[torch.Size]
+    recv_shape: torch.Size | Sequence[torch.Size]
+
     def get_slice(self, rank):
         return LogicalShape(
-            self.send_shape[rank], self.recv_shape[rank],
+            self.send_shape[rank],
+            self.recv_shape[rank],
         )
 
 
@@ -55,6 +59,7 @@ class DedupGradSumMetadata:
     We send a single copy on forward, and sum the gradients
     of all copies to only send the summed gradient back.
     """
+
     num_copies: torch.Tensor
     copy_start_id: torch.Tensor
     main_copy_mask: torch.Tensor
@@ -63,14 +68,14 @@ class DedupGradSumMetadata:
         return DedupGradSumMetadata(
             self.num_copies.cuda().to(torch.int32).contiguous(),
             self.copy_start_id.cuda().to(torch.int64).contiguous(),
-            self.main_copy_mask.cuda().to(torch.int8).contiguous()
+            self.main_copy_mask.cuda().to(torch.int8).contiguous(),
         )
 
 
 @dataclass
 class AlltoAllMetadata:
     # sender_send_offset, sender_transfer_sz, sender_recv_offset, recver_transfer_sz
-    fa2a_metadata: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    fa2a_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     # List of (world_size,) tensors, each of shape (num_sequences,). If a slice, no world_size dimension.
     # metadata on the sender side:
     #   the offset to copy each sequence to the buffer, ordered by the sender's sequence idx
@@ -79,9 +84,9 @@ class AlltoAllMetadata:
     #   the offset to copy each sequence from the buffer, ordered by the recver's sequence idx
     send_memcpy_metadata: Sequence[_Tensor_Or_Tensor_List]
     recv_memcpy_metadata: Sequence[_Tensor_Or_Tensor_List]
-    my_rank_send_offset: Union[int, List[int]]
-    my_rank_recv_offset: Union[int, List[int]]
-    my_rank_send_sz: Union[int, List[int]]
+    my_rank_send_offset: int | list[int]
+    my_rank_recv_offset: int | list[int]
+    my_rank_send_sz: int | list[int]
     seq_lens: Sequence[SeqLens]
     # Num received / send tokens for each tensor (i.e. (q,k) or (attn,))/
     # This is to construct the recv buffer size.
@@ -89,19 +94,19 @@ class AlltoAllMetadata:
     tensor_shape: Sequence[LogicalShape]
     # List of kv replica mask for each rank. (or this rank)
     # shape is (num_local_seqs, cp_degree).
-    kv_replica_mask: Optional[_Tensor_Or_Tensor_List] = None
-    kv_grad_send_dedup: Optional[DedupGradSumMetadata | Sequence[DedupGradSumMetadata]] = None
+    kv_replica_mask: _Tensor_Or_Tensor_List | None = None
+    kv_grad_send_dedup: DedupGradSumMetadata | Sequence[DedupGradSumMetadata] | None = None
     # Debug setting
     single_stream: bool = False
     # For cuda graph, the number of sequences and max cp degree are padded.
     # Below records the original values and should be passed to memcpy kernels.
-    send_num_seqs: Optional[Sequence[int]] = None
-    recv_num_seqs: Optional[Sequence[int]] = None
-    max_cp_degree: Optional[int] = None
+    send_num_seqs: Sequence[int] | None = None
+    recv_num_seqs: Sequence[int] | None = None
+    max_cp_degree: int | None = None
 
     def __better_print__(self):
         """Convert the tensor size to MB. This is just for debugging.
-        
+
         Usage:
         ```
         fa2a_metadata: AlltoAllMetadata = ...
@@ -111,7 +116,7 @@ class AlltoAllMetadata:
         import rich
         rich.print(d)
         ```
-        
+
         """
         # Print in the order of MB for tensor
         (
@@ -122,9 +127,9 @@ class AlltoAllMetadata:
         ) = self.fa2a_metadata
 
         def convert_to_mb(x):
-            y = x // (1024 ** 2)
-            return y.to('cpu')
-        
+            y = x // (1024**2)
+            return y.to("cpu")
+
         sender_send_offset = convert_to_mb(__sender_send_offset)
         sender_transfer_sz = convert_to_mb(__sender_transfer_sz)
         sender_recv_offset = convert_to_mb(__sender_recv_offset)
@@ -148,9 +153,21 @@ class AlltoAllMetadata:
                 _recv_memcpy_metadata.append(t)
         recv_memcpy_metadata = tuple(_recv_memcpy_metadata)
 
-        my_rank_send_offset = [i // (1024 ** 2) for i in self.my_rank_send_offset] if isinstance(self.my_rank_send_offset, list) else self.my_rank_send_offset // (1024 ** 2)
-        my_rank_recv_offset = [i // (1024 ** 2) for i in self.my_rank_recv_offset] if isinstance(self.my_rank_recv_offset, list) else self.my_rank_recv_offset // (1024 ** 2)
-        my_rank_send_sz = [i // (1024 ** 2) for i in self.my_rank_send_sz] if isinstance(self.my_rank_send_sz, list) else self.my_rank_send_sz // (1024 ** 2)
+        my_rank_send_offset = (
+            [i // (1024**2) for i in self.my_rank_send_offset]
+            if isinstance(self.my_rank_send_offset, list)
+            else self.my_rank_send_offset // (1024**2)
+        )
+        my_rank_recv_offset = (
+            [i // (1024**2) for i in self.my_rank_recv_offset]
+            if isinstance(self.my_rank_recv_offset, list)
+            else self.my_rank_recv_offset // (1024**2)
+        )
+        my_rank_send_sz = (
+            [i // (1024**2) for i in self.my_rank_send_sz]
+            if isinstance(self.my_rank_send_sz, list)
+            else self.my_rank_send_sz // (1024**2)
+        )
         seq_lens = self.seq_lens
         tensor_shape = self.tensor_shape
         kv_replica_mask = self.kv_replica_mask
@@ -161,10 +178,10 @@ class AlltoAllMetadata:
             sender_transfer_sz_mb=sender_transfer_sz,
             sender_recv_offset_mb=sender_recv_offset,
             recver_transfer_sz_mb=recver_transfer_sz,
-            send_memcpy_metadata='omit',
-            recv_memcpy_metadata='omit',
+            send_memcpy_metadata="omit",
+            recv_memcpy_metadata="omit",
             my_rank_send_offset_mb=my_rank_send_offset,
-            my_rank_recv_offset_mb=my_rank_recv_offset,   
+            my_rank_recv_offset_mb=my_rank_recv_offset,
             my_rank_send_sz_mb=my_rank_send_sz,
             seq_lens=seq_lens,
             # tensor_shape=tensor_shape,
@@ -179,14 +196,12 @@ class AlltoAllMetadata:
         fa2a_metadata = tuple(t[rank] for t in self.fa2a_metadata)
         send_memcpy_metadata = tuple(t[rank] for t in self.send_memcpy_metadata)
         recv_memcpy_metadata = tuple(t[rank] for t in self.recv_memcpy_metadata)
-        seq_lens = tuple(
-            sl.get_slice(rank) for sl in self.seq_lens
-        )
-        tensor_shape = tuple(
-            ts.get_slice(rank) for ts in self.tensor_shape
-        )
+        seq_lens = tuple(sl.get_slice(rank) for sl in self.seq_lens)
+        tensor_shape = tuple(ts.get_slice(rank) for ts in self.tensor_shape)
         return AlltoAllMetadata(
-            fa2a_metadata, send_memcpy_metadata, recv_memcpy_metadata,
+            fa2a_metadata,
+            send_memcpy_metadata,
+            recv_memcpy_metadata,
             self.my_rank_send_offset[rank],
             self.my_rank_recv_offset[rank],
             self.my_rank_send_sz[rank],
@@ -210,11 +225,11 @@ class AlltoAllMetadata:
             self.tensor_shape,
             kv_replica_mask=(
                 self.kv_replica_mask.cuda().to(torch.int8).contiguous()
-                if self.kv_replica_mask is not None else None
+                if self.kv_replica_mask is not None
+                else None
             ),
             kv_grad_send_dedup=(
-                self.kv_grad_send_dedup.normalize()
-                if self.kv_grad_send_dedup is not None else None
+                self.kv_grad_send_dedup.normalize() if self.kv_grad_send_dedup is not None else None
             ),
             single_stream=self.single_stream,
         )
@@ -226,19 +241,16 @@ def _get_diag(tensor: torch.Tensor, world_size: int):
 
 
 def _get_my_rank_from_metadata(fa2a_metadata: Sequence[torch.Tensor]):
-    (sender_send_disp, sender_transfer_sz,
-        sender_recv_disp, recver_transfer_sz) = fa2a_metadata
+    (sender_send_disp, sender_transfer_sz, sender_recv_disp, recver_transfer_sz) = fa2a_metadata
     world_size = sender_send_disp.shape[0]
     return {
         "my_rank_send_offset": _get_diag(sender_send_disp, world_size),
         "my_rank_recv_offset": _get_diag(sender_recv_disp, world_size),
-        "my_rank_send_sz": _get_diag(sender_transfer_sz, world_size)
+        "my_rank_send_sz": _get_diag(sender_transfer_sz, world_size),
     }
 
 
-def compute_reverse_a2a_layout_metadata(
-    fwd_metadata: AlltoAllMetadata
-):
+def compute_reverse_a2a_layout_metadata(fwd_metadata: AlltoAllMetadata):
     # TODO: as bwd values are mainly the same as fwd values
     # we should only store those that are different.
 
@@ -246,7 +258,9 @@ def compute_reverse_a2a_layout_metadata(
     send_memcpy_metadata = fwd_metadata.recv_memcpy_metadata
     recv_memcpy_metadata = fwd_metadata.send_memcpy_metadata
     # the tensor is sent back to the original location
-    fwd_sender_send_disp, fwd_sender_transfer_sz, fwd_sender_recv_disp, fwd_recver_transfer_sz = fwd_metadata.fa2a_metadata
+    fwd_sender_send_disp, fwd_sender_transfer_sz, fwd_sender_recv_disp, fwd_recver_transfer_sz = (
+        fwd_metadata.fa2a_metadata
+    )
 
     # fwd bytes received from each rank -> bwd bytes sent to each rank
     bwd_sender_transfer_sz = fwd_recver_transfer_sz
@@ -258,22 +272,26 @@ def compute_reverse_a2a_layout_metadata(
     bwd_sender_send_disp = fwd_sender_recv_disp.transpose(0, 1)
     bwd_sender_recv_disp = fwd_sender_send_disp.transpose(0, 1)
     bwd_fa2a_metadata = (
-        bwd_sender_send_disp, bwd_sender_transfer_sz, bwd_sender_recv_disp,
-        bwd_recver_transfer_sz
+        bwd_sender_send_disp,
+        bwd_sender_transfer_sz,
+        bwd_sender_recv_disp,
+        bwd_recver_transfer_sz,
     )
 
     bwd_seqlens = tuple(
-        SeqLens(seq_len.recv_seqlens, seq_len.send_seqlens)
-        for seq_len in fwd_metadata.seq_lens
+        SeqLens(seq_len.recv_seqlens, seq_len.send_seqlens) for seq_len in fwd_metadata.seq_lens
     )
     bwd_tensor_shape = tuple(
-        LogicalShape(ts.recv_shape, ts.send_shape)
-        for ts in fwd_metadata.tensor_shape
+        LogicalShape(ts.recv_shape, ts.send_shape) for ts in fwd_metadata.tensor_shape
     )
 
     my_rank_vals = _get_my_rank_from_metadata(bwd_fa2a_metadata)
     return AlltoAllMetadata(
-        bwd_fa2a_metadata, send_memcpy_metadata, recv_memcpy_metadata,
-        **my_rank_vals, seq_lens=bwd_seqlens, tensor_shape=bwd_tensor_shape,
+        bwd_fa2a_metadata,
+        send_memcpy_metadata,
+        recv_memcpy_metadata,
+        **my_rank_vals,
+        seq_lens=bwd_seqlens,
+        tensor_shape=bwd_tensor_shape,
         kv_replica_mask=fwd_metadata.kv_replica_mask,
     )

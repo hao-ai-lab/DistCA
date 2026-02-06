@@ -11,9 +11,9 @@ $ /opt/nccl-tests/build/all_gather_perf -t 1 -b 8M -e 8G -f 2 -d half -g 8
 #  Rank  6 Group  0 Pid    110 on      modal device  6 [0000:a4:00] NVIDIA H200
 #  Rank  7 Group  0 Pid    110 on      modal device  7 [0000:a5:00] NVIDIA H200
 #
-#                                                              out-of-place                       in-place          
+#                                                              out-of-place                       in-place
 #       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
-#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)       
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
      8388608        524288      half    none      -1    75.68  110.85   96.99      0    78.79  106.46   93.15      0
     16777216       1048576      half    none      -1    87.96  190.74  166.90      0    87.18  192.45  168.40      0
     33554432       2097152      half    none      -1    124.4  269.71  236.00      0    123.1  272.68  238.59      0
@@ -26,6 +26,5 @@ $ /opt/nccl-tests/build/all_gather_perf -t 1 -b 8M -e 8G -f 2 -d half -g 8
   4294967296     268435456      half    none      -1    10258  418.69  366.35      0    10239  419.48  367.05      0
   8589934592     536870912      half    none      -1    20442  420.21  367.69      0    20427  420.52  367.96      0
 # Out of bounds values : 0 OK
-# Avg bus bandwidth    : 299.172 
+# Avg bus bandwidth    : 299.172
 #
-

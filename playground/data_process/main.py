@@ -8,7 +8,5 @@ from datasets import load_dataset
 
 N = 100000
 
-train_data = load_dataset(
-    'codeparrot/codeparrot-clean-train', split=f'train[:{N}]'
-)
+train_data = load_dataset("codeparrot/codeparrot-clean-train", split=f"train[:{N}]")
 train_data.to_json("codeparrot_data.json", lines=True)

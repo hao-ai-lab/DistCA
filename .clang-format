@@ -1,0 +1,6 @@
+# DistCA: C++/CUDA style for csrc/ and baseline/
+# Ensures consistent clang-format output for csrc/ and baseline/.
+# See https://clang.llvm.org/docs/ClangFormatStyleOptions.html
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 100

@@ -1,4 +1,2 @@
-from . import attn_kernels
-from . import megatron
-
+from . import attn_kernels, megatron
 from .attn_kernels import ops

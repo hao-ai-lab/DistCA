@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Instruction to setup the environment inside nvcr container.
 # Assume
 #     nvcr.io/nvidia/pytorch:25.04-py3

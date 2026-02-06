@@ -1,8 +1,8 @@
 # profiler_ctx.py
 import os
-import torch
+
 import torch.profiler as tp
-import traceback
+
 
 class ProfilerCtx:
     """
@@ -11,6 +11,7 @@ class ProfilerCtx:
     - Exports a Chrome trace file at exit
     - Call .step() after each iteration you want recorded
     """
+
     def __init__(self, outdir: str, chrome_name: str = "trace.json"):
         self.outdir = outdir
         os.makedirs(self.outdir, exist_ok=True)
@@ -25,12 +26,12 @@ class ProfilerCtx:
 
     def __enter__(self):
         self.prof.__enter__()
-        print(f"⚪ Entering prof.")
+        print("⚪ Entering prof.")
         return self
 
     def __exit__(self, exc_type, exc, tb):
         # Export a Chrome trace even if there was an exception
-        print(f"⚪ Exiting prof.")
+        print("⚪ Exiting prof.")
         self.prof.__exit__(exc_type, exc, tb)
         print(f"⚪ Exporting chrome trace for {self.chrome_path}")
         self.prof.export_chrome_trace(self.chrome_path)

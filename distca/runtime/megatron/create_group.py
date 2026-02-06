@@ -1,10 +1,9 @@
 """Create communication group"""
 
 from datetime import timedelta
-from typing import Callable, List, Optional, Tuple
 
-from megatron.core import parallel_state as mpu
 import torch
+from megatron.core import parallel_state as mpu
 
 _ATTN_SERVER_GROUP = None
 _ATTN_SERVER_GROUP_GLOO = None
@@ -21,12 +20,12 @@ def initialize_attention_server_comm(
     # Create Gloo group only to send the uid in order to create the NVSHMEM group.
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
-    data_parallel_size = mpu.get_data_parallel_world_size() # TODO: double check
+    data_parallel_size = mpu.get_data_parallel_world_size()  # TODO: double check
 
     # CP
     assert (
-        mpu.get_context_parallel_group(check_initialized=False) is None or
-        mpu.get_context_parallel_world_size() == 1
+        mpu.get_context_parallel_group(check_initialized=False) is None
+        or mpu.get_context_parallel_world_size() == 1
     )
     context_parallel_size = 1
     # TP
@@ -52,14 +51,12 @@ def initialize_attention_server_comm(
         rank_offset=0,  # encoder world size = 0
     )
 
-    for ranks in decoder_rank_generator.get_ranks('dp-pp'):
+    for ranks in decoder_rank_generator.get_ranks("dp-pp"):
         group_gloo = mpu.create_group(
-            ranks, timeout=timeout, backend="gloo",
-            group_desc="ATTN_SERVER_GROUP_GLOO"
+            ranks, timeout=timeout, backend="gloo", group_desc="ATTN_SERVER_GROUP_GLOO"
         )
         group = mpu.create_group(
-            ranks, timeout=timeout, backend="nccl",
-            group_desc="ATTN_SERVER_GROUP"
+            ranks, timeout=timeout, backend="nccl", group_desc="ATTN_SERVER_GROUP"
         )
         if rank in ranks:
             _ATTN_SERVER_GROUP_GLOO = group_gloo
@@ -81,27 +78,31 @@ def destroy_attention_server_comm():
 ######## Tool functions ########
 def get_attn_server_group(check_initialized: bool = True):
     if check_initialized:
-        assert _ATTN_SERVER_GROUP is not None, "attention server communication group is not initialized."
+        assert _ATTN_SERVER_GROUP is not None, (
+            "attention server communication group is not initialized."
+        )
     return _ATTN_SERVER_GROUP
 
 
 def get_attn_server_group_gloo(check_initialized: bool = True):
     if check_initialized:
-        assert _ATTN_SERVER_GROUP_GLOO is not None, "attention server communication group is not initialized."
+        assert _ATTN_SERVER_GROUP_GLOO is not None, (
+            "attention server communication group is not initialized."
+        )
     return _ATTN_SERVER_GROUP_GLOO
 
 
 def get_attn_server_global_ranks(check_initialized: bool = True):
     if check_initialized:
-        assert _ATTN_SERVER_GLOBAL_RANKS is not None, "attention server global ranks are not initialized."
+        assert _ATTN_SERVER_GLOBAL_RANKS is not None, (
+            "attention server global ranks are not initialized."
+        )
     return _ATTN_SERVER_GLOBAL_RANKS
 
 
 def get_attn_server_rank():
     """Get the global rank of the attention server."""
-    return torch.distributed.get_rank(
-        group=get_attn_server_group_gloo(check_initialized=True)
-    )
+    return torch.distributed.get_rank(group=get_attn_server_group_gloo(check_initialized=True))
 
 
 def get_attn_server_group_src_rank():

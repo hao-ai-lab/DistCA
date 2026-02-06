@@ -1,12 +1,13 @@
 import warnings
-from typing import Optional
 
 import torch
-
 from megatron.core.extensions.transformer_engine import (
+    TELayerNormColumnParallelLinear,
     TENorm,
+    TERowParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -28,30 +29,23 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.utils import is_te_min_version
 
-import apex  # pylint: disable=unused-import
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.extensions.transformer_engine import (
-    TELayerNormColumnParallelLinear,
-    TENorm,
-    TERowParallelLinear,
-)
 LNImpl = FusedLayerNorm
 
-from distca.runtime.megatron.ping_pong.transformer_layer import (
-    TransformerLayer as PingPangTransformerLayer
-)
-from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
 from distca.runtime.megatron.per_doc_cp_attn import PerDocCPAttention
+from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
+from distca.runtime.megatron.ping_pong.transformer_layer import (
+    TransformerLayer as PingPangTransformerLayer,
+)
 
 
 def get_gpt_layer_with_transformer_engine_spec(
-    num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
-    qk_layernorm: Optional[bool] = False,
-    multi_latent_attention: Optional[bool] = False,
-    fp8: Optional[str] = None,  # pylint: disable=unused-arguments
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
-    qk_l2_norm: Optional[bool] = False,
+    num_experts: int | None = None,
+    moe_grouped_gemm: bool | None = False,
+    qk_layernorm: bool | None = False,
+    multi_latent_attention: bool | None = False,
+    fp8: str | None = None,  # pylint: disable=unused-arguments
+    moe_use_legacy_grouped_gemm: bool | None = False,
+    qk_l2_norm: bool | None = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -71,7 +65,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated'
-            ' and will be removed soon. Please update your code accordingly.'
+            " and will be removed soon. Please update your code accordingly."
         )
 
     mlp = get_mlp_module_spec(
@@ -87,7 +81,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     # we instead use the Apex implementation.
     qk_norm = TENorm if is_te_min_version("1.9.0") else FusedLayerNorm
     return ModuleSpec(
-        module=PingPangTransformerLayer,    # NOTE: monkey patch the transformer layer for ping-pang parallel
+        module=PingPangTransformerLayer,  # NOTE: monkey patch the transformer layer for ping-pang parallel
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
@@ -115,8 +109,8 @@ def get_gpt_layer_with_transformer_engine_spec(
 def get_gpt_decoder_block_spec(
     config: TransformerConfig,
     use_transformer_engine: bool,
-    normalization: Optional[str] = None,
-    qk_l2_norm: Optional[bool] = False,
+    normalization: str | None = None,
+    qk_l2_norm: bool | None = False,
 ) -> TransformerBlockSubmodules:
     """GPT block spec.
     Adapted from `megatron.core.models.gpt.gpt_layer_specs.get_gpt_decoder_block_spec`
@@ -202,19 +196,23 @@ def model_provider(pre_process=True, post_process=True) -> PingPongGPTModel:
     assert use_te
 
     if args.record_memory_history:
-        torch.cuda.memory._record_memory_history(True,
-            trace_alloc_max_entries=100000,
-            trace_alloc_record_context=True)
+        torch.cuda.memory._record_memory_history(
+            True, trace_alloc_max_entries=100000, trace_alloc_record_context=True
+        )
 
         def oom_observer(device, alloc, device_alloc, device_free):
-            print('saving allocated state during OOM')
+            print("saving allocated state during OOM")
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
-            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
+
+            dump(
+                snapshot,
+                open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", "wb"),
+            )
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
-    print_rank_0('building GPT model ...')
+    print_rank_0("building GPT model ...")
     # Experimental loading arguments from yaml
     config = core_transformer_config_from_args(args)
 
@@ -224,7 +222,9 @@ def model_provider(pre_process=True, post_process=True) -> PingPongGPTModel:
 
     mtp_block_spec = None
     if args.mtp_num_layers is not None:
-        mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_transformer_engine=use_te)
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config, transformer_layer_spec, use_transformer_engine=use_te
+        )
 
     model = PingPongGPTModel(
         config=config,
@@ -251,12 +251,12 @@ def get_gpt_config(
     hidden_size: int,
     num_attention_heads: int,
     ffn_hidden_size: int,
-    hidden_dropout: float = 0.,
-    attention_dropout: float = 0.,
+    hidden_dropout: float = 0.0,
+    attention_dropout: float = 0.0,
     normalization: str = "RMSNorm",
     fp16: bool = False,
     bf16: bool = False,
-    num_query_groups: int=None,
+    num_query_groups: int = None,
     tensor_model_parallel_size: int = 1,
     **kwargs,
 ):

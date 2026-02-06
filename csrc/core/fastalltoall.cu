@@ -10,23 +10,17 @@
 
 namespace attn {
 namespace {
-template<bool DO_SEND, bool DO_RECV>
+template <bool DO_SEND, bool DO_RECV>
 __global__ void spreadout_alltoallv_internode_kernel(
-  // rank information
-  const uint32_t this_rank,
-  const uint32_t local_rank_n,
-  const uint32_t rank_n,
-  // nvshmem memory for RDMA data exchange
-  uint8_t * send_buffer,
-  uint8_t * recv_buffer,
-  uint64_t * sync_signal,
-  // metadata for internode transfer
-  const uint64_t * inter_sender_send_disp,
-  const uint64_t * inter_sender_transfer_sz,
-  const uint64_t * inter_sender_recv_disp,
-  const uint64_t * inter_recver_transfer_sz,
-  const bool do_print,
-  const int64_t buffer_size // in bytes
+    // rank information
+    const uint32_t this_rank, const uint32_t local_rank_n, const uint32_t rank_n,
+    // nvshmem memory for RDMA data exchange
+    uint8_t *send_buffer, uint8_t *recv_buffer, uint64_t *sync_signal,
+    // metadata for internode transfer
+    const uint64_t *inter_sender_send_disp, const uint64_t *inter_sender_transfer_sz,
+    const uint64_t *inter_sender_recv_disp, const uint64_t *inter_recver_transfer_sz,
+    const bool do_print,
+    const int64_t buffer_size // in bytes
 ) {
   const uint32_t warp_id = threadIdx.x / THREAD_N_PER_WARP;
   const uint32_t lane_id = threadIdx.x % THREAD_N_PER_WARP;
@@ -36,45 +30,34 @@ __global__ void spreadout_alltoallv_internode_kernel(
   const uint32_t server_n = rank_n / local_rank_n;
   const uint32_t inter_node_rank_n = rank_n - local_rank_n;
   const bool do_send = DO_SEND && (warp_id == 0);
-  const bool do_recv = DO_RECV && (
-    (warp_id == 1) || (!DO_SEND && warp_id == 0)
-  );
+  const bool do_recv = DO_RECV && ((warp_id == 1) || (!DO_SEND && warp_id == 0));
 
   if (do_send) {
-    //use warp 0 in block 0 to do inter-node transfer
-    for (uint step = 1; step < server_n; step ++){
+    // use warp 0 in block 0 to do inter-node transfer
+    for (uint step = 1; step < server_n; step++) {
       const uint32_t dst_server_id = (server_id + step) % server_n;
-      // const uint32_t src_server_id = (server_id + server_n - step) % server_n;
-      for (uint j = 0; j < local_rank_n; j ++){
-        const uint32_t send_rank_id = dst_server_id * local_rank_n + (local_rank_id + j) % local_rank_n;
-        // const uint32_t recv_rank_id = src_server_id * local_rank_n + (local_rank_id + local_rank_n - j) % local_rank_n;
+      // const uint32_t src_server_id = (server_id + server_n - step) %
+      // server_n;
+      for (uint j = 0; j < local_rank_n; j++) {
+        const uint32_t send_rank_id =
+            dst_server_id * local_rank_n + (local_rank_id + j) % local_rank_n;
+        // const uint32_t recv_rank_id = src_server_id * local_rank_n +
+        // (local_rank_id + local_rank_n - j) % local_rank_n;
         const uint64_t send_offset = __ldg(&inter_sender_send_disp[send_rank_id]);
         const uint64_t recv_offset = __ldg(&inter_sender_recv_disp[send_rank_id]);
         const int64_t send_sz = __ldg(&inter_sender_transfer_sz[send_rank_id]);
-        nvshmemx_putmem_signal_nbi_warp(
-          recv_buffer + recv_offset,
-          send_buffer + send_offset,
-          send_sz,
-          &sync_signal[this_rank],
-          send_sz,
-          NVSHMEM_SIGNAL_ADD,
-          send_rank_id
-        );
-        if (do_print && lane_id == 0 &&
-            (recv_offset + send_sz) > (buffer_size)
-          ) {
-          printf(
-            "Overflow!!! sending %lu bytes from %d to %d, "
-            "recv offset %lu, send size %ld, buffer size %ld. \n",
-            send_sz, this_rank, send_rank_id,
-            recv_offset, send_sz, buffer_size);
+        nvshmemx_putmem_signal_nbi_warp(recv_buffer + recv_offset, send_buffer + send_offset,
+                                        send_sz, &sync_signal[this_rank], send_sz,
+                                        NVSHMEM_SIGNAL_ADD, send_rank_id);
+        if (do_print && lane_id == 0 && (recv_offset + send_sz) > (buffer_size)) {
+          printf("Overflow!!! sending %lu bytes from %d to %d, "
+                 "recv offset %lu, send size %ld, buffer size %ld. \n",
+                 send_sz, this_rank, send_rank_id, recv_offset, send_sz, buffer_size);
         }
       }
     }
-    for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP){
-      const uint32_t send_rank_id = (
-        (server_id + 1) * local_rank_n + i
-      ) % rank_n;
+    for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP) {
+      const uint32_t send_rank_id = ((server_id + 1) * local_rank_n + i) % rank_n;
       // Send one more byte on the signal here, to guarantee that
       // there is always a communication between each peers.
       // This is to guarantee that two ranks are running the
@@ -85,7 +68,7 @@ __global__ void spreadout_alltoallv_internode_kernel(
     nvshmem_quiet();
   }
   if (do_recv) {
-    for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP){
+    for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP) {
       const uint32_t src_rank = ((server_id + 1) * local_rank_n + i) % rank_n;
       // + 1 is because we've added a signal to all ranks to avoid no
       // communication.
@@ -96,41 +79,29 @@ __global__ void spreadout_alltoallv_internode_kernel(
   }
 }
 
-
 // Notify peers that this buffer is locally released
-__global__ void notify_release_buffer(
-  uint64_t * buffer_available_signal,
-  const uint32_t this_rank,
-  const uint32_t local_rank_n,
-  const uint32_t rank_n
-) {
+__global__ void notify_release_buffer(uint64_t *buffer_available_signal, const uint32_t this_rank,
+                                      const uint32_t local_rank_n, const uint32_t rank_n) {
   const uint32_t lane_id = threadIdx.x % THREAD_N_PER_WARP;
   const uint32_t server_id = this_rank / local_rank_n;
   const uint32_t inter_node_rank_n = rank_n - local_rank_n;
 
-  for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP){
-    const uint32_t send_rank_id = (
-      (server_id + 1) * local_rank_n + i
-    ) % rank_n;
+  for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP) {
+    const uint32_t send_rank_id = ((server_id + 1) * local_rank_n + i) % rank_n;
     nvshmemx_signal_op(&buffer_available_signal[this_rank], 1, NVSHMEM_SIGNAL_ADD, send_rank_id);
   }
   nvshmem_quiet();
 }
 
-
 // Assure that all peers have already released this buffer
 // and acquire it.
-__global__ void wait_and_consume_buffer(
-  uint64_t * buffer_available_signal,
-  const uint32_t this_rank,
-  const uint32_t local_rank_n,
-  const uint32_t rank_n
-) {
+__global__ void wait_and_consume_buffer(uint64_t *buffer_available_signal, const uint32_t this_rank,
+                                        const uint32_t local_rank_n, const uint32_t rank_n) {
   const uint32_t lane_id = threadIdx.x % THREAD_N_PER_WARP;
   const uint32_t server_id = this_rank / local_rank_n;
   const uint32_t inter_node_rank_n = rank_n - local_rank_n;
 
-  for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP){
+  for (uint i = lane_id; i < inter_node_rank_n; i += THREAD_N_PER_WARP) {
     const uint32_t src_rank = ((server_id + 1) * local_rank_n + i) % rank_n;
     nvshmem_uint64_wait_until(&buffer_available_signal[src_rank], NVSHMEM_CMP_EQ, 1);
     buffer_available_signal[src_rank] = 0;
@@ -138,108 +109,64 @@ __global__ void wait_and_consume_buffer(
 }
 }; // namespace
 
-
-int launch_alltoallv(
-  uint32_t this_rank,
-  uint32_t rank_n_per_node,
-  uint32_t rank_n,
-  struct fanout_nvshmem_buffer_t * buf,
-  struct internode_transfer_params_t * inter_params,
-  // NOTE: this is a partial intra-node send.
-  // Because we don't do optimizations for intra-node send,
-  // in this function, we have rank_n_per_node == 1.
-  // However, we need to memcpy locally (from send_nvshmem to recv_nvshmem on local rank).
-  // To achieve this, we launch a memcpy from the host because
-  // it utilizes DMA and is faster.
-  // Hence, we need the local memcpy offset and size on CPU.
-  int64_t my_rank_send_offset,
-  int64_t my_rank_recv_offset,
-  int64_t my_rank_send_sz,
-  cudaStream_t stream,
-  int64_t buffer_size,
-  bool separate_send_recv
-) {
+int launch_alltoallv(uint32_t this_rank, uint32_t rank_n_per_node, uint32_t rank_n,
+                     struct fanout_nvshmem_buffer_t *buf,
+                     struct internode_transfer_params_t *inter_params,
+                     // NOTE: this is a partial intra-node send.
+                     // Because we don't do optimizations for intra-node send,
+                     // in this function, we have rank_n_per_node == 1.
+                     // However, we need to memcpy locally (from send_nvshmem to
+                     // recv_nvshmem on local rank). To achieve this, we launch
+                     // a memcpy from the host because it utilizes DMA and is
+                     // faster. Hence, we need the local memcpy offset and size
+                     // on CPU.
+                     int64_t my_rank_send_offset, int64_t my_rank_recv_offset,
+                     int64_t my_rank_send_sz, cudaStream_t stream, int64_t buffer_size,
+                     bool separate_send_recv) {
   int device_id = -1;
   CUDACHECK(cudaGetDevice(&device_id));
   bool do_print = device_id == 0;
 
-  void* inter_args[] = {
-    &this_rank,
-    &rank_n_per_node,
-    &rank_n,
-    &buf->send_buffer,
-    &buf->recv_buffer,
-    &buf->sync_signal,
-    &inter_params->sender_send_disp,
-    &inter_params->sender_transfer_sz,
-    &inter_params->sender_recv_disp,
-    &inter_params->recver_transfer_sz,
-    &do_print,
-    &buffer_size
-  };
+  void *inter_args[] = {&this_rank,
+                        &rank_n_per_node,
+                        &rank_n,
+                        &buf->send_buffer,
+                        &buf->recv_buffer,
+                        &buf->sync_signal,
+                        &inter_params->sender_send_disp,
+                        &inter_params->sender_transfer_sz,
+                        &inter_params->sender_recv_disp,
+                        &inter_params->recver_transfer_sz,
+                        &do_print,
+                        &buffer_size};
   dim3 inter_grid(1, 1, 1);
   if (separate_send_recv) {
     dim3 inter_block(THREAD_N_PER_WARP, 1, 1);
-    CUDACHECK(cudaLaunchKernel(
-      (void *)&spreadout_alltoallv_internode_kernel<true, false>,
-      inter_grid,
-      inter_block, 
-      inter_args,
-      0,
-      stream
-    ));
-    CUDACHECK(cudaLaunchKernel(
-      (void *)&spreadout_alltoallv_internode_kernel<false, true>,
-      inter_grid,
-      inter_block, 
-      inter_args,
-      0,
-      stream
-    ));
+    CUDACHECK(cudaLaunchKernel((void *)&spreadout_alltoallv_internode_kernel<true, false>,
+                               inter_grid, inter_block, inter_args, 0, stream));
+    CUDACHECK(cudaLaunchKernel((void *)&spreadout_alltoallv_internode_kernel<false, true>,
+                               inter_grid, inter_block, inter_args, 0, stream));
   } else {
     dim3 inter_block(THREAD_N_PER_2WARP, 1, 1);
-    CUDACHECK(cudaLaunchKernel(
-      (void *)&spreadout_alltoallv_internode_kernel<true, true>,
-      inter_grid,
-      inter_block, 
-      inter_args,
-      0,
-      stream
-      ));
+    CUDACHECK(cudaLaunchKernel((void *)&spreadout_alltoallv_internode_kernel<true, true>,
+                               inter_grid, inter_block, inter_args, 0, stream));
   }
   // The local communication
-  CUDACHECK(cudaMemcpyAsync(
-    buf->recv_buffer + my_rank_recv_offset,
-    buf->send_buffer + my_rank_send_offset,
-    my_rank_send_sz,
-    cudaMemcpyDeviceToDevice,
-    stream
-  ));
+  CUDACHECK(cudaMemcpyAsync(buf->recv_buffer + my_rank_recv_offset,
+                            buf->send_buffer + my_rank_send_offset, my_rank_send_sz,
+                            cudaMemcpyDeviceToDevice, stream));
   return NVSHMEMX_SUCCESS;
 }
 
-
-void launch_buffer_availability_kernel(
-  uint32_t this_rank,
-  uint32_t rank_n_per_node,
-  uint32_t rank_n,
-  struct fanout_nvshmem_buffer_t * buf,
-  bool is_release,
-  cudaStream_t stream
-) {
+void launch_buffer_availability_kernel(uint32_t this_rank, uint32_t rank_n_per_node,
+                                       uint32_t rank_n, struct fanout_nvshmem_buffer_t *buf,
+                                       bool is_release, cudaStream_t stream) {
   // Launch the memcpy done notification kernel
   dim3 grid(1, 1, 1);
   dim3 block(THREAD_N_PER_WARP, 1, 1);
-  void* args[] = {
-    &buf->buffer_available_signal,
-    &this_rank,
-    &rank_n_per_node,
-    &rank_n
-  };
+  void *args[] = {&buf->buffer_available_signal, &this_rank, &rank_n_per_node, &rank_n};
   void *func = is_release ? (void *)&notify_release_buffer : (void *)&wait_and_consume_buffer;
-  CUDACHECK(cudaLaunchKernel(
-    func, grid, block, args, 0, stream
-  ));
+  CUDACHECK(cudaLaunchKernel(func, grid, block, args, 0, stream));
 }
 
 }; // namespace attn

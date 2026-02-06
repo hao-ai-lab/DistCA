@@ -1,4 +1,4 @@
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -22,7 +22,7 @@ def size_pad_by_int4(hidden_size: int, itemsize: int):
     return hidden_size_pad, pad_size
 
 
-def prepend_zero_fn(tensor: torch.Tensor, dim: int=0):
+def prepend_zero_fn(tensor: torch.Tensor, dim: int = 0):
     zero = torch.zeros_like(tensor.select(dim, 0)).unsqueeze(dim)
     return torch.cat([zero, tensor], dim=dim)
 

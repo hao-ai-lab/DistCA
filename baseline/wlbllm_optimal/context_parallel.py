@@ -21,14 +21,14 @@ def get_cp_index_slice(t: int, cp_size: int, cp_rank: int) -> list[int]:
     if not (0 <= cp_rank < cp_size):
         raise ValueError("cp_rank must be in [0, cp_size)")
 
-    main_part       = t // (2 * cp_size) * (2 * cp_size)
-    remaining_part  = t - main_part
+    main_part = t // (2 * cp_size) * (2 * cp_size)
+    remaining_part = t - main_part
     indices: list[int] = []
 
     # Handle the symmetric main part
     if main_part:
-        chunk = main_part // (2 * cp_size)          # size of each chunk
-        if chunk:                                   # only if big enough
+        chunk = main_part // (2 * cp_size)  # size of each chunk
+        if chunk:  # only if big enough
             # front chunk
             start_f = cp_rank * chunk
             indices.append(slice(start_f, start_f + chunk))
@@ -38,10 +38,7 @@ def get_cp_index_slice(t: int, cp_size: int, cp_rank: int) -> list[int]:
 
     # Hand out leftover tail tokens round-robin
     if cp_rank < remaining_part:
-        potential_indices = [
-            cp_rank, 
-            2 * cp_size - cp_rank - 1
-        ]
+        potential_indices = [cp_rank, 2 * cp_size - cp_rank - 1]
         for i in potential_indices:
             if main_part + i < t:
                 indices.append(slice(main_part + i, main_part + i + 1))
@@ -49,10 +46,7 @@ def get_cp_index_slice(t: int, cp_size: int, cp_rank: int) -> list[int]:
     return indices
 
 
-def get_batch_on_this_cp_rank__balanced_seq(
-    batch, token_lens, 
-    cp_size = None, cp_rank = None
-):
+def get_batch_on_this_cp_rank__balanced_seq(batch, token_lens, cp_size=None, cp_rank=None):
     """
     Slice the batch with balanced sequence length.
     --------------
@@ -68,27 +62,25 @@ def get_batch_on_this_cp_rank__balanced_seq(
     - L: sequence length
     """
 
-    L = batch['attention_mask'].shape[-1]
-    
+    L = batch["attention_mask"].shape[-1]
+
     if cp_size is None:
         from megatron.core.utils import parallel_state
+
         cp_size = parallel_state.get_context_parallel_world_size()
     if cp_rank is None:
         from megatron.core.utils import parallel_state
+
         cp_rank = parallel_state.get_context_parallel_rank()
-    
+
     if cp_size > 1:
+        tokens = batch["tokens"]
+        labels = batch["labels"]
+        loss_mask = batch["loss_mask"]
+        attention_mask = batch["attention_mask"]
+        position_ids = batch["position_ids"]
 
-        tokens = batch['tokens']
-        labels = batch['labels']
-        loss_mask = batch['loss_mask']
-        attention_mask = batch['attention_mask']
-        position_ids = batch['position_ids']
-
-        cp_slices = [
-            get_cp_index_slice(token_len, cp_size, cp_rank)
-            for token_len in token_lens
-        ]
+        cp_slices = [get_cp_index_slice(token_len, cp_size, cp_rank) for token_len in token_lens]
         new_tokens = []
         new_labels = []
         new_loss_mask = []
@@ -104,14 +96,12 @@ def get_batch_on_this_cp_rank__balanced_seq(
             _new_position_ids = []
 
             for cp_slice in index_slices:
-                _new_tokens.append(
-                    tokens[i, cp_slice]
-                )
+                _new_tokens.append(tokens[i, cp_slice])
                 _new_labels.append(labels[i, cp_slice])
                 _new_loss_mask.append(loss_mask[i, cp_slice])
                 _new_attention_mask.append(attention_mask[i, 0, cp_slice, :])
                 _new_position_ids.append(position_ids[i, cp_slice])
-            
+
             _token = torch.cat(_new_tokens, dim=0).reshape(1, -1)
             _label = torch.cat(_new_labels, dim=0).reshape(1, -1)
             _loss_mask = torch.cat(_new_loss_mask, dim=0).reshape(1, -1)
@@ -123,27 +113,27 @@ def get_batch_on_this_cp_rank__balanced_seq(
             new_loss_mask.append(_loss_mask)
             new_attention_mask.append(_attention_mask)
             new_position_ids.append(_position_ids)
-        
+
         new_tokens = torch.cat(new_tokens, dim=0)
         new_labels = torch.cat(new_labels, dim=0)
         new_loss_mask = torch.cat(new_loss_mask, dim=0)
         new_attention_mask = torch.cat(new_attention_mask, dim=0)
         new_position_ids = torch.cat(new_position_ids, dim=0)
-        
+
         batch = dict(
-            tokens = new_tokens,
-            labels = new_labels,
-            loss_mask = new_loss_mask,
-            attention_mask = new_attention_mask,
-            position_ids = new_position_ids,
+            tokens=new_tokens,
+            labels=new_labels,
+            loss_mask=new_loss_mask,
+            attention_mask=new_attention_mask,
+            position_ids=new_position_ids,
         )
     return batch
 
 
 def get_approx_kv_len(t: int, cp_size: int, cp_rank: int) -> int:
     """
-    Assume the token length for the token is `t`. 
-    Then we assume the 
+    Assume the token length for the token is `t`.
+    Then we assume the
 
     """
     if cp_size <= 0:
@@ -165,35 +155,23 @@ def slice_length(slice_obj: slice) -> int:
 
 
 def prepare_packed_seq_params(
-    token_lens, 
+    token_lens,
     max_seq_len,
-    cp_size, cp_rank,
+    cp_size,
+    cp_rank,
     device,
 ):
     # Calculate the q-lengths
     slice_lengths = [
-        sum(
-            slice_length(s)
-            for s in get_cp_index_slice(t, cp_size, cp_rank)
-        ) 
-        for t in token_lens
+        sum(slice_length(s) for s in get_cp_index_slice(t, cp_size, cp_rank)) for t in token_lens
     ]
 
-    seqlens_q = [0] + [
-        sum(slice_lengths[:i+1])
-        for i in range(len(slice_lengths))
-    ]
+    seqlens_q = [0] + [sum(slice_lengths[: i + 1]) for i in range(len(slice_lengths))]
 
     # Calculate the kv-lengths
-    seqlens_kv = [
-        get_approx_kv_len(t, cp_size, cp_rank)
-        for t in token_lens
-    ]
+    seqlens_kv = [get_approx_kv_len(t, cp_size, cp_rank) for t in token_lens]
 
-    seqlens_kv = [0] + [
-        sum(seqlens_kv[:i+1])
-        for i in range(len(seqlens_kv))
-    ]
+    seqlens_kv = [0] + [sum(seqlens_kv[: i + 1]) for i in range(len(seqlens_kv))]
 
     # Calculate the number of non-padding elements for each sequence
     cu_seqlens_q = torch.tensor(seqlens_q, dtype=torch.int32, device=device)
@@ -208,22 +186,21 @@ def prepare_packed_seq_params(
 
         @dataclass
         class PackedSeqParams:
-            '''
+            """
             parameters to TEDotProductAttention and fused rope kernels for the
             `thd` (packed) sequence format
-            '''
+            """
 
             qkv_format: str = None
-            cu_seqlens_q: 'Tensor' = None
-            cu_seqlens_kv: 'Tensor' = None
-            cu_seqlens_q_padded: 'Tensor' = None
-            cu_seqlens_kv_padded: 'Tensor' = None
-            max_seqlen_q: 'Tensor' = None
-            max_seqlen_kv: 'Tensor' = None
-
+            cu_seqlens_q: "Tensor" = None
+            cu_seqlens_kv: "Tensor" = None
+            cu_seqlens_q_padded: "Tensor" = None
+            cu_seqlens_kv_padded: "Tensor" = None
+            max_seqlen_q: "Tensor" = None
+            max_seqlen_kv: "Tensor" = None
 
     result = PackedSeqParams(
-        qkv_format='thd',
+        qkv_format="thd",
         # qkv_format='sbhd',
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,

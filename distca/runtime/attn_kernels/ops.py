@@ -1,9 +1,7 @@
 # pyright: reportCallIssue=false
 
-from collections.abc import Sequence
-import enum
 import os
-from typing import Optional, Tuple
+from collections.abc import Sequence
 
 import torch
 
@@ -14,16 +12,21 @@ _ops = torch.ops.dispatch_kernels
 ###### NVSHMEM utils ######
 
 _is_nvshmem_initialized = False
+
+
 def nvshmem_get_unique_id() -> torch.Tensor:
     return _ops.nvshmem_get_unique_id()
+
 
 def nvshmem_unique_id_size() -> int:
     return _ops.nvshmem_unique_id_size()
 
+
 def nvshmem_alloc_empty_unique_id() -> torch.Tensor:
     return torch.zeros(nvshmem_unique_id_size(), dtype=torch.uint8, device="cpu")
 
-def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int=-1) -> int:
+
+def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int = -1) -> int:
     # NOTE: this is because we set device in python. Should move it to the cpp end.
     torch.cuda.synchronize()
     status = _ops.nvshmem_init(uid, rank, world_size, local_rank)
@@ -32,18 +35,23 @@ def nvshmem_init(uid: torch.Tensor, rank: int, world_size: int, local_rank: int=
     _is_nvshmem_initialized = True
     return status
 
+
 def nvshmem_alltoall(dest: torch.Tensor, source: torch.Tensor) -> None:
     return _ops.nvshmem_alltoall(dest, source)
+
 
 def nvshmem_finalize() -> None:
     torch.cuda.synchronize()
     _ops.nvshmem_finalize()
 
+
 def nvshmem_my_pe() -> int:
     return _ops.nvshmem_my_pe()
 
+
 def nvshmem_n_pes() -> int:
     return _ops.nvshmem_n_pes()
+
 
 def nvshmem_malloc(
     shape: Sequence[int],
@@ -52,10 +60,12 @@ def nvshmem_malloc(
 ) -> torch.Tensor:
     return _ops.nvshmem_malloc(shape, dtype, device)
 
+
 def nvshmem_barrier_all() -> None:
     if not _is_nvshmem_initialized:
         return
     _ops.nvshmem_barrier_all()
+
 
 def nvshmem_barrier_all_on_current_stream() -> None:
     if not _is_nvshmem_initialized:
@@ -65,9 +75,7 @@ def nvshmem_barrier_all_on_current_stream() -> None:
 
 #### Fast dispatch
 class DispatcherWrapper:
-    instance: Tuple[
-        "DispatcherWrapper", "DispatcherWrapper"
-    ] = None
+    instance: tuple["DispatcherWrapper", "DispatcherWrapper"] = None
     is_acquired: list[bool] = [False, False]
     cur_instance: int = 0
     comm_stream: torch.cuda.Stream = None
@@ -97,19 +105,16 @@ class DispatcherWrapper:
             self.buffer_size = buffer_size
 
     @staticmethod
-    def init(
-        rank: int, local_rank: int, world_size: int, buffer_size: int,
-        uid: torch.Tensor
-    ):
+    def init(rank: int, local_rank: int, world_size: int, buffer_size: int, uid: torch.Tensor):
         # NOTE: local_rank here is currently disabled, because we don't
         # consider intra-rank communication here.
         nvshmem_init(uid, rank, world_size, local_rank)
-        DispatcherWrapper.instance = [DispatcherWrapper(
-            rank, local_rank, world_size, buffer_size
-        ) for _ in range(2)]
+        DispatcherWrapper.instance = [
+            DispatcherWrapper(rank, local_rank, world_size, buffer_size) for _ in range(2)
+        ]
 
     @staticmethod
-    def get_instance(instance_id: int=None) -> "DispatcherWrapper":
+    def get_instance(instance_id: int = None) -> "DispatcherWrapper":
         assert DispatcherWrapper.instance is not None, "DispatcherWrapper not initialized"
         instance_id = instance_id if instance_id is not None else DispatcherWrapper.cur_instance
         return DispatcherWrapper.instance[instance_id]
@@ -151,16 +156,18 @@ class DispatcherWrapper:
 
 
 def a2a_memcpy_non_cp(
-    tensor: torch.Tensor, nvshmem_offset: torch.Tensor,
-    shard_tokens: torch.Tensor, to_nvshmem: bool,
-    shard_do_copy_mask: Optional[torch.Tensor]=None,
-    buffer: Optional[torch.Tensor]=None, instance_id: int=None
+    tensor: torch.Tensor,
+    nvshmem_offset: torch.Tensor,
+    shard_tokens: torch.Tensor,
+    to_nvshmem: bool,
+    shard_do_copy_mask: torch.Tensor | None = None,
+    buffer: torch.Tensor | None = None,
+    instance_id: int = None,
 ):
     if buffer is not None:
         # Debug mode, explicitly pass the "nvshmem" buffer.
         return _ops.fast_a2a_memcpy_non_cp_debug(
-            tensor, nvshmem_offset, shard_tokens, shard_do_copy_mask,
-            to_nvshmem, buffer
+            tensor, nvshmem_offset, shard_tokens, shard_do_copy_mask, to_nvshmem, buffer
         )
     if shard_do_copy_mask is not None:
         assert to_nvshmem
@@ -174,15 +181,22 @@ def a2a_memcpy_non_cp(
 
     return _ops.fast_a2a_memcpy_non_cp(
         DispatcherWrapper.get_instance(instance_id).handle,
-        tensor, nvshmem_offset, shard_tokens, shard_do_copy_mask, to_nvshmem
+        tensor,
+        nvshmem_offset,
+        shard_tokens,
+        shard_do_copy_mask,
+        to_nvshmem,
     )
 
 
 def a2a_memcpy_cp(
-    tensor: torch.Tensor, do_shard: torch.Tensor,
-    nvshmem_offset: torch.Tensor, shard_tokens: torch.Tensor,
-    to_nvshmem: bool, buffer: Optional[torch.Tensor]=None,
-    instance_id: int=None,
+    tensor: torch.Tensor,
+    do_shard: torch.Tensor,
+    nvshmem_offset: torch.Tensor,
+    shard_tokens: torch.Tensor,
+    to_nvshmem: bool,
+    buffer: torch.Tensor | None = None,
+    instance_id: int = None,
 ):
     if buffer is not None:
         # Debug mode, explicitly pass the "nvshmem" buffer.
@@ -199,13 +213,19 @@ def a2a_memcpy_cp(
 
     return _ops.fast_a2a_memcpy_cp(
         DispatcherWrapper.get_instance(instance_id).handle,
-        tensor, do_shard, nvshmem_offset, shard_tokens, to_nvshmem
+        tensor,
+        do_shard,
+        nvshmem_offset,
+        shard_tokens,
+        to_nvshmem,
     )
 
 
 def pre_a2a_grad_acc(
-    tensor: torch.Tensor, num_copies: torch.Tensor,
-    copy_start_id: torch.Tensor, shard_tokens: torch.Tensor,
+    tensor: torch.Tensor,
+    num_copies: torch.Tensor,
+    copy_start_id: torch.Tensor,
+    shard_tokens: torch.Tensor,
 ):
     """
     When kv has multiple copies, and we accumulates their gradients to the main copy,
@@ -214,18 +234,24 @@ def pre_a2a_grad_acc(
     _ops.fast_a2a_grad_acc(tensor, num_copies, copy_start_id, shard_tokens)
     return tensor
 
+
 def _ops_fast_a2a_wrapper(*args):
     return _ops.fast_a2a(*args)
 
+
 def fast_a2a(
-    sender_send_disp: torch.Tensor, sender_transfer_sz: torch.Tensor,
-    sender_recv_disp: torch.Tensor, recver_transfer_sz: torch.Tensor,
-    my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
-    instance_id: int=None,
+    sender_send_disp: torch.Tensor,
+    sender_transfer_sz: torch.Tensor,
+    sender_recv_disp: torch.Tensor,
+    recver_transfer_sz: torch.Tensor,
+    my_rank_send_offset: int,
+    my_rank_recv_offset: int,
+    my_rank_send_sz: int,
+    instance_id: int = None,
 ):
     should_fa2a_barrier = os.environ.get("EXPERIMENT_FA2A_BARRIER", "0") == "1"
     should_skip_fa2a_op = os.environ.get("EXPERIMENT_SKIP_FA2A_OP", "0") == "1"
-    
+
     if instance_id is not None:
         assert not DispatcherWrapper.is_acquired[instance_id]
         # acquiring here ensures the sync in acquire is always on the same stream as all2all
@@ -242,17 +268,23 @@ def fast_a2a(
 
     if should_skip_fa2a_op:
         # Use a module-level variable to track if we've printed the message
-        if not hasattr(fast_a2a, '_printed_skip_message'):
-            print("🛑 skipping fast_a2a op. This usually happens at debugging. If this is not expected, please set EXPERIMENT_SKIP_FA2A_OP to 0.")
+        if not hasattr(fast_a2a, "_printed_skip_message"):
+            print(
+                "🛑 skipping fast_a2a op. This usually happens at debugging. If this is not expected, please set EXPERIMENT_SKIP_FA2A_OP to 0."
+            )
             fast_a2a._printed_skip_message = True
         return
 
     ret = _ops_fast_a2a_wrapper(
         DispatcherWrapper.get_instance(instance_id).handle,
-        sender_send_disp, sender_transfer_sz,
-        sender_recv_disp, recver_transfer_sz,
-        my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz,
-        True
+        sender_send_disp,
+        sender_transfer_sz,
+        sender_recv_disp,
+        recver_transfer_sz,
+        my_rank_send_offset,
+        my_rank_recv_offset,
+        my_rank_send_sz,
+        True,
     )
 
     return ret
@@ -262,7 +294,7 @@ def _debug_dump_buffer(
     dump_target: str,
     buffer_dtype: torch.dtype,
     device: torch.device,
-    instance_id: int=None,
+    instance_id: int = None,
 ):
     assert dump_target in ["send", "recv", "signal"]
     get_send = dump_target == "send"
@@ -270,12 +302,8 @@ def _debug_dump_buffer(
     get_signal = dump_target == "signal"
     instance = DispatcherWrapper.get_instance(instance_id)
     out_tensor = torch.zeros(
-        (instance.buffer_size // buffer_dtype.itemsize,),
-        dtype=buffer_dtype, device=device
+        (instance.buffer_size // buffer_dtype.itemsize,), dtype=buffer_dtype, device=device
     )
-    _ops._debug_nvshmem_buffer(
-        instance.handle,
-        get_send, get_recv, get_signal, out_tensor
-    )
+    _ops._debug_nvshmem_buffer(instance.handle, get_send, get_recv, get_signal, out_tensor)
     torch.cuda.synchronize()
     return out_tensor

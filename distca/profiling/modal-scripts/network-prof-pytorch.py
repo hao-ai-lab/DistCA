@@ -6,12 +6,17 @@ app = modal.App("network-prof")
 
 # Base image with PyTorch + CUDA already linked against NCCL
 image = (
-    modal.Image.debian_slim()
-    .pip_install("torch==2.3.0")   # use the latest stable that matches CUDA 12
+    modal.Image.debian_slim().pip_install(
+        "torch==2.3.0"
+    )  # use the latest stable that matches CUDA 12
 )
 
+
 def run_allreduce(local_rank, world_size, iters, tensor_elems, ret):
-    import os, time, torch, torch.multiprocessing as mp
+    import os
+
+    import torch
+
     # ----- NCCL setup -----
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29500"
@@ -44,7 +49,10 @@ def run_allreduce(local_rank, world_size, iters, tensor_elems, ret):
 
 
 def run_allgather(local_rank, world_size, iters, tensor_elems, ret):
-    import os, time, torch, torch.multiprocessing as mp
+    import os
+
+    import torch
+
     # ----- NCCL setup -----
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29500"
@@ -55,13 +63,11 @@ def run_allgather(local_rank, world_size, iters, tensor_elems, ret):
         rank=local_rank,
         init_method="env://",
     )
-    
+
     # ----- Benchmark -----
     tensors = []
     for i in range(world_size):
-        tensors.append(
-            (torch.ones(tensor_elems, device="cuda", dtype=torch.float16) * i)
-        )
+        tensors.append(torch.ones(tensor_elems, device="cuda", dtype=torch.float16) * i)
     tensor = tensors[local_rank]
 
     durations_ms = []
@@ -89,12 +95,14 @@ def run_allgather(local_rank, world_size, iters, tensor_elems, ret):
     if local_rank == 0:
         ret["latency_ms_list"] = [t.item() for t in all_elapsed_ms]
         ret["latency_ms"] = sum(durations_ms) / len(durations_ms)
-        print(f"AllGather Report with {tensor_elems} elements per GPU, {tensor_elems * world_size} elements total, float16, {iters} iterations, {world_size} GPUs")
+        print(
+            f"AllGather Report with {tensor_elems} elements per GPU, {tensor_elems * world_size} elements total, float16, {iters} iterations, {world_size} GPUs"
+        )
         print(f"- latency_ms_list: {ret['latency_ms_list']}")
         print(f"- latency_ms: {ret['latency_ms']}")
 
     torch.distributed.destroy_process_group()
-    
+
 
 def allreduce_worker(world_size: int, iters: int, tensor_elems: int):
     """
@@ -102,21 +110,20 @@ def allreduce_worker(world_size: int, iters: int, tensor_elems: int):
     Runs a single-process NCCL benchmark (rank == local GPU index).
     Returns average latency in milliseconds.
     """
-    import os, time, torch, torch.multiprocessing as mp
+    import torch.multiprocessing as mp
 
     manager = mp.Manager()
     shared = manager.dict()
-    mp.spawn(run_allreduce, args=(world_size, iters, tensor_elems, shared),
-             nprocs=world_size)
+    mp.spawn(run_allreduce, args=(world_size, iters, tensor_elems, shared), nprocs=world_size)
     return shared["latency_ms"]
 
 
 def allgather_worker(world_size: int, iters: int, tensor_elems: int):
-    import os, time, torch, torch.multiprocessing as mp
+    import torch.multiprocessing as mp
+
     manager = mp.Manager()
     shared = manager.dict()
-    mp.spawn(run_allgather, args=(world_size, iters, tensor_elems, shared),
-             nprocs=world_size)
+    mp.spawn(run_allgather, args=(world_size, iters, tensor_elems, shared), nprocs=world_size)
     return shared["latency_ms"]
 
 
@@ -124,45 +131,56 @@ def allgather_worker(world_size: int, iters: int, tensor_elems: int):
 def allreduce_worker_A100_2(iters: int, tensor_elems: int):
     return allreduce_worker(2, iters, tensor_elems)
 
+
 @app.function(image=image, gpu="A100:4", timeout=60)
 def allreduce_worker_A100_4(iters: int, tensor_elems: int):
     return allreduce_worker(4, iters, tensor_elems)
+
 
 @app.function(image=image, gpu="A100:8", timeout=60)
 def allreduce_worker_A100_8(iters: int, tensor_elems: int):
     return allreduce_worker(8, iters, tensor_elems)
 
+
 @app.function(image=image, gpu="H100:2", timeout=60)
 def allreduce_worker_H100_2(iters: int, tensor_elems: int):
     return allreduce_worker(2, iters, tensor_elems)
+
 
 @app.function(image=image, gpu="H100:4", timeout=60)
 def allreduce_worker_H100_4(iters: int, tensor_elems: int):
     return allreduce_worker(4, iters, tensor_elems)
 
+
 @app.function(image=image, gpu="H100:8", timeout=60)
 def allreduce_worker_H100_8(iters: int, tensor_elems: int):
     return allreduce_worker(8, iters, tensor_elems)
+
 
 @app.function(image=image, gpu="A100:2", timeout=60)
 def allgather_worker_A100_2(iters: int, tensor_elems: int):
     return allgather_worker(2, iters, tensor_elems)
 
+
 @app.function(image=image, gpu="A100:4", timeout=60)
 def allgather_worker_A100_4(iters: int, tensor_elems: int):
     return allgather_worker(4, iters, tensor_elems)
+
 
 @app.function(image=image, gpu="A100:8", timeout=60)
 def allgather_worker_A100_8(iters: int, tensor_elems: int):
     return allgather_worker(8, iters, tensor_elems)
 
+
 @app.function(image=image, gpu="H100:2", timeout=60)
 def allgather_worker_H100_2(iters: int, tensor_elems: int):
     return allgather_worker(2, iters, tensor_elems)
 
+
 @app.function(image=image, gpu="H100:4", timeout=60)
 def allgather_worker_H100_4(iters: int, tensor_elems: int):
     return allgather_worker(4, iters, tensor_elems)
+
 
 @app.function(image=image, gpu="H100:8", timeout=60)
 def allgather_worker_H100_8(iters: int, tensor_elems: int):
@@ -181,8 +199,8 @@ def main(
     op: str = "allgather",
     world_size: int = 8,
     iters: int = 10,
-    min_tensor_elems: int = 2 ** 5,  # 32 elements -> 64 bytes data
-    max_tensor_elems: int = 2 ** 34, # 16T elements -> 32 TB data
+    min_tensor_elems: int = 2**5,  # 32 elements -> 64 bytes data
+    max_tensor_elems: int = 2**34,  # 16T elements -> 32 TB data
     step_tensor_elems: int = 2,
 ):
     tensor_elems = min_tensor_elems
@@ -190,28 +208,27 @@ def main(
 
     filename = f"network-{op}-{gpu_type}-{world_size}.csv"
     import os
+
     if not os.path.exists(filename):
         with open(filename, "w") as f:
             pass
 
     with open(filename, "a") as f:
+
         def print_dual(*args):
             print(*args, file=f, flush=True)
             print(*args, flush=True)
             return
-        
-        print_dual(f"gpu_type,world_size,op,nelem,dtype,latency(ms),throughput(nelem_per_ms)")
+
+        print_dual("gpu_type,world_size,op,nelem,dtype,latency(ms),throughput(nelem_per_ms)")
         while tensor_elems <= max_tensor_elems:
-            latency = (
-                func.remote(iters, tensor_elems)
-            )
-            throughput_gbps = (
-                tensor_elems / latency
-            )
+            latency = func.remote(iters, tensor_elems)
+            throughput_gbps = tensor_elems / latency
             print_dual(
                 f"{gpu_type},{world_size},{op},{tensor_elems},fp16,{latency:.2f},{throughput_gbps:.1f}"
             )
             tensor_elems *= step_tensor_elems
+
 
 # @app.local_entrypoint()
 def main2():
@@ -219,7 +236,7 @@ def main2():
     op = "allgather"
     world_size = 8
     iters = 10
-    
+
     seq_len = 64 * 1024
     hidden_size = 64 * 4
     k_and_v = 2
@@ -227,7 +244,9 @@ def main2():
     min_tensor_elems = seq_len * hidden_size * k_and_v // world_size
     max_tensor_elems = seq_len * hidden_size * k_and_v // world_size
     step_tensor_elems = 2
-    print(f"Running with gpu_type: {gpu_type}, op: {op}, world_size: {world_size}, iters: {iters}, min_tensor_elems: {min_tensor_elems}, max_tensor_elems: {max_tensor_elems}, step_tensor_elems: {step_tensor_elems}")
+    print(
+        f"Running with gpu_type: {gpu_type}, op: {op}, world_size: {world_size}, iters: {iters}, min_tensor_elems: {min_tensor_elems}, max_tensor_elems: {max_tensor_elems}, step_tensor_elems: {step_tensor_elems}"
+    )
     func = gpu_func_maping(gpu_type, world_size, op)
     latency = func.remote(iters, min_tensor_elems)
     print(latency)

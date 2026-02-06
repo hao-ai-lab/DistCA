@@ -1,29 +1,29 @@
 """Mainly learned from verl."""
-from abc import ABC, abstractmethod
-from enum import Enum
-import logging
-from typing import Callable
-import rich
-import os
 
+import logging
+import os
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from enum import Enum
+
+import rich
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from megatron.core import mpu, tensor_parallel
-from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.optimizer.optimizer import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_attr_wrapped_model
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from distca.runtime.megatron.model_patch import get_gpt_decoder_block_spec
 from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
-
-from distca.utils.test_util import get_torch_device, get_device_name
+from distca.utils.test_util import get_device_name, get_torch_device
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +192,10 @@ def get_model(
                 add_encoder = mpu.is_pipeline_stage_before_split()
                 add_decoder = mpu.is_pipeline_stage_after_split()
             model = model_provider_func(
-                pre_process=pre_process, post_process=post_process, add_encoder=add_encoder, add_decoder=add_decoder
+                pre_process=pre_process,
+                post_process=post_process,
+                add_encoder=add_encoder,
+                add_decoder=add_decoder,
             )
         else:
             model = model_provider_func(pre_process=pre_process, post_process=post_process)
@@ -212,11 +215,7 @@ def get_model(
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
         print(
-            " > number of parameters on (tensor, pipeline) model parallel rank ({}, {}): {}".format(
-                mpu.get_tensor_model_parallel_rank(),
-                mpu.get_pipeline_model_parallel_rank(),
-                sum([sum([p.nelement() for p in model_module.parameters()]) for model_module in model]),
-            ),
+            f" > number of parameters on (tensor, pipeline) model parallel rank ({mpu.get_tensor_model_parallel_rank()}, {mpu.get_pipeline_model_parallel_rank()}): {sum([sum([p.nelement() for p in model_module.parameters()]) for model_module in model])}",
             flush=True,
         )
 
@@ -355,34 +354,40 @@ def _override_hf_config_num_layers_with_env_var(hf_config: PretrainedConfig):
         rank = int(os.environ.get("RANK", 0))
     except ValueError:
         rank = 0
-    
-    
+
     num_layers = os.environ.get("NUM_LAYERS", None)
-    
+
     if num_layers is not None:
         num_layers = int(num_layers)
-        if hasattr(hf_config, 'num_hidden_layers'):
+        if hasattr(hf_config, "num_hidden_layers"):
             hf_config.num_hidden_layers = num_layers
-        elif hasattr(hf_config, 'num_layers'):
+        elif hasattr(hf_config, "num_layers"):
             hf_config.num_layers = num_layers
-        elif hasattr(hf_config, 'n_layer'):
+        elif hasattr(hf_config, "n_layer"):
             hf_config.n_layer = num_layers
         else:
             # Fallback - try to set the most common attribute name
             hf_config.num_hidden_layers = num_layers
         if rank == 0:
-            rich.print(f"Override HF Config: Set number of layers: {num_layers}. Now HF Config: ", str(hf_config))
+            rich.print(
+                f"Override HF Config: Set number of layers: {num_layers}. Now HF Config: ",
+                str(hf_config),
+            )
     return hf_config
-    
+
 
 def hf_to_mcore_config_dense(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
-    
+
     hf_config = _override_hf_config_num_layers_with_env_var(hf_config)
 
     # for LlamaForCausalLM or Qwen2ForCausalLM
-    qkv_bias = True if "Qwen2ForCausalLM" in hf_config.architectures else getattr(hf_config, "attention_bias", False)
+    qkv_bias = (
+        True
+        if "Qwen2ForCausalLM" in hf_config.architectures
+        else getattr(hf_config, "attention_bias", False)
+    )
     qk_layernorm = True if "Qwen3ForCausalLM" in hf_config.architectures else False
 
     args: dict = _get_base_transformer_config(
@@ -417,7 +422,9 @@ class BaseModelInitializer(ABC):
         if "rope_scaling" in self.hf_config:
             if self.hf_config.rope_scaling is not None:
                 # assert self.hf_config.rope_scaling["type"] == "linear", "only linear scaling is supported for now"
-                rope_scaling_args["seq_len_interpolation_factor"] = self.hf_config.rope_scaling["factor"]
+                rope_scaling_args["seq_len_interpolation_factor"] = self.hf_config.rope_scaling[
+                    "factor"
+                ]
         return rope_scaling_args
 
     def initialize(
@@ -472,7 +479,9 @@ class DenseModel(BaseModelInitializer):
         return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True)
 
 
-MODEL_CONFIG_CONVERTER_REGISTRY: dict[SupportedModel, Callable[[PretrainedConfig, torch.dtype], TransformerConfig]] = {
+MODEL_CONFIG_CONVERTER_REGISTRY: dict[
+    SupportedModel, Callable[[PretrainedConfig, torch.dtype], TransformerConfig]
+] = {
     SupportedModel.LLAMA: hf_to_mcore_config_dense,
     SupportedModel.QWEN2: hf_to_mcore_config_dense,
 }
@@ -509,7 +518,9 @@ def hf_to_mcore_config(
     """
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
     model = get_supported_model(hf_config.architectures[0])
-    return MODEL_CONFIG_CONVERTER_REGISTRY[model](hf_config, dtype, **override_transformer_config_kwargs)
+    return MODEL_CONFIG_CONVERTER_REGISTRY[model](
+        hf_config, dtype, **override_transformer_config_kwargs
+    )
 
 
 def init_mcore_model(
@@ -549,7 +560,9 @@ def init_mcore_model(
         **extra_kwargs,
     )
 
+
 ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     """Directly copy from megatron/training/utils.py.
@@ -570,8 +583,15 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
 
 
 def gptmodel_forward(
-    model, input_ids, attention_mask, position_ids, sequence_parallel, packed_seq_params,
-    labels=None, logits_processor=None, logits_processor_kwargs=None,
+    model,
+    input_ids,
+    attention_mask,
+    position_ids,
+    sequence_parallel,
+    packed_seq_params,
+    labels=None,
+    logits_processor=None,
+    logits_processor_kwargs=None,
 ):
     pre_process = unwrap_model(model).pre_process
     if pre_process:

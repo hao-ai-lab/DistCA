@@ -51,7 +51,7 @@ docker run --gpus all -it --rm --ipc=host \
 
 If you find this work useful, please cite:
 
-> **WLB-LLM: Workload-Balanced 4D Parallelism for Large Language Model Training** 
+> **WLB-LLM: Workload-Balanced 4D Parallelism for Large Language Model Training**
 
 ```bibtex
 @inproceedings{wang2025wlb,

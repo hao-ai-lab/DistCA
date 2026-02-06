@@ -10,18 +10,18 @@ Each CSV row contains
     t_us_in ,algbw_in_gbs ,busbw_in_gbs
 """
 
-import argparse, csv, glob, re
+import argparse
+import csv
+import glob
+import re
 from pathlib import Path
 
 # ---------- CLI ----------
 p = argparse.ArgumentParser()
-p.add_argument(
-    "-d", "--dir", default=".", help="directory with *.txt benchmark files"
-)
-p.add_argument(
-    "-o", "--out", default="nccl_perf.csv", help="CSV file to create/overwrite"
-)
+p.add_argument("-d", "--dir", default=".", help="directory with *.txt benchmark files")
+p.add_argument("-o", "--out", default="nccl_perf.csv", help="CSV file to create/overwrite")
 args = p.parse_args()
+
 
 # ---------- helpers ----------
 def parse_filename(name: str):
@@ -55,7 +55,7 @@ def parse_row(tokens):
 rows = []
 for fname in glob.glob(f"{args.dir}/*-*-*.perf.txt"):
     op, ngpu, dtype = parse_filename(fname)
-    with open(fname, "r", encoding="utf-8") as f:
+    with open(fname, encoding="utf-8") as f:
         for line in f:
             if is_data_row(line):
                 toks = line.split()

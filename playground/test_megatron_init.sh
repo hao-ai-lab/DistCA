@@ -47,13 +47,13 @@ if [ "$is_in_slurm_env" -eq 1 ]; then
 else
     # Not in SLURM: rely on whatever was set in .env.sh or environment
     JOBID="${JOBID}"
-    
+
     # If JOBID is provided, query SLURM to get the node list
     if [ -n "$JOBID" ]; then
         echo "Querying SLURM for job $JOBID node list..."
         # Get the node list from scontrol show job
         NODELIST=$(scontrol show job "$JOBID" | grep -oP '^[\s]+NodeList=\K[^\s]+' || echo "")
-        
+
         if [ -n "$NODELIST" ]; then
             echo "Found node list: $NODELIST"
             # Convert node list to hostnames and get the first one
@@ -88,9 +88,9 @@ export NVSHMEM_IB_ENABLE_IBGDA=true
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 # unset CUDA_DEVICE_MAX_CONNECTIONS
 export TORCH_NCCL_CONNECT_TIMEOUT=60000 # 60s
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NVTE_NVTX_ENABLED=1
-export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
+export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
 
 export OMP_NUM_THREADS=16
 
@@ -135,6 +135,6 @@ set -x
 srun -w ${HEAD_NODE_IP} -N ${NNODES} --gres=gpu:${NPROC_PER_NODE} --jobid=${JOBID} \
 nsys profile --trace=cuda,nvtx --force-overwrite=true -o "${DISTCA_LOG_ROOT_DIR}/nsys/nsys-rep.%h.nsys-rep" --sample=none --capture-range=cudaProfilerApi --capture-range-end=stop \
 torchrun --nnodes=${NNODES} --nproc_per_node=${NPROC_PER_NODE} --rdzv_backend=c10d --rdzv_endpoint=${HEAD_NODE_IP}:29800 --rdzv_id=0000 --max_restarts=0 \
-    test_megatron_init.py 
+    test_megatron_init.py
 
 set +x

@@ -13,7 +13,7 @@ bash run.sh
 
 # Implementation
 
-## `pretrain_gpt.py` 
+## `pretrain_gpt.py`
 
 The main entry point. There includes a few hacks:
 - `get_batch()`: hack to intercept the data loader and get a batch to forward. This function will get the appropriate (tp, cp)-tuned batch for the worker.

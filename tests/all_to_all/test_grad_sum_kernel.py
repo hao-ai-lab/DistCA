@@ -2,11 +2,18 @@ import torch
 
 from distca.runtime.attn_kernels.ops import _ops
 
+
 def test_one_case(
-        num_token: int, hidden_size: int, num_seq_raw: int, max_num_copies: int,
-        dtype: torch.dtype, seed: int, logging: bool=False):
+    num_token: int,
+    hidden_size: int,
+    num_seq_raw: int,
+    max_num_copies: int,
+    dtype: torch.dtype,
+    seed: int,
+    logging: bool = False,
+):
     torch.manual_seed(seed)
-    tensor = torch.randn((num_token, hidden_size), dtype=dtype, device='cuda')
+    tensor = torch.randn((num_token, hidden_size), dtype=dtype, device="cuda")
 
     copy_freq = 0.4
     num_main_copies = 0
@@ -44,10 +51,10 @@ def test_one_case(
     ## identify the main copy
     main_copy_id = {}
     seq_cur_copy_id = {}
-    num_copies = torch.zeros((num_seq,), dtype=torch.int32, device='cuda')
-    seq_lens = torch.zeros((num_seq,), dtype=torch.int64, device='cuda')
-    copy_start_id = torch.zeros((num_seq, max_num_copies), dtype=torch.int64, device='cuda')
-    copy_seq_id = torch.zeros((num_seq, max_num_copies), dtype=torch.int64, device='cuda')
+    num_copies = torch.zeros((num_seq,), dtype=torch.int32, device="cuda")
+    seq_lens = torch.zeros((num_seq,), dtype=torch.int64, device="cuda")
+    copy_start_id = torch.zeros((num_seq, max_num_copies), dtype=torch.int64, device="cuda")
+    copy_seq_id = torch.zeros((num_seq, max_num_copies), dtype=torch.int64, device="cuda")
     cur_num_token = 0
 
     for permuted_seq_id, (raw_seq_id, seq_len) in enumerate(seq_len_and_copies):
@@ -72,7 +79,9 @@ def test_one_case(
         cur_num_token += seq_len
     assert cur_num_token == num_token
 
-    seq_start = torch.cumsum(torch.cat([torch.zeros(1, dtype=torch.long, device=seq_lens.device), seq_lens[:-1]]), dim=0)
+    seq_start = torch.cumsum(
+        torch.cat([torch.zeros(1, dtype=torch.long, device=seq_lens.device), seq_lens[:-1]]), dim=0
+    )
     if logging:
         print("num_seq:", num_seq, "num_token:", num_token, "hidden_size:", hidden_size)
         print("num_copies:", num_copies)
@@ -92,8 +101,9 @@ def test_one_case(
         elif main_copy_id[raw_seq_id] != seq_id:
             main_id = main_copy_id[raw_seq_id]
             main_start_token = seq_start[main_id]
-            target_tensor[main_start_token:main_start_token + seq_len] += target_tensor[
-                cur_num_token:cur_num_token + seq_len]
+            target_tensor[main_start_token : main_start_token + seq_len] += target_tensor[
+                cur_num_token : cur_num_token + seq_len
+            ]
         cur_num_token += seq_len
     torch.cuda.synchronize()
 
@@ -115,6 +125,6 @@ if __name__ == "__main__":
                     num_seq_raw=num_seq_raw,
                     max_num_copies=4,
                     dtype=torch.float16,
-                    seed=42
+                    seed=42,
                 )
     print("All test cases passed!")

@@ -10,7 +10,7 @@ We use the following environment in our setup and testing:
     - OPENMPI 5.0.8
     - PyTorch 2.7.0
 - Hardware: NVIDIA H200 GPU
-- Interconnect: 
+- Interconnect:
     - Intranode: NVLink
     - Internode: 40GB/s InfiniBand
 
@@ -27,7 +27,7 @@ conda activate distca
 pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-### Step 2: Setup `env.sh` 
+### Step 2: Setup `env.sh`
 
 We provide a template `env.template.sh` for setting up the environment variables. Please copy it to `env.sh` and customize it according to your environment (e.g. CUDA_DIR, NCCL_HOME, NVSHMEM_PREFIX, OPENMPI_DIR, etc.).
 ```bash
@@ -37,7 +37,7 @@ source env.sh
 
 ### Step 3: Install DistCA (`distca`) + dependencies
 
-The commands below assume you are at the **repo root** (i.e. the directory containing `setup.py`, `pretrain_llama.py`, `env.sh`, etc.). 
+The commands below assume you are at the **repo root** (i.e. the directory containing `setup.py`, `pretrain_llama.py`, `env.sh`, etc.).
 
 DistCA has the following external dependencies to install:
 - `distca`
@@ -47,7 +47,7 @@ DistCA has the following external dependencies to install:
 - `Megatron-LM`
 - `WLBLLM`
 
-Here, we provide a script to install all dependencies locally. For `TransformerEngine`, `Apex` and `Megatron-LM`, we follow the [Megatron-LM](https://github.com/NVIDIA/Megatron-LM?tab=readme-ov-file#installation) instructions. 
+Here, we provide a script to install all dependencies locally. For `TransformerEngine`, `Apex` and `Megatron-LM`, we follow the [Megatron-LM](https://github.com/NVIDIA/Megatron-LM?tab=readme-ov-file#installation) instructions.
 
 
 ```bash
@@ -154,7 +154,7 @@ print(flash_attn.__version__)
 
 #### 3.6 Build `distca` CUDA extensions (required)
 
-DistCA builds a simple all2all communication library on top of NVSHMEM to support efficient dispatch of attention tasks. 
+DistCA builds a simple all2all communication library on top of NVSHMEM to support efficient dispatch of attention tasks.
 
 
 The following command builds `libas_comm.so` into `distca/runtime/attn_kernels/` (the Python code loads it via `torch.ops.load_library(...)`).

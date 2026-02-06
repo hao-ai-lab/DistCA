@@ -1,6 +1,7 @@
 """
 Logging, directory setup, and debugging utilities for distributed training.
 """
+
 import logging
 import os
 import shutil
@@ -10,17 +11,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, List, Optional
+from typing import IO
 
 # =============================================================================
 # ANSI Colors
 # =============================================================================
 
 _COLOR_MAP = {
-    logging.DEBUG: "\033[36m",     # Cyan
-    logging.INFO: "\033[32m",      # Green
-    logging.WARNING: "\033[33m",   # Yellow
-    logging.ERROR: "\033[31m",     # Red
+    logging.DEBUG: "\033[36m",  # Cyan
+    logging.INFO: "\033[32m",  # Green
+    logging.WARNING: "\033[33m",  # Yellow
+    logging.ERROR: "\033[31m",  # Red
     logging.CRITICAL: "\033[35m",  # Magenta
 }
 _COLOR_RESET = "\033[0m"
@@ -29,18 +30,19 @@ _COLOR_RESET = "\033[0m"
 # Module-level state
 # =============================================================================
 
-_rank: Optional[int] = None
-_world_size: Optional[int] = None
-_logger: Optional[logging.Logger] = None
-_original_stdout: Optional[IO] = None
-_original_stderr: Optional[IO] = None
-_rank_log_handle: Optional[IO] = None
-_rank_log_file: Optional[Path] = None  # Path to current rank's log file
+_rank: int | None = None
+_world_size: int | None = None
+_logger: logging.Logger | None = None
+_original_stdout: IO | None = None
+_original_stderr: IO | None = None
+_rank_log_handle: IO | None = None
+_rank_log_file: Path | None = None  # Path to current rank's log file
 
 
 # =============================================================================
 # Accessors
 # =============================================================================
+
 
 def get_rank() -> int:
     """Return the current process rank. Must call setup_logging first or pass rank explicitly."""
@@ -67,9 +69,11 @@ def get_logger() -> logging.Logger:
 # Log Paths & Directory Setup
 # =============================================================================
 
+
 @dataclass
 class LogPaths:
     """Container for all log-related paths."""
+
     log_root_dir: Path
     data_cache_path: Path
     ckpt_path: Path
@@ -79,15 +83,15 @@ class LogPaths:
 
 class TeeStream:
     """Write to both an original stream (stdout/stderr) and a file."""
-    
+
     def __init__(self, file, original_stream):
         self.file = file
         self.original_stream = original_stream
-    
+
     def write(self, data):
         self.original_stream.write(data)
         self.file.write(data)
-    
+
     def flush(self):
         self.original_stream.flush()
         self.file.flush()
@@ -96,47 +100,47 @@ class TeeStream:
 def setup_log_directories(
     rank: int,
     barrier_fn,
-    base_dir: Optional[str] = None,
-    current_log_dir: Optional[str] = None,
-    timestamp: Optional[str] = None,
+    base_dir: str | None = None,
+    current_log_dir: str | None = None,
+    timestamp: str | None = None,
 ) -> LogPaths:
     """
     Set up logging directories and redirect stdout for distributed training.
-    
+
     Also adds a FileHandler to the module logger so all ranks log to their
     respective rank log files.
-    
+
     This function checks for DISTCA_LOG_* environment variables first, which allows
     the shell script to pre-create directories (e.g., for nsys profiling) and share
     the same paths with Python. If env vars are not set, falls back to defaults.
-    
+
     Environment variables (set by shell script):
         DISTCA_LOG_TIMESTAMP: Timestamp string (e.g., "20251225_082754")
         DISTCA_LOG_BASE_DIR: Base directory for logs (e.g., "/path/to/logs")
         DISTCA_LOG_ROOT_DIR: Full path to log root (e.g., "/path/to/logs/20251225_082754")
         DISTCA_LOG_LATEST_LINK: Path for symlink to latest log dir
-    
+
     Args:
         rank: The rank of the current process.
         barrier_fn: A callable to synchronize across ranks (e.g., torch.distributed.barrier).
         base_dir: Base directory for logs. Overridden by DISTCA_LOG_BASE_DIR if set.
         current_log_dir: Path for symlink. Overridden by DISTCA_LOG_LATEST_LINK if set.
         timestamp: Timestamp string. Overridden by DISTCA_LOG_TIMESTAMP if set.
-    
+
     Returns:
         LogPaths dataclass containing all the log paths.
     """
     global _original_stdout, _original_stderr, _rank_log_handle
-    
+
     # Check for environment variables from shell script
     env_timestamp = os.environ.get("DISTCA_LOG_TIMESTAMP")
     env_base_dir = os.environ.get("DISTCA_LOG_BASE_DIR")
     env_log_root = os.environ.get("DISTCA_LOG_ROOT_DIR")
     env_latest_link = os.environ.get("DISTCA_LOG_LATEST_LINK")
-    
+
     # If DISTCA_LOG_ROOT_DIR is set, the shell already created everything
     shell_created_dirs = env_log_root is not None
-    
+
     # Resolve paths - prefer env vars, then function args, then defaults
     if env_log_root:
         log_root_dir = Path(env_log_root).absolute()
@@ -146,48 +150,48 @@ def setup_log_directories(
         if base_dir is None:
             base_dir = env_base_dir or "logs"
         log_root_dir = Path(f"{base_dir}/{timestamp}").absolute()
-    
+
     data_cache_path = (log_root_dir / "data_cache").absolute()
     ckpt_path = (log_root_dir / "checkpoints").absolute()
     tensorboard_path = (log_root_dir / "tensorboard").absolute()
     rank_logs_path = (log_root_dir / "rank_logs").absolute()
-    
+
     if current_log_dir is None:
         current_log_dir = env_latest_link or "logs-latest"
     current_log_link = Path(current_log_dir).absolute()
-    
+
     # Rank 0 creates directories (skip if shell already created them)
     if rank == 0 and not shell_created_dirs:
         for path in [log_root_dir, data_cache_path, ckpt_path, tensorboard_path, rank_logs_path]:
             if path.exists() and path.is_dir():
                 shutil.rmtree(path)
             path.mkdir(parents=True, exist_ok=True)
-        
+
         # Create/update symlink to point to the latest log directory
         if current_log_link.is_symlink() or current_log_link.exists():
             current_log_link.unlink()
         current_log_link.symlink_to(log_root_dir)
-    
+
     # Wait for rank 0 to finish creating directories
     barrier_fn()
-    
+
     global _rank_log_file
-    
+
     # Redirect stdout and stderr to per-rank log files
     # Rank 0: tee to both console and file; Other ranks: file only
     _original_stdout = sys.stdout
     _original_stderr = sys.stderr
     rank_log_file = rank_logs_path / f"rank_{rank}.log"
     _rank_log_file = rank_log_file  # Store for use by redirect_external_loggers
-    _rank_log_handle = open(rank_log_file, 'w', buffering=1)  # line-buffered
-    
+    _rank_log_handle = open(rank_log_file, "w", buffering=1)  # line-buffered
+
     if rank == 0:
         sys.stdout = TeeStream(_rank_log_handle, _original_stdout)
         sys.stderr = TeeStream(_rank_log_handle, _original_stderr)
     else:
         sys.stdout = _rank_log_handle
         sys.stderr = _rank_log_handle
-    
+
     # Add file handler to the logger for all ranks
     # This ensures logger.info() etc. go to the rank log file
     if _logger is not None:
@@ -195,7 +199,7 @@ def setup_log_directories(
         file_handler.setFormatter(RankFormatter(rank=rank, use_color=False))
         file_handler.setLevel(_logger.level)
         _logger.addHandler(file_handler)
-    
+
     paths = LogPaths(
         log_root_dir=log_root_dir,
         data_cache_path=data_cache_path,
@@ -203,7 +207,7 @@ def setup_log_directories(
         tensorboard_path=tensorboard_path,
         rank_logs_path=rank_logs_path,
     )
-    
+
     # Print the paths (rank 0 only since print goes to console for rank 0)
     if rank == 0:
         print(f"log_root_dir: {paths.log_root_dir}")
@@ -211,20 +215,20 @@ def setup_log_directories(
         print(f"ckpt_path: {paths.ckpt_path}")
         print(f"tensorboard_path: {paths.tensorboard_path}")
         print(f"rank_logs_path: {paths.rank_logs_path}")
-    
+
     return paths
 
 
 def restore_streams():
     """Restore original stdout/stderr and close log file handles."""
     global _original_stdout, _original_stderr, _rank_log_handle
-    
+
     if _original_stdout is not None:
         sys.stdout = _original_stdout
-    
+
     if _original_stderr is not None:
         sys.stderr = _original_stderr
-    
+
     if _rank_log_handle is not None:
         _rank_log_handle.close()
         _rank_log_handle = None
@@ -235,32 +239,32 @@ restore_stdout = restore_streams
 
 
 def redirect_external_loggers(
-    logger_names: List[str] = None,
+    logger_names: list[str] = None,
     level: int = logging.INFO,
     use_rank_format: bool = True,
-) -> List[logging.Logger]:
+) -> list[logging.Logger]:
     """
     Redirect external loggers (e.g., Megatron's) to the same rank log file.
-    
+
     This function adds a FileHandler to specified loggers so their output
     goes to the same rank_X.log file as your main logs. It also optionally
     adds a console handler for rank 0.
-    
+
     Call this AFTER setup_log_directories() has been called.
-    
+
     Args:
         logger_names: List of logger names to redirect. If None, defaults to
             ["megatron"] which captures all megatron.* loggers.
         level: Logging level to set for these loggers.
         use_rank_format: Whether to use the RankFormatter (includes rank info).
-    
+
     Returns:
         List of configured loggers.
-    
+
     Example:
         # Redirect all Megatron logs to rank log files
         redirect_external_loggers(["megatron"])
-        
+
         # Redirect specific loggers
         redirect_external_loggers([
             "megatron.core",
@@ -268,59 +272,60 @@ def redirect_external_loggers(
         ])
     """
     if _rank_log_file is None:
-        raise RuntimeError(
-            "Log directories not set up. Call setup_log_directories() first."
-        )
-    
+        raise RuntimeError("Log directories not set up. Call setup_log_directories() first.")
+
     if logger_names is None:
         logger_names = ["megatron"]
-    
+
     configured_loggers = []
     rank = _rank if _rank is not None else 0
-    
+
     for name in logger_names:
         ext_logger = logging.getLogger(name)
         ext_logger.setLevel(level)
-        
+
         # Remove existing handlers to avoid duplicates
         ext_logger.handlers = []
-        
+
         # Don't propagate to root logger (we handle everything explicitly)
         ext_logger.propagate = False
-        
+
         # Add file handler - all ranks write to their respective log files
         file_handler = logging.FileHandler(_rank_log_file)
         if use_rank_format:
             file_handler.setFormatter(RankFormatter(rank=rank, use_color=False))
         else:
-            file_handler.setFormatter(logging.Formatter(
-                "%(asctime)s %(name)s %(levelname)s %(message)s",
-                datefmt="%H:%M:%S"
-            ))
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(name)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
+                )
+            )
         file_handler.setLevel(level)
         ext_logger.addHandler(file_handler)
-        
+
         # Add console handler for rank 0 only (matches your existing pattern)
         if rank == 0:
             console_handler = logging.StreamHandler(_original_stdout or sys.stdout)
             if use_rank_format:
                 console_handler.setFormatter(RankFormatter(rank=rank, use_color=True))
             else:
-                console_handler.setFormatter(logging.Formatter(
-                    "%(asctime)s %(name)s %(levelname)s %(message)s",
-                    datefmt="%H:%M:%S"
-                ))
+                console_handler.setFormatter(
+                    logging.Formatter(
+                        "%(asctime)s %(name)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
+                    )
+                )
             console_handler.setLevel(level)
             ext_logger.addHandler(console_handler)
-        
+
         configured_loggers.append(ext_logger)
-    
+
     return configured_loggers
 
 
 # =============================================================================
 # Python Logging Setup
 # =============================================================================
+
 
 class RankFormatter(logging.Formatter):
     """Formatter that includes rank info and optional ANSI colors."""
@@ -346,12 +351,12 @@ class RankFormatter(logging.Formatter):
 
 
 def setup_logging(
-    rank: Optional[int] = None,
-    world_size: Optional[int] = None,
+    rank: int | None = None,
+    world_size: int | None = None,
     level: int = logging.INFO,
     use_color: bool = True,
     logger_name: str = __name__,
-    console_ranks: Optional[List[int]] = None,
+    console_ranks: list[int] | None = None,
 ) -> logging.Logger:
     """
     Initialize logging with rank-aware formatting.
@@ -401,6 +406,7 @@ def setup_logging(
 # =============================================================================
 # Debugging Utilities
 # =============================================================================
+
 
 def log_tensor_stats(tensor, name: str = "tensor", preview: int = 0, logger: logging.Logger = None):
     """

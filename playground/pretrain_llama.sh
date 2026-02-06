@@ -155,7 +155,7 @@ EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP=${EXPERIMENT_SHOULD_LOG_MEMORY_DURING
 
 # -vvvv # Touching the --cpu-per-task and --cpu-bind variables may cause srun to hang.
 SRUN_BASE=(
-  srun --kill-on-bad-exit=1 
+  srun --kill-on-bad-exit=1
   -N ${NNODES}
   -G ${WORLD_SIZE}
   --ntasks-per-node=1
@@ -180,7 +180,7 @@ TORCHRUN_CMD=(
   --rdzv_endpoint=${RZV_ENDPOINT}
   --rdzv_id=${RZV_ID}
   --max_restarts=0
-  --no-python bash $PROJECT_ROOT/utils/bind_and_exec.sh 
+  --no-python bash $PROJECT_ROOT/utils/bind_and_exec.sh
     python pretrain_llama.py
     --num-tokens ${NUM_TOKENS}
     --num-batches ${BATCH_SIZE}
@@ -193,11 +193,11 @@ TORCHRUN_CMD=(
     --val-every-n-steps ${VAL_EVERY_N_STEPS}
     --ckpt-every-n-steps ${CKPT_EVERY_N_STEPS}
     --use-planner
-    
+
     --model-path ${MODEL_PATH}
     --num-layers ${NUM_LAYERS}
 
-    # TODO: 
+    # TODO:
     --max-sample-id ${MAX_SAMPLE_ID}
     --sample-name ${SAMPLE_NAME}
     --change-long-doc-ratio ${CHANGE_LONG_DOC_RATIO}
@@ -264,7 +264,7 @@ echo_and_tee "$EXP_README" "- Elapsed time: $elapsed_time seconds"
 # Check if the experiment finished successfully
 if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
     echo "Experiment failed. The benchmark.json file does not exist."
-else 
+else
     echo "Experiment success. See the $OUTPUT_DIR/benchmark.json file."
     echo_and_tee "$EXP_README" "Experiment success. See the $OUTPUT_DIR/benchmark.json file."
 fi

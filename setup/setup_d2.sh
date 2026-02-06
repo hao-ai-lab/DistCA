@@ -1,5 +1,4 @@
-
-
+#!/usr/bin/env bash
 # conda create -n distca python=3.12 -y
 
 # # Install pytorch
@@ -39,6 +38,6 @@ pip install flash-attn
 # Install distca/csrc
 cd distca/csrc
 rm -rf build
-cmake -B build -S . -G Ninja 
+cmake -B build -S . -G Ninja
 cmake --build build
 cd ../..

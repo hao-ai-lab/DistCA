@@ -6,52 +6,32 @@ Class: DotProductAttention.forward()
 
 """
 
-from contextlib import nullcontext
-import math
-import os
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import warnings
-import logging
 
-import rich
 import torch
 
 # import transformer_engine_torch as tex
 import transformer_engine.pytorch as tex
-from transformer_engine.pytorch.utils import get_cudnn_version
-from transformer_engine.pytorch.fp8 import get_fp8_te_dtype
-from transformer_engine.pytorch.float8_tensor import Float8Tensor
-from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
-from transformer_engine.pytorch.constants import (
-    AttnMaskTypes,
-    AttnTypes,
-    dist_group_type,
-)
-from transformer_engine.pytorch.distributed import (
-    get_distributed_world_size,
-    checkpoint,
-    set_all_rng_states,
-    CudaRNGStatesTracker,
-    graph_safe_rng_available,
-)
-from transformer_engine.pytorch.jit import no_torch_dynamo
-from transformer_engine.pytorch.graph import is_graph_capturing
-from transformer_engine.pytorch.attention.inference import InferenceParams
+import transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention as dpa
 
 # Import attention utils
 import transformer_engine.pytorch.attention.dot_product_attention.utils as dpa_utils
-from transformer_engine.pytorch.attention.dot_product_attention.utils import (
-    AttentionLogging as attn_log,
+from transformer_engine.pytorch.attention.inference import InferenceParams
+from transformer_engine.pytorch.constants import (
+    AttnMaskTypes,
+    dist_group_type,
 )
-
-from transformer_engine.pytorch.attention.dot_product_attention.backends import (
-    UnfusedDotProductAttention,
-    FusedAttention,
-    FlashAttention,
+from transformer_engine.pytorch.distributed import (
+    CudaRNGStatesTracker,
+    get_distributed_world_size,
+    graph_safe_rng_available,
 )
+from transformer_engine.pytorch.float8_tensor import Float8Tensor
+from transformer_engine.pytorch.fp8 import get_fp8_te_dtype
+from transformer_engine.pytorch.graph import is_graph_capturing
+from transformer_engine.pytorch.jit import no_torch_dynamo
+from transformer_engine.pytorch.utils import nvtx_range_pop, nvtx_range_push
 
-from transformer_engine.pytorch.utils import nvtx_range_push, nvtx_range_pop
-import transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention as dpa
 
 @no_torch_dynamo(recursive=False)
 def forward(
@@ -59,7 +39,7 @@ def forward(
     query_layer: torch.Tensor,
     key_layer: torch.Tensor,
     value_layer: torch.Tensor,
-    attention_mask: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
+    attention_mask: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = None,
     qkv_format: str = None,
     cu_seqlens_q: torch.Tensor = None,
     cu_seqlens_kv: torch.Tensor = None,
@@ -67,15 +47,15 @@ def forward(
     cu_seqlens_kv_padded: torch.Tensor = None,
     max_seqlen_q: int = None,
     max_seqlen_kv: int = None,
-    attn_mask_type: Optional[str] = None,
-    window_size: Optional[Tuple[int, int]] = None,
+    attn_mask_type: str | None = None,
+    window_size: tuple[int, int] | None = None,
     checkpoint_core_attention: bool = False,
     core_attention_bias_type: str = "no_bias",
-    core_attention_bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
+    core_attention_bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
     fast_zero_fill: bool = True,
-    inference_params: Optional[InferenceParams] = None,
-    pad_between_seqs: Optional[bool] = None,
+    inference_params: InferenceParams | None = None,
+    pad_between_seqs: bool | None = None,
     **other_packed_seq_kwargs,
 ) -> torch.Tensor:
     with self.prepare_forward(
@@ -83,17 +63,16 @@ def forward(
         num_gemms=3,
         allow_non_contiguous=True,
     ) as query_layer:
-
         nvtx_range_push("te.DotProductAttention.assert_args")
 
         # checks for RNG
         if self.rng_states_tracker is not None and is_graph_capturing():
-            assert isinstance(
-                self.rng_states_tracker, CudaRNGStatesTracker
-            ), "Unsupported RNG states tracker."
-            assert (
-                graph_safe_rng_available()
-            ), "Upgrade PyTorch version to get RNG manipulation support for cuda graph capture."
+            assert isinstance(self.rng_states_tracker, CudaRNGStatesTracker), (
+                "Unsupported RNG states tracker."
+            )
+            assert graph_safe_rng_available(), (
+                "Upgrade PyTorch version to get RNG manipulation support for cuda graph capture."
+            )
 
         # checks for FP8
         if self.fp8:
@@ -116,28 +95,28 @@ def forward(
             ], """DotProductAttention only supports "E4M3" and "E5M2" FP8 data types."""
 
         # checks for q/k/v shapes
-        assert (
-            query_layer.is_cuda and key_layer.is_cuda and value_layer.is_cuda
-        ), "DotProductAttention only supports CUDA tensors."
-        assert (
-            query_layer.dtype == key_layer.dtype and query_layer.dtype == value_layer.dtype
-        ), "Queries, keys and values must have the same data type!"
-        assert (
-            key_layer.shape[:-1] == value_layer.shape[:-1]
-        ), "Keys and values must have the same batch size, sequence length and number of heads!"
+        assert query_layer.is_cuda and key_layer.is_cuda and value_layer.is_cuda, (
+            "DotProductAttention only supports CUDA tensors."
+        )
+        assert query_layer.dtype == key_layer.dtype and query_layer.dtype == value_layer.dtype, (
+            "Queries, keys and values must have the same data type!"
+        )
+        assert key_layer.shape[:-1] == value_layer.shape[:-1], (
+            "Keys and values must have the same batch size, sequence length and number of heads!"
+        )
         num_attention_heads = query_layer.shape[-2]
         num_gqa_groups = key_layer.shape[-2]
-        assert (
-            query_layer.shape[-1] == key_layer.shape[-1]
-        ), "Queries and keys must have the same head dimension!"
+        assert query_layer.shape[-1] == key_layer.shape[-1], (
+            "Queries and keys must have the same head dimension!"
+        )
         head_dim_qk, head_dim_v = query_layer.shape[-1], value_layer.shape[-1]
-        assert (
-            head_dim_qk == self.hidden_size_per_attention_head_k
-        ), f"Keys have head_dim = {head_dim_qk}, "
+        assert head_dim_qk == self.hidden_size_per_attention_head_k, (
+            f"Keys have head_dim = {head_dim_qk}, "
+        )
         "but expected head_dim = {self.hidden_size_per_attention_head_k}!"
-        assert (
-            head_dim_v == self.hidden_size_per_attention_head_v
-        ), f"Values have head_dim = {head_dim_v}, "
+        assert head_dim_v == self.hidden_size_per_attention_head_v, (
+            f"Values have head_dim = {head_dim_v}, "
+        )
         "but expected head_dim = {self.hidden_size_per_attention_head_v}!"
         assert num_gqa_groups == self.num_gqa_groups_per_partition, (
             "Keys and values must have num_gqa_group ="
@@ -145,7 +124,6 @@ def forward(
         )
 
         nvtx_range_pop("te.DotProductAttention.assert_args")
-
 
         nvtx_range_push("te.DotProductAttention.check_attn_mask_type")
 
@@ -156,9 +134,9 @@ def forward(
             attn_mask_type = attn_mask_type.replace(",", "_")
             if attn_mask_type == "causal_padding":
                 attn_mask_type = "padding_causal"
-        assert (
-            attn_mask_type in AttnMaskTypes
-        ), f"Attention mask type {attn_mask_type} is not supported!"
+        assert attn_mask_type in AttnMaskTypes, (
+            f"Attention mask type {attn_mask_type} is not supported!"
+        )
 
         # checks for sliding window
         if window_size is None:
@@ -180,9 +158,9 @@ def forward(
         nvtx_range_push("te.DotProductAttention.get_seqlen")
 
         if qkv_format in ["sbhd", "bshd"]:
-            assert all(
-                len(x.shape) == 4 for x in (query_layer, key_layer, value_layer)
-            ), f"Queries, keys and values must be 4D tensors when {qkv_format=}!"
+            assert all(len(x.shape) == 4 for x in (query_layer, key_layer, value_layer)), (
+                f"Queries, keys and values must be 4D tensors when {qkv_format=}!"
+            )
             if qkv_format == "sbhd":
                 batch_size = query_layer.shape[1]
                 max_seqlen_q = query_layer.shape[0] if max_seqlen_q is None else max_seqlen_q
@@ -192,23 +170,23 @@ def forward(
                 max_seqlen_q = query_layer.shape[1] if max_seqlen_q is None else max_seqlen_q
                 max_seqlen_kv = key_layer.shape[1] if max_seqlen_kv is None else max_seqlen_kv
         if qkv_format == "thd":
-            assert all(
-                len(x.shape) == 3 for x in (query_layer, key_layer, value_layer)
-            ), "Queries, keys and values must be 3D tensors when qkv_format = thd!"
-            assert (
-                "padding" in attn_mask_type
-            ), "Attention mask type must be padding or padding_causal for qkv_format=thd!"
-            assert (
-                cu_seqlens_q is not None and cu_seqlens_kv is not None
-            ), "cu_seqlens_q and cu_seqlens_kv can not be None when qkv_format = thd!"
+            assert all(len(x.shape) == 3 for x in (query_layer, key_layer, value_layer)), (
+                "Queries, keys and values must be 3D tensors when qkv_format = thd!"
+            )
+            assert "padding" in attn_mask_type, (
+                "Attention mask type must be padding or padding_causal for qkv_format=thd!"
+            )
+            assert cu_seqlens_q is not None and cu_seqlens_kv is not None, (
+                "cu_seqlens_q and cu_seqlens_kv can not be None when qkv_format = thd!"
+            )
             assert (
                 cu_seqlens_q.shape == cu_seqlens_kv.shape
                 and len(cu_seqlens_q.shape) == 1
                 and len(cu_seqlens_kv.shape) == 1
             ), "cu_seqlens_q and cu_seqlens_q must both have shape [batch_size + 1]!"
-            assert (
-                cu_seqlens_q.dtype == torch.int32 and cu_seqlens_kv.dtype == torch.int32
-            ), "cu_seqlens_q and cu_seqlens_q must both be in dtype torch.int32!"
+            assert cu_seqlens_q.dtype == torch.int32 and cu_seqlens_kv.dtype == torch.int32, (
+                "cu_seqlens_q and cu_seqlens_q must both be in dtype torch.int32!"
+            )
             batch_size = len(cu_seqlens_q) - 1
             if max_seqlen_q is None:
                 if cu_seqlens_q_padded is not None:
@@ -312,9 +290,7 @@ def forward(
             max_seqlen_q *= cp_size
             if cu_seqlens_q is None:
                 if "padding" in attn_mask_type:
-                    assert (
-                        attention_mask is not None
-                    ), "Please provide attention_mask for padding!"
+                    assert attention_mask is not None, "Please provide attention_mask for padding!"
                     if self.attention_type == "self":
                         cu_seqlens_q = dpa_utils.get_cu_seqlens(attention_mask)
                     else:
@@ -329,9 +305,7 @@ def forward(
             max_seqlen_kv *= cp_size
             if cu_seqlens_kv is None:
                 if "padding" in attn_mask_type:
-                    assert (
-                        attention_mask is not None
-                    ), "Please provide attention_mask for padding!"
+                    assert attention_mask is not None, "Please provide attention_mask for padding!"
                     if self.attention_type == "self":
                         cu_seqlens_kv = dpa_utils.get_cu_seqlens(attention_mask)
                     else:
@@ -351,17 +325,17 @@ def forward(
         # global _alibi_cache
         _alibi_cache = dpa._alibi_cache
         if alibi_slopes is not None:
-            assert (
-                core_attention_bias_type == "alibi"
-            ), "core_attention_bias_type must be alibi in order to use alibi_slopes!"
+            assert core_attention_bias_type == "alibi", (
+                "core_attention_bias_type must be alibi in order to use alibi_slopes!"
+            )
             if self.layer_number == 1:
                 _alibi_cache["_alibi_slopes_require_update"] = True
                 _alibi_cache["_alibi_bias_require_update"] = True
         bottom_right_alignment = (attn_mask_type not in ["causal", "padding_causal"],)
         if core_attention_bias_type == "alibi":
-            assert (
-                core_attention_bias is None
-            ), "core_attention_bias must be None when core_attention_bias_type is alibi!"
+            assert core_attention_bias is None, (
+                "core_attention_bias must be None when core_attention_bias_type is alibi!"
+            )
             if (
                 _alibi_cache["_num_heads"] != query_layer.shape[-2]
                 or _alibi_cache["_max_seqlen_q"] != max_seqlen_q
@@ -385,16 +359,14 @@ def forward(
                 and core_attention_bias.shape[1] == query_layer.shape[-2]
             ):
                 core_attention_bias_shape = "1hss"
-            elif (
-                core_attention_bias.shape[0] == batch_size and core_attention_bias.shape[1] == 1
-            ):
+            elif core_attention_bias.shape[0] == batch_size and core_attention_bias.shape[1] == 1:
                 core_attention_bias_shape = "b1ss"
             elif core_attention_bias.shape[0] == 1 and core_attention_bias.shape[1] == 1:
                 core_attention_bias_shape = "11ss"
             else:
-                assert (
-                    False
-                ), "core_attention_bias must be in one of {bhss, 1hss, b1ss, 11ss} shapes"
+                assert False, (
+                    "core_attention_bias must be in one of {bhss, 1hss, b1ss, 11ss} shapes"
+                )
 
         nvtx_range_pop("te.DotProductAttention.set_alibi_attributes")
 
@@ -514,7 +486,7 @@ def forward(
             # debug_print(f"🔴 self.flash_attention.forward source file: {inspect.getfile(self.flash_attention.forward)}")
             # # debug_print(f"🔴 self.flash_attention.forward source code:")
             # debug_print(inspect.getsource(self.flash_attention.forward))
-            
+
             nvtx_range_push("te.DotProductAttention.flash_attention.forward")
             # Goes into distca/baseline/wlbllm_original/wlbllm/megatron_patch/backends.py
             ret = self.flash_attention(
@@ -664,21 +636,33 @@ def forward(
             )
         return None
 
+
 # ------------
 # Monkey Patch
 # ------------
 def monkey_patch():
     import transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention as dpa
+
     dpa.DotProductAttention.forward = forward
-    print("Monkey patching wlbllm.megatron_patch.dot_product_attention.forward() into transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()")
+    print(
+        "Monkey patching wlbllm.megatron_patch.dot_product_attention.forward() into transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()"
+    )
+
 
 from contextlib import contextmanager
+
+
 @contextmanager
 def monkey_patch_context():
     import transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention as dpa
+
     old_forward = dpa.DotProductAttention.forward
     dpa.DotProductAttention.forward = forward
-    print("Monkey patching wlbllm.megatron_patch.dot_product_attention.forward() into transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()")
+    print(
+        "Monkey patching wlbllm.megatron_patch.dot_product_attention.forward() into transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()"
+    )
     yield
     dpa.DotProductAttention.forward = old_forward
-    print("Unmonkey patching wlbllm.megatron_patch.dot_product_attention.forward() from transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()")
+    print(
+        "Unmonkey patching wlbllm.megatron_patch.dot_product_attention.forward() from transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention.DotProductAttention.forward()"
+    )

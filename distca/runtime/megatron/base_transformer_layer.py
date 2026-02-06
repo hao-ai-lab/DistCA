@@ -1,31 +1,36 @@
-from typing import Any, Iterable, Optional, Union
-import time
-import torch
-from torch import Tensor
 import os
-from megatron.core import tensor_parallel
+import time
+from collections.abc import Iterable
+from typing import Any
+
+import rich
+import torch
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
-)
-from distca.runtime.megatron.distca_rope import (
-    apply_rotary_pos_emb_distca,
-    apply_rotary_pos_emb_distca_triton,
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer as MegatronTransformerLayer,
+)
+from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
-from megatron.core import parallel_state
+from torch import Tensor
 
-from distca.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams, MLPLayoutPackedSeqParams
-import rich
-import numpy as np
+from distca.runtime.megatron.distca_rope import (
+    apply_rotary_pos_emb_distca,
+)
+from distca.runtime.megatron.packed_seq_params import (
+    MLPLayoutPackedSeqParams,
+    PingPangSingleStepPackedSeqParams,
+)
 
 
 def log_memory_usage(message: str, comment: str = None):
     import distca.mem
+
     distca.mem.log_memory_usage(message, comment=comment)
 
 
@@ -38,10 +43,11 @@ def _log_tensor_shapes(layer: "TransformerLayer", where: str, **named_values: An
         if v is None:
             return
         if torch.is_tensor(v):
-            
-            num_zeros = (v == 0).sum().item() if torch.is_floating_point(v) or torch.is_complex(v) else 'u'
-            num_nans = torch.isnan(v).sum().item() if torch.is_floating_point(v) else 'u'
-            
+            num_zeros = (
+                (v == 0).sum().item() if torch.is_floating_point(v) or torch.is_complex(v) else "u"
+            )
+            num_nans = torch.isnan(v).sum().item() if torch.is_floating_point(v) else "u"
+
             # print num_nans in red if num_nans > 0
             should_print = False
             if num_nans > 0:
@@ -79,24 +85,32 @@ def _log_cuda_graph_init(layer: "TransformerLayer", where: str, msg: str) -> Non
 
 class TransformerLayer(MegatronTransformerLayer):
     """Base transformer layer that splits the forward 3 steps: core attention, pre- and post- core attention."""
+
     def __init__(
         self,
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
-        hidden_dropout: Optional[float] = None,
+        hidden_dropout: float | None = None,
     ):
         super().__init__(config, submodules, layer_number, hidden_dropout)
 
         # TODO(yonghao): this is a dev annotation for type hinting. remove it later.
-        from megatron.core.transformer.attention import SelfAttention
         from megatron.core.extensions.transformer_engine import TEDotProductAttention
+        from megatron.core.transformer.attention import SelfAttention
+
         self.self_attention: SelfAttention
         assert isinstance(self.self_attention.core_attention, TEDotProductAttention)
         self.pre_attn_cuda_graph = None
         self.post_attn_cuda_graph = None
 
-    def init_pre_attn_cuda_graph(self, prev_layer: "Optional[TransformerLayer]", seq_len: int, device: torch.device, dtype: torch.dtype):
+    def init_pre_attn_cuda_graph(
+        self,
+        prev_layer: "TransformerLayer | None",
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
         # TODO: May need to also check `self.config.sequence_parallel_size`. If not, just assume SP == TP
         # use_sp = self.config.sequence_parallel
         tp = parallel_state.get_tensor_model_parallel_world_size()
@@ -109,59 +123,98 @@ class TransformerLayer(MegatronTransformerLayer):
 
         if prev_layer is None:
             # static_input = torch.zeros((seq_len, 1, self.config.hidden_size), device=device, dtype=dtype, requires_grad=True)
-            static_input = torch.zeros((seq_len // tp, 1, hidden_size_tp * tp), device=device, dtype=dtype, requires_grad=True)
-            _log_cuda_graph_init(self, "init_pre_attn_cuda_graph", f"prev_layer=None static_input.shape={tuple(static_input.shape)}")
-            self.pre_attn_cuda_graph = torch.cuda.make_graphed_callables(self.__pre_attn_cuda_graph, (static_input,))
-            _log_cuda_graph_init(self, "init_pre_attn_cuda_graph", f"created pre_attn_cuda_graph={self.pre_attn_cuda_graph!r}")
+            static_input = torch.zeros(
+                (seq_len // tp, 1, hidden_size_tp * tp),
+                device=device,
+                dtype=dtype,
+                requires_grad=True,
+            )
+            _log_cuda_graph_init(
+                self,
+                "init_pre_attn_cuda_graph",
+                f"prev_layer=None static_input.shape={tuple(static_input.shape)}",
+            )
+            self.pre_attn_cuda_graph = torch.cuda.make_graphed_callables(
+                self.__pre_attn_cuda_graph, (static_input,)
+            )
+            _log_cuda_graph_init(
+                self,
+                "init_pre_attn_cuda_graph",
+                f"created pre_attn_cuda_graph={self.pre_attn_cuda_graph!r}",
+            )
             return
-        
+
         # prev_layer.self_attention.query_projection_size // tp
         # static_core_attn_out = torch.zeros((seq_len * tp, 1, hidden_size_tp), device=device, dtype=dtype, requires_grad=True)
-        static_core_attn_out = torch.zeros((seq_len, 1, hidden_size_tp), device=device, dtype=dtype, requires_grad=True)
+        static_core_attn_out = torch.zeros(
+            (seq_len, 1, hidden_size_tp), device=device, dtype=dtype, requires_grad=True
+        )
         # static_residual = torch.zeros((seq_len // tp, 1, self.config.hidden_size), device=device, dtype=dtype, requires_grad=True)
         # static_residual = torch.zeros((seq_len, 1, self.config.hidden_size), device=device, dtype=dtype, requires_grad=True)
-        static_residual = torch.zeros((seq_len // tp, 1, hidden_size_tp * tp), device=device, dtype=dtype, requires_grad=True)
+        static_residual = torch.zeros(
+            (seq_len // tp, 1, hidden_size_tp * tp), device=device, dtype=dtype, requires_grad=True
+        )
+
         def post_then_pre_core_attn_cuda_graph(core_attn_out: Tensor, residual: Tensor):
             hidden_states = prev_layer._post_attn_cuda_graph(core_attn_out, residual)
             return self.__pre_attn_cuda_graph(hidden_states)
+
         _log_cuda_graph_init(
             self,
             "init_pre_attn_cuda_graph",
             f"prev_layer!=None static_core_attn_out.shape={tuple(static_core_attn_out.shape)} static_residual.shape={tuple(static_residual.shape)}",
         )
-        self.pre_attn_cuda_graph = torch.cuda.make_graphed_callables(post_then_pre_core_attn_cuda_graph, (static_core_attn_out, static_residual))
-        _log_cuda_graph_init(self, "init_pre_attn_cuda_graph", f"created pre_attn_cuda_graph={self.pre_attn_cuda_graph!r}")
+        self.pre_attn_cuda_graph = torch.cuda.make_graphed_callables(
+            post_then_pre_core_attn_cuda_graph, (static_core_attn_out, static_residual)
+        )
+        _log_cuda_graph_init(
+            self,
+            "init_pre_attn_cuda_graph",
+            f"created pre_attn_cuda_graph={self.pre_attn_cuda_graph!r}",
+        )
         return
-    
+
     def init_post_attn_cuda_graph(self, seq_len: int, device: torch.device, dtype: torch.dtype):
         tp = parallel_state.get_tensor_model_parallel_world_size()
         hidden_size_tp = self.config.hidden_size // tp
         # prev_layer.self_attention.query_projection_size // tp
         # static_core_attn_out = torch.zeros((seq_len * tp, 1, hidden_size_tp), device=device, dtype=dtype, requires_grad=True)
-        static_core_attn_out = torch.zeros((seq_len, 1, hidden_size_tp), device=device, dtype=dtype, requires_grad=True)
+        static_core_attn_out = torch.zeros(
+            (seq_len, 1, hidden_size_tp), device=device, dtype=dtype, requires_grad=True
+        )
         # static_residual = torch.zeros((seq_len, 1, self.config.hidden_size), device=device, dtype=dtype, requires_grad=True)
-        static_residual = torch.zeros((seq_len // tp, 1, hidden_size_tp * tp), device=device, dtype=dtype, requires_grad=True)
+        static_residual = torch.zeros(
+            (seq_len // tp, 1, hidden_size_tp * tp), device=device, dtype=dtype, requires_grad=True
+        )
         _log_cuda_graph_init(
             self,
             "init_post_attn_cuda_graph",
             f"tp={tp} hidden_size={self.config.hidden_size} hidden_size_tp={hidden_size_tp} "
             f"static_core_attn_out.shape={tuple(static_core_attn_out.shape)} static_residual.shape={tuple(static_residual.shape)}",
         )
-        self.post_attn_cuda_graph = torch.cuda.make_graphed_callables(self._post_attn_cuda_graph, (static_core_attn_out, static_residual))
-        _log_cuda_graph_init(self, "init_post_attn_cuda_graph", f"created post_attn_cuda_graph={self.post_attn_cuda_graph!r}")
+        self.post_attn_cuda_graph = torch.cuda.make_graphed_callables(
+            self._post_attn_cuda_graph, (static_core_attn_out, static_residual)
+        )
+        _log_cuda_graph_init(
+            self,
+            "init_post_attn_cuda_graph",
+            f"created post_attn_cuda_graph={self.post_attn_cuda_graph!r}",
+        )
 
     def _forward_pre_attn_cuda_graph(
         self,
         args: Iterable[torch.Tensor],
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None
+        rotary_pos_emb: Tensor | None = None,
+        rotary_pos_cos: Tensor | None = None,
+        rotary_pos_sin: Tensor | None = None,
+        packed_seq_params: PingPangSingleStepPackedSeqParams | None = None,
+        sequence_len_offset: Tensor | None = None,
     ):
         query, key, value, residual = self.pre_attn_cuda_graph(*args)
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(init, before input layernorm)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(init, before input layernorm)"
+        )
 
         assert rotary_pos_cos is None and rotary_pos_sin is None
 
@@ -173,24 +226,30 @@ class TransformerLayer(MegatronTransformerLayer):
         # being handled in the attention layout (the pos id will be hard to handle)
         inference_context = None
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after  qkv, before adjust_key_value_for_inference)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(after  qkv, before adjust_key_value_for_inference)"
+        )
 
-        query, key, value, rotary_pos_emb, attn_mask_type = self.self_attention._adjust_key_value_for_inference(
-            inference_context,
-            query,
-            key,
-            value,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
+        query, key, value, rotary_pos_emb, attn_mask_type = (
+            self.self_attention._adjust_key_value_for_inference(
+                inference_context,
+                query,
+                key,
+                value,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+            )
         )
         if packed_seq_params is not None:
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after adjust_key_value_for_inference, before rope)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(after adjust_key_value_for_inference, before rope)"
+        )
 
         # ================================================
         # relative positional embedding (rotary embedding)
@@ -224,17 +283,21 @@ class TransformerLayer(MegatronTransformerLayer):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after rope, before return)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(after rope, before return)"
+        )
         return query, key, value, residual, attn_mask_type
 
     def _forward_post_attn_cuda_graph(
-        self, core_attn_out: Tensor, residual: Tensor,
-        context: Optional[Tensor] = None, context_mask: Optional[Tensor] = None,
+        self,
+        core_attn_out: Tensor,
+        residual: Tensor,
+        context: Tensor | None = None,
+        context_mask: Tensor | None = None,
     ):
         assert context is None and context_mask is None, "not supported in cudagraph"
         return self.post_attn_cuda_graph(core_attn_out, residual)
 
-    
     def __pre_attn_cuda_graph(self, hidden_states: Tensor):
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -244,10 +307,14 @@ class TransformerLayer(MegatronTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after input layernorm, before qkv)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(after input layernorm, before qkv)"
+        )
 
         # q, k, v
-        query, key, value = self.self_attention.get_query_key_value_tensors(input_layernorm_output, None)
+        query, key, value = self.self_attention.get_query_key_value_tensors(
+            input_layernorm_output, None
+        )
         return query, key, value, hidden_states
 
     def _post_attn_cuda_graph(self, core_attn_out: Tensor, residual: Tensor):
@@ -288,7 +355,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
         # if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
         #     context = attention_output_with_bias["context"]
-        
+
         attention_output_with_bias = self.pre_cross_attn_layernorm(hidden_states)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -311,7 +378,9 @@ class TransformerLayer(MegatronTransformerLayer):
         else:
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after pre mlp layernorm)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_post_core_attn:(after pre mlp layernorm)"
+        )
 
         mlp_output = self._forward_mlp(pre_mlp_layernorm_output, residual)
         log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after mlp)")
@@ -320,17 +389,19 @@ class TransformerLayer(MegatronTransformerLayer):
     def _forward_pre_core_attn(
         self,
         hidden_states: Tensor,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
+        rotary_pos_emb: Tensor | None = None,
+        rotary_pos_cos: Tensor | None = None,
+        rotary_pos_sin: Tensor | None = None,
+        packed_seq_params: PingPangSingleStepPackedSeqParams | None = None,
+        sequence_len_offset: Tensor | None = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
         the attention operations.
         """
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(init, before input layernorm)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(init, before input layernorm)"
+        )
         _log_tensor_shapes(
             self,
             "_forward_pre_core_attn.entry",
@@ -355,7 +426,9 @@ class TransformerLayer(MegatronTransformerLayer):
             residual=residual,
         )
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after input layernorm, before qkv)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(after input layernorm, before qkv)"
+        )
         # Below code copied from megatron.core.transformer.attention.Attention.forward
         # rotary pos emb
         assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -365,24 +438,37 @@ class TransformerLayer(MegatronTransformerLayer):
             rotary_pos_emb = (rotary_pos_emb,) * 2
         # q, k, v
         log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(before qkv)")
-        query, key, value = self.self_attention.get_query_key_value_tensors(input_layernorm_output, None)
-        _log_tensor_shapes(self, "_forward_pre_core_attn.after_qkv", query=query, key=key, value=value, rotary_pos_emb=rotary_pos_emb)
+        query, key, value = self.self_attention.get_query_key_value_tensors(
+            input_layernorm_output, None
+        )
+        _log_tensor_shapes(
+            self,
+            "_forward_pre_core_attn.after_qkv",
+            query=query,
+            key=key,
+            value=value,
+            rotary_pos_emb=rotary_pos_emb,
+        )
 
         #### Some code in core_attention. This is because we don't want the pos embedding
         # being handled in the attention layout (the pos id will be hard to handle)
         inference_context = None
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after  qkv, before adjust_key_value_for_inference)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(after  qkv, before adjust_key_value_for_inference)"
+        )
 
-        query, key, value, rotary_pos_emb, attn_mask_type = self.self_attention._adjust_key_value_for_inference(
-            inference_context,
-            query,
-            key,
-            value,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
+        query, key, value, rotary_pos_emb, attn_mask_type = (
+            self.self_attention._adjust_key_value_for_inference(
+                inference_context,
+                query,
+                key,
+                value,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+            )
         )
         _log_tensor_shapes(
             self,
@@ -396,16 +482,26 @@ class TransformerLayer(MegatronTransformerLayer):
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
-            _log_tensor_shapes(self, "_forward_pre_core_attn.after_packed_squeeze", query=query, key=key, value=value)
+            _log_tensor_shapes(
+                self,
+                "_forward_pre_core_attn.after_packed_squeeze",
+                query=query,
+                key=key,
+                value=value,
+            )
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after adjust_key_value_for_inference, before rope)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(after adjust_key_value_for_inference, before rope)"
+        )
 
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
         if rotary_pos_emb is not None and not self.config.flash_decode:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            _log_tensor_shapes(self, "_forward_pre_core_attn.rope_inputs", q_pos_emb=q_pos_emb, k_pos_emb=k_pos_emb)
+            _log_tensor_shapes(
+                self, "_forward_pre_core_attn.rope_inputs", q_pos_emb=q_pos_emb, k_pos_emb=k_pos_emb
+            )
 
             if packed_seq_params is not None:
                 if isinstance(packed_seq_params, MLPLayoutPackedSeqParams):
@@ -414,22 +510,31 @@ class TransformerLayer(MegatronTransformerLayer):
                         cu_seqlens_q = mlp_seq_param.cu_seqlens_q_padded
                     else:
                         cu_seqlens_q = mlp_seq_param.cu_seqlens_q
-                    
-                    _log_tensor_shapes(self, "_forward_pre_core_attn.cu_seqlens_q", cu_seqlens_q=cu_seqlens_q)
+
+                    _log_tensor_shapes(
+                        self, "_forward_pre_core_attn.cu_seqlens_q", cu_seqlens_q=cu_seqlens_q
+                    )
                     if mlp_seq_param.cu_seqlens_kv_padded is not None:
                         cu_seqlens_kv = mlp_seq_param.cu_seqlens_kv_padded
                     else:
                         cu_seqlens_kv = mlp_seq_param.cu_seqlens_kv
-                    _log_tensor_shapes(self, "_forward_pre_core_attn.cu_seqlens_kv", cu_seqlens_kv=cu_seqlens_kv)
+                    _log_tensor_shapes(
+                        self, "_forward_pre_core_attn.cu_seqlens_kv", cu_seqlens_kv=cu_seqlens_kv
+                    )
                     shard_logical_range = packed_seq_params.shard_logical_range[0]
                     # Get max_seqlen from mlp_seq_param
                     max_seqlen_q = mlp_seq_param.max_seqlen_q
                     max_seqlen_kv = mlp_seq_param.max_seqlen_kv
-                    print(f"max_seqlen_q = {max_seqlen_q}, max_seqlen_kv = {max_seqlen_kv}", flush=True)
-                    
+                    print(
+                        f"max_seqlen_q = {max_seqlen_q}, max_seqlen_kv = {max_seqlen_kv}",
+                        flush=True,
+                    )
+
                     if os.getenv("D2_LOG_ROPE_METADATA", "0") == "1":
                         seqlens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-                        rich.print(f"[bold yellow]🟡 [L{self.layer_number}] RoPE Metadata:[/bold yellow]")
+                        rich.print(
+                            f"[bold yellow]🟡 [L{self.layer_number}] RoPE Metadata:[/bold yellow]"
+                        )
                         rich.print(f"  Physical Shard Lengths: {seqlens.tolist()}")
                         rich.print(f"  Logical Ranges: {shard_logical_range.tolist()}")
                 else:
@@ -452,12 +557,16 @@ class TransformerLayer(MegatronTransformerLayer):
                         final_indices = None
                         if isinstance(packed_seq_params, MLPLayoutPackedSeqParams):
                             final_indices = packed_seq_params.rope_final_indices
-                        
+
                         if final_indices is not None:
                             query = apply_rotary_pos_emb_distca(
-                                query, q_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                                query,
+                                q_pos_emb,
+                                config=self.config,
+                                final_indices=final_indices,
+                                mscale=1.0,
                             )
-                        
+
                             # query = apply_rotary_pos_emb_distca_triton(
                             #     query, q_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
                             # )
@@ -473,10 +582,14 @@ class TransformerLayer(MegatronTransformerLayer):
                         final_indices = None
                         if isinstance(packed_seq_params, MLPLayoutPackedSeqParams):
                             final_indices = packed_seq_params.rope_final_indices
-                        
+
                         if final_indices is not None:
                             key = apply_rotary_pos_emb_distca(
-                                key, k_pos_emb, config=self.config, final_indices=final_indices, mscale=1.0
+                                key,
+                                k_pos_emb,
+                                config=self.config,
+                                final_indices=final_indices,
+                                mscale=1.0,
                             )
 
                             # key = apply_rotary_pos_emb_distca_triton(
@@ -492,8 +605,17 @@ class TransformerLayer(MegatronTransformerLayer):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-        log_memory_usage(f"(L{self.layer_number}) _forward_pre_core_attn:(after rope, before return)")
-        _log_tensor_shapes(self, "_forward_pre_core_attn.return", query=query, key=key, value=value, residual=residual)
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_pre_core_attn:(after rope, before return)"
+        )
+        _log_tensor_shapes(
+            self,
+            "_forward_pre_core_attn.return",
+            query=query,
+            key=key,
+            value=value,
+            residual=residual,
+        )
         return query, key, value, residual, attn_mask_type
 
     def _forward_core_attn(
@@ -501,10 +623,12 @@ class TransformerLayer(MegatronTransformerLayer):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        attn_mask_type: Optional[AttnMaskType] = None,
-        packed_seq_params: Optional[Union[PingPangSingleStepPackedSeqParams, MLPLayoutPackedSeqParams]] = None,
+        attention_mask: Tensor | None = None,
+        attention_bias: Tensor | None = None,
+        attn_mask_type: AttnMaskType | None = None,
+        packed_seq_params: PingPangSingleStepPackedSeqParams
+        | MLPLayoutPackedSeqParams
+        | None = None,
     ):
         """
         Copied from megatron.core.transformer.attention.Attention.forward
@@ -529,7 +653,9 @@ class TransformerLayer(MegatronTransformerLayer):
             # torch.distributed.barrier()
         log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(start)")
         if self.self_attention.checkpoint_core_attention and self.training:
-            log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(before checkpointed attention forward)")
+            log_memory_usage(
+                f"(L{self.layer_number}) _forward_core_attn:(before checkpointed attention forward)"
+            )
             core_attn_out = self.self_attention._checkpointed_attention_forward(
                 query,
                 key,
@@ -539,14 +665,18 @@ class TransformerLayer(MegatronTransformerLayer):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
-            log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(after checkpointed attention forward)")
+            log_memory_usage(
+                f"(L{self.layer_number}) _forward_core_attn:(after checkpointed attention forward)"
+            )
         else:
             # Static batching attention kernel.
             # NOTE(yonghao): megatron.core.extensions.transformer_engine.TEDotProductAttention
             # core impl in te.pytorch.DotProductAttention
             # use `set_context_parallel_group` to disable context parallel
             #   cp_size = get_distributed_world_size(self.cp_group)
-            log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(before core attention forward)")
+            log_memory_usage(
+                f"(L{self.layer_number}) _forward_core_attn:(before core attention forward)"
+            )
             core_attn_out = self.self_attention.core_attention(
                 query,
                 key,
@@ -556,25 +686,33 @@ class TransformerLayer(MegatronTransformerLayer):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
-            log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(after core attention forward)")
-        _log_tensor_shapes(self, "_forward_core_attn.after_core_attention", core_attn_out=core_attn_out)
+            log_memory_usage(
+                f"(L{self.layer_number}) _forward_core_attn:(after core attention forward)"
+            )
+        _log_tensor_shapes(
+            self, "_forward_core_attn.after_core_attention", core_attn_out=core_attn_out
+        )
         if should_distca_sync_time_core_attn:
             torch.cuda.synchronize()
             # torch.distributed.barrier()
         end_time = time.time()
         duration = end_time - start_time
         duration_ms = duration * 1000
-        
-        if should_distca_sync_time_core_attn:
-            print(f"🟡 TransformerLayer._forward_core_attn[{self.layer_number}] duration: {duration_ms:.3f} ms")
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if should_distca_sync_time_core_attn:
+            print(
+                f"🟡 TransformerLayer._forward_core_attn[{self.layer_number}] duration: {duration_ms:.3f} ms"
+            )
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
-            _log_tensor_shapes(self, "_forward_core_attn.after_thd_reshape", core_attn_out=core_attn_out)
+            _log_tensor_shapes(
+                self, "_forward_core_attn.after_thd_reshape", core_attn_out=core_attn_out
+            )
         log_memory_usage(f"(L{self.layer_number}) _forward_core_attn:(end)")
         return core_attn_out
 
@@ -582,13 +720,19 @@ class TransformerLayer(MegatronTransformerLayer):
         self,
         core_attn_out: Tensor,
         residual: Tensor,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
+        context: Tensor | None = None,
+        context_mask: Tensor | None = None,
     ):
         inference_context = None
-        _log_tensor_shapes(self, "_forward_post_core_attn.entry", core_attn_out=core_attn_out, residual=residual)
+        _log_tensor_shapes(
+            self, "_forward_post_core_attn.entry", core_attn_out=core_attn_out, residual=residual
+        )
         attention_output_with_bias = self.self_attention.linear_proj(core_attn_out)
-        _log_tensor_shapes(self, "_forward_post_core_attn.after_linear_proj", attention_output_with_bias=attention_output_with_bias)
+        _log_tensor_shapes(
+            self,
+            "_forward_post_core_attn.after_linear_proj",
+            attention_output_with_bias=attention_output_with_bias,
+        )
 
         log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(before layernorm)")
         if self.recompute_input_layernorm:
@@ -606,15 +750,23 @@ class TransformerLayer(MegatronTransformerLayer):
             hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                 attention_output_with_bias, residual, self.hidden_dropout
             )
-        _log_tensor_shapes(self, "_forward_post_core_attn.after_self_attn_bda", hidden_states=hidden_states)
+        _log_tensor_shapes(
+            self, "_forward_post_core_attn.after_self_attn_bda", hidden_states=hidden_states
+        )
 
         # Residual connection.
         residual = hidden_states
-        _log_tensor_shapes(self, "_forward_post_core_attn.after_residual_connection", residual=residual)
+        _log_tensor_shapes(
+            self, "_forward_post_core_attn.after_residual_connection", residual=residual
+        )
 
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
-        _log_tensor_shapes(self, "_forward_post_core_attn.after_pre_cross_ln", pre_cross_attn_layernorm_output=pre_cross_attn_layernorm_output)
+        _log_tensor_shapes(
+            self,
+            "_forward_post_core_attn.after_pre_cross_ln",
+            pre_cross_attn_layernorm_output=pre_cross_attn_layernorm_output,
+        )
 
         # Cross attention.
         log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(cross attention)")
@@ -625,7 +777,11 @@ class TransformerLayer(MegatronTransformerLayer):
             inference_context=inference_context,
         )
         log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after cross attention)")
-        _log_tensor_shapes(self, "_forward_post_core_attn.after_cross_attention", attention_output_with_bias=attention_output_with_bias)
+        _log_tensor_shapes(
+            self,
+            "_forward_post_core_attn.after_cross_attention",
+            attention_output_with_bias=attention_output_with_bias,
+        )
 
         if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
             context = attention_output_with_bias["context"]
@@ -637,7 +793,9 @@ class TransformerLayer(MegatronTransformerLayer):
                 attention_output_with_bias, residual, self.hidden_dropout
             )
         log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after cross attn bda)")
-        _log_tensor_shapes(self, "_forward_post_core_attn.after_cross_attn_bda", hidden_states=hidden_states)
+        _log_tensor_shapes(
+            self, "_forward_post_core_attn.after_cross_attn_bda", hidden_states=hidden_states
+        )
 
         # Residual connection.
         residual = hidden_states
@@ -650,31 +808,39 @@ class TransformerLayer(MegatronTransformerLayer):
             )
         else:
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
-        _log_tensor_shapes(self, "_forward_post_core_attn.after_pre_mlp_ln", pre_mlp_layernorm_output=pre_mlp_layernorm_output)
+        _log_tensor_shapes(
+            self,
+            "_forward_post_core_attn.after_pre_mlp_ln",
+            pre_mlp_layernorm_output=pre_mlp_layernorm_output,
+        )
 
-        log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after pre mlp layernorm)")
+        log_memory_usage(
+            f"(L{self.layer_number}) _forward_post_core_attn:(after pre mlp layernorm)"
+        )
 
         mlp_output = self._forward_mlp(pre_mlp_layernorm_output, residual)
         log_memory_usage(f"(L{self.layer_number}) _forward_post_core_attn:(after mlp)")
-        _log_tensor_shapes(self, "_forward_post_core_attn.return", mlp_output=mlp_output, context=context)
+        _log_tensor_shapes(
+            self, "_forward_post_core_attn.return", mlp_output=mlp_output, context=context
+        )
         return mlp_output, context
 
     ######## Debug ########
     def forward_orig_impl(
         self,
         hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_context: Optional[Any] = None,
-        packed_seq_params: Optional[PingPangSingleStepPackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
+        attention_mask: Tensor | None = None,
+        context: Tensor | None = None,
+        context_mask: Tensor | None = None,
+        rotary_pos_emb: Tensor | None = None,
+        rotary_pos_cos: Tensor | None = None,
+        rotary_pos_sin: Tensor | None = None,
+        attention_bias: Tensor | None = None,
+        inference_context: Any | None = None,
+        packed_seq_params: PingPangSingleStepPackedSeqParams | None = None,
+        sequence_len_offset: Tensor | None = None,
         *,
-        inference_params: Optional[Any] = None,
+        inference_params: Any | None = None,
         return_debug: bool = False,
     ):
         # import traceback
@@ -682,16 +848,15 @@ class TransformerLayer(MegatronTransformerLayer):
         # print(packed_seq_params)
         # exit(0)
         """Debug use. normal forward with output hooked."""
-        
+
         layer_number = self.layer_number
         with torch.cuda.nvtx.range(f"forward[L={layer_number}]"):
-
             assert inference_params is None, "inference not supported yet"
             assert inference_context is None, "inference not supported yet"
             assert context is None, "cross-attention not supported yet"
             assert context_mask is None, "cross-attention not supported yet"
 
-            setattr(packed_seq_params, "stream", torch.cuda.current_stream())
+            packed_seq_params.stream = torch.cuda.current_stream()
             # Enable RoPE.
             # rotary_pos_emb = None
 
@@ -705,7 +870,9 @@ class TransformerLayer(MegatronTransformerLayer):
                 packed_seq_params,
                 sequence_len_offset,
             )
-            debug_tensors = [(query, key, value),]
+            debug_tensors = [
+                (query, key, value),
+            ]
 
             log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after pre core attn)")
 
@@ -730,7 +897,7 @@ class TransformerLayer(MegatronTransformerLayer):
 
             log_memory_usage(f"(L{self.layer_number}) _forward_orig_impl:(after post core attn)")
 
-            return (mlp_output, context,) + (
-                (debug_tensors,) if return_debug else ()
-            )
-
+            return (
+                mlp_output,
+                context,
+            ) + ((debug_tensors,) if return_debug else ())
