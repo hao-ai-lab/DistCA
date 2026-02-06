@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot: build DistCA Docker image (if needed), run container with repo mounted,
 # install distca + Megatron-LM + build csrc, then drop into a shell where you can run
-# pretrain_llama.py or benchmark. Ref: RUN_STATUS.md §4.3, README.Installation.md
+# pretrain_llama.py or scripts/single_gpu_smoke.sh / scripts/single_gpu_benchmark.sh.
 
 set -e
 
@@ -17,7 +17,7 @@ if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
 fi
 
 echo "Running container (mount $DISTCA_ROOT -> /workspace/DistCA), running install + build then bash..."
-echo "Using --shm-size=2g for NCCL/pretrain (see RUN_STATUS.md §3.1 problem 9)."
+echo "Using --shm-size=2g for NCCL/pretrain."
 docker run --gpus all -it --rm --shm-size=2g \
   -v "$DISTCA_ROOT:/workspace/DistCA" \
   "$IMAGE_NAME" \

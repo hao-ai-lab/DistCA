@@ -33,12 +33,12 @@ if _flash_attn_varlen_bwd is None:
 if _flash_attn_varlen_fwd is None:
     raise ImportError(
         "flash_attn: need one of _wrapped_flash_attn_varlen_forward, flash_attn_varlen_forward, "
-        "_flash_attn_varlen_forward, or flash_attn_varlen_func. Your build exposes none. See RUN_STATUS.md §3.1 problem 11."
+        "_flash_attn_varlen_forward, or flash_attn_varlen_func. Your build exposes none. See installation docs / flash-attn build."
     )
 if _flash_attn_varlen_bwd is None:
     raise ImportError(
         "flash_attn: need one of _wrapped_flash_attn_varlen_backward, flash_attn_varlen_backward, "
-        "_flash_attn_varlen_backward, or flash_attn_varlen_bwd (required for backward). Your build exposes none. See RUN_STATUS.md §3.1 problem 11."
+        "_flash_attn_varlen_backward, or flash_attn_varlen_bwd (required for backward). Your build exposes none. See installation docs / flash-attn build."
     )
 # Dao-AILab v2.5.x uses positional args and window_size tuple; no window_size_left/right kwargs, no softcap.
 # Older builds may have 13-arg forward (no block_table); newer have 14.

@@ -22,7 +22,7 @@ fi
 echo "=== Installing distca and requirements ==="
 pip install $pip_extra -e .
 pip install $pip_extra -r requirements.txt
-# Pin transformers to avoid ImportError(TransformGetItemToIndex) with NGC torch 2.6.0a0 (§3.1 problem 7)
+# Pin transformers to avoid ImportError with NGC torch 2.6.0a0
 pip install $pip_extra 'transformers>=4.40,<4.46'
 
 if [ -d Megatron-LM ]; then
@@ -41,7 +41,7 @@ if [ -d TransformerEngine ] && [ -d TransformerEngine/transformer_engine/pytorch
   (cd TransformerEngine && export NVTE_FRAMEWORK=pytorch && export MAX_JOBS && pip install --no-build-isolation -e '.[pytorch]' $pip_extra)
 fi
 
-# NGC image flash-attn may lack varlen backward; install full flash-attn for FusedCommAttn (§3.1 problem 11).
+# NGC image flash-attn may lack varlen backward; install full flash-attn for FusedCommAttn.
 # With NGC torch (2.6.0a0+...), pip constraint often causes ResolutionImpossible → build from source with --no-deps.
 if [ "${INSTALL_FLASH_ATTN:-1}" = "1" ]; then
   echo "=== Installing flash-attn (full build for varlen forward/backward); may take 10–20 min ==="
@@ -117,4 +117,19 @@ print('transformer_engine.pytorch OK, dot_product_attention.utils OK')
 "
 
 echo "=== Done. You can run pretrain_llama.py or benchmark. ==="
+
+# Optional: run single-GPU smoke test then exit (for CI / PR verification)
+if [ "${1:-}" = "--smoke" ] || [ "${RUN_SMOKE:-0}" = "1" ]; then
+  echo "=== Running single-GPU smoke test (scripts/single_gpu_smoke.sh) ==="
+  bash "$DISTCA_ROOT/scripts/single_gpu_smoke.sh"
+  exit $?
+fi
+
+# Optional: run single-GPU benchmark then exit (throughput report)
+if [ "${1:-}" = "--benchmark" ] || [ "${RUN_BENCHMARK:-0}" = "1" ]; then
+  echo "=== Running single-GPU benchmark (scripts/single_gpu_benchmark.sh) ==="
+  bash "$DISTCA_ROOT/scripts/single_gpu_benchmark.sh"
+  exit $?
+fi
+
 exec bash
