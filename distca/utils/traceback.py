@@ -1,18 +1,19 @@
-
-
 # --------------------------------
 # Better traceback formatting
 # --------------------------------
+import os
 import sys
 import traceback
-import os
 
 RED = "\033[31m"
 BLUE = "\033[34m"
 RESET = "\033[0m"
 
-should_enable_clickable_excepthook = os.environ.get("EXPERIMENT_PYTHON_BETTER_TRACEBACK", "1") == "1"
+should_enable_clickable_excepthook = (
+    os.environ.get("EXPERIMENT_PYTHON_BETTER_TRACEBACK", "1") == "1"
+)
 should_trace_calls = os.environ.get("EXPERIMENT_PYTHON_DEBUG_TRACE_CALLS", "0") == "1"
+
 
 def clickable_excepthook(exc_type, exc_value, tb, file=None):
     for filename, lineno, func, text in traceback.extract_tb(tb):
@@ -20,10 +21,11 @@ def clickable_excepthook(exc_type, exc_value, tb, file=None):
         print(f"{path}:{lineno}: in {func}", file=file)
         if text:
             print(f"    {text}", file=file)
-    
+
     prefix = ""
     try:
         import torch
+
         rank = torch.distributed.get_rank()
         prefix = f"🔴 Rank {rank} "
     except:
@@ -31,13 +33,14 @@ def clickable_excepthook(exc_type, exc_value, tb, file=None):
     # error in red
     print(f"{RED}{prefix}{exc_type.__name__}: {exc_value}{RESET}", file=file)
 
+
 def enable_clickable_excepthook():
     sys.excepthook = clickable_excepthook
 
-import sys
 
 BLUE = "\033[34m"
 RESET = "\033[0m"
+
 
 class TraceFunctions:
     def __init__(self, filter_path: str = None):
@@ -58,11 +61,15 @@ class TraceFunctions:
             return self._trace
 
         if event == "call":
-            print(f"{BLUE}{' ' * self.indent}--> Enter {funcname} ({filename}:{frame.f_lineno}){RESET}")
+            print(
+                f"{BLUE}{' ' * self.indent}--> Enter {funcname} ({filename}:{frame.f_lineno}){RESET}"
+            )
             self.indent += 1
         elif event == "return":
             self.indent = max(0, self.indent - 1)
-            print(f"{BLUE}{' ' * self.indent}<-- Exit  {funcname} ({filename}:{frame.f_lineno}){RESET}")
+            print(
+                f"{BLUE}{' ' * self.indent}<-- Exit  {funcname} ({filename}:{frame.f_lineno}){RESET}"
+            )
 
         return self._trace
 
@@ -83,6 +90,7 @@ def enable_trace_calls(filter_path: str = None) -> TraceFunctions:
     tracer = TraceFunctions(filter_path)
     sys.settrace(tracer._trace)
     return tracer
+
 
 # Example usage:
 # with TraceFunctions(filter_path="my_project"):

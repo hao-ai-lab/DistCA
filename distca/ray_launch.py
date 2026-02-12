@@ -1,11 +1,12 @@
 # ray_launcher.py
-import ray
-import fire
-import argparse
+import os
 import subprocess
 import time
-import os
 from datetime import datetime
+
+import fire
+import ray
+
 
 # Define a remote function that runs the command on one node with all 8 GPUs
 @ray.remote(num_gpus=8)
@@ -18,23 +19,27 @@ def run_cmd(cmd: str, no_duplicate_log: bool = False, work_dir: str = None, outp
     if "{hostname}" in cmd:
         cmd = cmd.replace("{hostname}", hostname)
     print(f"Running on {hostname}: {cmd}")
-    
+
     os.environ["RAY_DEDUP_LOGS"] = "0" if no_duplicate_log else "1"
     try:
         process = subprocess.Popen(
-            cmd, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, universal_newlines=True
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
         )
-        
+
         stdout_lines = []
         # Stream output line by line
-        for line in iter(process.stdout.readline, ''):
+        for line in iter(process.stdout.readline, ""):
             line = line.rstrip()
             if line:
                 print(line, flush=True)
                 stdout_lines.append(line)
-        
+
         # Wait for process to complete
         process.wait()
 
@@ -44,7 +49,7 @@ def run_cmd(cmd: str, no_duplicate_log: bool = False, work_dir: str = None, outp
                 f.write("\n".join(stdout_lines))
             with open(os.path.join(output_dir, f"{hostname}.stderr.log"), "w") as f:
                 f.write(process.stderr.read())
-        
+
         return {
             "hostname": hostname,
             "command": cmd,
@@ -57,7 +62,7 @@ def run_cmd(cmd: str, no_duplicate_log: bool = False, work_dir: str = None, outp
 
 
 def main(
-    cmd: str, 
+    cmd: str,
     num_tasks: int = 1,
     address: str = "auto",
     torchrun: bool = False,
@@ -69,7 +74,7 @@ def main(
     master_endpoint: str = None,
 ):
     """General Ray cluster command launcher.
-    
+
     Args:
         cmd: Command line to run
         num_tasks: Number of parallel tasks (default=1)
@@ -115,7 +120,7 @@ def main(
         master_endpoint = f"{get_master_ip}:29600"
         print(f"Master endpoint: {master_endpoint}")
     rdvz_id = f"ray_launch_{int(time.time())}_{os.getpid()}"
-    
+
     if torchrun:
         cmd = f"torchrun --rdzv_backend=c10d --rdzv_endpoint={master_endpoint} --rdzv_id={rdvz_id} --max_restarts=0 --nnodes={nnodes} {cmd}"
 
@@ -124,8 +129,10 @@ def main(
 
     print(f"Running command: {cmd}")
 
-
-    tasks = [run_cmd.remote(cmd, no_duplicate_log=no_duplicate_log, work_dir=pwd, output_dir=output_dir) for _ in range(num_tasks)]
+    tasks = [
+        run_cmd.remote(cmd, no_duplicate_log=no_duplicate_log, work_dir=pwd, output_dir=output_dir)
+        for _ in range(num_tasks)
+    ]
     results = ray.get(tasks)
 
     # Print results
@@ -133,6 +140,7 @@ def main(
     #     print(f"\n=== Task {i} ===")
     #     for k, v in res.items():
     #         print(f"{k}: {v}")
+
 
 if __name__ == "__main__":
     fire.Fire(main)

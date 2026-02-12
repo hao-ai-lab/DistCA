@@ -25,4 +25,3 @@ fi
 
 # Run the app
 streamlit run memory_frontier_app.py --server.port $PORT --server.headless true
-

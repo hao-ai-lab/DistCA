@@ -63,5 +63,5 @@ python3 -m torch.distributed.launch $DISTRIBUTED_ARGS \
         --logging-level 0 \
         $CONTROL_ARGS \
         $TENSORBOARD_ARGS \
-        $@
+        "$@"
 set +x

@@ -5,37 +5,45 @@ This module contains all data loading, tokenization, and batch preparation logic
 for the D2 training pipeline.
 """
 
-from typing import Iterable, Iterator, List, Optional, Tuple
-from dataclasses import dataclass
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+
 import torch
-from distca.simulator.optimizers.samples import sample_wlbllm_docs_upsample, batch_documents, sample_prolong_docs
+
 from distca.planner.planner import Item
+from distca.simulator.optimizers.samples import (
+    batch_documents,
+    sample_prolong_docs,
+    sample_wlbllm_docs_upsample,
+)
 
 
 @dataclass
 class BatchEntry:
     """Represents a single batch entry with sequence lengths and optional token chunks."""
-    lengths: List[int]
-    token_chunks: Optional[List[torch.Tensor]] = None
+
+    lengths: list[int]
+    token_chunks: list[torch.Tensor] | None = None
 
 
 @dataclass
 class SequenceRecord:
     """Records tokens and positions for a sequence, with a cursor for incremental reading."""
+
     tokens: torch.Tensor
     positions: torch.Tensor
     cursor: int = 0
 
-    def take(self, length: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def take(self, length: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Take the next `length` tokens and positions from this sequence.
-        
+
         Parameters
         ----------
         length : int
             Number of tokens to take
-            
+
         Returns
         -------
         Tuple[torch.Tensor, torch.Tensor]
@@ -46,16 +54,16 @@ class SequenceRecord:
             raise RuntimeError(
                 f"Requested {length} tokens but only {self.tokens.size(0) - self.cursor} remain."
             )
-        token_slice = self.tokens[self.cursor:end]
-        position_slice = self.positions[self.cursor:end]
+        token_slice = self.tokens[self.cursor : end]
+        position_slice = self.positions[self.cursor : end]
         self.cursor = end
         return token_slice, position_slice
 
 
 # Global state for batch generation and tokenization
 ITERATION_ID = 0
-GLOBAL_BATCH: Optional[Iterable[BatchEntry]] = None
-GLOBAL_TOKENIZED_DATA: Optional[List[torch.Tensor]] = None  # Store tokenized sequences
+GLOBAL_BATCH: Iterable[BatchEntry] | None = None
+GLOBAL_TOKENIZED_DATA: list[torch.Tensor] | None = None  # Store tokenized sequences
 TOKENIZER = None  # Store tokenizer
 TOKEN_PAD_ID = 0
 GLOBAL_DOC_INDEX = 0
@@ -137,15 +145,15 @@ def _advance_doc_cursor():
 def _next_token_chunk(target_len: int) -> torch.Tensor:
     """
     Extract the next chunk of tokens from the global tokenized dataset.
-    
+
     This function handles reading tokens across document boundaries and
     maintains the global cursor position.
-    
+
     Parameters
     ----------
     target_len : int
         Number of tokens to extract
-        
+
     Returns
     -------
     torch.Tensor
@@ -156,7 +164,7 @@ def _next_token_chunk(target_len: int) -> torch.Tensor:
     if target_len <= 0:
         return torch.empty(0, dtype=torch.long)
     global GLOBAL_DOC_INDEX, GLOBAL_DOC_OFFSET
-    chunks: List[torch.Tensor] = []
+    chunks: list[torch.Tensor] = []
     remaining = target_len
     while remaining > 0:
         if not GLOBAL_TOKENIZED_DATA:
@@ -170,7 +178,7 @@ def _next_token_chunk(target_len: int) -> torch.Tensor:
             _advance_doc_cursor()
             continue
         take = min(available, remaining)
-        chunks.append(doc[GLOBAL_DOC_OFFSET:GLOBAL_DOC_OFFSET + take])
+        chunks.append(doc[GLOBAL_DOC_OFFSET : GLOBAL_DOC_OFFSET + take])
         GLOBAL_DOC_OFFSET += take
         remaining -= take
         if GLOBAL_DOC_OFFSET == doc.numel():
@@ -180,46 +188,50 @@ def _next_token_chunk(target_len: int) -> torch.Tensor:
     return torch.cat(chunks, dim=0)
 
 
-def _build_real_batch_generator(doc_iter: Iterable[List[int]]):
+def _build_real_batch_generator(doc_iter: Iterable[list[int]]):
     """
     Build a batch generator that extracts real tokens from the dataset.
-    
+
     Parameters
     ----------
     doc_iter : Iterable[List[int]]
         Iterator over batches of document lengths
-        
+
     Returns
     -------
     Generator
         Generator yielding BatchEntry objects with real tokens
     """
+
     def generator():
         for batch in doc_iter:
             lengths = [int(val) for val in batch]
             token_chunks = [_next_token_chunk(length) for length in lengths]
             yield BatchEntry(lengths=lengths, token_chunks=token_chunks)
+
     return generator()
 
 
-def _build_synthetic_batch_generator(doc_iter: Iterable[List[int]]):
+def _build_synthetic_batch_generator(doc_iter: Iterable[list[int]]):
     """
     Build a batch generator for synthetic data (no real tokens).
-    
+
     Parameters
     ----------
     doc_iter : Iterable[List[int]]
         Iterator over batches of document lengths
-        
+
     Returns
     -------
     Generator
         Generator yielding BatchEntry objects without tokens
     """
+
     def generator():
         for batch in doc_iter:
             lengths = [int(val) for val in batch]
             yield BatchEntry(lengths=lengths, token_chunks=None)
+
     return generator()
 
 
@@ -227,8 +239,8 @@ def load_and_tokenize_dataset(
     dataset_name: str,
     tokenizer,
     seed: int = 42,
-    max_total_tokens: Optional[int] = None,
-) -> List[torch.Tensor]:
+    max_total_tokens: int | None = None,
+) -> list[torch.Tensor]:
     """
     Load a dataset and tokenize it.
 
@@ -238,8 +250,8 @@ def load_and_tokenize_dataset(
 
     The interface is kept generic, but we only route these two names.
     """
-    from datasets import load_dataset
     import numpy as np
+    from datasets import load_dataset
 
     print(f"Loading dataset: {dataset_name}...")
 
@@ -254,7 +266,7 @@ def load_and_tokenize_dataset(
         hf_name = "allenai/c4"
         hf_config = "en"
         hf_split = "train"
-        is_streaming = True   # very large; use streaming
+        is_streaming = True  # very large; use streaming
         text_column = "text"
     else:
         raise ValueError(
@@ -269,17 +281,19 @@ def load_and_tokenize_dataset(
     else:
         dataset = load_dataset(hf_name, hf_config, split=hf_split)
 
-    tokenized_sequences: List[torch.Tensor] = []
+    tokenized_sequences: list[torch.Tensor] = []
     rng = np.random.default_rng(seed)
     total_tokens = 0  # track total tokens yielded for optional capping
-    
+
     print("Starting loading dataset...")
     if is_streaming:
         # Streaming: process examples sequentially, respecting both max_total_tokens
         print(f"Tokenizing streaming dataset '{hf_name}'...")
         for i, example in enumerate(dataset):
             if max_total_tokens is not None and total_tokens >= max_total_tokens:
-                print(f"Reached max_total_tokens={max_total_tokens} at sample_id={i}, total_tokens={total_tokens}")
+                print(
+                    f"Reached max_total_tokens={max_total_tokens} at sample_id={i}, total_tokens={total_tokens}"
+                )
                 break
             text = example.get(text_column)
             if not (isinstance(text, str) and text.strip()):
@@ -291,7 +305,9 @@ def load_and_tokenize_dataset(
             if max_total_tokens is not None:
                 remaining = max_total_tokens - total_tokens
                 if remaining <= 0:
-                    print(f"Reached max_total_tokens={max_total_tokens} at sample_id={i}, total_tokens={total_tokens}")
+                    print(
+                        f"Reached max_total_tokens={max_total_tokens} at sample_id={i}, total_tokens={total_tokens}"
+                    )
                     break
                 if len(tokens) > remaining:
                     tokens = tokens[:remaining]
@@ -299,15 +315,21 @@ def load_and_tokenize_dataset(
             tokenized_sequences.append(token_tensor)
             total_tokens += token_tensor.numel()
             if (i + 1) % 1000 == 0:
-                print(f"  Tokenized {i + 1} samples, {len(tokenized_sequences)} sequences, total_tokens={total_tokens}")
+                print(
+                    f"  Tokenized {i + 1} samples, {len(tokenized_sequences)} sequences, total_tokens={total_tokens}"
+                )
     else:
         # Non-streaming: sample randomly, but still respect max_total_tokens if provided
         dataset_size = len(dataset)
         indices = rng.choice(dataset_size, size=dataset_size, replace=False)
-        print(f"Tokenizing {dataset_size} randomly sampled documents from {dataset_size} total in '{hf_name}'...")
+        print(
+            f"Tokenizing {dataset_size} randomly sampled documents from {dataset_size} total in '{hf_name}'..."
+        )
         for idx, i in enumerate(indices):
             if max_total_tokens is not None and total_tokens >= max_total_tokens:
-                print(f"Reached max_total_tokens={max_total_tokens} at sample_id={idx}, total_tokens={total_tokens}")
+                print(
+                    f"Reached max_total_tokens={max_total_tokens} at sample_id={idx}, total_tokens={total_tokens}"
+                )
                 break
             example = dataset[int(i)]
             text = example.get(text_column)
@@ -327,7 +349,7 @@ def load_and_tokenize_dataset(
             total_tokens += token_tensor.numel()
             if (idx + 1) % 1000 == 0:
                 print(f"  Tokenized {idx + 1}/{dataset_size} samples, total_tokens={total_tokens}")
-    
+
     print(
         f"🟢 Loaded and tokenized {len(tokenized_sequences)} sequences "
         f"from '{hf_name}' (total_tokens={total_tokens})"
@@ -336,24 +358,24 @@ def load_and_tokenize_dataset(
 
 
 def setup_global_batch(
-    total_seq_len, 
+    total_seq_len,
     up_sample_factor=2,
     elongate_factor=1,
     filter_threshold=64 * 1024,
     filter_ratio=0.90,
     should_add_debug_cases=False,
     change_long_doc_ratio=0.0,
-    sample_name='wlbllm',
+    sample_name="wlbllm",
     tokenizer=None,
-    max_total_tokens: Optional[int] = None,
+    max_total_tokens: int | None = None,
 ):
     """
     Setup global batch data for training.
-    
+
     This function can either:
     1. Load synthetic sequence length distributions ('wlbllm', 'prolong')
     2. Load real datasets with actual tokens ('bookcorpus', 'wikitext', 'openwebtext', 'c4')
-    
+
     Parameters
     ----------
     total_seq_len : int
@@ -376,33 +398,33 @@ def setup_global_batch(
         - 'bookcorpus', 'wikitext', 'openwebtext', 'c4': Real datasets with actual tokens
     tokenizer : AutoTokenizer, optional
         Required when using real datasets to tokenize the text
-        
+
     Usage Example
     -------------
     # To use with a real dataset like bookcorpus:
     # python training_3d.py --sample-name bookcorpus ...
-    
+
     # To use with synthetic data (default):
     # python training_3d.py --sample-name wlbllm ...
     """
     global GLOBAL_BATCH
     global GLOBAL_TOKENIZED_DATA
     global TOKENIZER
-    
+
     if GLOBAL_BATCH is not None:
         return
 
     assert elongate_factor > 0, f"elongate_factor: {elongate_factor} must be greater than 0"
 
     # Check if we're loading a real dataset
-    real_datasets = ['bookcorpus', 'wikitext', 'openwebtext', 'c4']
-    is_real_dataset = sample_name not in ['wlbllm', 'prolong']
-    
+    real_datasets = ["bookcorpus", "wikitext", "openwebtext", "c4"]
+    is_real_dataset = sample_name not in ["wlbllm", "prolong"]
+
     if is_real_dataset:
         # Load and tokenize real dataset
         if tokenizer is None:
             raise ValueError(f"Tokenizer must be provided when using dataset: {sample_name}")
-        
+
         _set_tokenizer_reference(tokenizer)
         _reset_token_cursor()
         GLOBAL_TOKENIZED_DATA = load_and_tokenize_dataset(
@@ -411,15 +433,15 @@ def setup_global_batch(
             seed=42,
             max_total_tokens=max_total_tokens,
         )
-        
+
         # Get document lengths from tokenized data
         doc_lengths = [len(seq) for seq in GLOBAL_TOKENIZED_DATA]
-        
+
         # Create batches based on actual token lengths
         doc_iter = batch_documents(doc_lengths, max_ctx_length=total_seq_len)
         GLOBAL_BATCH = _build_real_batch_generator(doc_iter)
-        
-    elif sample_name == 'wlbllm':
+
+    elif sample_name == "wlbllm":
         sample_func = sample_wlbllm_docs_upsample
         doc_iter = batch_documents(
             sample_func(
@@ -429,10 +451,11 @@ def setup_global_batch(
                 upsample_long_factor=up_sample_factor,
                 elongate_factor=elongate_factor,
                 change_long_doc_ratio=change_long_doc_ratio,
-            ), max_ctx_length=total_seq_len
+            ),
+            max_ctx_length=total_seq_len,
         )
         GLOBAL_BATCH = _build_synthetic_batch_generator(doc_iter)
-    elif sample_name == 'prolong':
+    elif sample_name == "prolong":
         sample_func = sample_prolong_docs
         doc_iter = batch_documents(
             sample_func(
@@ -442,28 +465,31 @@ def setup_global_batch(
                 upsample_long_factor=up_sample_factor,
                 elongate_factor=elongate_factor,
                 change_long_doc_ratio=change_long_doc_ratio,
-            ), max_ctx_length=total_seq_len
+            ),
+            max_ctx_length=total_seq_len,
         )
         GLOBAL_BATCH = _build_synthetic_batch_generator(doc_iter)
     else:
         raise ValueError(f"Invalid sample_name: {sample_name}")
-    
+
     if should_add_debug_cases:
         raise NotImplementedError("Debug cases are not supported with the new batch generator.")
     return
 
 
-def get_next_batch(dp_size, iterated_samples) -> Tuple[List[List[int]], List[Optional[List[torch.Tensor]]]]:
+def get_next_batch(
+    dp_size, iterated_samples
+) -> tuple[list[list[int]], list[list[torch.Tensor] | None]]:
     """
     Get next batch of sequence lengths and corresponding tokens.
-    
+
     Parameters
     ----------
     dp_size : int
         Data parallel size (number of batches to get)
     iterated_samples : list
         List to append the batches to (for tracking)
-    
+
     Returns
     -------
     Tuple[List[List[int]], List[Optional[List[torch.Tensor]]]]
@@ -472,35 +498,35 @@ def get_next_batch(dp_size, iterated_samples) -> Tuple[List[List[int]], List[Opt
     """
     global GLOBAL_BATCH
     global ITERATION_ID
-    
-    # get dp_size number of batches 
+
+    # get dp_size number of batches
     batches = []
     batch_tokens = []
-    
-    for _ in range(dp_size):    
+
+    for _ in range(dp_size):
         batch_entry = next(GLOBAL_BATCH)
         batches.append(batch_entry.lengths)
         batch_tokens.append(batch_entry.token_chunks)
-    
+
     ITERATION_ID += 1
     iterated_samples.append(batches)
     return batches, batch_tokens
 
 
 def build_sequence_records(
-    seq_lens_half: List[List[int]],
-    batch_tokens_half: List[Optional[List[torch.Tensor]]],
-) -> List[SequenceRecord]:
+    seq_lens_half: list[list[int]],
+    batch_tokens_half: list[list[torch.Tensor] | None],
+) -> list[SequenceRecord]:
     """
     Build sequence records from sequence lengths and token chunks.
-    
+
     Parameters
     ----------
     seq_lens_half : List[List[int]]
         List of batches, each containing sequence lengths
     batch_tokens_half : List[Optional[List[torch.Tensor]]]
         List of token chunks for each batch
-        
+
     Returns
     -------
     List[SequenceRecord]
@@ -508,7 +534,7 @@ def build_sequence_records(
     """
     if any(tokens is None for tokens in batch_tokens_half):
         raise RuntimeError("Real dataset tokens are required for all sequences.")
-    sequence_records: List[SequenceRecord] = []
+    sequence_records: list[SequenceRecord] = []
     for lengths, tokens in zip(seq_lens_half, batch_tokens_half):
         assert tokens is not None
         if len(lengths) != len(tokens):
@@ -530,16 +556,16 @@ def build_sequence_records(
 
 
 def build_rank_shards(
-    items: List[Item],
-    sequence_records: List[SequenceRecord],
+    items: list[Item],
+    sequence_records: list[SequenceRecord],
     num_ranks: int,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     Build token and position shards for each rank based on planner items.
-    
+
     This function distributes tokens and positions to ranks according to the
     planner's scheduling decisions (stored in Item objects).
-    
+
     Parameters
     ----------
     items : List[Item]
@@ -548,7 +574,7 @@ def build_rank_shards(
         List of sequence records containing tokens and positions
     num_ranks : int
         Number of ranks (attention server world size)
-        
+
     Returns
     -------
     Tuple[List[torch.Tensor], List[torch.Tensor]]
@@ -559,14 +585,14 @@ def build_rank_shards(
     for item in items:
         items_by_src[item.src_gpuid].append(item)
 
-    tokens_per_rank: List[torch.Tensor] = []
-    positions_per_rank: List[torch.Tensor] = []
+    tokens_per_rank: list[torch.Tensor] = []
+    positions_per_rank: list[torch.Tensor] = []
 
     for rank in range(num_ranks):
         rank_items = items_by_src.get(rank, [])
         rank_items.sort(key=lambda x: x.seqid)
-        token_chunks: List[torch.Tensor] = []
-        position_chunks: List[torch.Tensor] = []
+        token_chunks: list[torch.Tensor] = []
+        position_chunks: list[torch.Tensor] = []
         for item in rank_items:
             if item.complete:
                 chunk_lengths = [int(item.complete_item["q"])]
@@ -583,4 +609,3 @@ def build_rank_shards(
             tokens_per_rank.append(torch.empty(0, dtype=torch.long))
             positions_per_rank.append(torch.empty(0, dtype=torch.long))
     return tokens_per_rank, positions_per_rank
-

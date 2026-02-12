@@ -9,24 +9,23 @@ app = modal.App(name="transformer-prof")
 
 
 K = 1024
-M = 1024 ** 2
+M = 1024**2
+
 
 @app.function(image=image, gpu="H100:1", timeout=60)
-def profile_transformer(
-    ctx_len: int = K * 4,
-    model_id: str = "Qwen/Qwen3-235B-A22B"
-):
+def profile_transformer(ctx_len: int = K * 4, model_id: str = "Qwen/Qwen3-235B-A22B"):
     import time
+
     import torch
     import transformers.modeling_utils
-    from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     # 94 layers originally  [oai_citation:0‡Hugging Face](https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json?utm_source=chatgpt.com)
     cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     cfg.num_hidden_layers = 1
 
     torch.set_default_device("cuda")
-    torch.manual_seed(42)              # reproducible randomness
+    torch.manual_seed(42)  # reproducible randomness
     with torch.no_grad():
         model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
 
@@ -37,9 +36,11 @@ def profile_transformer(
     def want_hook(name, module):
         # leaf = no children; skip attention classes (FlashAttention2, QwenAttention, …)
         is_leaf = len(list(module.children())) == 0
-        is_attn = "attn" in module.__class__.__name__.lower() or \
-                "attention" in module.__class__.__name__.lower()
-        return is_leaf 
+        is_attn = (
+            "attn" in module.__class__.__name__.lower()
+            or "attention" in module.__class__.__name__.lower()
+        )
+        return is_leaf
         # return is_leaf and not is_attn
 
     for name, m in model.named_modules():
@@ -48,8 +49,10 @@ def profile_transformer(
 
         # forward-pre & forward hooks share the closure variable 'name'
         def pre_hook(mod, inp, name=name):
-            profile[name] = {"start": time.perf_counter(),
-                            "params": sum(p.numel() for p in mod.parameters())}
+            profile[name] = {
+                "start": time.perf_counter(),
+                "params": sum(p.numel() for p in mod.parameters()),
+            }
 
         def post_hook(mod, inp, out, name=name):
             torch.cuda.synchronize()
@@ -59,10 +62,11 @@ def profile_transformer(
         m.register_forward_hook(post_hook)
 
     old_attn_funcs = transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS._global_mapping
-    
+
     # Hook the attention functions too
     new_attn_funcs = {}
     for k, v in old_attn_funcs.items():
+
         def new_func(*args, **kwargs):
             start = time.perf_counter()
             ret = v(*args, **kwargs)
@@ -74,17 +78,17 @@ def profile_transformer(
                 "end": end,
             }
             return ret
+
         new_attn_funcs[k] = new_func
 
     transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS._global_mapping = new_attn_funcs
 
-    
     # Introduce the input
     inp = tok(" a" * ctx_len, return_tensors="pt").to(model.device)
     ctx_len = len(inp.input_ids[0])
 
     with torch.no_grad():
-        model(**inp)                        # warm-up (CUDA kernels/JIT)
+        model(**inp)  # warm-up (CUDA kernels/JIT)
         torch.cuda.synchronize()
 
         start = time.perf_counter()
@@ -93,7 +97,6 @@ def profile_transformer(
         total = time.perf_counter() - start
         total *= 1e3
 
-
     # Profile the model
     rows = []
     for name, rec in profile.items():
@@ -101,7 +104,7 @@ def profile_transformer(
         rows.append((dur_ms, name, rec["params"]))
 
     print(f"{'module':45}  latency  params")
-    print("-"*70)
+    print("-" * 70)
 
     total_layer0_time = 0
     expert_time = 0
@@ -115,8 +118,8 @@ def profile_transformer(
             expert_time += dur
             expert_params += nparam
         else:
-            print(f"{name:45}  {dur:7.3f} ms  {nparam/1e6:7.2f} M")
-        
+            print(f"{name:45}  {dur:7.3f} ms  {nparam / 1e6:7.2f} M")
+
         if name == "model.layers.0.self_attn.attn":
             layer_attn_time += dur
 
@@ -131,7 +134,7 @@ def profile_transformer(
         model_id=model_id,
         ctx_len=ctx_len,
         layer_attn_time=layer_attn_time,
-        layer_mlp_time=layer_mlp_time, 
+        layer_mlp_time=layer_mlp_time,
         total_layer0_time=total_layer0_time,
         expert_time=expert_time,
         expert_params=expert_params,
@@ -142,7 +145,7 @@ def profile_transformer(
     mlp_only_result = dict(
         model_id=model_id,
         ctx_len=ctx_len,
-        layer_mlp_time=layer_mlp_time, 
+        layer_mlp_time=layer_mlp_time,
     )
 
     return full_result, mlp_only_result
@@ -157,8 +160,8 @@ def main(
 ):
     import json
 
-    filename = f"compute-profile.jsonl"
-    mlp_only_filename = f"compute-profile-mlp-only.csv"
+    filename = "compute-profile.jsonl"
+    mlp_only_filename = "compute-profile-mlp-only.csv"
 
     with open(mlp_only_filename, "w") as f:
         f.write("model_id,ctx_len,layer_mlp_time\n")
@@ -177,9 +180,8 @@ def main(
             print(mlp_only_result)
             f_mlp.write(f"{model_id},{ctx_len},{mlp_only_result['layer_mlp_time']:.2f}\n")
             f_mlp.flush()
-            
-            ctx_len *= step_factor
 
+            ctx_len *= step_factor
 
 
 if __name__ == "__main__":

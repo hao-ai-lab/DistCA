@@ -7,9 +7,9 @@ $ /opt/nccl-tests/build/reduce_scatter_perf -t 1 -b 8M -e 8G -f 2 -d half -g 4
 #  Rank  2 Group  0 Pid    240 on      modal device  2 [0000:72:00] NVIDIA H200
 #  Rank  3 Group  0 Pid    240 on      modal device  3 [0000:73:00] NVIDIA H200
 #
-#                                                              out-of-place                       in-place          
+#                                                              out-of-place                       in-place
 #       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
-#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)       
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
      8388608       1048576      half     sum      -1    57.31  146.36  109.77      0    54.27  154.57  115.93      0
     16777216       2097152      half     sum      -1    70.43  238.20  178.65      0    69.20  242.44  181.83      0
     33554432       4194304      half     sum      -1    106.0  316.69  237.52      0    115.9  289.55  217.16      0
@@ -22,6 +22,5 @@ $ /opt/nccl-tests/build/reduce_scatter_perf -t 1 -b 8M -e 8G -f 2 -d half -g 4
   4294967296     536870912      half     sum      -1   9519.3  451.18  338.39      0   9393.5  457.23  342.92      0
   8589934592    1073741824      half     sum      -1    18536  463.43  347.57      0    18507  464.15  348.11      0
 # Out of bounds values : 0 OK
-# Avg bus bandwidth    : 272.902 
+# Avg bus bandwidth    : 272.902
 #
-

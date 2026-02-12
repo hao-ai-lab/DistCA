@@ -1,5 +1,5 @@
+#!/usr/bin/env bash
 set -e
-
 
 # Create output directory
 TS=$(TZ=America/Los_Angeles date +%m%d_%H%M%S)_PST
@@ -33,12 +33,12 @@ model_config="deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 8"
 # Example configs running for formal benchmarking
 # param_configs_cases=(
 # # 8B 128k
-# #    n bs mb t       mode  cp  pp  tp  comment 
-#     "16 1 4 131072    distca   8  2  8  'distca subopt-mem'  " 
-#     "16 1 4 131072    distca   4  4  8  'distca subopt-mem'  " 
+# #    n bs mb t       mode  cp  pp  tp  comment
+#     "16 1 4 131072    distca   8  2  8  'distca subopt-mem'  "
+#     "16 1 4 131072    distca   4  4  8  'distca subopt-mem'  "
 #     "16 1 4 131072 wlbllm  4  4  8  'wlbllm subopt-mem'  "
-#     "16 1 4 131072 wlbllm  8  2  8  'wlbllm subopt-mem'  "  
-#     "16 2 2 131072 wlbllm  4  2  8  'wlbllm subopt-mem'  "  
+#     "16 1 4 131072 wlbllm  8  2  8  'wlbllm subopt-mem'  "
+#     "16 2 2 131072 wlbllm  4  2  8  'wlbllm subopt-mem'  "
 
 # )
 # for config in "${param_configs_cases[@]}"; do
@@ -48,8 +48,8 @@ model_config="deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 8"
 # Example configs running for debugging
 param_configs_cases=(
 # 8B 128k
-#    n bs mb t     mode  cp  pp  tp  comment 
-    "2 1 4 65536     distca   1  2  8  'distca subopt-mem'  " 
+#    n bs mb t     mode  cp  pp  tp  comment
+    "2 1 4 65536     distca   1  2  8  'distca subopt-mem'  "
     "2 1 4 65536 wlbllm   1  2  8  'wlbllm subopt-mem'  "
 
 )
@@ -97,14 +97,14 @@ sleep 3
 max_cases=100
 echo "🏁 Start regression sweep. Only running $max_cases cases."
 cases_index=0
-    
+
 
 for sample_config in "${dists[@]}"; do
 # for config in "${wlbllm_cases[@]}"; do
 for config in "${cases[@]}"; do
     read -r model_path attn_linear_breakpoint num_layers nnodes batch_size microbatch_size num_tokens mode cp_size pp_size tp_size comment <<< "$config"
     read -r sample_name change_long_doc_ratio <<< "$sample_config"
-    
+
     export MODE=$mode
     export BATCH_SIZE=$batch_size
     export NNODES=$nnodes
@@ -119,13 +119,13 @@ for config in "${cases[@]}"; do
     export MODEL_PATH_normalized=$(echo $model_path | sed 's/\//_/g')
     export SAMPLE_NAME=$sample_name
     export CHANGE_LONG_DOC_RATIO=$change_long_doc_ratio
-    
+
 
     export ELONGATE_FACTOR=$(($NUM_TOKENS / 65536))
     if [ $ELONGATE_FACTOR -lt 1 ]; then
         ELONGATE_FACTOR=1
     fi
-    
+
     # D2 normal
     echo "🟡 Running config: MODE=$MODE, NNODES=$NNODES, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, NUM_MICROBATCH=$NUM_MICROBATCH, CP_SIZE=$CP_SIZE, PP_SIZE=$PP_SIZE, TP_SIZE=$TP_SIZE, MODE=$MODE, MODEL_PATH=$MODEL_PATH, MODEL_PATH_normalized=$MODEL_PATH_normalized, NUM_LAYERS=$NUM_LAYERS, ATTN_LINEAR_BREAKPOINT=$ATTN_LINEAR_BREAKPOINT, COMMENT=$COMMENT"
 
@@ -135,8 +135,8 @@ for config in "${cases[@]}"; do
     fi
 
     export OUTPUT_DIR_SUFFIX_ADDON="-${MODEL_PATH_normalized}"
-    
-    
+
+
     if [ $MODE == "distca" ]; then
         bash test_megatron_e2e_pipeline_with_cp.sh
     fi
@@ -146,7 +146,7 @@ for config in "${cases[@]}"; do
     fi
 
     echo "🟡 Finished running config: MODE=$MODE, NNODES=$NNODES, BATCH_SIZE=$BATCH_SIZE, NUM_TOKENS=$NUM_TOKENS, NUM_MICROBATCH=$NUM_MICROBATCH, CP_SIZE=$CP_SIZE, PP_SIZE=$PP_SIZE, TP_SIZE=$TP_SIZE, MODE=$MODE, MODEL_PATH=$MODEL_PATH, MODEL_PATH_normalized=$MODEL_PATH_normalized, NUM_LAYERS=$NUM_LAYERS, ATTN_LINEAR_BREAKPOINT=$ATTN_LINEAR_BREAKPOINT, COMMENT=$COMMENT"
-    
+
 
     cases_index=$((cases_index + 1))
     if [ $cases_index -gt $max_cases ]; then

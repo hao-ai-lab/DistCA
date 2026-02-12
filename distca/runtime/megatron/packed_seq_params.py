@@ -1,14 +1,12 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
 
 import torch
-
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from distca.runtime.metadata import AlltoAllMetadata
 
 
-def _to_cuda_int32(tensor: Optional[torch.Tensor]):
+def _to_cuda_int32(tensor: torch.Tensor | None):
     if tensor is None:
         return None
     return tensor.cuda().to(torch.int32).contiguous()
@@ -59,9 +57,9 @@ class PingPangSingleStepPackedSeqParams(PackedSeqParams):
 # MLP Layout Packed Seq Params used for RoPE.
 @dataclass
 class MLPLayoutPackedSeqParams(PackedSeqParams):
-    mlp_layout_seq_params: List[PackedSeqParams] = field(default_factory=list)
-    shard_logical_range: List[torch.Tensor] = field(default_factory=list)
-    rope_final_indices: Optional[torch.Tensor] = None
+    mlp_layout_seq_params: list[PackedSeqParams] = field(default_factory=list)
+    shard_logical_range: list[torch.Tensor] = field(default_factory=list)
+    rope_final_indices: torch.Tensor | None = None
 
     def to_device(self):
         # Extract parent class fields from the first mlp_layout_seq_param if available
@@ -76,14 +74,14 @@ class MLPLayoutPackedSeqParams(PackedSeqParams):
             qkv_format = first_param.qkv_format
         else:
             # Fallback to self's values or None
-            max_seqlen_q = getattr(self, 'max_seqlen_q', None)
-            max_seqlen_kv = getattr(self, 'max_seqlen_kv', None)
-            cu_seqlens_q = getattr(self, 'cu_seqlens_q', None)
-            cu_seqlens_kv = getattr(self, 'cu_seqlens_kv', None)
-            cu_seqlens_q_padded = getattr(self, 'cu_seqlens_q_padded', None)
-            cu_seqlens_kv_padded = getattr(self, 'cu_seqlens_kv_padded', None)
-            qkv_format = getattr(self, 'qkv_format', 'thd')
-        
+            max_seqlen_q = getattr(self, "max_seqlen_q", None)
+            max_seqlen_kv = getattr(self, "max_seqlen_kv", None)
+            cu_seqlens_q = getattr(self, "cu_seqlens_q", None)
+            cu_seqlens_kv = getattr(self, "cu_seqlens_kv", None)
+            cu_seqlens_q_padded = getattr(self, "cu_seqlens_q_padded", None)
+            cu_seqlens_kv_padded = getattr(self, "cu_seqlens_kv_padded", None)
+            qkv_format = getattr(self, "qkv_format", "thd")
+
         return MLPLayoutPackedSeqParams(
             qkv_format=qkv_format,
             cu_seqlens_q=_to_cuda_int32(cu_seqlens_q),
@@ -92,25 +90,31 @@ class MLPLayoutPackedSeqParams(PackedSeqParams):
             max_seqlen_kv=_to_int(max_seqlen_kv) if max_seqlen_kv is not None else None,
             cu_seqlens_q_padded=_to_cuda_int32(cu_seqlens_q_padded),
             cu_seqlens_kv_padded=_to_cuda_int32(cu_seqlens_kv_padded),
-            mlp_layout_seq_params=[arg_to_cuda(seq_param) for seq_param in self.mlp_layout_seq_params],
-            shard_logical_range=[arg_to_cuda(shard_logical_range) for shard_logical_range in self.shard_logical_range],
-            rope_final_indices=arg_to_cuda(self.rope_final_indices) if self.rope_final_indices is not None else None,
+            mlp_layout_seq_params=[
+                arg_to_cuda(seq_param) for seq_param in self.mlp_layout_seq_params
+            ],
+            shard_logical_range=[
+                arg_to_cuda(shard_logical_range) for shard_logical_range in self.shard_logical_range
+            ],
+            rope_final_indices=arg_to_cuda(self.rope_final_indices)
+            if self.rope_final_indices is not None
+            else None,
         )
 
 
 @dataclass
 class PingPangPackedSeqParams:
-    seq_params: List[PingPangSingleStepPackedSeqParams]
+    seq_params: list[PingPangSingleStepPackedSeqParams]
     # The seq params for mlp layout. This is mainly used for the RoPE.
-    mlp_layout_seq_params: List[MLPLayoutPackedSeqParams]
+    mlp_layout_seq_params: list[MLPLayoutPackedSeqParams]
     # NOTE: within a TransformerLayer, this will make sure all communications run on the compute stream.
     debug: bool = False
     do_gather: bool = False
     # NOTE: These attributes are used for rotary seq len's max length.
     # since we do rope in the MLP layout, it should be the max length
     # at the MLP layout (i.e. the number of tokens).
-    max_seqlen_q: Optional[Union[torch.Tensor, int]] = None
-    max_seqlen_kv: Optional[Union[torch.Tensor, int]] = None
+    max_seqlen_q: torch.Tensor | int | None = None
+    max_seqlen_kv: torch.Tensor | int | None = None
     qkv_format: str = "thd"
 
     def to_device(self):

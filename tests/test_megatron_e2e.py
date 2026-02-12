@@ -8,27 +8,39 @@ nsys profile -o ./test_megatron_e2e.nsys-rep --trace=cuda,nvtx --force-overwrite
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_e2e.py \
     --num-nodes=1 --num-gpus-per-node=4 --tp-size=2
 """
+
 import argparse
 import os
 import time
 
+import torch
 from megatron.core import mpu
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron_test_utils import (
+    get_megatron_optimizer_param_scheduler,
+    get_model,
+    gptmodel_forward,
+    hf_to_mcore_config,
+    init_mcore_model,
+    init_megatron_optim_config,
+    make_batch_generator,
+    print_model_size,
+    unwrap_model,
+    update_model_config,
+)
 from omegaconf import OmegaConf
-import torch
-from transformers import AutoConfig, AutoTokenizer, AutoProcessor
+from test_pingpong_layer import create_one_batch, get_single_step_packed_seq_params
+from test_util import (
+    MegatronBaseWorker,
+    ParallelConfig,
+    init_worker_torch_distributed,
+    set_random_seed,
+)
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from distca.runtime.compute_metadata import get_attn_metadata
-from distca.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangPackedSeqParams
-
-from test_util import MegatronBaseWorker, ParallelConfig, init_worker_torch_distributed, set_random_seed
-from test_pingpong_layer import create_one_batch, get_single_step_packed_seq_params
-from megatron_test_utils import (
-    get_megatron_optimizer_param_scheduler, get_model, gptmodel_forward,
-    hf_to_mcore_config, init_mcore_model, init_megatron_optim_config,
-    make_batch_generator, print_model_size, update_model_config, unwrap_model,
-)
+from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams, arg_to_cuda
 
 
 class MegatronE2eWorker(MegatronBaseWorker):
@@ -38,7 +50,14 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self.enable_gradient_checkpointing = False
         self.gradient_checkpointing_kwargs = {}
 
-    def set_config(self, dtype=torch.bfloat16, enable_gradient_checkpointing=False, gradient_checkpointing_kwargs={}):
+    def set_config(
+        self,
+        dtype=torch.bfloat16,
+        enable_gradient_checkpointing=False,
+        gradient_checkpointing_kwargs=None,
+    ):
+        if gradient_checkpointing_kwargs is None:
+            gradient_checkpointing_kwargs = {}
         self.dtype = dtype
         self.enable_gradient_checkpointing = enable_gradient_checkpointing
         self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
@@ -47,35 +66,40 @@ class MegatronE2eWorker(MegatronBaseWorker):
         set_random_seed(seed)
         self.model_path = model_path
         override_model_config = OmegaConf.create()
-        override_transformer_config = OmegaConf.create({
-            "apply_rope_fusion": True,
-            # bias-act fusion
-            "bias_activation_fusion": True,
-            # no layer norm so no need for that fusion
-            # attention is in FA so no masked_softmax fusion
-            # bias-drop_out-add fusion
-            "bias_dropout_fusion": True,
-        })
+        override_transformer_config = OmegaConf.create(
+            {
+                "apply_rope_fusion": True,
+                # bias-act fusion
+                "bias_activation_fusion": True,
+                # no layer norm so no need for that fusion
+                # attention is in FA so no masked_softmax fusion
+                # bias-drop_out-add fusion
+                "bias_dropout_fusion": True,
+            }
+        )
         # A default optim config
-        optim_config = OmegaConf.create({
-            "clip_grad": 1.0,
-            "lr": 1e-5,
-            "lr_warmup_init": 1e-5,
-            "lr_decay_steps": 1000000,
-            "lr_decay_style": 'constant',
-            "lr_warmup_steps": 1000,
-            "lr_warmup_steps_ratio": 0.0,
-            "min_lr": 1e-6,
-            "min_lr_ratio": None,
-            "total_training_steps": -1,
-            "warmup_style": "constant",
-            "weight_decay": 0.01,
-            "weight_decay_incr_style": "constant",
-            "use_checkpoint_opt_param_scheduler": False,
-            "lr_wsd_decay_style": "linear",
-
-        })
-        self._build_model_optimizer(model_path, optim_config, override_model_config, override_transformer_config)
+        optim_config = OmegaConf.create(
+            {
+                "clip_grad": 1.0,
+                "lr": 1e-5,
+                "lr_warmup_init": 1e-5,
+                "lr_decay_steps": 1000000,
+                "lr_decay_style": "constant",
+                "lr_warmup_steps": 1000,
+                "lr_warmup_steps_ratio": 0.0,
+                "min_lr": 1e-6,
+                "min_lr_ratio": None,
+                "total_training_steps": -1,
+                "warmup_style": "constant",
+                "weight_decay": 0.01,
+                "weight_decay_incr_style": "constant",
+                "use_checkpoint_opt_param_scheduler": False,
+                "lr_wsd_decay_style": "linear",
+            }
+        )
+        self._build_model_optimizer(
+            model_path, optim_config, override_model_config, override_transformer_config
+        )
 
         assert self.device is not None
         for module in self.train_module:
@@ -92,8 +116,12 @@ class MegatronE2eWorker(MegatronBaseWorker):
 
         # Step 1: initialize the tokenizer
         self.local_path = model_path
-        self.tokenizer = AutoTokenizer.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
-        self.processor = AutoProcessor.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.local_path, trust_remote_code=trust_remote_code
+        )
+        self.processor = AutoProcessor.from_pretrained(
+            self.local_path, trust_remote_code=trust_remote_code
+        )
 
         # Step 2: get the hf
         hf_config = AutoConfig.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
@@ -116,12 +144,18 @@ class MegatronE2eWorker(MegatronBaseWorker):
             # add optimization config to tf_config, e.g. checkpointing
             if self.enable_gradient_checkpointing:
                 gradient_checkpointing_cfg = dict(self.gradient_checkpointing_kwargs)
-                tf_config.recompute_method = gradient_checkpointing_cfg.get("activations_checkpoint_method", "full")
+                tf_config.recompute_method = gradient_checkpointing_cfg.get(
+                    "activations_checkpoint_method", "full"
+                )
                 tf_config.recompute_granularity = gradient_checkpointing_cfg.get(
                     "activations_checkpoint_granularity", "full"
                 )
-                tf_config.recompute_num_layers = gradient_checkpointing_cfg.get("activations_checkpoint_num_layers", -1)
-            print(f"🟡 [Rank {self.rank}] Adding selective checkpoint: {tf_config.recompute_method = }, {tf_config.recompute_granularity = }, {tf_config.recompute_num_layers = }")
+                tf_config.recompute_num_layers = gradient_checkpointing_cfg.get(
+                    "activations_checkpoint_num_layers", -1
+                )
+            print(
+                f"🟡 [Rank {self.rank}] Adding selective checkpoint: {tf_config.recompute_method = }, {tf_config.recompute_granularity = }, {tf_config.recompute_num_layers = }"
+            )
 
         add_optimization_config_to_tf_config(tf_config)
 
@@ -130,13 +164,13 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self.hf_config = hf_config
         self.tf_config = tf_config
 
-    def forward_backward_batch(self, microbatches: list[dict], forward_only: bool=False, normal_forward_fn: bool=False):
+    def forward_backward_batch(
+        self, microbatches: list[dict], forward_only: bool = False, normal_forward_fn: bool = False
+    ):
         # TODO: for PP, since backward has a different attention layout dispatching order,
         # we should modify the forward_backward_func here.
 
-        microbatches = [{
-            k: arg_to_cuda(v) for k, v in microbatches[0].items()
-        }]
+        microbatches = [{k: arg_to_cuda(v) for k, v in microbatches[0].items()}]
         for module in self.train_module:
             unwrap_model(module).set_debug(normal_forward_fn)
         assert len(self.train_module) == 1, "only support one module"
@@ -144,23 +178,28 @@ class MegatronE2eWorker(MegatronBaseWorker):
         forward_backward_func = get_forward_backward_func()
         n_micro_batch = len(microbatches)
         # thd layout
-        total_seqlen = microbatches[0]['input_ids'].shape[0]
+        total_seqlen = microbatches[0]["input_ids"].shape[0]
 
         def loss_func(output):
             # NOTE: this is a dummy loss function.
-            loss = ((output - 1)**2).mean()
-            return loss, {'loss': loss}
+            loss = ((output - 1) ** 2).mean()
+            return loss, {"loss": loss}
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
-            input_ids = batch['input_ids']
-            position_ids = batch['position_ids']
+            input_ids = batch["input_ids"]
+            position_ids = batch["position_ids"]
             attention_mask = None
-            packed_seq_params = batch['packed_seq_params']
+            packed_seq_params = batch["packed_seq_params"]
             # returns "hidden_states" if not model.post_process (not the last layer)
             # returns "logits" when label is None.
             output = gptmodel_forward(
-                model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel, packed_seq_params
+                model,
+                input_ids,
+                attention_mask,
+                position_ids,
+                self.tf_config.sequence_parallel,
+                packed_seq_params,
             )
             return output, loss_func
 
@@ -189,8 +228,8 @@ class MegatronE2eWorker(MegatronBaseWorker):
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
         return losses_reduced, grad_norm
 
-    def _build_model_optimizer(self,
-        model_path, optim_config, override_model_config, override_transformer_config
+    def _build_model_optimizer(
+        self, model_path, optim_config, override_model_config, override_transformer_config
     ):
 
         self._init_hf_config_and_tf_config(
@@ -198,7 +237,7 @@ class MegatronE2eWorker(MegatronBaseWorker):
             self.dtype,
             override_model_config,
             override_transformer_config,
-            True, # trust_remote_code
+            True,  # trust_remote_code
         )
 
         def make_model(wrap_with_ddp=False):
@@ -211,14 +250,14 @@ class MegatronE2eWorker(MegatronBaseWorker):
                     post_process,
                     share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
                     value=False,
-                    freeze_moe_router=override_model_config.get("moe_config", {}).get("freeze_moe_router", False),
+                    freeze_moe_router=override_model_config.get("moe_config", {}).get(
+                        "freeze_moe_router", False
+                    ),
                 )
                 parallel_model.to("cuda")
                 return parallel_model
 
-            override_ddp_config = OmegaConf.to_container(
-                OmegaConf.create(), resolve=True
-            )
+            override_ddp_config = OmegaConf.to_container(OmegaConf.create(), resolve=True)
             return get_model(
                 megatron_actor_model_provider,
                 wrap_with_ddp=wrap_with_ddp,
@@ -233,12 +272,10 @@ class MegatronE2eWorker(MegatronBaseWorker):
             print_model_size(train_module[0])
 
         optim_config_megatron = init_megatron_optim_config(optim_config)
-        optimizer = get_megatron_optimizer(
-            model_chunks=train_module, config=optim_config_megatron)
+        optimizer = get_megatron_optimizer(model_chunks=train_module, config=optim_config_megatron)
         optimizer_scheduler = get_megatron_optimizer_param_scheduler(
             optimizer=optimizer, config=optim_config
         )
-
 
         self.train_module = train_module
         self.optimizer = optimizer
@@ -248,24 +285,24 @@ class MegatronE2eWorker(MegatronBaseWorker):
 
 
 def init_megatron_e2e_test(
-    hidden_size_q: int, hidden_size_kv: int, num_tokens: int,
-    world_size: int, max_cp_degree: int, tp_size: int,
-    dtype, worker_cls=MegatronE2eWorker
+    hidden_size_q: int,
+    hidden_size_kv: int,
+    num_tokens: int,
+    world_size: int,
+    max_cp_degree: int,
+    tp_size: int,
+    dtype,
+    worker_cls=MegatronE2eWorker,
 ):
     token_bytes_q = hidden_size_q * dtype.itemsize
     token_bytes_kv = hidden_size_kv * dtype.itemsize
     max_tokens_query = num_tokens * (world_size // tp_size)
     max_tokens_key_value = num_tokens * (world_size // tp_size)
     buffer_size = (
-        token_bytes_q * max_tokens_query +
-        token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
+        token_bytes_q * max_tokens_query + token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     )
-    parallel_config = ParallelConfig(
-        tensor_model_parallel_size=tp_size
-    )
-    worker = init_worker_torch_distributed(
-        world_size, buffer_size, worker_cls, parallel_config
-    )
+    parallel_config = ParallelConfig(tensor_model_parallel_size=tp_size)
+    worker = init_worker_torch_distributed(world_size, buffer_size, worker_cls, parallel_config)
     print("Communication groups initialized")
     return worker
 
@@ -288,13 +325,19 @@ def test(args):
 
     hidden_size_kv = hidden_size_q
     if hasattr(hf_config, "num_key_value_heads"):
-        hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
-                          hf_config.num_attention_heads)
+        hidden_size_kv = (
+            hidden_size_kv * hf_config.num_key_value_heads // hf_config.num_attention_heads
+        )
 
     worker: MegatronE2eWorker = init_megatron_e2e_test(
-        hidden_size_q, hidden_size_kv, num_tokens,
-        world_size, max_cp_degree, tp_size,
-        dtype, MegatronE2eWorker
+        hidden_size_q,
+        hidden_size_kv,
+        num_tokens,
+        world_size,
+        max_cp_degree,
+        tp_size,
+        dtype,
+        MegatronE2eWorker,
     )
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
@@ -308,20 +351,35 @@ def test(args):
     dp_size = as_world_size
     num_batched_token_per_as_rank = num_tokens // dp_size
     os.environ["D2_SEQ_LEN"] = str(num_batched_token_per_as_rank)
-    print(f"🟡 [Rank {as_rank}] {dp_size=}, {num_batched_token_per_as_rank=}, {os.environ['D2_SEQ_LEN']=}")
-    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
-
+    print(
+        f"🟡 [Rank {as_rank}] {dp_size=}, {num_batched_token_per_as_rank=}, {os.environ['D2_SEQ_LEN']=}"
+    )
+    worker.train_module[
+        0
+    ].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
 
     _, fa2a_metadata_0, attn_metadata_0, doc_lens_0 = create_one_batch(
-        seed, as_world_size, num_token_on_rank, num_docs, max_cp_degree,
-        hidden_size_q_tp, hidden_size_k_tp, element_size
+        seed,
+        as_world_size,
+        num_token_on_rank,
+        num_docs,
+        max_cp_degree,
+        hidden_size_q_tp,
+        hidden_size_k_tp,
+        element_size,
     )
     _, fa2a_metadata_1, attn_metadata_1, doc_lens_1 = create_one_batch(
-        seed + 1, as_world_size, num_token_on_rank, num_docs, max_cp_degree,
-        hidden_size_q_tp, hidden_size_k_tp, element_size
+        seed + 1,
+        as_world_size,
+        num_token_on_rank,
+        num_docs,
+        max_cp_degree,
+        hidden_size_q_tp,
+        hidden_size_k_tp,
+        element_size,
     )
 
     set_random_seed(seed, set_megatron=False)
@@ -385,13 +443,18 @@ if __name__ == "__main__":
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--num-gpus-per-node", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--profile-memory", action="store_true", default=False,)
+    parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        default=False,
+    )
     parser.add_argument("--profile-memory-output-path", type=str, default="profile")
     args = parser.parse_args()
 
     if args.profile_memory:
         os.makedirs(args.profile_memory_output_path, exist_ok=True)
         import torch
+
         torch.cuda.memory._record_memory_history()
 
     if args.profile_memory:
@@ -407,8 +470,9 @@ if __name__ == "__main__":
         ) as prof:
             try:
                 test(args)
-            except Exception as e:
+            except Exception:
                 import traceback
+
                 traceback.print_exc()
                 pass
     else:
@@ -417,8 +481,10 @@ if __name__ == "__main__":
     if args.profile_memory:
         print("Dumping memory snapshot")
         rank = torch.distributed.get_rank()
-        torch.cuda.memory._dump_snapshot(f"{args.profile_memory_output_path}/mem_snapshot_{rank}.pickle")
-        prof.export_memory_timeline(f"{args.profile_memory_output_path}/mem_timeline_{rank}.html", device="cuda:0")
+        torch.cuda.memory._dump_snapshot(
+            f"{args.profile_memory_output_path}/mem_snapshot_{rank}.pickle"
+        )
+        prof.export_memory_timeline(
+            f"{args.profile_memory_output_path}/mem_timeline_{rank}.html", device="cuda:0"
+        )
         print("Memory snapshot dumped")
-
-

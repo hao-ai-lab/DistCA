@@ -10,9 +10,9 @@
 #SBATCH --mem=512G
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
-#SBATCH --partition=lowprio 
+#SBATCH --partition=lowprio
 #SBATCH --qos=lowprio
-#SBATCH --requeue 
+#SBATCH --requeue
 
 # ------------------------------------------------------
 # Input Variables (what you will set outside)
@@ -97,9 +97,9 @@ mkdir -p "$LOG_DIR"
 # Environment variables
 # ---------------------------
 # export NVSHMEM_BOOTSTRAP=mpi
-export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
 export NVSHMEM_IB_ENABLE_IBGDA=true
-# export TORCH_CPP_LOG_LEVEL=INFO 
+# export TORCH_CPP_LOG_LEVEL=INFO
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
 # export TORCH_DIST_INIT_RETRY_TIMEOUT=15
 export TORCH_DIST_INIT_RETRY_TIMEOUT=30
@@ -120,7 +120,7 @@ export TORCH_DIST_INIT_RETRY_TIMEOUT=30
 # export NVSHMEM_IBGDA_NUM_RC_PER_PE=4
 # export NCCL_ASYNC_ERROR_HANDLING=1
 # Comment out for a clean log.
-# export CUDA_LAUNCH_BLOCKING=1 
+# export CUDA_LAUNCH_BLOCKING=1
 # export D2_DEBUG_PRINT=0
 # export D2_FA2A_DISABLE_SEND_RECV=0
 # export WLBLLM_DISABLE_LSE=1
@@ -193,7 +193,7 @@ SHOULD_PROFILE_MEMORY=${SHOULD_PROFILE_MEMORY:-0}
 
 # -vvvv # Touching the --cpu-per-task and --cpu-bind variables may cause srun to hang.
 SRUN_BASE=(
-  srun --kill-on-bad-exit=1 
+  srun --kill-on-bad-exit=1
   -N ${NNODES}
   -G ${WORLD_SIZE}
   --ntasks-per-node=1
@@ -224,7 +224,7 @@ TORCHRUN_CMD=(
   --rdzv_endpoint=${RZV_ENDPOINT}
   --rdzv_id=${RZV_ID}
   --max_restarts=0
-  --no-python bash ./bind_and_exec.sh 
+  --no-python bash ./bind_and_exec.sh
     python test_wlb_e2e.py
     --num-tokens ${NUM_TOKENS}
     --num-batches ${BATCH_SIZE}
@@ -377,7 +377,7 @@ echo_and_tee "$EXP_README" "- Elapsed time: $elapsed_time seconds"
 # Check if the experiment finished successfully
 if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
     echo "Experiment failed. The benchmark.json file does not exist."
-else 
+else
     echo "Experiment success. See the $OUTPUT_DIR/benchmark.json file."
     echo_and_tee "$EXP_README" "Experiment success. See the $OUTPUT_DIR/benchmark.json file."
 fi

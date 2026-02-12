@@ -19,19 +19,23 @@ class AlltoAllPhase(Enum):
         return self in (AlltoAllPhase.FWD_ATTN, AlltoAllPhase.BWD_ATTN, AlltoAllPhase.FWD_ATTN_LSE)
 
 
-@dataclass(eq=True, frozen=True)    # frozen to make it hashable
+@dataclass(eq=True, frozen=True)  # frozen to make it hashable
 class AlltoAllMetadataRecord:
     num_seqs_pad: int
     max_cp_degree_pad: int
     phase: AlltoAllPhase
     ping_pong_id: int
     microbatch_id: int
+
+
 ####
 
 
 def _create_static_metadata(
-    num_seqs_pad: int, max_cp_degree_pad: int,
-    phase: AlltoAllPhase, world_size: int,
+    num_seqs_pad: int,
+    max_cp_degree_pad: int,
+    phase: AlltoAllPhase,
+    world_size: int,
 ):
     # whether kv will be sent
     comm_non_repeat_only = phase.comm_non_repeat_only()
@@ -42,27 +46,43 @@ def _create_static_metadata(
         send_memcpy_metadata=tuple(
             torch.zeros((num_seqs_pad,), dtype=torch.int64),
             *(
-                torch.zeros((max_cp_degree_pad, num_seqs_pad,), dtype=torch.int64)
+                torch.zeros(
+                    (
+                        max_cp_degree_pad,
+                        num_seqs_pad,
+                    ),
+                    dtype=torch.int64,
+                )
                 for _ in range(2 if not comm_non_repeat_only else 0)
             ),
         ),
         recv_memcpy_metadata=tuple(
             torch.zeros((num_seqs_pad,), dtype=torch.int64),
             *(
-                torch.zeros((max_cp_degree_pad, num_seqs_pad,), dtype=torch.int64)
+                torch.zeros(
+                    (
+                        max_cp_degree_pad,
+                        num_seqs_pad,
+                    ),
+                    dtype=torch.int64,
+                )
                 for _ in range(2 if not comm_non_repeat_only else 0)
             ),
         ),
         my_rank_send_offset=0,
         my_rank_recv_offset=0,
         my_rank_send_sz=0,
-        seq_lens=tuple(SeqLens(
-            torch.zeros((num_seqs_pad,), dtype=torch.int64),
-            torch.zeros((num_seqs_pad,), dtype=torch.int64),
-        ) for _ in range(1 if comm_non_repeat_only else 2)),
+        seq_lens=tuple(
+            SeqLens(
+                torch.zeros((num_seqs_pad,), dtype=torch.int64),
+                torch.zeros((num_seqs_pad,), dtype=torch.int64),
+            )
+            for _ in range(1 if comm_non_repeat_only else 2)
+        ),
         tensor_shape=tuple(None for _ in range(1 if comm_non_repeat_only else 2)),
         kv_replica_mask=(
-            None if comm_non_repeat_only
+            None
+            if comm_non_repeat_only
             else torch.zeros((num_seqs_pad, max_cp_degree_pad), dtype=torch.int8)
         ),
         single_stream=None,
@@ -71,13 +91,16 @@ def _create_static_metadata(
 
 
 def _copy_to_static_metadata(
-    metadata: AlltoAllMetadata, dst_static_metadata: AlltoAllMetadata,
-    send_num_seqs: list[int], recv_num_seqs: list[int], max_cp_degree: int | None
+    metadata: AlltoAllMetadata,
+    dst_static_metadata: AlltoAllMetadata,
+    send_num_seqs: list[int],
+    recv_num_seqs: list[int],
+    max_cp_degree: int | None,
 ):
     def copy_to_head(src: torch.Tensor, dst: torch.Tensor):
         dst = dst.flatten()
         src = src.flatten()
-        dst[:src.numel()].copy_(src, non_blocking=True)
+        dst[: src.numel()].copy_(src, non_blocking=True)
 
     for src, tgt in zip(metadata.fa2a_metadata, dst_static_metadata.fa2a_metadata):
         tgt.copy_(src, non_blocking=True)
@@ -117,32 +140,46 @@ class StaticMetadataStorage:
     Store static AlltoAllMetadata. This also checks that for each iteration,
     a static metadata is only copied once.
     """
+
     def __init__(self):
         self._storage: dict[AlltoAllMetadataRecord, AlltoAllMetadata] = {}
         self._used_keys: set[AlltoAllMetadataRecord] = set()
 
     def create_metadata(
-        self, num_seqs_pad: int, max_cp_degree_pad: int,
-        phase: AlltoAllPhase, ping_pong_id: int, microbatch_id: int,
+        self,
+        num_seqs_pad: int,
+        max_cp_degree_pad: int,
+        phase: AlltoAllPhase,
+        ping_pong_id: int,
+        microbatch_id: int,
         world_size: int,
     ):
         key = AlltoAllMetadataRecord(
-            num_seqs_pad=num_seqs_pad, max_cp_degree_pad=max_cp_degree_pad,
-            phase=phase, ping_pong_id=ping_pong_id, microbatch_id=microbatch_id
+            num_seqs_pad=num_seqs_pad,
+            max_cp_degree_pad=max_cp_degree_pad,
+            phase=phase,
+            ping_pong_id=ping_pong_id,
+            microbatch_id=microbatch_id,
         )
         assert key not in self._storage
-        metadata = _create_static_metadata(
-            num_seqs_pad, max_cp_degree_pad, phase, world_size
-        )
+        metadata = _create_static_metadata(num_seqs_pad, max_cp_degree_pad, phase, world_size)
         self._storage[key] = metadata
 
     def copy_to_static_metadata(
-        self, metadata: AlltoAllMetadata, num_seqs_pad: int, max_cp_degree_pad: int,
-        phase: AlltoAllPhase, ping_pong_id: int, microbatch_id: int,
+        self,
+        metadata: AlltoAllMetadata,
+        num_seqs_pad: int,
+        max_cp_degree_pad: int,
+        phase: AlltoAllPhase,
+        ping_pong_id: int,
+        microbatch_id: int,
     ):
         key = AlltoAllMetadataRecord(
-            num_seqs_pad=num_seqs_pad, max_cp_degree_pad=max_cp_degree_pad,
-            phase=phase, ping_pong_id=ping_pong_id, microbatch_id=microbatch_id
+            num_seqs_pad=num_seqs_pad,
+            max_cp_degree_pad=max_cp_degree_pad,
+            phase=phase,
+            ping_pong_id=ping_pong_id,
+            microbatch_id=microbatch_id,
         )
         comm_non_repeat_only = phase.comm_non_repeat_only()
         send_num_seqs = [sl.send_seqlens.shape[0] for sl in metadata.seq_lens]

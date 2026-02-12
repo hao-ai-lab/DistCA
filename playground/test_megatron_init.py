@@ -1,21 +1,17 @@
 import argparse
-import os
 import logging
-
+import os
 from datetime import timedelta
+
+from utils.cpu_affinity import set_cpu_affinity
+from utils.hf_config import (
+    get_known_model_config,
+    get_megatron_args_dict_from_hf_model,
+)
 
 from distca.utils.logging import (
     setup_logging,
-    log_tensor_stats,
-    log_module,
     time_it,
-)
-from utils.cpu_affinity import set_cpu_affinity
-from utils.hf_config import (
-    get_megatron_args_dict_from_hf_model,
-    get_known_model_config,
-    MegatronModelArgs,
-    KNOWN_MODEL_CONFIGS,
 )
 
 # --------------------------------
@@ -51,7 +47,8 @@ local_rank = int(os.environ["LOCAL_RANK"])
 # Initialize logging with rank-aware formatting
 # Only specified ranks will log to console; all ranks get file logging later
 logger = setup_logging(
-    rank=rank, world_size=world_size,
+    rank=rank,
+    world_size=world_size,
     level=logging.DEBUG,
     console_ranks=list(range(0, world_size, 8)),  # Only rank 0 logs to console
 )
@@ -68,7 +65,6 @@ with time_it("core-binding"):
     set_cpu_affinity(local_rank, ncpu_per_proc=16, logger=logger)
 
 
-
 logger.info(f"Rank: {rank}, World Size: {world_size}, Local Rank: {local_rank}")
 
 with time_it("set device"):
@@ -77,20 +73,18 @@ with time_it("set device"):
 
 with time_it("init_process_group"):
     torch.distributed.init_process_group(
-        backend="cpu:gloo,cuda:nccl", 
-        rank=rank, 
-        world_size=world_size, 
-        timeout = timedelta(seconds=60),
+        backend="cpu:gloo,cuda:nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
     )
 
 with time_it("import megatron.core"):
     import megatron.core
 with time_it("import megatron.core.tensor_parallel"):
-    from megatron.core import tensor_parallel
+    pass
 with time_it("import megatron.core.parallel_state"):
     from megatron.core import parallel_state
-
-
 
 
 # Use parallel_state to initialize the model parallel groups
@@ -119,20 +113,22 @@ with time_it("initialize model parallel groups"):
     #     tp = 4; pp = 2; cp = 2;
     # else:
     #     tp = 8; pp = 2; cp = 2;
-    
-    tp = 1; pp = 1; cp = 1;
+
+    tp = 1
+    pp = 1
+    cp = 1
     # tp = min(8, world_size);
     # pp = world_size // tp;
-    cp = 1;
+    cp = 1
     # tp = 1; pp = 2; cp = 1;
 
     parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size=tp, 
+        tensor_model_parallel_size=tp,
         pipeline_model_parallel_size=pp,
         context_parallel_size=cp,
         distributed_timeout_minutes=2,
         # nccl_communicator_config_path=None, # default
-        order = "tp-cp-ep-dp-pp", # default
+        order="tp-cp-ep-dp-pp",  # default
     )
 
     # get the tp,pp,cp,dp,ep rank of this process
@@ -146,12 +142,15 @@ with time_it("initialize model parallel groups"):
     dp_size = parallel_state.get_data_parallel_world_size()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
     ep_size = parallel_state.get_expert_model_parallel_world_size()
-    logger.info(f"TP: {tp_rank} / {tp_size}, PP: {pp_rank} / {pp_size}, CP: {cp_rank} / {cp_size}, DP: {dp_rank} / {dp_size}, EP: {ep_rank} / {ep_size}")
+    logger.info(
+        f"TP: {tp_rank} / {tp_size}, PP: {pp_rank} / {pp_size}, CP: {cp_rank} / {cp_size}, DP: {dp_rank} / {dp_size}, EP: {ep_rank} / {ep_size}"
+    )
 
     # Print all of the tp/pp/cp/dp ranks
     def print_ranks(group):
         ranks = torch.distributed.get_process_group_ranks(group)
         return ranks
+
     logger.info(f"TP Ranks: {print_ranks(parallel_state.get_tensor_model_parallel_group())}")
     logger.info(f"PP Ranks: {print_ranks(parallel_state.get_pipeline_model_parallel_group())}")
     logger.info(f"CP Ranks: {print_ranks(parallel_state.get_context_parallel_group())}")
@@ -174,10 +173,11 @@ else:
 
 
 torch.distributed.barrier()
-logger.info(f"Finish initializing megatron parallel groups.")
+logger.info("Finish initializing megatron parallel groups.")
 
-from distca.utils.logging import setup_log_directories, redirect_external_loggers
 from pathlib import Path
+
+from distca.utils.logging import redirect_external_loggers, setup_log_directories
 
 log_paths = setup_log_directories(
     rank=rank,
@@ -192,10 +192,9 @@ data_cache_path = log_paths.data_cache_path
 ckpt_path = log_paths.ckpt_path
 tensorboard_path = log_paths.tensorboard_path
 
-data_path = Path(__file__).parent / 'data_process' / 'code_content_document'
+data_path = Path(__file__).parent / "data_process" / "code_content_document"
 data_path = data_path.resolve().absolute()
 logger.info(f"Data path: {data_path}")
-
 
 
 # --------------------------------
@@ -260,49 +259,70 @@ logger.info(f"Model config: {model_config_dict}")
 designated_args = [
     # Minimal required Megatron arguments to pass validation.
     # Organized to match megatron-args.txt ordering.
-
-    "--seed", "42",
-
+    "--seed",
+    "42",
     ####################
     # 1. Model Architecture
     ####################
-    "--num-layers", str(model_config_dict["num_layers"]),
-    "--hidden-size", str(model_config_dict["hidden_size"]),
-    "--ffn-hidden-size", str(model_config_dict["ffn_hidden_size"]),
-    "--num-attention-heads", str(model_config_dict["num_attention_heads"]),
+    "--num-layers",
+    str(model_config_dict["num_layers"]),
+    "--hidden-size",
+    str(model_config_dict["hidden_size"]),
+    "--ffn-hidden-size",
+    str(model_config_dict["ffn_hidden_size"]),
+    "--num-attention-heads",
+    str(model_config_dict["num_attention_heads"]),
     "--group-query-attention",
-    "--num-query-groups", str(model_config_dict["num_query_groups"]),
-    "--max-position-embeddings", str(model_config_dict["max_position_embeddings"]),
-    "--position-embedding-type", str(model_config_dict["position_embedding_type"]),
-    "--rotary-base", str(model_config_dict["rotary_base"]),
-    "--normalization", str(model_config_dict["normalization"]),
+    "--num-query-groups",
+    str(model_config_dict["num_query_groups"]),
+    "--max-position-embeddings",
+    str(model_config_dict["max_position_embeddings"]),
+    "--position-embedding-type",
+    str(model_config_dict["position_embedding_type"]),
+    "--rotary-base",
+    str(model_config_dict["rotary_base"]),
+    "--normalization",
+    str(model_config_dict["normalization"]),
     "--swiglu" if model_config_dict["swiglu"] else None,
-    "--untie-embeddings-and-output-weights" if model_config_dict["untie_embeddings_and_output_weights"] else None,
-    "--seq-length", str(model_config_dict["seq_length"]),
-    "--vocab-size", str(model_config_dict["vocab_size"]),
-    "--attention-backend", "auto",
-
+    "--untie-embeddings-and-output-weights"
+    if model_config_dict["untie_embeddings_and_output_weights"]
+    else None,
+    "--seq-length",
+    str(model_config_dict["seq_length"]),
+    "--vocab-size",
+    str(model_config_dict["vocab_size"]),
+    "--attention-backend",
+    "auto",
     ####################
     # 2. Training Hyperparameters
     ####################
-    "--micro-batch-size", "1",
-    "--lr", "1.0e-5",
+    "--micro-batch-size",
+    "1",
+    "--lr",
+    "1.0e-5",
     # "--train-samples", "100000",
     # "--train-iters", "100000",
-    "--train-iters", "1",
-    "--lr-warmup-init", "1e-5",
-    "--lr-decay-iters", "1000000",
-    "--lr-decay-style", "constant",
+    "--train-iters",
+    "1",
+    "--lr-warmup-init",
+    "1e-5",
+    "--lr-decay-iters",
+    "1000000",
+    "--lr-decay-style",
+    "constant",
     # "--lr-warmup-iters", "1000",
     # "--lr-warmup-fraction", "0.0",
-    "--min-lr", "1e-6",
+    "--min-lr",
+    "1e-6",
     # "--min-lr-ratio", None,
     # "--warmup-style", "constant",
-    "--weight-decay", "0.01",
-    "--weight-decay-incr-style", "constant",
+    "--weight-decay",
+    "0.01",
+    "--weight-decay-incr-style",
+    "constant",
     # "--use-checkpoint-opt-param-scheduler",
-    "--lr-wsd-decay-style", "linear",
-
+    "--lr-wsd-decay-style",
+    "linear",
     ####################
     # 3. Dropout & Regularization
     ####################
@@ -311,95 +331,111 @@ designated_args = [
     # "--no-bias-swiglu-fusion",
     # "--no-bias-dropout-fusion",
     # "--no-rope-fusion",
-
     ####################
     # 4. Mixed Precision
     ####################
     "--bf16",  # REQUIRED for flash attention to work!
-
     ####################
     # 5. Parallelism & Distributed Training
     ####################
-    "--tensor-model-parallel-size", str(tp),
-    "--pipeline-model-parallel-size", str(pp),
-    "--context-parallel-size", str(cp),
-    "--cp-comm-type", "p2p",  # async
+    "--tensor-model-parallel-size",
+    str(tp),
+    "--pipeline-model-parallel-size",
+    str(pp),
+    "--context-parallel-size",
+    str(cp),
+    "--cp-comm-type",
+    "p2p",  # async
     # "--distributed-backend", "nccl",
-    "--distributed-timeout-minutes", "1",
-    "--local-rank", str(local_rank),
-
+    "--distributed-timeout-minutes",
+    "1",
+    "--local-rank",
+    str(local_rank),
     ####################
     # 6. Data/IO
     ####################
-    "--data-path", str(data_path),
+    "--data-path",
+    str(data_path),
     # "--mock-data",
     # "--tokenizer-type", "NullTokenizer",
-    "--tokenizer-type", "HuggingFaceTokenizer",
-    "--tokenizer-model", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "--tokenizer-type",
+    "HuggingFaceTokenizer",
+    "--tokenizer-model",
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
     # Note: --vocab-size is now provided by model_arch_args from HF config
-    "--data-cache-path", str(data_cache_path),
-    "--tiktoken-pattern", "v2",
+    "--data-cache-path",
+    str(data_cache_path),
+    "--tiktoken-pattern",
+    "v2",
     # "--no-create-attention-mask-in-dataloader",
     # "--no-mmap-bin-files",
-    "--num-workers", "1",
-    "--split", "90,5,5",
+    "--num-workers",
+    "1",
+    "--split",
+    "90,5,5",
     # --data-path $DATA_PATH
     # --vocab-file $VOCAB_FILE
     # --merge-file $MERGE_FILE
-
     ####################
     # 7. Checkpointing & Saving
     ####################
-    "--save", str(ckpt_path),
-    "--load", str(ckpt_path),
-    "--save-interval", "0",
-
+    "--save",
+    str(ckpt_path),
+    "--load",
+    str(ckpt_path),
+    "--save-interval",
+    "0",
     ####################
     # 8. Logging & Monitoring
     ####################
     # "--eval-interval", "10",
     # "--log-progress",
-    "--log-interval", "1",
+    "--log-interval",
+    "1",
     "--log-params-norm",
     "--log-timers-to-tensorboard",
     "--log-memory-to-tensorboard",
     "--log-throughput",
-    "--tensorboard-dir", str(tensorboard_path),  # Required for wandb logging to work!
-    "--tensorboard-log-interval", "1",
-    "--wandb-project", "distca",
-    "--wandb-exp-name", "test-megatron-init",
-    "--logging-level", "20",  # Megatron logging level: INFO = 20
+    "--tensorboard-dir",
+    str(tensorboard_path),  # Required for wandb logging to work!
+    "--tensorboard-log-interval",
+    "1",
+    "--wandb-project",
+    "distca",
+    "--wandb-exp-name",
+    "test-megatron-init",
+    "--logging-level",
+    "20",  # Megatron logging level: INFO = 20
     # "--record-memory-history",
     # "--profile",
-    "--profile-step-start", "2",
-    "--profile-step-end", "4",
+    "--profile-step-start",
+    "2",
+    "--profile-step-end",
+    "4",
     # "--profile-ranks",
-
     ####################
     # 9. Advanced Features & Extensions
     ####################
     # MoE related
     # fp8 related
-
     ####################
     # 10. Special Modes/Debugging
     ####################
     # "--no-check-for-nan-in-loss-and-grad",
     "--check-for-spiky-loss",
     "--check-for-large-grads",
-
     ####################
     # 11. Miscellaneous
     ####################
     # Activation Recomputation
     # "--recompute-granularity", "selective",
     # "--recompute-modules", "mlp",
-    "--recompute-granularity", "selective",
-    "--recompute-modules", "core_attn", #"mlp",
-
+    "--recompute-granularity",
+    "selective",
+    "--recompute-modules",
+    "core_attn",  # "mlp",
     # Cuda Graphs
     # "--enable-cuda-graph", "True",
-
     # Network/Communication Overlap
     # "--overlap-grad-reduce",
     # "--overlap-param-gather",
@@ -415,33 +451,44 @@ designated_args = [arg for arg in designated_args if arg is not None]
 # -----------------------------------------
 # Get the proper config object
 # -----------------------------------------
-from megatron.core.transformer.transformer_config import TransformerConfig
 from dataclasses import dataclass
+
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+
 @dataclass
 class DistCAConfig(TransformerConfig):
     """Configuration object for DistCA."""
 
     distca_nvshmem_buffer_size_gb: float = 1.0
-    """Set the NVSHMEM buffer size (in GB). 
+    """Set the NVSHMEM buffer size (in GB).
     TODO: By default, we want to make it configurable by the planner."""
-
 
     distca_quit_if_maybe_oom: bool = False
     """If True, the program will quit if the estimated memory can probably exceeds the GPU max memory."""
 
     pass
 
-def replace_parser_and_parse_args(parser: argparse.ArgumentParser):    
+
+def replace_parser_and_parse_args(parser: argparse.ArgumentParser):
     """Hijack the parser, and use the `designated_args` as the arguments. Then we also inject some of our own arguments."""
 
     # Define the extra arguments for DistCA
-    group = parser.add_argument_group(title='distca')
-    
-    group.add_argument("--distca-nvshmem-buffer-size-gb", type=int, default=2, 
-    help="Set the NVSHMEM buffer size (in GB)")
+    group = parser.add_argument_group(title="distca")
 
-    group.add_argument("--distca-quit-if-maybe-oom", action="store_true", default=False, 
-    help="If True, the program will quit if the estimated memory can probably exceeds the GPU max memory.")
+    group.add_argument(
+        "--distca-nvshmem-buffer-size-gb",
+        type=int,
+        default=2,
+        help="Set the NVSHMEM buffer size (in GB)",
+    )
+
+    group.add_argument(
+        "--distca-quit-if-maybe-oom",
+        action="store_true",
+        default=False,
+        help="If True, the program will quit if the estimated memory can probably exceeds the GPU max memory.",
+    )
 
     old_parser_parse_args = parser.parse_args
     old_parser_parse_known_args = parser.parse_known_args
@@ -450,28 +497,31 @@ def replace_parser_and_parse_args(parser: argparse.ArgumentParser):
 
     return parser
 
-with time_it("initialize megatron"):
-    from megatron.training.initialize import initialize_megatron    
-    initialize_megatron(
-        extra_args_provider=replace_parser_and_parse_args, # default
-        args_defaults={}, # default
-        get_embedding_ranks=None, # default
-        get_position_embedding_ranks=None, # default
-    )
-    logger.info(f"Successfully initialized megatron")
 
+with time_it("initialize megatron"):
+    from megatron.training.initialize import initialize_megatron
+
+    initialize_megatron(
+        extra_args_provider=replace_parser_and_parse_args,  # default
+        args_defaults={},  # default
+        get_embedding_ranks=None,  # default
+        get_position_embedding_ranks=None,  # default
+    )
+    logger.info("Successfully initialized megatron")
 
 
 checkpointing_context = {}
 
-from megatron.training.global_vars import get_args
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.global_vars import get_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 args = get_args()
 if args.yaml_cfg is not None:
-    assert False, "YAML config is not supported yet becuase inside the core_transformer_config_from_yaml, you can only use TransformerConfig. We need to extend the config class to support DistCA configs."
+    assert False, (
+        "YAML config is not supported yet becuase inside the core_transformer_config_from_yaml, you can only use TransformerConfig. We need to extend the config class to support DistCA configs."
+    )
     config = core_transformer_config_from_yaml(args, "language_model")
 else:
     config = core_transformer_config_from_args(args, config_class=DistCAConfig)
@@ -482,22 +532,22 @@ assert isinstance(config, TransformerConfig)
 # Report theoretical memory and FLOPS estimates
 # -----------------------------------------
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from utils.estimate import log_memory_estimate, log_flops_estimate
-
+from utils.estimate import log_flops_estimate, log_memory_estimate
 
 num_microbatches = get_num_microbatches()
 
 # Log memory estimates
 memory_estimate = log_memory_estimate(
-    args, 
-    num_microbatches=num_microbatches, 
-    verbose=True, 
-    logger=logger
+    args, num_microbatches=num_microbatches, verbose=True, logger=logger
 )
 
 if memory_estimate.maybe_oom() and args.distca_quit_if_maybe_oom:
-    logger.error(f"Estimated memory ({memory_estimate.total_gb:.2f} GB) can probably exceeds GPU max memory ({memory_estimate.gpu_max_memory_gb:.2f} GB). Training will likely OOM!")
-    raise RuntimeError(f"Estimated memory {memory_estimate.total_gb:.2f} GB can probably exceeds GPU max memory {memory_estimate.gpu_max_memory_gb:.2f} GB. Training will likely OOM! Quit the program.")
+    logger.error(
+        f"Estimated memory ({memory_estimate.total_gb:.2f} GB) can probably exceeds GPU max memory ({memory_estimate.gpu_max_memory_gb:.2f} GB). Training will likely OOM!"
+    )
+    raise RuntimeError(
+        f"Estimated memory {memory_estimate.total_gb:.2f} GB can probably exceeds GPU max memory {memory_estimate.gpu_max_memory_gb:.2f} GB. Training will likely OOM! Quit the program."
+    )
 
 # Log FLOPS estimates
 flops_estimate = log_flops_estimate(
@@ -524,11 +574,16 @@ flops_estimate = log_flops_estimate(
 # -----------------------------------------
 # Model, optimizer, and learning rate.
 # -----------------------------------------
-from megatron.training.training import setup_model_and_optimizer
-from megatron.core.enums import ModelType
 from typing import Union
+
+from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'megatron.legacy.model.GPTModel']:
+from megatron.training.training import setup_model_and_optimizer
+
+
+def model_provider(
+    pre_process=True, post_process=True
+) -> Union[GPTModel, "megatron.legacy.model.GPTModel"]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -545,49 +600,72 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'mega
     use_te = args.transformer_impl == "transformer_engine"
 
     if args.record_memory_history:
-        torch.cuda.memory._record_memory_history(True,
+        torch.cuda.memory._record_memory_history(
+            True,
             # keep 100,000 alloc/free events from before the snapshot
             trace_alloc_max_entries=100000,
-
             # record stack information for the trace events
-            trace_alloc_record_context=True)
+            trace_alloc_record_context=True,
+        )
 
         def oom_observer(device, alloc, device_alloc, device_free):
             # snapshot right after an OOM happened
-            print('saving allocated state during OOM')
+            print("saving allocated state during OOM")
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
-            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
+
+            dump(
+                snapshot,
+                open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", "wb"),
+            )
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
     logger.info(f"Building model for rank {torch.distributed.get_rank()}")
 
-
     if args.num_experts:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+
         # Define the decoder block spec
-        transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te, normalization=args.normalization)
+        transformer_layer_spec = get_gpt_decoder_block_spec(
+            config, use_transformer_engine=use_te, normalization=args.normalization
+        )
     elif args.heterogeneous_layers_config_path is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_heterogeneous_layer_spec
+
         transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
     else:
         # Define the decoder layer spec
         if use_te:
-            from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+            from megatron.core.models.gpt.gpt_layer_specs import (
+                get_gpt_layer_with_transformer_engine_spec,
+            )
+
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                args.num_experts, args.moe_grouped_gemm,
-                args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
+                args.num_experts,
+                args.moe_grouped_gemm,
+                args.qk_layernorm,
+                args.multi_latent_attention,
+                args.moe_use_legacy_grouped_gemm,
+            )
         else:
             from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+
             transformer_layer_spec = get_gpt_layer_local_spec(
-                args.num_experts, args.moe_grouped_gemm,
-                args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm,
-                normalization=args.normalization)
-    
+                args.num_experts,
+                args.moe_grouped_gemm,
+                args.qk_layernorm,
+                args.multi_latent_attention,
+                args.moe_use_legacy_grouped_gemm,
+                normalization=args.normalization,
+            )
+
     mtp_block_spec = None
     if args.mtp_num_layers is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
-        mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_transformer_engine=use_te)
+
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config, transformer_layer_spec, use_transformer_engine=use_te
+        )
 
     model = GPTModel(
         config=config,
@@ -608,6 +686,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'mega
 
     return model
 
+
 with time_it("setup_model_and_optimizer()"):
     model_type = ModelType.encoder_or_decoder
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -615,8 +694,7 @@ with time_it("setup_model_and_optimizer()"):
     )
     logger.info(f"Successfully setup model and optimizer for rank {torch.distributed.get_rank()}")
 
-logger.info('after model, optimizer, and learning rate '
-            'scheduler are built')
+logger.info("after model, optimizer, and learning rate scheduler are built")
 
 logger.debug(f"Model: {model}")
 logger.debug(f"Optimizer: {optimizer}")
@@ -625,23 +703,22 @@ logger.debug(f"Learning Rate Scheduler: {opt_param_scheduler}")
 # --------------------------------
 # Initialize DataLoader (?)
 # --------------------------------
+
 import numpy
-from typing import Optional, Tuple, List
-from megatron.training.tokenizer.tokenizer import MegatronTokenizer
-from megatron.core.datasets.utils import Split
-from megatron.training.training import build_train_valid_test_data_iterators
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
+from megatron.core.datasets.utils import Split
 from megatron.training import get_tokenizer
-from typing import Optional, Tuple, List
+from megatron.training.tokenizer.tokenizer import MegatronTokenizer
+from megatron.training.training import build_train_valid_test_data_iterators
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
 )
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 
 mpu = parallel_state
+
 
 def is_dataset_built_on_rank():
     return (
@@ -654,8 +731,8 @@ def core_gpt_dataset_config_from_args(args):
     tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend: tuple[list[str], list[float] | None] | None
+    blend_per_split: list[tuple[list[str], list[float] | None] | None] | None
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
     return GPTDatasetConfig(
@@ -674,7 +751,6 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         s3_cache_path=args.s3_cache_path,
     )
-
 
 
 class DistCAMockGPTLowLevelDataset:
@@ -701,8 +777,7 @@ class DistCAMockGPTLowLevelDataset:
         self.tokenizer = tokenizer
         rng = numpy.random.default_rng(seed=self.seed)
         self.sequence_lengths = rng.integers(
-            low=1, high=self.max_sequence_length, 
-            size=self.size, dtype=numpy.int32
+            low=1, high=self.max_sequence_length, size=self.size, dtype=numpy.int32
         )
 
     def __len__(self) -> int:
@@ -715,7 +790,7 @@ class DistCAMockGPTLowLevelDataset:
         )
         return sample
 
-    def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
+    def get(self, idx: int, offset: int = 0, length: int | None = None) -> numpy.ndarray:
         """This function is an abstraction over __getitem__ with support for slicing
 
         Args:
@@ -754,7 +829,7 @@ class DistCAMockGPTDataset(GPTDataset):
     def __init__(
         self,
         dataset: DistCAMockGPTLowLevelDataset,
-        dataset_path: Optional[str],
+        dataset_path: str | None,
         indices: numpy.ndarray,
         num_samples: int,
         index_split: Split,
@@ -778,7 +853,7 @@ class DistCAMockGPTDataset(GPTDataset):
 
     @staticmethod
     def build_low_level_dataset(
-        dataset_path: Optional[str], config: GPTDatasetConfig
+        dataset_path: str | None, config: GPTDatasetConfig
     ) -> DistCAMockGPTLowLevelDataset:
         """Abstract method implementation
 
@@ -813,20 +888,18 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     logger.info("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type,
-        train_val_test_num_samples,
-        is_dataset_built_on_rank,
-        config
+        dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
     ).build()
 
     logger.info("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
 
+
 train_valid_test_datasets_provider.is_distributed = True
-train_data_iterator, valid_data_iterator, test_data_iterator \
-    = build_train_valid_test_data_iterators(
-        train_valid_test_datasets_provider)
+train_data_iterator, valid_data_iterator, test_data_iterator = (
+    build_train_valid_test_data_iterators(train_valid_test_datasets_provider)
+)
 
 
 logger.debug(f"train_data_iterator: {train_data_iterator}")
@@ -835,7 +908,7 @@ logger.debug(f"test_data_iterator: {test_data_iterator}")
 
 if rank == 0:
     # train_data_iterator: RerunDataIterator
-    from megatron.core.rerun_state_machine import RerunDataIterator
+    pass
     # assert isinstance(train_data_iterator, RerunDataIterator)
     # logger.debug(f"train_data_iterator.iterable: {train_data_iterator.iterable}")
     # logger.debug(f"train_data_iterator.saved_microbatches: {train_data_iterator.saved_microbatches}")
@@ -845,8 +918,7 @@ if rank == 0:
     #     if i > 5:
     #         break
 
-logger.info('done with setup ...')
-
+logger.info("done with setup ...")
 
 
 # -----------------------------------------
@@ -854,8 +926,9 @@ logger.info('done with setup ...')
 # -----------------------------------------
 
 # Patch forward_step and backward_step with nvtx markers
-import torch.cuda.nvtx
 import megatron.core.pipeline_parallel.schedules
+import torch.cuda.nvtx
+
 old_forward_step = megatron.core.pipeline_parallel.schedules.forward_step
 old_backward_step = megatron.core.pipeline_parallel.schedules.backward_step
 
@@ -864,64 +937,101 @@ def forward_step_with_nvtx(*args, **kwargs):
     with torch.cuda.nvtx.range("forward_step"):
         return old_forward_step(*args, **kwargs)
 
+
 def backward_step_with_nvtx(*args, **kwargs):
     # with torch.autograd.profiler.emit_nvtx(record_shapes=True):
     with torch.cuda.nvtx.range("backward_step"):
         return old_backward_step(*args, **kwargs)
 
+
 megatron.core.pipeline_parallel.schedules.forward_step = forward_step_with_nvtx
 megatron.core.pipeline_parallel.schedules.backward_step = backward_step_with_nvtx
 
 
-
 # Patch the functions in forward_backward_func
-import megatron.core.pipeline_parallel.schedules 
-old_forward_backward_pipelining_with_interleaving = megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving
-old_forward_backward_pipelining_without_interleaving = megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving
-old_forward_backward_no_pipelining = megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining
+import megatron.core.pipeline_parallel.schedules
+
+old_forward_backward_pipelining_with_interleaving = (
+    megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving
+)
+old_forward_backward_pipelining_without_interleaving = (
+    megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving
+)
+old_forward_backward_no_pipelining = (
+    megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining
+)
+
 
 def forward_backward_pipelining_with_interleaving_with_nvtx(*args, **kwargs):
     with torch.cuda.nvtx.range("forward_backward_pipelining_with_interleaving"):
         return old_forward_backward_pipelining_with_interleaving(*args, **kwargs)
+
+
 def forward_backward_pipelining_without_interleaving_with_nvtx(*args, **kwargs):
     with torch.cuda.nvtx.range("forward_backward_pipelining_without_interleaving"):
         return old_forward_backward_pipelining_without_interleaving(*args, **kwargs)
+
+
 def forward_backward_no_pipelining_with_nvtx(*args, **kwargs):
     with torch.cuda.nvtx.range("forward_backward_no_pipelining"):
         return old_forward_backward_no_pipelining(*args, **kwargs)
-megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving = forward_backward_pipelining_with_interleaving_with_nvtx
-megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving = forward_backward_pipelining_without_interleaving_with_nvtx
-megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining = forward_backward_no_pipelining_with_nvtx
+
+
+megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving = (
+    forward_backward_pipelining_with_interleaving_with_nvtx
+)
+megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving = (
+    forward_backward_pipelining_without_interleaving_with_nvtx
+)
+megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining = (
+    forward_backward_no_pipelining_with_nvtx
+)
 
 
 # Patch optimizer.step with nvtx markers
 old_optimizer_step = optimizer.step
+
+
 def optimizer_step_with_nvtx(*args, **kwargs):
     with torch.cuda.nvtx.range("optimizer_step"):
         return old_optimizer_step(*args, **kwargs)
+
+
 optimizer.step = optimizer_step_with_nvtx
 
 
 # Patch a train_step
 import megatron.training.training
+
 old_train_step = megatron.training.training.train_step
+
+
 def train_step_with_nvtx(*args, **kwargs):
-    logger.debug(f"Start train_step")
+    logger.debug("Start train_step")
     with torch.cuda.nvtx.range("train_step"):
         return old_train_step(*args, **kwargs)
+
+
 megatron.training.training.train_step = train_step_with_nvtx
 
 
 # Patch each layer such that I will know when the forward function gets called
 import megatron.core.transformer.transformer_layer
+
 old_transformer_layer_forward = megatron.core.transformer.transformer_layer.TransformerLayer.forward
+
+
 def transformer_layer_forward_with_nvtx(self, *args, **kwargs):
     # logger.debug(f"Start transformer_layer_forward[{self.layer_number}]")
     with torch.cuda.nvtx.range(f"transformer_layer_forward[{self.layer_number}]"):
         r = old_transformer_layer_forward(self, *args, **kwargs)
     # logger.debug(f"End transformer_layer_forward[{self.layer_number}]")
     return r
-megatron.core.transformer.transformer_layer.TransformerLayer.forward = transformer_layer_forward_with_nvtx
+
+
+megatron.core.transformer.transformer_layer.TransformerLayer.forward = (
+    transformer_layer_forward_with_nvtx
+)
 
 logger.info(f"model: {model}")
 
@@ -930,6 +1040,7 @@ logger.info(f"model: {model}")
 # Start training
 # -----------------------------------------
 from megatron.training.training import train
+
 
 def get_batch(data_iterator):
     """Generate a batch."""
@@ -958,6 +1069,7 @@ def get_batch(data_iterator):
 SPIKY_LOSS_FACTOR = 10
 
 from functools import partial
+
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 
@@ -991,14 +1103,14 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             result=loss[0],
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are determinisic
             fatal=True,
         )
         rerun_state_machine.validate_result(
             result=loss[0],
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are determinisic
             fatal=True,
         )
     # Check for spiky loss
@@ -1011,7 +1123,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are determinisic
             fatal=False,
         )
     # Reduce loss for logging.
@@ -1025,12 +1137,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     return (
         loss[0].clone(),
         local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+        {"lm loss": (reporting_loss[0], reporting_loss[1])},
     )
 
 
-from megatron.training.training import get_timers
 from megatron.core.utils import StragglerDetector
+from megatron.training.training import get_timers
 
 stimer = StragglerDetector()
 
@@ -1038,7 +1150,6 @@ stimer = StragglerDetector()
 from utils.token_monitor import (
     monitor_batch_tokens,
     set_token_monitor_config,
-    get_token_monitor_config,
 )
 
 # Configure token monitoring (optional - defaults are sensible)
@@ -1056,18 +1167,17 @@ def forward_step(data_iterator, model: GPTModel):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator', log_level=2).start()
+    timers("batch-generator", log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
-    
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+
     # Monitor tokens - log decoded text for debugging
     # Only log on first pipeline stage and TP rank 0 to avoid duplicate logs
     # if tokens is not None and mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
     tokenizer = get_tokenizer()
     monitor_batch_tokens(
-        tokens, 
+        tokens,
         tokenizer,
         loss_mask=loss_mask,
         # attention_mask=attention_mask,
@@ -1075,19 +1185,17 @@ def forward_step(data_iterator, model: GPTModel):
         logger=logger,
     )
 
-    timers('batch-generator').stop()
+    timers("batch-generator").stop()
 
     with stimer:
         if args.use_legacy_models:
-            output_tensor = model(tokens, position_ids, attention_mask,
-                                labels=labels)
+            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
-            output_tensor = model(tokens, position_ids, attention_mask,
-                                labels=labels, loss_mask=loss_mask)
+            output_tensor = model(
+                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+            )
 
     return output_tensor, partial(loss_func, loss_mask)
-
-
 
 
 process_non_loss_data_func = None
@@ -1117,10 +1225,7 @@ non_loss_data_func = None
 
 
 memory_estimate = log_memory_estimate(
-    args, 
-    num_microbatches=num_microbatches, 
-    verbose=True, 
-    logger=logger
+    args, num_microbatches=num_microbatches, verbose=True, logger=logger
 )
 logger.info(f"Memory estimate: {memory_estimate}")
 
@@ -1129,12 +1234,16 @@ logger.info(f"Memory estimate: {memory_estimate}")
 iteration = 0
 iteration, num_floating_point_operations_so_far = train(
     forward_step,
-    model, optimizer, opt_param_scheduler,
-    train_data_iterator, valid_data_iterator,
-    process_non_loss_data_func, config, checkpointing_context,
-    non_loss_data_func
+    model,
+    optimizer,
+    opt_param_scheduler,
+    train_data_iterator,
+    valid_data_iterator,
+    process_non_loss_data_func,
+    config,
+    checkpointing_context,
+    non_loss_data_func,
 )
-
 
 
 # %%
@@ -1143,11 +1252,10 @@ iteration, num_floating_point_operations_so_far = train(
 # -----------------------------------------
 
 from megatron.training.global_vars import get_wandb_writer
+
 wandb_writer = get_wandb_writer()
 if wandb_writer:
     wandb_writer.finish()
-
-
 
 
 # -----------------------------------------

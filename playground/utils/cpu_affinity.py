@@ -1,8 +1,8 @@
 """
 CPU core affinity utilities for distributed training.
 """
+
 import os
-from typing import List, Optional
 
 import psutil
 
@@ -11,7 +11,7 @@ def set_cpu_affinity(
     local_rank: int,
     ncpu_per_proc: int = 16,
     logger=None,
-) -> List[int]:
+) -> list[int]:
     """
     Bind the current process to a specific set of CPU cores based on local_rank.
 
@@ -36,8 +36,9 @@ def set_cpu_affinity(
     core_list = list(range(start_core, end_core))
     p.cpu_affinity(core_list)
 
-
-    if len(core_list) > 1 and all(core_list[i] == core_list[i-1]+1 for i in range(1, len(core_list))):
+    if len(core_list) > 1 and all(
+        core_list[i] == core_list[i - 1] + 1 for i in range(1, len(core_list))
+    ):
         core_list_str = f"{core_list[0]}-{core_list[-1]}"
     else:
         core_list_str = ",".join(map(str, core_list))
@@ -48,7 +49,7 @@ def set_cpu_affinity(
     return core_list
 
 
-def get_cpu_affinity() -> List[int]:
+def get_cpu_affinity() -> list[int]:
     """
     Get the current CPU affinity of this process.
 
@@ -57,5 +58,3 @@ def get_cpu_affinity() -> List[int]:
     """
     p = psutil.Process(os.getpid())
     return p.cpu_affinity()
-
-

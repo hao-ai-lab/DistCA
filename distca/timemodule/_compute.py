@@ -1,7 +1,10 @@
-
 def get_attn_time_old(
-    x: int, tp: int, cp: int,
-    hqo: int = 64, hkv: int = 4, d: int = 128,
+    x: int,
+    tp: int,
+    cp: int,
+    hqo: int = 64,
+    hkv: int = 4,
+    d: int = 128,
 ) -> float:
     unit_time = {
         (1, 1): {
@@ -17,7 +20,7 @@ def get_attn_time_old(
             49152: 111.39,
             65536: 195.51,
             98304: 463.5,
-            131072: 842.39
+            131072: 842.39,
         },
         (1, 2): {
             128: 0.06,
@@ -32,7 +35,7 @@ def get_attn_time_old(
             49152: 54.38,
             65536: 97.41,
             98304: 227.86,
-            131072: 417.1
+            131072: 417.1,
         },
         (1, 4): {
             128: 0.06,
@@ -47,7 +50,7 @@ def get_attn_time_old(
             49152: 27.39,
             65536: 47.17,
             98304: 114.07,
-            131072: 207.66
+            131072: 207.66,
         },
         (1, 8): {
             128: 0.06,
@@ -62,7 +65,7 @@ def get_attn_time_old(
             49152: 13.68,
             65536: 23.56,
             98304: 55.54,
-            131072: 103.4
+            131072: 103.4,
         },
         (2, 1): {
             128: 0.06,
@@ -77,7 +80,7 @@ def get_attn_time_old(
             49152: 55.79,
             65536: 98.18,
             98304: 232.67,
-            131072: 422.24
+            131072: 422.24,
         },
         (2, 2): {
             128: 0.06,
@@ -92,7 +95,7 @@ def get_attn_time_old(
             49152: 27.37,
             65536: 47.03,
             98304: 115.53,
-            131072: 208.96
+            131072: 208.96,
         },
         (2, 4): {
             128: 0.06,
@@ -107,7 +110,7 @@ def get_attn_time_old(
             49152: 14.15,
             65536: 23.83,
             98304: 56.88,
-            131072: 104.16
+            131072: 104.16,
         },
         (2, 8): {
             128: 0.06,
@@ -122,7 +125,7 @@ def get_attn_time_old(
             49152: 6.96,
             65536: 11.9,
             98304: 27.88,
-            131072: 50.74
+            131072: 50.74,
         },
         (4, 1): {
             128: 0.06,
@@ -137,7 +140,7 @@ def get_attn_time_old(
             49152: 27.47,
             65536: 47.74,
             98304: 116.77,
-            131072: 212.28
+            131072: 212.28,
         },
         (4, 2): {
             128: 0.06,
@@ -152,7 +155,7 @@ def get_attn_time_old(
             49152: 13.9,
             65536: 23.9,
             98304: 56.39,
-            131072: 104.8
+            131072: 104.8,
         },
         (4, 4): {
             128: 0.06,
@@ -167,7 +170,7 @@ def get_attn_time_old(
             49152: 7.03,
             65536: 12.22,
             98304: 28.02,
-            131072: 51.52
+            131072: 51.52,
         },
         (4, 8): {
             128: 0.06,
@@ -182,7 +185,7 @@ def get_attn_time_old(
             49152: 3.52,
             65536: 6.09,
             98304: 14.38,
-            131072: 25.25
+            131072: 25.25,
         },
         (8, 1): {
             128: 0.06,
@@ -197,7 +200,7 @@ def get_attn_time_old(
             49152: 14.06,
             65536: 24.21,
             98304: 58.44,
-            131072: 107.35
+            131072: 107.35,
         },
         (8, 2): {
             128: 0.06,
@@ -212,7 +215,7 @@ def get_attn_time_old(
             49152: 7.23,
             65536: 12.33,
             98304: 28.28,
-            131072: 51.82
+            131072: 51.82,
         },
         (8, 4): {
             128: 0.07,
@@ -227,7 +230,7 @@ def get_attn_time_old(
             49152: 3.66,
             65536: 6.39,
             98304: 14.51,
-            131072: 25.97
+            131072: 25.97,
         },
         (8, 8): {
             128: 0.06,
@@ -242,24 +245,23 @@ def get_attn_time_old(
             49152: 2.26,
             65536: 3.23,
             98304: 6.94,
-            131072: 12.99
-        }
+            131072: 12.99,
+        },
     }
 
     scoped_time = unit_time[(tp, cp)]
     # y = x / (tp * cp)
     y = x
-    
+
     if y < 128:
         return scoped_time[128]
-    
+
     if y > 131072:
         return scoped_time[131072] * (y / 131072) ** 2
-    
+
     if y in scoped_time:
         return scoped_time[y]
-    
-    
+
     # TODO: May be slow.
     # interpolate if not exists.
     lower_key = max(k for k in scoped_time.keys() if k <= y)
@@ -267,32 +269,30 @@ def get_attn_time_old(
 
     lower_time = scoped_time[lower_key]
     upper_time = scoped_time[upper_key]
-    
+
     result = lower_time + (upper_time - lower_time) * (y - lower_key) / (upper_key - lower_key)
     return result
-
 
 
 def get_mlp_time(x: int, tp: int, cp: int) -> float:
     # length -> time ms
     unit_time = {
-        64:10.00,
-        128:10.50,
-        256:11.00,
-        512:11.46,
-        1024:12.31,
-        2048:12.56,
-        4096:13.87,
-        8192:17.79,
-        16384:25.86,
-        32768:44.25,
-        65536:76.6,
-        131072:153.2,
-        262144:306.4,
-        524288:612.8
+        64: 10.00,
+        128: 10.50,
+        256: 11.00,
+        512: 11.46,
+        1024: 12.31,
+        2048: 12.56,
+        4096: 13.87,
+        8192: 17.79,
+        16384: 25.86,
+        32768: 44.25,
+        65536: 76.6,
+        131072: 153.2,
+        262144: 306.4,
+        524288: 612.8,
     }
 
-    
     y = x / (tp * cp)
     # Find the two closest keys to y
     sorted_keys = list(unit_time.keys())
@@ -303,7 +303,7 @@ def get_mlp_time(x: int, tp: int, cp: int) -> float:
         return unit_time[min_key]
     elif y > 524288:
         return unit_time[524288] / 524288 * y
-    
+
     # If y is an exact match, return immediately
     if y in unit_time:
         z = unit_time[y]
@@ -311,12 +311,11 @@ def get_mlp_time(x: int, tp: int, cp: int) -> float:
         # Find the two closest keys
         lower_key = max(k for k in sorted_keys if k <= y)
         upper_key = min(k for k in sorted_keys if k >= y)
-        
+
         # Linear interpolation
         lower_time = unit_time[lower_key]
         upper_time = unit_time[upper_key]
-        
+
         # Interpolate
         z = lower_time + (upper_time - lower_time) * (y - lower_key) / (upper_key - lower_key)
     return z
-

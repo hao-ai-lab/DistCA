@@ -1,6 +1,6 @@
 import collections
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import torch
 
@@ -16,17 +16,16 @@ class ShardInfo:
         logical_sid: The logical order ID of this shard in the original complete sequence (starting from 0).
         shard_len: The length of this shard, usually referring to the number of tokens.
     """
+
     rid: int
     dispatch_rid: int
     logical_sid: int
     shard_len: int
 
 
-
 def handle_planner_metadata(
-    world_size: int,
-    sequence_plans: List[List[ShardInfo]]
-) -> Tuple[torch.Tensor, ...]:
+    world_size: int, sequence_plans: list[list[ShardInfo]]
+) -> tuple[torch.Tensor, ...]:
     """
     Args:
         world_size: Total number of ranks.
@@ -36,7 +35,9 @@ def handle_planner_metadata(
         A tuple containing all computed metadata tensors.
     """
     if not sequence_plans or not any(sequence_plans) or world_size <= 0:
-        raise ValueError("Invalid input! Sequence_plans cannot be None. world_size need bigger than 0.")
+        raise ValueError(
+            "Invalid input! Sequence_plans cannot be None. world_size need bigger than 0."
+        )
 
     all_shards_with_seq_id = []
     for seq_idx, sequence in enumerate(sequence_plans):
@@ -66,8 +67,12 @@ def handle_planner_metadata(
     cp_seq_lens = torch.zeros((world_size, max_shards_per_rank), dtype=torch.int64)
     kv_context_size = torch.zeros((world_size, max_shards_per_rank), dtype=torch.int64)
     q_to_num_kv_seq = torch.ones((world_size, max_shards_per_rank), dtype=torch.int64) * -1
-    kv_to_q_mapping = torch.ones((world_size, max_shards_per_rank, max_shards_per_seq, 2), dtype=torch.int64) * -1
-    kv_to_q_rank = torch.ones((world_size, max_shards_per_rank, max_shards_per_seq), dtype=torch.int64) * -1
+    kv_to_q_mapping = (
+        torch.ones((world_size, max_shards_per_rank, max_shards_per_seq, 2), dtype=torch.int64) * -1
+    )
+    kv_to_q_rank = (
+        torch.ones((world_size, max_shards_per_rank, max_shards_per_seq), dtype=torch.int64) * -1
+    )
 
     for seq_idx, original_sequence in enumerate(sequence_plans):
         sequence = sorted(original_sequence, key=lambda s: s.logical_sid)
@@ -112,30 +117,31 @@ def handle_planner_metadata(
 
 
 # Transfer Items output from planner to List[List[ShardInfo]]
-def items_into_shardinfos(data: List[Dict[str, Any]]) -> List[List[ShardInfo]]:
+def items_into_shardinfos(data: list[dict[str, Any]]) -> list[list[ShardInfo]]:
     sequences_map = collections.defaultdict(list)
 
-
     for shard_dict in data:
-        sequence_key = (shard_dict['seqid']) # sequence_key = (shard_dict['src_gpuid'], shard_dict['seqid'])
+        sequence_key = shard_dict[
+            "seqid"
+        ]  # sequence_key = (shard_dict['src_gpuid'], shard_dict['seqid'])
         sequences_map[sequence_key].append(shard_dict)
 
-    all_sequences: List[List[ShardInfo]] = []
+    all_sequences: list[list[ShardInfo]] = []
 
     for sequence_key, shard_dicts in sequences_map.items():
-        shard_dicts.sort(key=lambda d: d['shard_id'])
+        shard_dicts.sort(key=lambda d: d["shard_id"])
 
-        current_sequence_shards: List[ShardInfo] = []
+        current_sequence_shards: list[ShardInfo] = []
         for shard_dict in shard_dicts:
             shard_info = ShardInfo(
-                rid=shard_dict['src_gpuid'],
-                dispatch_rid=shard_dict['gpuid'],
-                logical_sid=shard_dict['shard_id'],
-                shard_len=shard_dict['q'],
+                rid=shard_dict["src_gpuid"],
+                dispatch_rid=shard_dict["gpuid"],
+                logical_sid=shard_dict["shard_id"],
+                shard_len=shard_dict["q"],
                 # document_id=shard_dict['seqid']
             )
             current_sequence_shards.append(shard_info)
-        
+
         all_sequences.append(current_sequence_shards)
-        
+
     return all_sequences

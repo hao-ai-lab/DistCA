@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 # TODO(yonghao): compile csrc parts when setting up.
 
@@ -9,5 +9,5 @@ setup(
     install_requires=[
         # List your dependencies or read from requirements.txt
     ],
-    python_requires='>=3.8',
+    python_requires=">=3.8",
 )

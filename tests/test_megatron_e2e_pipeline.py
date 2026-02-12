@@ -3,28 +3,41 @@ Debug example:
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 torchrun --nnodes 1 --nproc_per_node 2 test_megatron_e2e_pipeline.py --num-gpus-per-node 2 --pp-size 2 --num-microbatch 2
 """
 
-from distca.utils.traceback import enable_clickable_excepthook, enable_trace_calls
+from distca.utils.traceback import enable_clickable_excepthook
+
 enable_clickable_excepthook()
 
 import argparse
-from functools import partial
 import os
 import time
+from functools import partial
 
 import megatron.core.parallel_state as mpu
+import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-import torch
+from megatron_test_utils import (
+    gptmodel_forward,
+    make_batch_generator,
+    unwrap_model,
+)
+from test_megatron_e2e import MegatronE2eWorker as BaseMegatronE2eWorker
+from test_megatron_e2e import set_random_seed
+from test_util import (
+    ParallelConfig,
+    create_qkv_dispatch_pipeline_tick,
+    init_worker_torch_distributed,
+)
 from transformers import AutoConfig
 
 from distca.runtime.compute_metadata import get_attn_metadata
-from distca.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams
-from distca.runtime.megatron.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
-
-from test_util import ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch_pipeline_tick
-from test_megatron_e2e import MegatronE2eWorker as BaseMegatronE2eWorker, set_random_seed
-from megatron_test_utils import (
-    gptmodel_forward, make_batch_generator, unwrap_model,
+from distca.runtime.megatron.forward_backward_func import (
+    forward_backward_pipelining_without_interleaving as forward_backward_func,
+)
+from distca.runtime.megatron.packed_seq_params import (
+    PingPangPackedSeqParams,
+    PingPangSingleStepPackedSeqParams,
+    arg_to_cuda,
 )
 
 
@@ -35,12 +48,17 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         torch.cuda.set_device(local_rank)
         torch.set_default_device(torch.device("cuda", local_rank))
 
-    def forward_backward_batch(self, microbatches: list[dict], forward_only: bool=False,
-                               mode: str="ping_pong", with_dummy: bool=True):
+    def forward_backward_batch(
+        self,
+        microbatches: list[dict],
+        forward_only: bool = False,
+        mode: str = "ping_pong",
+        with_dummy: bool = True,
+    ):
 
-        microbatches = [{
-            k: arg_to_cuda(v) for k, v in microbatch.items()
-        } for microbatch in microbatches]
+        microbatches = [
+            {k: arg_to_cuda(v) for k, v in microbatch.items()} for microbatch in microbatches
+        ]
         if "orig" in mode:
             for mb in microbatches:
                 psp = mb["packed_seq_params"]
@@ -54,25 +72,30 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         n_micro_batch = len(microbatches) - pp_size + 1
         # thd layout
-        total_seqlen = microbatches[0]['input_ids'].shape[0]
+        total_seqlen = microbatches[0]["input_ids"].shape[0]
 
         def loss_func(output):
             # NOTE: this is a dummy loss function.
             loss = output.mean()
-            return loss, {'loss': loss}
+            return loss, {"loss": loss}
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
             torch.cuda.nvtx.range_push("forward_step")
-            input_ids = batch['input_ids']
-            position_ids = batch['position_ids']
+            input_ids = batch["input_ids"]
+            position_ids = batch["position_ids"]
             attention_mask = None
-            packed_seq_params = batch['packed_seq_params']
+            packed_seq_params = batch["packed_seq_params"]
             # returns "hidden_states" if not model.post_process (not the last layer)
             # returns "logits" when label is None.
             output = gptmodel_forward(
-                model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel,
-                packed_seq_params, labels=input_ids.unsqueeze(0),
+                model,
+                input_ids,
+                attention_mask,
+                position_ids,
+                self.tf_config.sequence_parallel,
+                packed_seq_params,
+                labels=input_ids.unsqueeze(0),
             )
             torch.cuda.nvtx.range_pop()
             return output, loss_func
@@ -88,15 +111,20 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         # shift bwd metadata since the order it runs is different from the
         # corresponding dummy forward's.
         dummy_bwd_packed_seq_params = [
-            microbatch['packed_seq_params'] for microbatch in
-            (microbatches[-pp_size + pp_rank + 1:][:pp_size - pp_rank - 1] + microbatches[:pp_rank])
+            microbatch["packed_seq_params"]
+            for microbatch in (
+                microbatches[-pp_size + pp_rank + 1 :][: pp_size - pp_rank - 1]
+                + microbatches[:pp_rank]
+            )
         ]
-        dummy_bwd_packed_seq_params = dummy_bwd_packed_seq_params[pp_rank:] + dummy_bwd_packed_seq_params[:pp_rank]
+        dummy_bwd_packed_seq_params = (
+            dummy_bwd_packed_seq_params[pp_rank:] + dummy_bwd_packed_seq_params[:pp_rank]
+        )
 
         assert mode in ["ping_pong", "orig_reimpl", "single_sided"]
 
         for module in self.train_module:
-            debug = (mode != "ping_pong")
+            debug = mode != "ping_pong"
             debug_fwd_impl = mode if debug else None
             unwrap_model(module).set_debug(debug=debug, debug_fwd_impl=debug_fwd_impl)
             unwrap_model(module).train()
@@ -104,13 +132,13 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
 
         dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
         batch_generator = make_batch_generator(
-            microbatches if with_dummy else microbatches[pp_rank:],
-            vpp_size=len(self.train_module)
+            microbatches if with_dummy else microbatches[pp_rank:], vpp_size=len(self.train_module)
         )
         # if mpu.get_pipeline_model_parallel_world_size() > 1:
 
         torch.cuda.synchronize()
         from distca.runtime.attn_kernels.ops import nvshmem_barrier_all
+
         nvshmem_barrier_all()
         if with_dummy:
             losses_reduced = forward_backward_func(
@@ -137,7 +165,11 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
                 micro_batch_size=1,  # no use when input_shapes was set
                 forward_only=forward_only,
             )
-        grad_sample = unwrap_model(self.train_module[0]).decoder.layers[-1].self_attention.linear_proj.weight.main_grad.clone()
+        grad_sample = (
+            unwrap_model(self.train_module[0])
+            .decoder.layers[-1]
+            .self_attention.linear_proj.weight.main_grad.clone()
+        )
 
         # when testing numerical correctness, instead of running optimizer step, reset grads.
         for tm in self.train_module:
@@ -147,9 +179,16 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
 
 
 def init_megatron_e2e_test(
-    hidden_size_q: int, hidden_size_kv: int, num_heads: int, num_tokens: int,
-    world_size: int, max_cp_degree: int, tp_size: int, pp_size: int,
-    dtype, worker_cls=MegatronE2eWorker
+    hidden_size_q: int,
+    hidden_size_kv: int,
+    num_heads: int,
+    num_tokens: int,
+    world_size: int,
+    max_cp_degree: int,
+    tp_size: int,
+    pp_size: int,
+    dtype,
+    worker_cls=MegatronE2eWorker,
 ):
     token_bytes_q = hidden_size_q * dtype.itemsize // tp_size
     token_bytes_kv = hidden_size_kv * dtype.itemsize // tp_size
@@ -161,27 +200,35 @@ def init_megatron_e2e_test(
     #     num_heads * torch.float32.itemsize * 2 * max_tokens_query +
     #     token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     # )
-    buffer_size = 512 * 1024 ** 2 # 512MB
-    print(f'{buffer_size=}', flush=True)
+    buffer_size = 512 * 1024**2  # 512MB
+    print(f"{buffer_size=}", flush=True)
     parallel_config = ParallelConfig(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
     )
 
-    worker = init_worker_torch_distributed(
-        world_size, buffer_size, worker_cls, parallel_config
-    )
+    worker = init_worker_torch_distributed(world_size, buffer_size, worker_cls, parallel_config)
     print("Communication groups initialized")
     return worker
 
 
-def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
-                           as_world_size: int, total_seq_len: int, num_seqs: int,
-                           max_cp_degree: int, hidden_size_q_tp: int,
-                           hidden_size_k_tp: int, element_size: int,
-                           num_head_in_dtype: int, tp_size: int, dp_size: int,
-                           num_token_per_rank: int,
-                           use_planner: bool=False):
+def create_pp_microbatches(
+    num_microbatch: int,
+    pp_degree: int,
+    as_rank: int,
+    as_world_size: int,
+    total_seq_len: int,
+    num_seqs: int,
+    max_cp_degree: int,
+    hidden_size_q_tp: int,
+    hidden_size_k_tp: int,
+    element_size: int,
+    num_head_in_dtype: int,
+    tp_size: int,
+    dp_size: int,
+    num_token_per_rank: int,
+    use_planner: bool = False,
+):
     tick_per_rank_doc_lens = None
     bwd_metadata = []
     microbatches = []
@@ -195,25 +242,32 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
         add_dummy_forward = i >= num_microbatch
 
         (
-            fa_fwd_params, fa_bwd_params,
-            qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
-            attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
+            fa_fwd_params,
+            fa_bwd_params,
+            qkv_fwd_fa2a_metadata,
+            qkv_bwd_fa2a_metadata,
+            attn_out_fwd_fa2a_metadata,
+            attn_out_qkv_bwd_fa2a_metadata,
             tick_per_rank_doc_lens,
         ) = create_qkv_dispatch_pipeline_tick(
-            as_world_size, total_seq_len, num_seqs, max_cp_degree,
-            hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
+            as_world_size,
+            total_seq_len,
+            num_seqs,
+            max_cp_degree,
+            hidden_size_q_tp,
+            hidden_size_k_tp,
+            element_size,
+            num_head_in_dtype,
             ref_doc_lens=tick_per_rank_doc_lens,
             add_dummy=add_dummy_forward,
             tp_size=tp_size,
             dp_size=dp_size,
             num_token_per_rank=num_token_per_rank,
-            use_planner=use_planner
+            use_planner=use_planner,
         )
         this_rank_num_tokens = sum(tick_per_rank_doc_lens[as_rank])
 
-        bwd_packed_seq_params = PackedSeqParams(
-            qkv_format="thd", **fa_bwd_params[as_rank]
-        )
+        bwd_packed_seq_params = PackedSeqParams(qkv_format="thd", **fa_bwd_params[as_rank])
         tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens[as_rank], dtype=torch.int32)
         mlp_packed_seq_params = get_attn_metadata(tensor_doc_lens, get_packed_seq_params=True)
 
@@ -238,12 +292,15 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
 
         # store the corresponding bwd metadata (for later ticks)
         bwd_metadata.append(
-            (qkv_bwd_fa2a_metadata.get_slice(as_rank), attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank), bwd_packed_seq_params)
+            (
+                qkv_bwd_fa2a_metadata.get_slice(as_rank),
+                attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank),
+                bwd_packed_seq_params,
+            )
         )
 
     pp_rank = as_rank // dp_size
     dp_rank = as_rank % dp_size
-
 
     # put bwd metadata to the corresponding side
     for i, microbatch in enumerate(microbatches):
@@ -256,7 +313,9 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
         # is 0. Therefore, t - t' = pp_degree - 1, and thus
         # t' + 2 * (pp_degree - 1 - pp_rank) == t + pp_degree - 1 - pp_rank * 2
         bwd_metadata_idx = (i + pp_degree - 1 - pp_rank * 2) % len(bwd_metadata)
-        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[bwd_metadata_idx]
+        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[
+            bwd_metadata_idx
+        ]
         packed_seq_params = microbatch["packed_seq_params"]
         packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
         packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
@@ -267,11 +326,11 @@ def create_pp_microbatches(num_microbatch: int, pp_degree: int, as_rank: int,
 def test(args):
     seed = args.seed
     # test scale
-    num_tokens = args.num_tokens   
+    num_tokens = args.num_tokens
     max_cp_degree = args.cp_degree
     num_seqs = args.num_seqs
-    total_seq_len = args.num_tokens 
-    num_token_per_rank = num_tokens      # num_token_per_rank = num_tokens in DP case. CP case, num_token_per_rank need to be deduced.
+    total_seq_len = args.num_tokens
+    num_token_per_rank = num_tokens  # num_token_per_rank = num_tokens in DP case. CP case, num_token_per_rank need to be deduced.
     # parallelization
     tp_size = args.tp_size
     pp_size = args.pp_size
@@ -288,17 +347,24 @@ def test(args):
 
     hidden_size_kv = hidden_size_q
     if hasattr(hf_config, "num_key_value_heads"):
-        hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
-                          hf_config.num_attention_heads)
+        hidden_size_kv = (
+            hidden_size_kv * hf_config.num_key_value_heads // hf_config.num_attention_heads
+        )
 
-    
     num_tokens_for_cuda_graph = num_token_per_rank
     os.environ["D2_SEQ_LEN"] = str(num_tokens_for_cuda_graph)
 
     worker: MegatronE2eWorker = init_megatron_e2e_test(
-        hidden_size_q, hidden_size_kv, hf_config.num_attention_heads, num_tokens,
-        world_size, max_cp_degree, tp_size, pp_size,
-        dtype, MegatronE2eWorker
+        hidden_size_q,
+        hidden_size_kv,
+        hf_config.num_attention_heads,
+        num_tokens,
+        world_size,
+        max_cp_degree,
+        tp_size,
+        pp_size,
+        dtype,
+        MegatronE2eWorker,
     )
     worker.set_config(dtype=dtype)
     worker.init(model_path, seed=seed)
@@ -309,7 +375,7 @@ def test(args):
     worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()
     print("init cuda graphs done")
     # return
-    
+
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
@@ -323,24 +389,46 @@ def test(args):
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
-    num_head_in_dtype = (hf_config.num_attention_heads *
-                         torch.float32.itemsize // element_size // tp_size)
+    num_head_in_dtype = (
+        hf_config.num_attention_heads * torch.float32.itemsize // element_size // tp_size
+    )
     if args.use_planner:
         from global_batch_provider import setup_global_batch
+
         setup_global_batch(total_seq_len=total_seq_len)
-        
+
     microbatches_0 = create_pp_microbatches(
-        args.num_microbatch, pp_size, as_rank,
-        as_world_size, total_seq_len, num_seqs, max_cp_degree,
-        hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-        tp_size, dp_size, num_token_per_rank,
+        args.num_microbatch,
+        pp_size,
+        as_rank,
+        as_world_size,
+        total_seq_len,
+        num_seqs,
+        max_cp_degree,
+        hidden_size_q_tp,
+        hidden_size_k_tp,
+        element_size,
+        num_head_in_dtype,
+        tp_size,
+        dp_size,
+        num_token_per_rank,
         args.use_planner,
     )
     microbatches_1 = create_pp_microbatches(
-        args.num_microbatch, pp_size, as_rank,
-        as_world_size, total_seq_len, num_seqs, max_cp_degree,
-        hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-        tp_size, dp_size, num_token_per_rank,
+        args.num_microbatch,
+        pp_size,
+        as_rank,
+        as_world_size,
+        total_seq_len,
+        num_seqs,
+        max_cp_degree,
+        hidden_size_q_tp,
+        hidden_size_k_tp,
+        element_size,
+        num_head_in_dtype,
+        tp_size,
+        dp_size,
+        num_token_per_rank,
         args.use_planner,
     )
     set_random_seed(seed, set_megatron=True)
@@ -354,10 +442,10 @@ def test(args):
         mb_0_psp.dispatcher_id = 0
         mb_1_psp.dispatcher_id = 1
         ping_pong_params = PingPangPackedSeqParams(
-            seq_params = [mb_0_psp, mb_1_psp],
-            mlp_layout_seq_params = [mb_0_mlp_psp, mb_1_mlp_psp],
-            max_seqlen_q = max(mb_0_mlp_psp.max_seqlen_q, mb_1_mlp_psp.max_seqlen_q),
-            max_seqlen_kv = max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
+            seq_params=[mb_0_psp, mb_1_psp],
+            mlp_layout_seq_params=[mb_0_mlp_psp, mb_1_mlp_psp],
+            max_seqlen_q=max(mb_0_mlp_psp.max_seqlen_q, mb_1_mlp_psp.max_seqlen_q),
+            max_seqlen_kv=max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
         )
         num_tokens = sum(mb["position_ids"].numel() for mb in [mb_0, mb_1])
         input_ids = torch.randint(10, 1000, (num_tokens,))
@@ -369,14 +457,20 @@ def test(args):
         microbatches.append(mb)
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q = torch.concat([
-                mb_0_mlp_psp.cu_seqlens_q, mb_1_mlp_psp.cu_seqlens_q[1:] + mb_0_mlp_psp.cu_seqlens_q[-1]
-            ]),
-            cu_seqlens_kv = torch.concat([
-                mb_0_mlp_psp.cu_seqlens_kv, mb_1_mlp_psp.cu_seqlens_kv[1:] + mb_0_mlp_psp.cu_seqlens_kv[-1]
-            ]),
-            max_seqlen_q = ping_pong_params.max_seqlen_q,
-            max_seqlen_kv = ping_pong_params.max_seqlen_kv,
+            cu_seqlens_q=torch.concat(
+                [
+                    mb_0_mlp_psp.cu_seqlens_q,
+                    mb_1_mlp_psp.cu_seqlens_q[1:] + mb_0_mlp_psp.cu_seqlens_q[-1],
+                ]
+            ),
+            cu_seqlens_kv=torch.concat(
+                [
+                    mb_0_mlp_psp.cu_seqlens_kv,
+                    mb_1_mlp_psp.cu_seqlens_kv[1:] + mb_0_mlp_psp.cu_seqlens_kv[-1],
+                ]
+            ),
+            max_seqlen_q=ping_pong_params.max_seqlen_q,
+            max_seqlen_kv=ping_pong_params.max_seqlen_kv,
         )
         orig_mb = {
             "input_ids": mb["input_ids"],

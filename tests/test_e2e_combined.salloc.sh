@@ -10,9 +10,9 @@
 #SBATCH --mem=512G
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
-#SBATCH --partition=lowprio 
+#SBATCH --partition=lowprio
 #SBATCH --qos=lowprio
-#SBATCH --requeue 
+#SBATCH --requeue
 
 # ------------------------------------------------------
 # Input Variables (what you will set outside)
@@ -124,9 +124,9 @@ nvidia-smi --query-gpu=index,name --format=csv
 # Environment variables
 # ---------------------------
 # export NVSHMEM_BOOTSTRAP=mpi
-export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
 export NVSHMEM_IB_ENABLE_IBGDA=true
-# export TORCH_CPP_LOG_LEVEL=INFO 
+# export TORCH_CPP_LOG_LEVEL=INFO
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
 # export TORCH_DIST_INIT_RETRY_TIMEOUT=15
 export TORCH_DIST_INIT_RETRY_TIMEOUT=30
@@ -147,7 +147,7 @@ export TORCH_DIST_INIT_RETRY_TIMEOUT=30
 # export NVSHMEM_IBGDA_NUM_RC_PER_PE=4
 # export NCCL_ASYNC_ERROR_HANDLING=1
 # Comment out for a clean log.
-# export CUDA_LAUNCH_BLOCKING=1 
+# export CUDA_LAUNCH_BLOCKING=1
 # export D2_DEBUG_PRINT=0
 # export D2_FA2A_DISABLE_SEND_RECV=0
 # export WLBLLM_DISABLE_LSE=1
@@ -174,7 +174,7 @@ EXPERIMENT_DEBUG_SET_METADATA_TRANSFER_SIZE_TO_0=${EXPERIMENT_DEBUG_SET_METADATA
 D2_SHOULD_REPLAN=${D2_SHOULD_REPLAN:-1}
 D2_SKIP_FLOAT_CONVERSION=${D2_SKIP_FLOAT_CONVERSION:-1}
 SHOULD_ADD_DEBUG_CASES=${SHOULD_ADD_DEBUG_CASES:-1}
-# EXPERIMENT_LOG_MEMORY_USAGE: 
+# EXPERIMENT_LOG_MEMORY_USAGE:
 #   Log memory usage (using torch.cuda.memory_summary and pynvml) to file and console.
 #   May have overhead, so only enable it when needed.
 EXPERIMENT_LOG_MEMORY_USAGE=${EXPERIMENT_LOG_MEMORY_USAGE:-0}
@@ -196,7 +196,7 @@ EXPERIMENT_D2_BALANCE_PING_PONG=${EXPERIMENT_D2_BALANCE_PING_PONG:-0}
 SAMPLE_START_IDX=${SAMPLE_START_IDX:-0}
 
 export NVTE_NVTX_ENABLED=1
-export NSYS_NVTX_PROFILER_REGISTER_ONLY=0 
+export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
 
@@ -247,7 +247,7 @@ SHOULD_PROFILE_MEMORY=${SHOULD_PROFILE_MEMORY:-0}
 
 # -vvvv # Touching the --cpu-per-task and --cpu-bind variables may cause srun to hang.
 SRUN_BASE=(
-  srun --kill-on-bad-exit=1 
+  srun --kill-on-bad-exit=1
   -N ${NNODES}
   -G ${WORLD_SIZE}
   # -vv
@@ -267,7 +267,7 @@ echo "SRUN_INCLUDE_NODES=${SRUN_INCLUDE_NODES}"
 if [ -n "${SRUN_INCLUDE_NODES}" ]; then
   SRUN_BASE+=(-w "${SRUN_INCLUDE_NODES}")
 fi
-echo srun command: 
+echo srun command:
 echo "${SRUN_BASE[@]}"
 # exit 0
 
@@ -505,7 +505,7 @@ echo_and_tee "$EXP_README" "- Elapsed time: $elapsed_time seconds"
 # Check if the experiment finished successfully
 if [ ! -f ${OUTPUT_DIR}/benchmark.json ]; then
     echo "🔴 Experiment failed. The benchmark.json file does not exist. See $OUTPUT_DIR/slurm.stdout and the logs for more details."
-else 
+else
     echo "🟢 Experiment success. See the $OUTPUT_DIR/benchmark.json file."
 fi
 

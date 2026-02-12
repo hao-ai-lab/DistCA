@@ -1,0 +1,43 @@
+# DistCA: Lint & format CI
+# Runs the same checks as local pre-commit: Ruff, ShellCheck, clang-format, generic hooks.
+# No GPU; Python 3.12. Submodules excluded (Megatron-LM, TransformerEngine, .build).
+#
+# Optional: pre-commit.ci (https://pre-commit.ci) can be enabled for this repo to get
+# auto-fix PRs and faster cached runs; our .pre-commit-config.yaml already has ci: settings.
+# Refs: https://docs.github.com/en/actions, https://pre-commit.com, pre-commit/action (maintenance mode).
+
+name: Lint
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Run pre-commit
+        run: pre-commit run --all-files

@@ -7,7 +7,7 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 4 test_megatron_layer.py \
     --world-size 4 --tp-size 2
 
-# Profile: Node = 2, TP = 8, SeqLen = 16k 
+# Profile: Node = 2, TP = 8, SeqLen = 16k
 # (testing 8k does not make comp/comm overlap)
 
 mkdir -p nsys-profile
@@ -18,39 +18,47 @@ NVSHMEM_DEBUG=DEBUG NVSHMEM_IB_ENABLE_IBGDA=true NVTE_ALLOW_NONDETERMINISTIC_ALG
 """
 
 from contextlib import nullcontext
-from typing import Optional
 
 import megatron.core.parallel_state as mpu
+import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-import torch
+from test_shard_info_to_fa2a import simulate_all2all
+from test_util import (
+    MegatronBaseWorker,
+    ParallelConfig,
+    init_worker_torch_distributed,
+    random_shard_info_linear_layout_dp,
+)
 
 from distca.runtime.compute_metadata import from_planner_output, get_attn_metadata
 from distca.runtime.megatron.create_group import get_attn_server_group
-from distca.runtime.megatron.model_patch import get_gpt_layer_with_transformer_engine_spec, get_gpt_config
-from distca.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams
-from distca.runtime.megatron.ping_pong.transformer_layer import TransformerLayer as PingPangTransformerLayer
-
-from test_util import (
-    MegatronBaseWorker, ParallelConfig,
-    init_worker_torch_distributed, random_shard_info_linear_layout_dp
+from distca.runtime.megatron.model_patch import (
+    get_gpt_config,
+    get_gpt_layer_with_transformer_engine_spec,
 )
-from test_shard_info_to_fa2a import simulate_all2all
+from distca.runtime.megatron.packed_seq_params import PingPangSingleStepPackedSeqParams
+from distca.runtime.megatron.ping_pong.transformer_layer import (
+    TransformerLayer as PingPangTransformerLayer,
+)
 
 
 class MegatronLayerWorker(MegatronBaseWorker):
     def __init__(self, rank: int, world_size: int):
         super().__init__(rank, world_size)
-        self.layer: Optional[PingPangTransformerLayer] = None
+        self.layer: PingPangTransformerLayer | None = None
 
-    def init_layer(self, config: TransformerConfig, spec: ModuleSpec,
-                   seed: int):
+    def init_layer(self, config: TransformerConfig, spec: ModuleSpec, seed: int):
         torch.manual_seed(seed + mpu.get_tensor_model_parallel_rank())
         self.layer = build_module(spec, config)
 
-    def forward_normal(self, tensor_input: torch.Tensor, packed_seq_params: PackedSeqParams,
-                       return_grad: bool = False):
+    def forward_normal(
+        self,
+        tensor_input: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+        return_grad: bool = False,
+    ):
         packed_seq_params = PackedSeqParams(
             qkv_format=packed_seq_params.qkv_format,
             cu_seqlens_q=packed_seq_params.cu_seqlens_q.cuda().to(torch.int32),
@@ -68,7 +76,9 @@ class MegatronLayerWorker(MegatronBaseWorker):
             ctx = nullcontext()
         with ctx:
             mlp_output, context, debug = self.layer.forward_orig_impl(
-                tensor_input, packed_seq_params=packed_seq_params, return_debug=True,
+                tensor_input,
+                packed_seq_params=packed_seq_params,
+                return_debug=True,
             )
             if return_grad:
                 mlp_output.sum().backward()
@@ -78,7 +88,8 @@ class MegatronLayerWorker(MegatronBaseWorker):
         return (mlp_output, context, *((tensor_input.grad,) if return_grad else ())), debug
 
     def forward_ping_pang_one_stage(
-        self, tensor_input: torch.Tensor,
+        self,
+        tensor_input: torch.Tensor,
         packed_seq_params: PingPangSingleStepPackedSeqParams,
         return_grad: bool = False,
     ):
@@ -94,7 +105,8 @@ class MegatronLayerWorker(MegatronBaseWorker):
             ctx = nullcontext()
         with ctx:
             mlp_output, context, debug_tensors = self.layer.forward_ping_pong_single_sided(
-                tensor_input, packed_seq_params=packed_seq_params,
+                tensor_input,
+                packed_seq_params=packed_seq_params,
                 return_debug=True,
             )
             if return_grad:
@@ -106,9 +118,15 @@ class MegatronLayerWorker(MegatronBaseWorker):
 
 
 def test_forward(
-    seed: int, total_seq_len: int, num_docs: int, max_cp_degree: int,
-    worker: MegatronLayerWorker, hidden_size_q: int, hidden_size_k: int,
-    tp_size: int = 1, profile: bool = False,
+    seed: int,
+    total_seq_len: int,
+    num_docs: int,
+    max_cp_degree: int,
+    worker: MegatronLayerWorker,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    tp_size: int = 1,
+    profile: bool = False,
 ):
     torch.manual_seed(seed)
     dtype = torch.float16
@@ -117,38 +135,43 @@ def test_forward(
     as_rank = worker.as_rank
 
     planner_output, doc_lens_per_rank = random_shard_info_linear_layout_dp(
-        as_world_size, num_docs, tot_num_token=total_seq_len,
-        max_num_shard=max_cp_degree, seed=seed,
+        as_world_size,
+        num_docs,
+        tot_num_token=total_seq_len,
+        max_num_shard=max_cp_degree,
+        seed=seed,
     )
     doc_lens_per_rank = [
-        torch.tensor(val, dtype=torch.int32, device='cuda') for val in doc_lens_per_rank
+        torch.tensor(val, dtype=torch.int32, device="cuda") for val in doc_lens_per_rank
     ]
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_k // tp_size
 
     lse_size = 0
-    (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
-     attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
-     as_attn_metadata,
+    (
+        qkv_fwd_fa2a_metadata,
+        qkv_rev_fa2a_metadata,
+        attn_out_fwd_fa2a_metadata,
+        attn_out_rev_fa2a_metadata,
+        as_attn_metadata,
     ) = from_planner_output(
-        as_world_size, planner_output, hidden_size_q_tp, hidden_size_k_tp,
-        lse_size, element_size, is_pipeline_tick=False
+        as_world_size,
+        planner_output,
+        hidden_size_q_tp,
+        hidden_size_k_tp,
+        lse_size,
+        element_size,
+        is_pipeline_tick=False,
     )
 
     # thd layout's hidden size input is "t,1,h"
     torch.manual_seed(seed)
-    tensors = torch.randn(
-        (as_world_size, total_seq_len, 1, hidden_size_q), dtype=dtype
-    )
+    tensors = torch.randn((as_world_size, total_seq_len, 1, hidden_size_q), dtype=dtype)
     tensor_shard = tensors[as_rank]
     # 1. normal forward. Need to provide the PackedSeqParams
-    packed_seq_params = get_attn_metadata(
-        doc_lens_per_rank[as_rank], get_packed_seq_params=True
-    )
-    normal_forward_out, debug_ref = worker.forward_normal(
-        tensor_shard, packed_seq_params
-    )
+    packed_seq_params = get_attn_metadata(doc_lens_per_rank[as_rank], get_packed_seq_params=True)
+    normal_forward_out, debug_ref = worker.forward_normal(tensor_shard, packed_seq_params)
 
     ping_pong_params = PingPangSingleStepPackedSeqParams(
         qkv_format="thd",
@@ -158,9 +181,7 @@ def test_forward(
         attn_out_bwd_metadata=attn_out_rev_fa2a_metadata.get_slice(as_rank),
         **as_attn_metadata[as_rank],
     )
-    ping_pang_out, debug_out = worker.forward_ping_pang_one_stage(
-        tensor_shard, ping_pong_params
-    )
+    ping_pang_out, debug_out = worker.forward_ping_pang_one_stage(tensor_shard, ping_pong_params)
 
     ref_debug = [None] * as_world_size
     ans_debug = [None] * as_world_size
@@ -174,6 +195,7 @@ def test_forward(
     print("debug tensors gathered.")
     if as_rank == 0:
         device = torch.device("cuda", worker.rank)
+
         def to_device(o):
             if isinstance(o, torch.Tensor):
                 return o.to(device)
@@ -183,6 +205,7 @@ def test_forward(
                 return [to_device(x) for x in o]
             else:
                 return o
+
         ref_debug = [to_device(debug_tensor) for debug_tensor in ref_debug]
         ans_debug = [to_device(debug_tensor) for debug_tensor in ans_debug]
 
@@ -198,47 +221,53 @@ def test_forward(
         ref_ks = [debug_tensor[1].flatten(start_dim=1) for debug_tensor in ref_qkvs]
         ref_vs = [debug_tensor[2].flatten(start_dim=1) for debug_tensor in ref_qkvs]
         ref_qs_post_comm, ref_ks_post_comm, ref_vs_post_comm = simulate_all2all(
-            ref_qs, ref_ks, ref_vs, qkv_fwd_fa2a_metadata,
-            element_size, hidden_size_q_tp, hidden_size_k_tp,
+            ref_qs,
+            ref_ks,
+            ref_vs,
+            qkv_fwd_fa2a_metadata,
+            element_size,
+            hidden_size_q_tp,
+            hidden_size_k_tp,
             is_from_linear_layout=True,
         )
-        ref_qs_post_comm = [
-            t.unsqueeze(1) for t in ref_qs_post_comm
-        ]
-        ref_ks_post_comm = [
-            t.unsqueeze(1) for t in ref_ks_post_comm
-        ]
-        ref_vs_post_comm = [
-            t.unsqueeze(1) for t in ref_vs_post_comm
-        ]
+        ref_qs_post_comm = [t.unsqueeze(1) for t in ref_qs_post_comm]
+        ref_ks_post_comm = [t.unsqueeze(1) for t in ref_ks_post_comm]
+        ref_vs_post_comm = [t.unsqueeze(1) for t in ref_vs_post_comm]
         ref_qkvs_post_comm = [
-            (ref_qs_post_comm[rank], ref_ks_post_comm[rank], ref_vs_post_comm[rank]) for rank in range(as_world_size)
+            (ref_qs_post_comm[rank], ref_ks_post_comm[rank], ref_vs_post_comm[rank])
+            for rank in range(as_world_size)
         ]
-        torch.testing.assert_close(
-            ans_debug_qkvs_post_transfer, ref_qkvs_post_comm
-        )
+        torch.testing.assert_close(ans_debug_qkvs_post_transfer, ref_qkvs_post_comm)
         print("post transfer debug qkv allclose")
 
         from flash_attn import flash_attn_varlen_func
+
         ref_attn_outs_a_layout = []
         for rank in range(as_world_size):
             metadata = pingpong_seq_params[rank].to_device()
             print(ref_qs_post_comm[rank].shape)
             ref_attn_out = flash_attn_varlen_func(
-                ref_qs_post_comm[rank], ref_ks_post_comm[rank], ref_vs_post_comm[rank],
-                cu_seqlens_q = metadata.cu_seqlens_q,
-                cu_seqlens_k = metadata.cu_seqlens_kv,
-                max_seqlen_q = metadata.max_seqlen_q,
-                max_seqlen_k = metadata.max_seqlen_kv,
-                causal = True,
-                dropout_p = 0.0,
+                ref_qs_post_comm[rank],
+                ref_ks_post_comm[rank],
+                ref_vs_post_comm[rank],
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k=metadata.cu_seqlens_kv,
+                max_seqlen_q=metadata.max_seqlen_q,
+                max_seqlen_k=metadata.max_seqlen_kv,
+                causal=True,
+                dropout_p=0.0,
             )
             ref_attn_out = ref_attn_out.reshape(ref_attn_out.shape[0], 1, -1)
             ref_attn_outs_a_layout.append(ref_attn_out)
         ref_attn_outs_post_comm, _, _ = simulate_all2all(
             [t.flatten(start_dim=1) for t in ref_attn_outs_a_layout],
-            None, None, attn_out_fwd_fa2a_metadata,
-            element_size, hidden_size_q_tp, None, is_from_linear_layout=False
+            None,
+            None,
+            attn_out_fwd_fa2a_metadata,
+            element_size,
+            hidden_size_q_tp,
+            None,
+            is_from_linear_layout=False,
         )
         ref_attn_outs_post_comm = [t.unsqueeze(1) for t in ref_attn_outs_post_comm]
         torch.testing.assert_close(ref_attn_outs, ref_attn_outs_post_comm)
@@ -281,25 +310,29 @@ def test_forward(
 
 
 def init_megatron_test(
-    world_size, hidden_size, num_heads, num_query_heads, dtype,
-    max_tokens_query, max_tokens_key_value, max_cp_degree, tp_size, seed,
-    worker_cls=MegatronLayerWorker
+    world_size,
+    hidden_size,
+    num_heads,
+    num_query_heads,
+    dtype,
+    max_tokens_query,
+    max_tokens_key_value,
+    max_cp_degree,
+    tp_size,
+    seed,
+    worker_cls=MegatronLayerWorker,
 ):
     assert hidden_size // num_heads <= 256, "FA requires head_dim <= 256"
     assert dtype == torch.float16
     token_bytes_q = hidden_size * dtype.itemsize
     token_bytes_kv = hidden_size * dtype.itemsize
     buffer_size = (
-        token_bytes_q * max_tokens_query * 3 +
-        num_heads * torch.float32.itemsize * 2 * max_tokens_query +
-        token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
+        token_bytes_q * max_tokens_query * 3
+        + num_heads * torch.float32.itemsize * 2 * max_tokens_query
+        + token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     )
-    parallel_config = ParallelConfig(
-        tensor_model_parallel_size=tp_size
-    )
-    worker = init_worker_torch_distributed(
-        world_size, buffer_size, worker_cls, parallel_config
-    )
+    parallel_config = ParallelConfig(tensor_model_parallel_size=tp_size)
+    worker = init_worker_torch_distributed(world_size, buffer_size, worker_cls, parallel_config)
     spec = get_gpt_layer_with_transformer_engine_spec()
     config = get_gpt_config(
         num_layers=1,
@@ -331,19 +364,34 @@ def test(args):
     hidden_size_kv = (hidden_size * num_query_heads) // num_heads
 
     worker: MegatronLayerWorker = init_megatron_test(
-        world_size, hidden_size, num_heads, num_query_heads, dtype,
-        max_tokens_query, max_tokens_key_value, max_cp_degree, tp_size, seed,
+        world_size,
+        hidden_size,
+        num_heads,
+        num_query_heads,
+        dtype,
+        max_tokens_query,
+        max_tokens_key_value,
+        max_cp_degree,
+        tp_size,
+        seed,
     )
 
     test_forward(
-        args.seed, args.num_tokens, args.num_docs, max_cp_degree,
-        worker, hidden_size, hidden_size_kv,
-        tp_size, profile=args.profile,
+        args.seed,
+        args.num_tokens,
+        args.num_docs,
+        max_cp_degree,
+        worker,
+        hidden_size,
+        hidden_size_kv,
+        tp_size,
+        profile=args.profile,
     )
 
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--world-size", type=int, default=2)
@@ -356,6 +404,10 @@ if __name__ == "__main__":
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-query-heads", type=int, default=2)
-    parser.add_argument("--profile", action="store_true", default=False,)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+    )
     args = parser.parse_args()
     test(args)

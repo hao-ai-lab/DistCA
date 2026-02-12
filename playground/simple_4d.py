@@ -6,38 +6,34 @@ DistCA Test Script
 # Import torch and megatron
 # ================================
 import argparse
-import os
 import logging
-import time
+import os
+import typing
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
-from typing import Optional, Tuple, List, Union
 from pickle import dump
-import typing
-from typing import Dict
+from typing import Union
 
-from distca.utils.logging import (
-    setup_logging,
-    time_it,
-    setup_log_directories,
-    redirect_external_loggers,
-)
 from utils.cpu_affinity import set_cpu_affinity
+from utils.estimate import log_flops_estimate, log_memory_estimate
 from utils.hf_config import (
     get_megatron_args_dict_from_hf_model,
 )
-from utils.estimate import log_memory_estimate, log_flops_estimate
-from utils.token_monitor import (
-    monitor_batch_tokens,
-    set_token_monitor_config,
-)
 from utils.nan_detector import (
     register_nan_detection_hooks,
-    remove_hooks,
+)
+from utils.token_monitor import (
+    set_token_monitor_config,
 )
 
+from distca.utils.logging import (
+    redirect_external_loggers,
+    setup_log_directories,
+    setup_logging,
+    time_it,
+)
 
 if typing.TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -50,7 +46,8 @@ global_batch_size = int(os.environ["GLOBAL_BATCH_SIZE"])
 seq_length = int(os.environ["SEQ_LENGTH"])
 
 logger = setup_logging(
-    rank=rank, world_size=world_size,
+    rank=rank,
+    world_size=world_size,
     level=logging.DEBUG,
     console_ranks=[0],
     # console_ranks=list(range(0, world_size, 8)),  # Only rank 0 logs to console
@@ -64,39 +61,49 @@ logger_batch_to_items = logging.getLogger(__name__ + ".batch_to_items_with_dummy
 # By default, inherit level from parent (logger), but can be overridden
 # The level will be set later based on args.distca_debug_batch_to_items if needed
 
+
 # Update logger formatters to include function:lineno
 # This adds funcName:lineno to all log messages for better debugging
 # Also add a filter to optionally filter by category (e.g., 'batch_to_items')
 class CategoryFilter(logging.Filter):
     """Filter logs by category if specified in extra dict."""
+
     def __init__(self, allowed_categories=None):
         super().__init__()
         self.allowed_categories = allowed_categories or set()
-    
+
     def filter(self, record):
         # If no category filtering is set, allow all
         if not self.allowed_categories:
             return True
         # Check if record has a category in extra
-        category = getattr(record, 'category', None)
+        category = getattr(record, "category", None)
         return category in self.allowed_categories if category else True
+
 
 # Update all handlers to include funcName:lineno in format
 for handler in logger.handlers:
     formatter = handler.formatter
     if formatter:
         # Check if it's a RankFormatter (has rank attribute) or standard Formatter
-        if hasattr(formatter, 'fmt') or hasattr(formatter, '_fmt'):
+        if hasattr(formatter, "fmt") or hasattr(formatter, "_fmt"):
             # Get the current format string
-            current_fmt = getattr(formatter, 'fmt', None) or getattr(formatter, '_fmt', None)
-            if current_fmt and '%(funcName)s' not in current_fmt:
+            current_fmt = getattr(formatter, "fmt", None) or getattr(formatter, "_fmt", None)
+            if current_fmt and "%(funcName)s" not in current_fmt:
                 # Insert funcName:lineno before the message
-                new_fmt = current_fmt.replace('%(message)s', '%(funcName)s:%(lineno)d %(message)s')
+                new_fmt = current_fmt.replace("%(message)s", "%(funcName)s:%(lineno)d %(message)s")
                 # Preserve rank formatting if it's a RankFormatter
-                if hasattr(formatter, 'rank'):
+                if hasattr(formatter, "rank"):
                     from distca.utils.logging import RankFormatter
-                    handler.setFormatter(RankFormatter(fmt=new_fmt, datefmt=formatter.datefmt, 
-                                                       rank=formatter.rank, use_color=getattr(formatter, 'use_color', True)))
+
+                    handler.setFormatter(
+                        RankFormatter(
+                            fmt=new_fmt,
+                            datefmt=formatter.datefmt,
+                            rank=formatter.rank,
+                            use_color=getattr(formatter, "use_color", True),
+                        )
+                    )
                 else:
                     handler.setFormatter(logging.Formatter(new_fmt, formatter.datefmt))
 
@@ -110,10 +117,10 @@ with time_it("set device"):
 
 with time_it("init_process_group"):
     torch.distributed.init_process_group(
-        backend="cpu:gloo,cuda:nccl", 
-        rank=rank, 
-        world_size=world_size, 
-        timeout = timedelta(seconds=60),
+        backend="cpu:gloo,cuda:nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
     )
 
 # ================================
@@ -155,81 +162,94 @@ logger.info(f"Rank: {rank}, World Size: {world_size}, Local Rank: {local_rank}")
 # ================================
 with time_it("import megatron.core"):
     import megatron.core
-    from megatron.core import tensor_parallel
     from megatron.core import parallel_state
+
     mpu = parallel_state
 
     # Additional Megatron imports (after core is loaded)
     import megatron.core.pipeline_parallel.schedules
     import megatron.core.transformer.transformer_layer
     import megatron.training.training
-    from megatron.training.global_vars import get_args, get_wandb_writer
-    from megatron.training.arguments import core_transformer_config_from_args
-    from megatron.training.yaml_arguments import core_transformer_config_from_yaml
-    from megatron.core.transformer.transformer_config import TransformerConfig
-    from megatron.core.num_microbatches_calculator import get_num_microbatches
-    from megatron.training.training import (
-        setup_model_and_optimizer,
-        build_train_valid_test_data_iterators,
-        train as megatron_original_train,
-        get_timers,
+    from megatron.core.datasets.blended_megatron_dataset_builder import (
+        BlendedMegatronDatasetBuilder,
     )
+    from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
     from megatron.core.enums import ModelType
     from megatron.core.models.gpt import GPTModel
-    from megatron.training.tokenizer.tokenizer import MegatronTokenizer
-    from megatron.core.datasets.utils import Split
-    from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-    from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset, GPTDatasetConfig
-    from megatron.training import get_tokenizer
-    from megatron.training.utils import (
-        get_batch_on_this_cp_rank,
-        get_batch_on_this_tp_rank,
-        get_blend_and_blend_per_split,
-    )
-    from megatron.core.rerun_state_machine import RerunDataIterator, get_rerun_state_machine
-    from megatron.core.utils import StragglerDetector
-    from megatron.training.utils import unwrap_model
+    from megatron.core.num_microbatches_calculator import get_num_microbatches
     from megatron.core.packed_seq_params import PackedSeqParams
-
+    from megatron.core.rerun_state_machine import RerunDataIterator, get_rerun_state_machine
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.utils import StragglerDetector
+    from megatron.training import get_tokenizer
+    from megatron.training.arguments import core_transformer_config_from_args
+    from megatron.training.global_vars import get_args, get_wandb_writer
+    from megatron.training.training import (
+        setup_model_and_optimizer,
+    )
+    from megatron.training.utils import (
+        get_blend_and_blend_per_split,
+        unwrap_model,
+    )
+    from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
 # ====================================
 # Initialize Megatron Parallel Groups
 # ====================================
-tp = int(os.environ["TP"]); 
-pp = int(os.environ["PP"]); 
-cp = int(os.environ["CP"]);
-dp = int(os.environ["DP"]);
+tp = int(os.environ["TP"])
+pp = int(os.environ["PP"])
+cp = int(os.environ["CP"])
+dp = int(os.environ["DP"])
 # ensure that tp * pp * cp * dp == world_size
-assert tp * pp * cp * dp == world_size, f"{tp = }, {pp = }, {cp = }, {dp = }: tp * pp * cp * dp = {tp * pp * cp * dp} != world_size: {world_size}"
+assert tp * pp * cp * dp == world_size, (
+    f"{tp = }, {pp = }, {cp = }, {dp = }: tp * pp * cp * dp = {tp * pp * cp * dp} != world_size: {world_size}"
+)
 
 with time_it("initialize model parallel groups"):
     # tp = min(8, world_size);
     mpu.initialize_model_parallel(
-        tensor_model_parallel_size=tp, 
+        tensor_model_parallel_size=tp,
         pipeline_model_parallel_size=pp,
         context_parallel_size=cp,
         distributed_timeout_minutes=2,
         # nccl_communicator_config_path=None, # default
-        order = "tp-cp-ep-dp-pp", # default
+        order="tp-cp-ep-dp-pp",  # default
     )
 
     # get the tp,pp,cp,dp,ep rank of this process
-    tp_rank = mpu.get_tensor_model_parallel_rank();   tp_size = mpu.get_tensor_model_parallel_world_size()
-    pp_rank = mpu.get_pipeline_model_parallel_rank(); pp_size = mpu.get_pipeline_model_parallel_world_size()
-    cp_rank = mpu.get_context_parallel_rank();        cp_size = mpu.get_context_parallel_world_size()
-    dp_rank = mpu.get_data_parallel_rank();           dp_size = mpu.get_data_parallel_world_size()
-    ep_rank = mpu.get_expert_model_parallel_rank();   ep_size = mpu.get_expert_model_parallel_world_size()
-    logger.info(f"TP: {tp_rank} / {tp_size}, PP: {pp_rank} / {pp_size}, CP: {cp_rank} / {cp_size}, DP: {dp_rank} / {dp_size}, EP: {ep_rank} / {ep_size}")
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_size = mpu.get_context_parallel_world_size()
+    dp_rank = mpu.get_data_parallel_rank()
+    dp_size = mpu.get_data_parallel_world_size()
+    ep_rank = mpu.get_expert_model_parallel_rank()
+    ep_size = mpu.get_expert_model_parallel_world_size()
+    logger.info(
+        f"TP: {tp_rank} / {tp_size}, PP: {pp_rank} / {pp_size}, CP: {cp_rank} / {cp_size}, DP: {dp_rank} / {dp_size}, EP: {ep_rank} / {ep_size}"
+    )
 
-    logger.info(f"TP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_tensor_model_parallel_group())}")
-    logger.info(f"PP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_pipeline_model_parallel_group())}")
-    logger.info(f"CP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_context_parallel_group())}")
-    logger.info(f"DP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_data_parallel_group())}")
-    logger.info(f"EP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_expert_model_parallel_group())}")
+    logger.info(
+        f"TP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_tensor_model_parallel_group())}"
+    )
+    logger.info(
+        f"PP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_pipeline_model_parallel_group())}"
+    )
+    logger.info(
+        f"CP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_context_parallel_group())}"
+    )
+    logger.info(
+        f"DP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_data_parallel_group())}"
+    )
+    logger.info(
+        f"EP Ranks: {torch.distributed.get_process_group_ranks(mpu.get_expert_model_parallel_group())}"
+    )
 
 torch.distributed.barrier()
-logger.info(f"Finish initializing megatron parallel groups.")
+logger.info("Finish initializing megatron parallel groups.")
 
 
 # ================================
@@ -238,26 +258,32 @@ logger.info(f"Finish initializing megatron parallel groups.")
 
 # local_rank
 from distca.runtime.attn_kernels.ops import (
-    nvshmem_get_unique_id, 
+    DispatcherWrapper,
     nvshmem_alloc_empty_unique_id,
-    DispatcherWrapper
+    nvshmem_get_unique_id,
 )
 from distca.runtime.megatron.create_group import (
     get_attn_server_group_gloo,
-    get_attn_server_rank, 
     get_attn_server_group_src_rank,
-    initialize_attention_server_comm
-)
-from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
-from distca.utils.megatron_test_utils import init_mcore_model
-from distca.utils.megatron_test_utils import (
-    gptmodel_forward, make_batch_generator, unwrap_model,
+    get_attn_server_rank,
+    initialize_attention_server_comm,
 )
 from distca.runtime.megatron.packed_seq_params import (
-    arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams,
+    PingPangPackedSeqParams,
+    PingPangSingleStepPackedSeqParams,
+    arg_to_cuda,
 )
+from distca.runtime.megatron.ping_pong.transformer_block import PingPongGPTModel
+from distca.utils.megatron_test_utils import (
+    gptmodel_forward,
+    init_mcore_model,
+    make_batch_generator,
+    unwrap_model,
+)
+
 # Additional imports for create_pp_microbatches
-from distca.utils.traceback import enable_clickable_excepthook, enable_trace_calls
+from distca.utils.traceback import enable_clickable_excepthook
+
 enable_clickable_excepthook()
 
 with time_it("initialize nvshmem"):
@@ -273,12 +299,10 @@ with time_it("initialize nvshmem"):
         uid = nvshmem_alloc_empty_unique_id()
     torch.distributed.broadcast(uid, src=0)
 
-    buffer_size = 1 * 1024 ** 3 # 1 GB
-    DispatcherWrapper.init(
-        rank, local_rank, world_size, buffer_size, uid
-    )
+    buffer_size = 1 * 1024**3  # 1 GB
+    DispatcherWrapper.init(rank, local_rank, world_size, buffer_size, uid)
 
-    logger.info(f"Successfully initialized NVSHMEM comm group")
+    logger.info("Successfully initialized NVSHMEM comm group")
 
 # ================================
 # Setup logging directories
@@ -299,7 +323,7 @@ with time_it("setup logging directories"):
     tensorboard_path = log_paths.tensorboard_path
     oom_snapshot_path = log_root_dir / "oom_snapshot"
     oom_snapshot_path.mkdir(parents=True, exist_ok=True)
-    data_path = Path(__file__).parent / 'data_process' / 'code_content_document'
+    data_path = Path(__file__).parent / "data_process" / "code_content_document"
     data_path = data_path.resolve().absolute()
     logger.info(f"Data path: {data_path}")
 
@@ -335,49 +359,72 @@ logger.info(f"Model config: {type(model_config_dict) = }, {model_config_dict = }
 designated_args = [
     # Minimal required Megatron arguments to pass validation.
     # Organized to match megatron-args.txt ordering.
-    "--seed", "42",
-
+    "--seed",
+    "42",
     ####################
     # 1. Model Architecture
     ####################
-    "--num-layers", str(model_config_dict["num_layers"]),
-    "--hidden-size", str(model_config_dict["hidden_size"]),
-    "--ffn-hidden-size", str(model_config_dict["ffn_hidden_size"]),
-    "--num-attention-heads", str(model_config_dict["num_attention_heads"]),
+    "--num-layers",
+    str(model_config_dict["num_layers"]),
+    "--hidden-size",
+    str(model_config_dict["hidden_size"]),
+    "--ffn-hidden-size",
+    str(model_config_dict["ffn_hidden_size"]),
+    "--num-attention-heads",
+    str(model_config_dict["num_attention_heads"]),
     "--group-query-attention",
-    "--num-query-groups", str(model_config_dict["num_query_groups"]),
-    "--max-position-embeddings", str(model_config_dict["max_position_embeddings"]),
-    "--position-embedding-type", str(model_config_dict["position_embedding_type"]),
-    "--rotary-base", str(model_config_dict["rotary_base"]),
-    "--normalization", str(model_config_dict["normalization"]),
+    "--num-query-groups",
+    str(model_config_dict["num_query_groups"]),
+    "--max-position-embeddings",
+    str(model_config_dict["max_position_embeddings"]),
+    "--position-embedding-type",
+    str(model_config_dict["position_embedding_type"]),
+    "--rotary-base",
+    str(model_config_dict["rotary_base"]),
+    "--normalization",
+    str(model_config_dict["normalization"]),
     "--swiglu" if model_config_dict["swiglu"] else None,
-    "--untie-embeddings-and-output-weights" if model_config_dict["untie_embeddings_and_output_weights"] else None,
-    "--seq-length", str(model_config_dict["seq_length"]),
-    "--vocab-size", str(model_config_dict["vocab_size"]),
-    "--attention-backend", "auto",
-
+    "--untie-embeddings-and-output-weights"
+    if model_config_dict["untie_embeddings_and_output_weights"]
+    else None,
+    "--seq-length",
+    str(model_config_dict["seq_length"]),
+    "--vocab-size",
+    str(model_config_dict["vocab_size"]),
+    "--attention-backend",
+    "auto",
     ####################
     # 2. Training Hyperparameters
     ####################
-    "--micro-batch-size", str(micro_batch_size),
-    "--global-batch-size", str(global_batch_size),
-    "--lr", "1.0e-5",
+    "--micro-batch-size",
+    str(micro_batch_size),
+    "--global-batch-size",
+    str(global_batch_size),
+    "--lr",
+    "1.0e-5",
     # "--train-samples", "100000",
     # "--train-iters", "100000",
-    "--train-iters", "10",
-    "--lr-warmup-init", "1e-5",
-    "--lr-decay-iters", "1000000",
-    "--lr-decay-style", "constant",
+    "--train-iters",
+    "10",
+    "--lr-warmup-init",
+    "1e-5",
+    "--lr-decay-iters",
+    "1000000",
+    "--lr-decay-style",
+    "constant",
     # "--lr-warmup-iters", "1000",
     # "--lr-warmup-fraction", "0.0",
-    "--min-lr", "1e-6",
+    "--min-lr",
+    "1e-6",
     # "--min-lr-ratio", None,
     # "--warmup-style", "constant",
-    "--weight-decay", "0.01",
-    "--weight-decay-incr-style", "constant",
+    "--weight-decay",
+    "0.01",
+    "--weight-decay-incr-style",
+    "constant",
     # "--use-checkpoint-opt-param-scheduler",
-    "--lr-wsd-decay-style", "linear",
-
+    "--lr-wsd-decay-style",
+    "linear",
     ####################
     # 3. Dropout & Regularization
     ####################
@@ -386,105 +433,119 @@ designated_args = [
     # "--no-bias-swiglu-fusion",
     # "--no-bias-dropout-fusion",
     # "--no-rope-fusion",
-
     ####################
     # 4. Mixed Precision
     ####################
     # "--bf16",  # REQUIRED for flash attention to work!
     "--fp16",  # REQUIRED for flash attention to work!
-    "--transformer-impl", "transformer_engine",
-
+    "--transformer-impl",
+    "transformer_engine",
     ####################
     # 5. Parallelism & Distributed Training
     ####################
-    "--tensor-model-parallel-size", str(tp),
-    "--pipeline-model-parallel-size", str(pp),
-    "--context-parallel-size", str(cp),
-    "--cp-comm-type", "p2p",  # async
+    "--tensor-model-parallel-size",
+    str(tp),
+    "--pipeline-model-parallel-size",
+    str(pp),
+    "--context-parallel-size",
+    str(cp),
+    "--cp-comm-type",
+    "p2p",  # async
     # "--distributed-backend", "nccl",
-    "--distributed-timeout-minutes", "1",
-    "--local-rank", str(local_rank),
-
+    "--distributed-timeout-minutes",
+    "1",
+    "--local-rank",
+    str(local_rank),
     ####################
     # 6. Data/IO
     ####################
-    "--data-path", str(data_path),
+    "--data-path",
+    str(data_path),
     # "--mock-data",
     # "--tokenizer-type", "NullTokenizer",
-    "--tokenizer-type", "HuggingFaceTokenizer",
-    "--tokenizer-model", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "--tokenizer-type",
+    "HuggingFaceTokenizer",
+    "--tokenizer-model",
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
     # Note: --vocab-size is now provided by model_arch_args from HF config
-    "--data-cache-path", str(data_cache_path),
-    "--tiktoken-pattern", "v2",
+    "--data-cache-path",
+    str(data_cache_path),
+    "--tiktoken-pattern",
+    "v2",
     "--no-create-attention-mask-in-dataloader",
     # "--no-mmap-bin-files",
-    "--num-workers", "1",
-    "--split", "90,5,5",
+    "--num-workers",
+    "1",
+    "--split",
+    "90,5,5",
     # --data-path $DATA_PATH
     # --vocab-file $VOCAB_FILE
     # --merge-file $MERGE_FILE
-
     ####################
     # 7. Checkpointing & Saving
     ####################
-    "--save", str(ckpt_path),
-    "--load", str(ckpt_path),
-    "--save-interval", "0",
-
+    "--save",
+    str(ckpt_path),
+    "--load",
+    str(ckpt_path),
+    "--save-interval",
+    "0",
     ####################
     # 8. Logging & Monitoring
     ####################
     # "--eval-interval", "10",
     # "--log-progress",
-    "--log-interval", "1",
+    "--log-interval",
+    "1",
     "--log-params-norm",
     "--log-timers-to-tensorboard",
     "--log-memory-to-tensorboard",
     "--log-throughput",
-    "--tensorboard-dir", str(tensorboard_path),  # Required for wandb logging to work!
-    "--tensorboard-log-interval", "1",
-    "--wandb-project", "distca",
-    "--wandb-exp-name", "test-megatron-init",
-    "--logging-level", "20",  # Megatron logging level: INFO = 20
+    "--tensorboard-dir",
+    str(tensorboard_path),  # Required for wandb logging to work!
+    "--tensorboard-log-interval",
+    "1",
+    "--wandb-project",
+    "distca",
+    "--wandb-exp-name",
+    "test-megatron-init",
+    "--logging-level",
+    "20",  # Megatron logging level: INFO = 20
     # "--record-memory-history",
     # "--profile",
-    "--profile-step-start", "2",
-    "--profile-step-end", "4",
+    "--profile-step-start",
+    "2",
+    "--profile-step-end",
+    "4",
     # "--profile-ranks",
-
     ####################
     # 9. Advanced Features & Extensions
     ####################
     # MoE related
     # fp8 related
-
     ####################
     # 10. Special Modes/Debugging
     ####################
     # "--no-check-for-nan-in-loss-and-grad",
     "--check-for-spiky-loss",
     "--check-for-large-grads",
-
     ####################
     # 11. Miscellaneous
     ####################
     # Activation Recomputation
     # "--recompute-granularity", "selective",
-    "--recompute-granularity", "selective",
-    "--recompute-modules", "core_attn", 
+    "--recompute-granularity",
+    "selective",
+    "--recompute-modules",
+    "core_attn",
     # "mlp",
-
     # Cuda Graphs
     # "--enable-cuda-graph", "True",
-
     # Network/Communication Overlap
     # "--overlap-grad-reduce",
     # "--overlap-param-gather",
     # "--overlap-param-gather-with-optimizer-step",
     # "--tp-comm-overlap",
-    
-    
-    
     # DistCA arguments
     "--distca-quit-if-maybe-oom",
     # "--distca-debug-nan-detector",
@@ -505,13 +566,11 @@ with time_it("initialize megatron"):
         """Configuration object for DistCA."""
 
         distca_nvshmem_buffer_size_gb: float = 1.0
-        """Set the NVSHMEM buffer size (in GB). 
+        """Set the NVSHMEM buffer size (in GB).
         TODO: By default, we want to make it configurable by the planner."""
-
 
         distca_quit_if_maybe_oom: bool = False
         """If True, the program will quit if the estimated memory can probably exceeds the GPU max memory."""
-
 
         distca_debug_nan_detector: bool = False
         """If True, the program will debug the nan detector."""
@@ -525,61 +584,82 @@ with time_it("initialize megatron"):
 
         pass
 
-    def replace_parser_and_parse_args(parser: argparse.ArgumentParser):    
+    def replace_parser_and_parse_args(parser: argparse.ArgumentParser):
         """Hijack the parser, and use the `designated_args` as the arguments. Then we also inject some of our own arguments."""
 
         # Define the extra arguments for DistCA
-        group = parser.add_argument_group(title='distca')
-        
-        group.add_argument("--distca-nvshmem-buffer-size-gb", type=int, default=2, 
-        help="Set the NVSHMEM buffer size (in GB)")
+        group = parser.add_argument_group(title="distca")
 
-        group.add_argument("--distca-quit-if-maybe-oom", action="store_true", default=False, 
-        help="If True, the program will quit if the estimated memory can probably exceeds the GPU max memory.")
+        group.add_argument(
+            "--distca-nvshmem-buffer-size-gb",
+            type=int,
+            default=2,
+            help="Set the NVSHMEM buffer size (in GB)",
+        )
 
-        group.add_argument("--distca-debug-nan-detector", action="store_true", default=False,
-        help="If True, enable detailed debug logging in nan detector.")
+        group.add_argument(
+            "--distca-quit-if-maybe-oom",
+            action="store_true",
+            default=False,
+            help="If True, the program will quit if the estimated memory can probably exceeds the GPU max memory.",
+        )
 
-        group.add_argument("--distca-debug-batch-to-items", action="store_true", default=False,
-        help="If True, enable detailed debug logging in batch_to_items_with_dummy function.")
+        group.add_argument(
+            "--distca-debug-nan-detector",
+            action="store_true",
+            default=False,
+            help="If True, enable detailed debug logging in nan detector.",
+        )
+
+        group.add_argument(
+            "--distca-debug-batch-to-items",
+            action="store_true",
+            default=False,
+            help="If True, enable detailed debug logging in batch_to_items_with_dummy function.",
+        )
 
         old_parser_parse_args = parser.parse_args
         old_parser_parse_known_args = parser.parse_known_args
         parser.parse_args = lambda *args, **kwargs: old_parser_parse_args(designated_args)
-        parser.parse_known_args = lambda *args, **kwargs: old_parser_parse_known_args(designated_args)
+        parser.parse_known_args = lambda *args, **kwargs: old_parser_parse_known_args(
+            designated_args
+        )
 
         return parser
 
-    from megatron.training.initialize import initialize_megatron    
-    initialize_megatron(
-        extra_args_provider=replace_parser_and_parse_args, # default
-        args_defaults={}, # default
-        get_embedding_ranks=None, # default
-        get_position_embedding_ranks=None, # default
-    )
-    logger.info(f"Successfully initialized megatron")
+    from megatron.training.initialize import initialize_megatron
 
+    initialize_megatron(
+        extra_args_provider=replace_parser_and_parse_args,  # default
+        args_defaults={},  # default
+        get_embedding_ranks=None,  # default
+        get_position_embedding_ranks=None,  # default
+    )
+    logger.info("Successfully initialized megatron")
 
     checkpointing_context = {}
 
     args = get_args()
     if args.yaml_cfg is not None:
-        assert False, "YAML config is not supported yet becuase inside the core_transformer_config_from_yaml, you can only use TransformerConfig. We need to extend the config class to support DistCA configs."
+        assert False, (
+            "YAML config is not supported yet becuase inside the core_transformer_config_from_yaml, you can only use TransformerConfig. We need to extend the config class to support DistCA configs."
+        )
         config = core_transformer_config_from_yaml(args, "language_model")
     else:
         config = core_transformer_config_from_args(args, config_class=DistCAConfig)
     assert isinstance(config, TransformerConfig)
-    
+
     # Configure logger for batch_to_items_with_dummy based on flag
     # This provides backward compatibility with --distca-debug-batch-to-items
     # Standard way: logging.getLogger(__name__ + ".batch_to_items_with_dummy").setLevel(logging.DEBUG)
     if args.distca_debug_batch_to_items:
         logger_batch_to_items.setLevel(logging.DEBUG)
-        logger.info(f"Enabled debug logging for batch_to_items_with_dummy (logger: {logger_batch_to_items.name})")
+        logger.info(
+            f"Enabled debug logging for batch_to_items_with_dummy (logger: {logger_batch_to_items.name})"
+        )
     else:
         # Inherit from parent logger (default behavior)
         logger_batch_to_items.setLevel(logging.NOTSET)  # NOTSET means inherit from parent
-
 
 
 logger.info(f"args: {args}")
@@ -594,15 +674,16 @@ with time_it("report theoretical memory and FLOPS estimates"):
 
     # Log memory estimates
     memory_estimate = log_memory_estimate(
-        args, 
-        num_microbatches=num_microbatches, 
-        verbose=True, 
-        logger=logger
+        args, num_microbatches=num_microbatches, verbose=True, logger=logger
     )
 
     if memory_estimate.maybe_oom() and args.distca_quit_if_maybe_oom:
-        logger.error(f"Estimated memory ({memory_estimate.total_gb:.2f} GB) can probably exceeds GPU max memory ({memory_estimate.gpu_max_memory_gb:.2f} GB). Training will likely OOM!")
-        raise RuntimeError(f"Estimated memory {memory_estimate.total_gb:.2f} GB can probably exceeds GPU max memory {memory_estimate.gpu_max_memory_gb:.2f} GB. Training will likely OOM! Quit the program.")
+        logger.error(
+            f"Estimated memory ({memory_estimate.total_gb:.2f} GB) can probably exceeds GPU max memory ({memory_estimate.gpu_max_memory_gb:.2f} GB). Training will likely OOM!"
+        )
+        raise RuntimeError(
+            f"Estimated memory {memory_estimate.total_gb:.2f} GB can probably exceeds GPU max memory {memory_estimate.gpu_max_memory_gb:.2f} GB. Training will likely OOM! Quit the program."
+        )
 
     # Log FLOPS estimates
     flops_estimate = log_flops_estimate(
@@ -625,29 +706,34 @@ with time_it("report theoretical memory and FLOPS estimates"):
 #     from megatron.training.initialize import set_jit_fusion_options
 #     set_jit_fusion_options()
 def monitor_oom():
-    torch.cuda.memory._record_memory_history(True,
+    torch.cuda.memory._record_memory_history(
+        True,
         # keep 100,000 alloc/free events from before the snapshot
         trace_alloc_max_entries=100000,
-
         # record stack information for the trace events
-        trace_alloc_record_context=True)
+        trace_alloc_record_context=True,
+    )
 
     def oom_observer(device, alloc, device_alloc, device_free):
         # snapshot right after an OOM happened
-        print('saving allocated state during OOM')
+        print("saving allocated state during OOM")
         snapshot = torch.cuda.memory._snapshot()
         snapshot_path = oom_snapshot_path / f"oom_rank-{torch.distributed.get_rank()}.pkl"
-        with open(snapshot_path, 'wb') as f:
+        with open(snapshot_path, "wb") as f:
             dump(snapshot, f)
 
     torch._C._cuda_attach_out_of_memory_observer(oom_observer)
     return
 
+
 # ================================
 # Model, optimizer, and learning rate.
 # ================================
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'megatron.legacy.model.GPTModel']:
+
+def model_provider(
+    pre_process=True, post_process=True
+) -> Union[GPTModel, "megatron.legacy.model.GPTModel"]:
     # TODO: Simplified model provider for DistCA.
     """Builds the model.
 
@@ -669,11 +755,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'mega
         monitor_oom()
     logger.info(f"Building model for rank {torch.distributed.get_rank()}")
 
-    
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+
     transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        args.num_experts, args.moe_grouped_gemm,
-        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
+        args.num_experts,
+        args.moe_grouped_gemm,
+        args.qk_layernorm,
+        args.multi_latent_attention,
+        args.moe_use_legacy_grouped_gemm,
+    )
 
     model = GPTModel(
         config=config,
@@ -695,35 +785,35 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, 'mega
     return model
 
 
-
 def distca_model_provider(
-    pre_process=True, post_process=True, 
-    hf_config_: 'PretrainedConfig'= hf_config, # bound argument
-) -> Union['PingPongGPTModel']:
+    pre_process=True,
+    post_process=True,
+    hf_config_: "PretrainedConfig" = hf_config,  # bound argument
+) -> Union["PingPongGPTModel"]:
     """Builds the DistCA model using init_mcore_model (similar to _build_model_optimizer approach).
-    
+
     This function is parallel to model_provider but uses init_mcore_model which automatically
     creates a PingPongGPTModel through the model registry system.
-    
+
     Args:
         pre_process (bool, optional): Set to true if you need to compute embeddings. Defaults to True.
         post_process (bool, optional): Set to true if you need to compute output logits/loss. Defaults to True.
-    
+
     Returns:
         PingPongGPTModel: The returned model
     """
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
     assert use_te, "Transformer Engine is required for DistCA."
-    
+
     if args.record_memory_history:
         monitor_oom()
     logger.info(f"Building DistCA model for rank {torch.distributed.get_rank()}")
-    
+
     # Get share_embeddings_and_output_weights from args (mirrors model_provider)
     share_embeddings_and_output_weights = not args.untie_embeddings_and_output_weights
-    freeze_moe_router=False # TODO: Find this configuration in the args
-    
+    freeze_moe_router = False  # TODO: Find this configuration in the args
+
     # Initialize model using init_mcore_model (this returns PingPongGPTModel via registry)
     parallel_model = init_mcore_model(
         config,  # tf_config (TransformerConfig) - already available as 'config'
@@ -735,7 +825,7 @@ def distca_model_provider(
         freeze_moe_router=freeze_moe_router,
     )
     parallel_model.to("cuda")
-    
+
     return parallel_model
 
 
@@ -744,15 +834,16 @@ with time_it("setup_model_and_optimizer()"):
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         # model_provider,
         distca_model_provider,
-        model_type, checkpointing_context=checkpointing_context
-    )    
+        model_type,
+        checkpointing_context=checkpointing_context,
+    )
 
     train_module = unwrap_model(model)
     device = torch.cuda.current_device()
     for module in train_module:
         unwrap_model(module).init_ping_pong_communication_ctx(device)
     logger.info(f"Successfully setup model and optimizer for rank {rank}")
-    logger.info('after model, optimizer, and learning rate scheduler are built')
+    logger.info("after model, optimizer, and learning rate scheduler are built")
     logger.debug(f"Model: {model}")
     logger.debug(f"Optimizer: {optimizer}")
     logger.debug(f"Learning Rate Scheduler: {opt_param_scheduler}")
@@ -769,15 +860,16 @@ def __original_is_dataset_built_on_rank():
 
 
 # def is_dataset_built_on_rank() -> bool:
-#     """DistCA: Only build the dataset on Rank 0. 
+#     """DistCA: Only build the dataset on Rank 0.
 #     Rank 0 will be the only rank that will build the dataset and plan.
 #     """
-#     return mpu.get_data_parallel_rank() == 0    
+#     return mpu.get_data_parallel_rank() == 0
+
 
 # TODO: (Refactor) Dataset should only build on rank 0 and broadcast to other ranks.
 # We didn't have a very good abstraction to create microbatches for PP just yet.
 def is_dataset_built_on_rank() -> bool:
-    """DistCA: Only build the dataset on Rank 0. 
+    """DistCA: Only build the dataset on Rank 0.
     Rank 0 will be the only rank that will build the dataset and plan.
     """
     return True
@@ -788,8 +880,8 @@ def core_gpt_dataset_config_from_args(args):
     tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend: tuple[list[str], list[float] | None] | None
+    blend_per_split: list[tuple[list[str], list[float] | None] | None] | None
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
     return GPTDatasetConfig(
@@ -812,9 +904,9 @@ def core_gpt_dataset_config_from_args(args):
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build the train test and validation datasets.
-    Only build the dataset on the first rank. 
-    
-    This way, we will only return the dataset on the first rank, 
+    Only build the dataset on the first rank.
+
+    This way, we will only return the dataset on the first rank,
     and then build the dataset on the other ranks.
 
     Args:
@@ -825,15 +917,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     config = core_gpt_dataset_config_from_args(args)
     logger.info(f"> GPTDatasetConfig: {config}")
 
-    dataset_type = GPTDataset # NOTE: Add DistCAMockGPTDataset and stuff
+    dataset_type = GPTDataset  # NOTE: Add DistCAMockGPTDataset and stuff
 
     logger.info("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type,
-        train_val_test_num_samples,
-        is_dataset_built_on_rank,
-        config
+        dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
     ).build()
 
     logger.info("> finished creating GPT datasets ...")
@@ -846,10 +935,11 @@ def cyclic_iter(iter):
         for x in iter:
             yield x
 
-old_args_dataloader_type = args.dataloader_type
-args.dataloader_type = "external" # TODO: Set to "single" for the normal data parallel data loader.
 
-with time_it("setup data iterators"):    
+old_args_dataloader_type = args.dataloader_type
+args.dataloader_type = "external"  # TODO: Set to "single" for the normal data parallel data loader.
+
+with time_it("setup data iterators"):
     train_valid_test_datasets_provider.is_distributed = True
 
     # Build loaders.
@@ -865,27 +955,31 @@ with time_it("setup data iterators"):
     #           |- MegatronPretrainingSampler (contains in the torch DataLoader)
     #        (if "external" is specified, then you only get back the GPTDataset dataset object)
     from megatron.training.training import build_train_valid_test_data_loaders
-    train_dataloader, valid_dataloader, test_dataloader = \
-        build_train_valid_test_data_loaders(
-            train_valid_test_datasets_provider)
+
+    train_dataloader, valid_dataloader, test_dataloader = build_train_valid_test_data_loaders(
+        train_valid_test_datasets_provider
+    )
 
     # Build iterators.
     dl_type = args.dataloader_type
-    assert dl_type in ['single', 'cyclic', 'external'], f"Expected dl_type is one of 'single', 'cyclic', or 'external', but got {dl_type}"
+    assert dl_type in ["single", "cyclic", "external"], (
+        f"Expected dl_type is one of 'single', 'cyclic', or 'external', but got {dl_type}"
+    )
 
     def _get_iterator(dataloader_type, dataloader, is_train=False):
         """Return dataset iterator."""
 
         # Build the MegatronPretrainingSampler and torch dataloader here.
-        if dl_type == 'external':
+        if dl_type == "external":
             dataset = dataloader
             assert isinstance(dataset, GPTDataset), f"Expected GPTDataset, but got {type(dataset)}"
             # Actually build the MegatronPretrainingSampler and torch dataloader here.
             from megatron.legacy.data.data_samplers import MegatronPretrainingSampler
+
             consumed_samples = 0
             if is_train:
                 consumed_samples = args.consumed_train_samples
-            
+
             micro_batch_size = args.micro_batch_size
             batch_sampler = MegatronPretrainingSampler(
                 total_samples=len(dataset),
@@ -895,7 +989,7 @@ with time_it("setup data iterators"):
                 # data_parallel_rank=mpu.get_data_parallel_rank(),
                 # data_parallel_size=mpu.get_data_parallel_world_size(),
                 data_parallel_rank=0,
-                data_parallel_size=1
+                data_parallel_size=1,
             )
             dataloader = torch.utils.data.DataLoader(
                 dataset,
@@ -905,7 +999,7 @@ with time_it("setup data iterators"):
                 persistent_workers=True if args.num_workers > 0 else False,
             )
             pass
-    
+
         # Return the RerunDataIterator here.
         if dataloader_type == "single":
             return RerunDataIterator(iter(dataloader))
@@ -943,8 +1037,9 @@ with time_it("setup data iterators"):
     # print(f"item: {item}")
     args.dataloader_type = old_args_dataloader_type
 
-logger.info('done with setup ...')
+logger.info("done with setup ...")
 # exit(0)
+
 
 # ==========================================================
 # Monkey Patch training functions with NVTX markers
@@ -953,7 +1048,6 @@ def monkey_patch_nvtx_markers():
     # Patch forward_step and backward_step with nvtx markers
     old_forward_step = megatron.core.pipeline_parallel.schedules.forward_step
     old_backward_step = megatron.core.pipeline_parallel.schedules.backward_step
-
 
     def forward_step_with_nvtx(*args, **kwargs):
         with torch.cuda.nvtx.range("forward_step"):
@@ -967,46 +1061,63 @@ def monkey_patch_nvtx_markers():
     megatron.core.pipeline_parallel.schedules.forward_step = forward_step_with_nvtx
     megatron.core.pipeline_parallel.schedules.backward_step = backward_step_with_nvtx
 
-
-
     # Patch the functions in forward_backward_func
-    old_forward_backward_pipelining_with_interleaving = megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving
-    old_forward_backward_pipelining_without_interleaving = megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving
-    old_forward_backward_no_pipelining = megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining
+    old_forward_backward_pipelining_with_interleaving = (
+        megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving
+    )
+    old_forward_backward_pipelining_without_interleaving = (
+        megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving
+    )
+    old_forward_backward_no_pipelining = (
+        megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining
+    )
 
     def forward_backward_pipelining_with_interleaving_with_nvtx(*args, **kwargs):
         with torch.cuda.nvtx.range("forward_backward_pipelining_with_interleaving"):
             return old_forward_backward_pipelining_with_interleaving(*args, **kwargs)
+
     def forward_backward_pipelining_without_interleaving_with_nvtx(*args, **kwargs):
         with torch.cuda.nvtx.range("forward_backward_pipelining_without_interleaving"):
             return old_forward_backward_pipelining_without_interleaving(*args, **kwargs)
+
     def forward_backward_no_pipelining_with_nvtx(*args, **kwargs):
         with torch.cuda.nvtx.range("forward_backward_no_pipelining"):
             return old_forward_backward_no_pipelining(*args, **kwargs)
-    megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving = forward_backward_pipelining_with_interleaving_with_nvtx
-    megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving = forward_backward_pipelining_without_interleaving_with_nvtx
-    megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining = forward_backward_no_pipelining_with_nvtx
 
+    megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving = (
+        forward_backward_pipelining_with_interleaving_with_nvtx
+    )
+    megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_without_interleaving = (
+        forward_backward_pipelining_without_interleaving_with_nvtx
+    )
+    megatron.core.pipeline_parallel.schedules.forward_backward_no_pipelining = (
+        forward_backward_no_pipelining_with_nvtx
+    )
 
     # Patch optimizer.step with nvtx markers
     old_optimizer_step = optimizer.step
+
     def optimizer_step_with_nvtx(*args, **kwargs):
         with torch.cuda.nvtx.range("optimizer_step"):
             return old_optimizer_step(*args, **kwargs)
-    optimizer.step = optimizer_step_with_nvtx
 
+    optimizer.step = optimizer_step_with_nvtx
 
     # Patch a train_step
     old_train_step = megatron.training.training.train_step
+
     def train_step_with_nvtx(*args, **kwargs):
-        logger.debug(f"Start train_step")
+        logger.debug("Start train_step")
         with torch.cuda.nvtx.range("train_step"):
             return old_train_step(*args, **kwargs)
+
     megatron.training.training.train_step = train_step_with_nvtx
 
-
     # Patch each layer such that I will know when the forward function gets called
-    old_transformer_layer_forward = megatron.core.transformer.transformer_layer.TransformerLayer.forward
+    old_transformer_layer_forward = (
+        megatron.core.transformer.transformer_layer.TransformerLayer.forward
+    )
+
     def transformer_layer_forward_with_nvtx(self, *args, **kwargs):
         if self.layer_number in [0, 1]:
             logger.debug(f"Start transformer_layer_forward[{self.layer_number}]")
@@ -1015,10 +1126,14 @@ def monkey_patch_nvtx_markers():
         if self.layer_number == model_config_dict["num_layers"] - 1:
             logger.debug(f"End transformer_layer_forward[{self.layer_number}]")
         return r
-    megatron.core.transformer.transformer_layer.TransformerLayer.forward = transformer_layer_forward_with_nvtx
+
+    megatron.core.transformer.transformer_layer.TransformerLayer.forward = (
+        transformer_layer_forward_with_nvtx
+    )
 
     logger.info(f"model: {model}")
     return
+
 
 monkey_patch_nvtx_markers()
 
@@ -1073,14 +1188,14 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             result=loss[0],
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are determinisic
             fatal=True,
         )
         rerun_state_machine.validate_result(
             result=loss[0],
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are determinisic
             fatal=True,
         )
     # Check for spiky loss
@@ -1093,7 +1208,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are determinisic
             fatal=False,
         )
     # Reduce loss for logging.
@@ -1107,7 +1222,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     return (
         loss[0].clone(),
         local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+        {"lm loss": (reporting_loss[0], reporting_loss[1])},
     )
 
 
@@ -1122,7 +1237,9 @@ non_loss_data_func = None
 # Main training function
 # ================================
 
-memory_estimate = log_memory_estimate(args, num_microbatches=num_microbatches, verbose=True, logger=logger)
+memory_estimate = log_memory_estimate(
+    args, num_microbatches=num_microbatches, verbose=True, logger=logger
+)
 logger.info(f"Memory estimate: {memory_estimate}")
 
 # =============================================
@@ -1135,23 +1252,30 @@ logger.info(f"Memory estimate: {memory_estimate}")
 args = get_args()
 sequence_parallel = args.sequence_parallel
 
+
 def forward_step(batch_iter, model):
     batch = next(batch_iter)
 
-    input_ids = batch['input_ids']
-    position_ids = batch['position_ids']
-    loss_mask = batch['loss_mask']
-    labels = batch['labels']
+    input_ids = batch["input_ids"]
+    position_ids = batch["position_ids"]
+    loss_mask = batch["loss_mask"]
+    labels = batch["labels"]
     attention_mask = None
-    packed_seq_params = batch['packed_seq_params']
-    
+    packed_seq_params = batch["packed_seq_params"]
+
     # Use gptmodel_forward utility function
     with torch.cuda.nvtx.range("forward_step"):
         output = gptmodel_forward(
-            model, input_ids, attention_mask, position_ids, sequence_parallel,
-            packed_seq_params, labels=labels,
+            model,
+            input_ids,
+            attention_mask,
+            position_ids,
+            sequence_parallel,
+            packed_seq_params,
+            labels=labels,
         )
     return output, partial(loss_func, loss_mask)
+
 
 # Define dummy backward step function
 def dummy_backward_step(model, dummy_bwd_iter, skip: bool):
@@ -1163,6 +1287,7 @@ def dummy_backward_step(model, dummy_bwd_iter, skip: bool):
     except StopIteration:
         # No more dummy backward batches
         pass
+
 
 def forward_backward_batch(
     microbatches: list[dict],
@@ -1177,67 +1302,68 @@ def forward_backward_batch(
     2. Defines a forward_step function
     3. Handles dummy backward batches
     4. Uses forward_backward_func with dummy_bwd_func
-    
+
     This is a simplified version of the pattern from test_megatron_e2e_pipeline_with_cp.py
     """
-    
-    
+
     # Move microbatches to CUDA
-    microbatches = [{
-        k: arg_to_cuda(v) 
-        for k, v in microbatch.items()
-    } for microbatch in microbatches]
+    microbatches = [
+        {k: arg_to_cuda(v) for k, v in microbatch.items()} for microbatch in microbatches
+    ]
     # logger.debug(f"forward_backward_batch: {microbatches = }")
-    
+
     # Get pipeline parallel info
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
     n_micro_batch = len(microbatches) - pp_size + 1
-    total_seqlen = (
-        microbatches[0]['input_ids'].shape[0] 
-        if 'input_ids' in microbatches[0] 
-        else None
-    )
-    
+    total_seqlen = microbatches[0]["input_ids"].shape[0] if "input_ids" in microbatches[0] else None
+
     # Prepare model for training
     # Note: model might be a list in case of virtual pipeline parallelism
     train_module = model if isinstance(model, list) else [model]
     assert len(train_module) == 1, "only support one module"
-    
+
     # Prepare dummy backward metadata
     # Shift bwd metadata since the order it runs is different from the
     # corresponding dummy forward's.
     dummy_bwd_packed_seq_params = [
-        microbatch.get('packed_seq_params') for microbatch in
-        (microbatches[-pp_size + pp_rank + 1:][:pp_size - pp_rank - 1] + microbatches[:pp_rank])
+        microbatch.get("packed_seq_params")
+        for microbatch in (
+            microbatches[-pp_size + pp_rank + 1 :][: pp_size - pp_rank - 1] + microbatches[:pp_rank]
+        )
     ]
-    dummy_bwd_packed_seq_params = dummy_bwd_packed_seq_params[pp_rank:] + dummy_bwd_packed_seq_params[:pp_rank]
-    
+    dummy_bwd_packed_seq_params = (
+        dummy_bwd_packed_seq_params[pp_rank:] + dummy_bwd_packed_seq_params[:pp_rank]
+    )
+
     assert mode in ["ping_pong", "orig_reimpl", "single_sided"]
-    
+
     # Set debug mode for modules
     for module in train_module:
-        debug = (mode != "ping_pong")
+        debug = mode != "ping_pong"
         assert debug == False, "debug mode is not supported"
         debug_fwd_impl = mode if debug else None
         unwrap_model(module).set_debug(debug=debug, debug_fwd_impl=debug_fwd_impl)
         unwrap_model(module).train()
-    
+
     # Create batch generator and dummy backward iterator
     dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
     batch_generator = make_batch_generator(
-        microbatches if with_dummy else microbatches[pp_rank:],
-        vpp_size=len(train_module)
+        microbatches if with_dummy else microbatches[pp_rank:], vpp_size=len(train_module)
     )
-    
+
     # TODO: Maybe remove for performance purpose.
-    # (Benchmark use) Synchronize before starting 
+    # (Benchmark use) Synchronize before starting
     torch.cuda.synchronize()
     from distca.runtime.attn_kernels.ops import nvshmem_barrier_all
+
     nvshmem_barrier_all()
-    
+
     # Call forward_backward_func
-    from distca.runtime.megatron.forward_backward_func import forward_backward_pipelining_without_interleaving
+    from distca.runtime.megatron.forward_backward_func import (
+        forward_backward_pipelining_without_interleaving,
+    )
+
     kwargs = dict(
         forward_step_func=forward_step,
         data_iterator=batch_generator,
@@ -1248,8 +1374,9 @@ def forward_backward_batch(
         forward_only=forward_only,
     )
     if with_dummy:
-        dummy_bwd_func=partial(
-            dummy_backward_step, dummy_bwd_iter=dummy_bwd_packed_seq_params_iter,
+        dummy_bwd_func = partial(
+            dummy_backward_step,
+            dummy_bwd_iter=dummy_bwd_packed_seq_params_iter,
             skip="orig" in mode,
         )
         losses_reduced = forward_backward_pipelining_without_interleaving(
@@ -1264,14 +1391,15 @@ def forward_backward_batch(
         )
     else:
         from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+
         func = get_forward_backward_func()
         losses_reduced = func(**kwargs)
-    
+
     # Optimizer step
     for tm in train_module:
         for param in unwrap_model(tm).parameters():
             param.main_grad.zero_()
-    
+
     return losses_reduced
 
 
@@ -1280,16 +1408,17 @@ def forward_backward_batch(
 # ==========================================================
 
 # Copied from test_megatron_e2e_pipeline_with_cp.py
-from distca.runtime.compute_metadata import get_attn_metadata
-from distca.planner.planner import cp_list_to_mlp_list
-# from distca.utils.test_util import create_qkv_dispatch_pipeline_tick
-from distca.planner.planner import Planner, Item
 from types import SimpleNamespace
+
+# from distca.utils.test_util import create_qkv_dispatch_pipeline_tick
+from distca.planner.planner import Item, Planner, cp_list_to_mlp_list
+from distca.runtime.compute_metadata import get_attn_metadata
+
 
 @dataclass
 class MicrobatchCreateConfig:
     pp_size: int
-    tp_size: int    
+    tp_size: int
     dp_size: int
     as_rank: int
     as_world_size: int
@@ -1298,13 +1427,13 @@ class MicrobatchCreateConfig:
     hidden_size_k_tp: int
     element_size: int
     num_head_in_dtype: int
-    
+
     # num_token_per_rank = num_tokens * num_batches // dpcp_size
     # represent the the number of batch per tick we need to get.
     num_token_per_rank: int
     # context length after document packing of one batch
     total_seq_len: int
-    num_seqs: int # deprecate
+    num_seqs: int  # deprecate
 
     # num_microbatch = pp micro batches
     num_microbatch: int
@@ -1313,31 +1442,35 @@ class MicrobatchCreateConfig:
     softmax_lse_size: float
     # softmax_lse_size = num_heads_local * fp32.itemsize // element_size
 
-with time_it("create_pp_microbatches"):
-    from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams
 
+with time_it("create_pp_microbatches"):
     # Get model dimensions from config
     hidden_size_q = config.hidden_size
     hidden_size_kv = hidden_size_q
     if hasattr(hf_config, "num_key_value_heads"):
-        hidden_size_kv = (hidden_size_q * hf_config.num_key_value_heads //
-                            hf_config.num_attention_heads)
+        hidden_size_kv = (
+            hidden_size_q * hf_config.num_key_value_heads // hf_config.num_attention_heads
+        )
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
     element_size = args.params_dtype.itemsize
-    num_head_in_dtype = (hf_config.num_attention_heads * torch.float32.itemsize // element_size // tp_size)
+    num_head_in_dtype = (
+        hf_config.num_attention_heads * torch.float32.itemsize // element_size // tp_size
+    )
 
     # Calculate token distribution
     num_token_per_rank = args.seq_length * num_microbatches // dp_size
     total_seq_len = args.seq_length
     num_seqs = args.micro_batch_size
     max_cp_degree = cp_size if cp_size > 1 else dp_size
-    # TODO: Properly check what is the affect of num_batches 
+    # TODO: Properly check what is the affect of num_batches
     # num_batches = None  # Use MLP-DP by default
     num_batches = global_batch_size // micro_batch_size
 
-    softmax_lse_size = (hf_config.num_attention_heads // tp_size) * torch.float32.itemsize // element_size
+    softmax_lse_size = (
+        (hf_config.num_attention_heads // tp_size) * torch.float32.itemsize // element_size
+    )
 
     mbc_config = MicrobatchCreateConfig(
         pp_size=pp_size,
@@ -1365,36 +1498,41 @@ batch_registry = []
 doclength_registry = []
 tokenizer = get_tokenizer()
 
+
 def clear_registry():
     batch_registry.clear()
     doclength_registry.clear()
 
+
 def get_registry():
     return batch_registry, doclength_registry
+
 
 def get_doc_lengths_from_item(item: dict, tokenizer) -> list[int]:
     """
     Get document lengths within a batch item.
-    
+
     Documents are separated by EOD (end-of-document) tokens. This function
     finds document boundaries and calculates per-document token counts.
-    
+
     Args:
         item: Dictionary containing 'tokens' tensor with shape [1, seq_length]
         tokenizer: Tokenizer with an 'eod' property that returns the EOD token ID
-        
+
     Returns:
         List of document lengths (number of tokens per document)
     """
     # TODO: Support multiple sequences.
 
     # Get the tokens from the item.
-    assert 'tokens' in item, f"item: {item} does not contain 'tokens'"
-    tokens_tensor = item['tokens']
-    
+    assert "tokens" in item, f"item: {item} does not contain 'tokens'"
+    tokens_tensor = item["tokens"]
+
     # Extract tokens from item - shape is [1, seq_length]
     # assert it only has 1 sequence.
-    assert tokens_tensor.shape[0] == 1, f"tokens_tensor: {tokens_tensor.shape} should have 1 sequence"
+    assert tokens_tensor.shape[0] == 1, (
+        f"tokens_tensor: {tokens_tensor.shape} should have 1 sequence"
+    )
 
     if tokens_tensor.dim() == 2:
         # Extract the first (and only) sequence
@@ -1402,17 +1540,17 @@ def get_doc_lengths_from_item(item: dict, tokenizer) -> list[int]:
     else:
         # Already 1D
         tokens = tokens_tensor.cpu().tolist()
-    
+
     # Get EOD token ID from tokenizer
     eod_token_id = tokenizer.eod
-    
+
     # Find EOD positions
     eod_positions = [i for i, tok in enumerate(tokens) if tok == eod_token_id]
-    
+
     if not eod_positions:
         # No EOD found - treat entire sequence as one document
         return [len(tokens)]
-    
+
     # Calculate tokens per document
     # Documents are: [0:eod_0+1], [eod_0+1:eod_1+1], ...
     doc_lengths = []
@@ -1421,18 +1559,17 @@ def get_doc_lengths_from_item(item: dict, tokenizer) -> list[int]:
         doc_length = eod_pos - prev_end + 1  # Include the EOD token
         doc_lengths.append(doc_length)
         prev_end = eod_pos + 1
-    
+
     # If there are tokens after the last EOD, count them as a partial document
     if prev_end < len(tokens):
         doc_lengths.append(len(tokens) - prev_end)
-    
-    return doc_lengths
 
+    return doc_lengths
 
 
 def modify_train_data_iterator(
     mbc_config: MicrobatchCreateConfig,
-    data_iterator: 'Iterator[dict]',
+    data_iterator: "Iterator[dict]",
 ):
     """
     Return a modified data iterator that yields items with `num_token_per_rank` tokens.
@@ -1442,13 +1579,13 @@ def modify_train_data_iterator(
     while True:
         item = next(data_iterator)
         # Reorganize the item such that each tensor will have `num_token_per_rank` tokens.
-        
+
         # Only assume the batch has keys (tokens, labels, loss_mask, position_ids)
-        original_tokens = item['tokens']
-        original_labels = item['labels']
-        original_loss_mask = item['loss_mask']
-        original_position_ids = item['position_ids']
-        
+        original_tokens = item["tokens"]
+        original_labels = item["labels"]
+        original_loss_mask = item["loss_mask"]
+        original_position_ids = item["position_ids"]
+
         # Reorganize the item such that each tensor will have `num_token_per_rank` tokens.
         splitted_tokens = torch.split(original_tokens, num_token_per_rank, dim=1)
         splitted_labels = torch.split(original_labels, num_token_per_rank, dim=1)
@@ -1459,16 +1596,18 @@ def modify_train_data_iterator(
         num_splits = len(splitted_tokens)
         for i in range(num_splits):
             new_item = {
-                'tokens': splitted_tokens[i],
-                'labels': splitted_labels[i],
-                'loss_mask': splitted_loss_mask[i],
-                'position_ids': splitted_position_ids[i],
+                "tokens": splitted_tokens[i],
+                "labels": splitted_labels[i],
+                "loss_mask": splitted_loss_mask[i],
+                "position_ids": splitted_position_ids[i],
             }
             yield new_item
 
     pass
 
+
 train_data_iterator__modified = modify_train_data_iterator(mbc_config, train_data_iterator)
+
 
 def get_next_batch(num_batches: int) -> list[list[int]]:
     """
@@ -1488,7 +1627,9 @@ def get_next_batch(num_batches: int) -> list[list[int]]:
 
     batch_registry.append(this_batch)
     doclength_registry.append(doc_lengths)
-    logger.info(f"[get_next_batch] [as_rank = {mbc_config.as_rank}] doc_lengths: {doc_lengths}, num_batches: {num_batches}, total_seq_len: {mbc_config.total_seq_len}")
+    logger.info(
+        f"[get_next_batch] [as_rank = {mbc_config.as_rank}] doc_lengths: {doc_lengths}, num_batches: {num_batches}, total_seq_len: {mbc_config.total_seq_len}"
+    )
     # return [[seq_length] for _ in range(num_batches)]
     return doc_lengths
 
@@ -1500,11 +1641,11 @@ def _block_reverse_list(l: list, d: int):
     This is because the backward is the flip of forward in the pp dimension, but
     keep the order in the dp dimension.
     """
-    return [item for i in range(len(l), 0, -d) for item in l[max(0, i - d):i]]
+    return [item for i in range(len(l), 0, -d) for item in l[max(0, i - d) : i]]
 
 
 def create_pipeline_doclens(
-    ref_doc_lens: Optional[list[list[int]]],
+    ref_doc_lens: list[list[int]] | None,
     add_dummy: bool,
     is_backward: bool,
     world_size: int,
@@ -1512,7 +1653,7 @@ def create_pipeline_doclens(
     tp_size: int,
     dp_size: int,
     num_batches: int = None,
-) -> tuple[list[list[int]], list[bool]]: # list of batch[int], list of dummy mask
+) -> tuple[list[list[int]], list[bool]]:  # list of batch[int], list of dummy mask
     """
     Create `num_batches` batch for a microbatch (one pp-tick).
     - Take a batch from get_next_batch (or random) and also handle some padding logic.
@@ -1536,7 +1677,7 @@ def create_pipeline_doclens(
         # (backward batches are typically not dummy)
         dummy_mask = [False] * len(result)
         return result, dummy_mask
-    
+
     dummy_length = total_token_on_rank // dp_size
     # Create new microbatches for the first PP stage
     dummy_mask = []
@@ -1545,18 +1686,20 @@ def create_pipeline_doclens(
         # to avoid Sequence Parallel having an issue.
 
         # FIXME: using total_token_on_rank for cudagraph to work out-of-box, can be tp_size when cudagraph is disabled.
-        pp_head_new_doc_len = [[dummy_length] for _ in range(dp_size)]  
+        pp_head_new_doc_len = [[dummy_length] for _ in range(dp_size)]
         dummy_mask = [True] * dp_size
     else:
-        assert total_token_on_rank % tp_size == 0, "Sequence Parallel requires total token divisible by tp_size"
-        num_batches = num_batches or dp_size 
+        assert total_token_on_rank % tp_size == 0, (
+            "Sequence Parallel requires total token divisible by tp_size"
+        )
+        num_batches = num_batches or dp_size
         pp_head_new_doc_len = get_next_batch(num_batches)
         dummy_mask = [False] * num_batches
 
-    # pp_head_new_doc_len : shape : [dp, num_seqs]  
+    # pp_head_new_doc_len : shape : [dp, num_seqs]
     # We should sample seq_len here.
-    # And add the sampled seq_len to the batch. 
-    # Next step is based on the previous batch, move the batch. 
+    # And add the sampled seq_len to the batch.
+    # Next step is based on the previous batch, move the batch.
     # Get existing microbatch seqlens
     if ref_doc_lens is not None:
         if num_batches == None:
@@ -1568,9 +1711,9 @@ def create_pipeline_doclens(
             other_pp_doc_len = ref_doc_lens[:-num_batches]
     else:
         dummy_fwd_num = world_size - dp_size
-        # FIXME: using total_token_on_rank for cudagraph to work out-of-box, 
+        # FIXME: using total_token_on_rank for cudagraph to work out-of-box,
         # can be tp_size when cudagraph is disabled.
-        other_pp_doc_len = [[dummy_length] for _ in range(dummy_fwd_num)]  
+        other_pp_doc_len = [[dummy_length] for _ in range(dummy_fwd_num)]
     tick_per_rank_doc_len = pp_head_new_doc_len + other_pp_doc_len
     dummy_mask += [False] * len(other_pp_doc_len)
 
@@ -1583,12 +1726,13 @@ def create_pipeline_doclens(
 #     batch_to_items_with_dummy,
 # )
 
+
 def batch_to_items_with_dummy(
-    batches: List[List[int]], 
-    num_tokens_per_rank: int, 
-    as_world_size: int, 
+    batches: list[list[int]],
+    num_tokens_per_rank: int,
+    as_world_size: int,
     model_config: dict,
-    dummy_mask: List[bool],
+    dummy_mask: list[bool],
 ):
 
     items = []
@@ -1596,42 +1740,72 @@ def batch_to_items_with_dummy(
     rank_budgets = [num_tokens_per_rank] * as_world_size
     current_rank_idx = 0
 
-    assert len(batches) == len(dummy_mask), \
+    assert len(batches) == len(dummy_mask), (
         f"Length mismatch: batches={len(batches)}, dummy_mask={len(dummy_mask)}"
-    
-    logger_batch_to_items.debug(f"START: batches={batches}, num_tokens_per_rank={num_tokens_per_rank}, as_world_size={as_world_size}")
+    )
+
+    logger_batch_to_items.debug(
+        f"START: batches={batches}, num_tokens_per_rank={num_tokens_per_rank}, as_world_size={as_world_size}"
+    )
     logger_batch_to_items.debug(f"dummy_mask={dummy_mask}")
-    logger_batch_to_items.debug(f"INITIAL STATE: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
+    logger_batch_to_items.debug(
+        f"INITIAL STATE: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}"
+    )
 
     for batch_idx, batch in enumerate(batches):
         logger_batch_to_items.debug(f"\nProcessing batch[{batch_idx}]={batch}")
-        logger_batch_to_items.debug(f"BEFORE batch: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
-        
+        logger_batch_to_items.debug(
+            f"BEFORE batch: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}"
+        )
+
         # Use explicit dummy_mask instead of inference
         is_dummy = dummy_mask[batch_idx]
-        
+
         if is_dummy:
-            logger_batch_to_items.debug(f"DUMMY BATCH detected: len={len(batch)}, doc_len={batch[0]}")
-            logger_batch_to_items.debug(f"BEFORE finding rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
-            
+            logger_batch_to_items.debug(
+                f"DUMMY BATCH detected: len={len(batch)}, doc_len={batch[0]}"
+            )
+            logger_batch_to_items.debug(
+                f"BEFORE finding rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}"
+            )
+
             while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
                 old_idx = current_rank_idx
                 current_rank_idx += 1
-                logger_batch_to_items.debug(f"Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}")
-            
-            logger_batch_to_items.debug(f"Selected rank_idx={current_rank_idx} for dummy doc, rank_budget={rank_budgets[current_rank_idx]}")
-            assert rank_budgets[current_rank_idx] == num_tokens_per_rank, "dummy doc should put on a empty rank"
+                logger_batch_to_items.debug(
+                    f"Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}"
+                )
+
+            logger_batch_to_items.debug(
+                f"Selected rank_idx={current_rank_idx} for dummy doc, rank_budget={rank_budgets[current_rank_idx]}"
+            )
+            assert rank_budgets[current_rank_idx] == num_tokens_per_rank, (
+                "dummy doc should put on a empty rank"
+            )
             # dummy doc, this rank only put this dummy item.
             doc_len = batch[0]
-            item_dict = {'q': doc_len, 'kv': doc_len}
-            new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
-                            item_dict, is_original=True)
+            item_dict = {"q": doc_len, "kv": doc_len}
+            new_item = Item(
+                model_config,
+                doc_len,
+                seqid,
+                current_rank_idx,
+                current_rank_idx,
+                item_dict,
+                is_original=True,
+            )
             items.append(new_item)
-            logger_batch_to_items.debug(f"Created dummy item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}")
-            logger_batch_to_items.debug(f"BEFORE increment: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
+            logger_batch_to_items.debug(
+                f"Created dummy item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}"
+            )
+            logger_batch_to_items.debug(
+                f"BEFORE increment: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}"
+            )
             current_rank_idx += 1
             seqid += 1
-            logger_batch_to_items.debug(f"AFTER dummy processing: current_rank_idx={current_rank_idx}, seqid={seqid}, rank_budgets={rank_budgets} (NOTE: budget NOT decremented!)")
+            logger_batch_to_items.debug(
+                f"AFTER dummy processing: current_rank_idx={current_rank_idx}, seqid={seqid}, rank_budgets={rank_budgets} (NOTE: budget NOT decremented!)"
+            )
         else:
             logger_batch_to_items.debug(f"REGULAR BATCH: len={len(batch)}, docs={batch}")
             for doc_idx, doc_length in enumerate(batch):
@@ -1641,26 +1815,40 @@ def batch_to_items_with_dummy(
                 tail_suffix_start_pos = doc_len
                 is_original_flag = True
 
-                logger_batch_to_items.debug(f"Processing doc[{doc_idx}]: doc_len={doc_len}, remaining_len={remaining_len}")
-                logger_batch_to_items.debug(f"BEFORE doc loop: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}, seqid={seqid}")
+                logger_batch_to_items.debug(
+                    f"Processing doc[{doc_idx}]: doc_len={doc_len}, remaining_len={remaining_len}"
+                )
+                logger_batch_to_items.debug(
+                    f"BEFORE doc loop: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}, seqid={seqid}"
+                )
 
                 while remaining_len > 0:
                     logger_batch_to_items.debug(f"WHILE remaining_len={remaining_len} > 0")
-                    logger_batch_to_items.debug(f"BEFORE finding available rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}")
-                    
+                    logger_batch_to_items.debug(
+                        f"BEFORE finding available rank: current_rank_idx={current_rank_idx}, rank_budgets={rank_budgets}"
+                    )
+
                     while current_rank_idx < as_world_size and rank_budgets[current_rank_idx] == 0:
                         old_idx = current_rank_idx
                         current_rank_idx += 1
-                        logger_batch_to_items.debug(f"Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}")
-                    
-                    logger_batch_to_items.debug(f"AFTER finding rank: current_rank_idx={current_rank_idx}, as_world_size={as_world_size}")
-                    
+                        logger_batch_to_items.debug(
+                            f"Skipped rank {old_idx} (budget=0), moved to rank_idx={current_rank_idx}"
+                        )
+
+                    logger_batch_to_items.debug(
+                        f"AFTER finding rank: current_rank_idx={current_rank_idx}, as_world_size={as_world_size}"
+                    )
+
                     if current_rank_idx >= as_world_size:
                         total_capacity = as_world_size * num_tokens_per_rank
                         total_allocated = total_capacity - sum(rank_budgets)
                         total_remaining = sum(rank_budgets)
-                        logger_batch_to_items.debug(f"ERROR: current_rank_idx={current_rank_idx} >= as_world_size={as_world_size}")
-                        logger_batch_to_items.debug(f"ERROR: total_remaining={total_remaining}, rank_budgets={rank_budgets}")
+                        logger_batch_to_items.debug(
+                            f"ERROR: current_rank_idx={current_rank_idx} >= as_world_size={as_world_size}"
+                        )
+                        logger_batch_to_items.debug(
+                            f"ERROR: total_remaining={total_remaining}, rank_budgets={rank_budgets}"
+                        )
                         raise ValueError(
                             f"Not enough space to allocate document. \n"
                             f"seqid={seqid}, original_doc_len={doc_len}, remaining_len={remaining_len}. \n"
@@ -1670,45 +1858,76 @@ def batch_to_items_with_dummy(
                             f"All batches: {batches}. \n"
                             f"Current rank index: {current_rank_idx}. \n"
                         )
-                    
+
                     chunk_size = min(remaining_len, rank_budgets[current_rank_idx])
-                    logger_batch_to_items.debug(f"Allocating chunk: chunk_size={chunk_size} (min of remaining_len={remaining_len}, rank_budget={rank_budgets[current_rank_idx]})")
-                    
+                    logger_batch_to_items.debug(
+                        f"Allocating chunk: chunk_size={chunk_size} (min of remaining_len={remaining_len}, rank_budget={rank_budgets[current_rank_idx]})"
+                    )
+
                     if remaining_len == doc_len and chunk_size == doc_len:
-                        item_dict = {'q': doc_len, 'kv': doc_len}
-                        new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
-                                        item_dict, is_original=True)
+                        item_dict = {"q": doc_len, "kv": doc_len}
+                        new_item = Item(
+                            model_config,
+                            doc_len,
+                            seqid,
+                            current_rank_idx,
+                            current_rank_idx,
+                            item_dict,
+                            is_original=True,
+                        )
                         items.append(new_item)
-                        logger_batch_to_items.debug(f"Created single-chunk item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}")
+                        logger_batch_to_items.debug(
+                            f"Created single-chunk item: seqid={seqid}, rank={current_rank_idx}, doc_len={doc_len}, items_count={len(items)}"
+                        )
                     else:
                         q_len_head = chunk_size // 2
                         q_len_tail = chunk_size - q_len_head
-                        
-                        new_head_kv = head_prefix_len + q_len_head
-                        head_item = {'q': q_len_head, 'kv': new_head_kv}
-                        tail_item = {'q': q_len_tail, 'kv': tail_suffix_start_pos}
 
-                        new_item = Item(model_config, doc_len, seqid, current_rank_idx, current_rank_idx,
-                                        head_item, tail_item, is_original=is_original_flag)
+                        new_head_kv = head_prefix_len + q_len_head
+                        head_item = {"q": q_len_head, "kv": new_head_kv}
+                        tail_item = {"q": q_len_tail, "kv": tail_suffix_start_pos}
+
+                        new_item = Item(
+                            model_config,
+                            doc_len,
+                            seqid,
+                            current_rank_idx,
+                            current_rank_idx,
+                            head_item,
+                            tail_item,
+                            is_original=is_original_flag,
+                        )
                         items.append(new_item)
-                        logger_batch_to_items.debug(f"Created split-chunk item: seqid={seqid}, rank={current_rank_idx}, chunk_size={chunk_size}, head={head_item}, tail={tail_item}, items_count={len(items)}")
+                        logger_batch_to_items.debug(
+                            f"Created split-chunk item: seqid={seqid}, rank={current_rank_idx}, chunk_size={chunk_size}, head={head_item}, tail={tail_item}, items_count={len(items)}"
+                        )
 
                         head_prefix_len = new_head_kv
                         tail_suffix_start_pos -= q_len_tail
                         is_original_flag = False
-                        logger_batch_to_items.debug(f"Updated split state: head_prefix_len={head_prefix_len}, tail_suffix_start_pos={tail_suffix_start_pos}")
+                        logger_batch_to_items.debug(
+                            f"Updated split state: head_prefix_len={head_prefix_len}, tail_suffix_start_pos={tail_suffix_start_pos}"
+                        )
 
                     old_budget = rank_budgets[current_rank_idx]
                     rank_budgets[current_rank_idx] -= chunk_size
                     remaining_len -= chunk_size
-                    logger_batch_to_items.debug(f"Updated budgets: rank[{current_rank_idx}] {old_budget} -> {rank_budgets[current_rank_idx]}, remaining_len: {remaining_len + chunk_size} -> {remaining_len}")
+                    logger_batch_to_items.debug(
+                        f"Updated budgets: rank[{current_rank_idx}] {old_budget} -> {rank_budgets[current_rank_idx]}, remaining_len: {remaining_len + chunk_size} -> {remaining_len}"
+                    )
 
                 seqid += 1
-                logger_batch_to_items.debug(f"Finished doc[{doc_idx}]: seqid incremented to {seqid}")
-        
-        logger_batch_to_items.debug(f"AFTER batch[{batch_idx}]: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}, items_count={len(items)}")
-    
-    logger_batch_to_items.debug(f"\nFINAL: items_count={len(items)}, rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}")
+                logger_batch_to_items.debug(
+                    f"Finished doc[{doc_idx}]: seqid incremented to {seqid}"
+                )
+
+        logger_batch_to_items.debug(
+            f"AFTER batch[{batch_idx}]: rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}, items_count={len(items)}"
+        )
+
+    logger_batch_to_items.debug(
+        f"\nFINAL: items_count={len(items)}, rank_budgets={rank_budgets}, current_rank_idx={current_rank_idx}, seqid={seqid}"
+    )
     return items
 
 
@@ -1716,7 +1935,7 @@ def batch_to_items_with_dummy(
 def create_qkv_dispatch_pipeline_tick(
     mbc_config: MicrobatchCreateConfig,
     tolerance_factor: float = 0.05,
-    ref_doc_lens: Optional[torch.Tensor] = None,
+    ref_doc_lens: torch.Tensor | None = None,
     add_dummy: bool = None,
 ):
     """
@@ -1726,10 +1945,8 @@ def create_qkv_dispatch_pipeline_tick(
     # from distca.planner.planner import (
     #     batch_to_items_with_dummy,
     # )
-    from distca.runtime.compute_metadata import (
-        from_planner_output, backward_from_planner_output
-    )
-    
+    from distca.runtime.compute_metadata import backward_from_planner_output, from_planner_output
+
     create_pp_doclen_kwargs = dict(
         world_size=mbc_config.as_world_size,
         total_token_on_rank=mbc_config.total_seq_len,
@@ -1739,19 +1956,21 @@ def create_qkv_dispatch_pipeline_tick(
 
     # Get the new sequence lens from get_next_batch.
     cur_tick_per_rank_doc_lens, cur_tick_dummy_mask = create_pipeline_doclens(
-        ref_doc_lens, 
-        add_dummy, 
-        is_backward=False, 
+        ref_doc_lens,
+        add_dummy,
+        is_backward=False,
         world_size=mbc_config.as_world_size,
         total_token_on_rank=mbc_config.total_seq_len,
         tp_size=mbc_config.tp_size,
         dp_size=mbc_config.dp_size,
-        num_batches = mbc_config.num_batches, 
+        num_batches=mbc_config.num_batches,
     )
-    assert isinstance(cur_tick_per_rank_doc_lens, list), f"cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens} is not a list"
-    assert len(cur_tick_per_rank_doc_lens) == len(cur_tick_dummy_mask), \
+    assert isinstance(cur_tick_per_rank_doc_lens, list), (
+        f"cur_tick_per_rank_doc_lens: {cur_tick_per_rank_doc_lens} is not a list"
+    )
+    assert len(cur_tick_per_rank_doc_lens) == len(cur_tick_dummy_mask), (
         f"Length mismatch: batches={len(cur_tick_per_rank_doc_lens)}, dummy_mask={len(cur_tick_dummy_mask)}"
-
+    )
 
     world_size = mbc_config.tp_size * mbc_config.pp_size * mbc_config.dp_size
     planner = Planner.from_individual_params(
@@ -1760,81 +1979,92 @@ def create_qkv_dispatch_pipeline_tick(
         dp_size=mbc_config.dp_size,
         world_size=world_size,
         hidden_size_q=mbc_config.hidden_size_q_tp,
-        hidden_size_k=mbc_config.hidden_size_k_tp
+        hidden_size_k=mbc_config.hidden_size_k_tp,
     )
     planner.tolerance_factor = tolerance_factor
-    
+
     # Create a temp_model_config for item initialization.
     temp_model_config = SimpleNamespace(
         hidden_size=mbc_config.hidden_size_q_tp * mbc_config.tp_size,
-        num_attention_heads = 1,
-        num_key_value_heads = mbc_config.hidden_size_q_tp // mbc_config.hidden_size_k_tp,
-        num_hidden_layers = 1
+        num_attention_heads=1,
+        num_key_value_heads=mbc_config.hidden_size_q_tp // mbc_config.hidden_size_k_tp,
+        num_hidden_layers=1,
     )
     # Use batch_to_items_with_dummy to handle dummy doc to item.
     items = batch_to_items_with_dummy(
-        batches=cur_tick_per_rank_doc_lens, 
-        num_tokens_per_rank = mbc_config.num_token_per_rank,
+        batches=cur_tick_per_rank_doc_lens,
+        num_tokens_per_rank=mbc_config.num_token_per_rank,
         as_world_size=mbc_config.as_world_size,
         model_config=temp_model_config,
-        dummy_mask=cur_tick_dummy_mask)
-    
-    fwd_planner_out = planner.items_to_shardinfo(items)
-    
-    (
-        qkv_linear_to_attn_fa2a, _, 
-        out_attn_to_linear_fa2a, _, 
-        fwd_attn_metadata
-    ) = from_planner_output(
-        mbc_config.as_world_size, 
-        fwd_planner_out, 
-        mbc_config.hidden_size_q_tp, 
-        mbc_config.hidden_size_k_tp,
-        mbc_config.softmax_lse_size, 
-        mbc_config.element_size, 
-        is_pipeline_tick=True
+        dummy_mask=cur_tick_dummy_mask,
     )
-    
+
+    fwd_planner_out = planner.items_to_shardinfo(items)
+
+    (qkv_linear_to_attn_fa2a, _, out_attn_to_linear_fa2a, _, fwd_attn_metadata) = (
+        from_planner_output(
+            mbc_config.as_world_size,
+            fwd_planner_out,
+            mbc_config.hidden_size_q_tp,
+            mbc_config.hidden_size_k_tp,
+            mbc_config.softmax_lse_size,
+            mbc_config.element_size,
+            is_pipeline_tick=True,
+        )
+    )
+
     # CP flip logic.
     if len(cur_tick_per_rank_doc_lens) < mbc_config.as_world_size:
-        bwd_tick_per_rank_doc_lens = _block_reverse_list(cur_tick_per_rank_doc_lens, mbc_config.num_batches)
+        bwd_tick_per_rank_doc_lens = _block_reverse_list(
+            cur_tick_per_rank_doc_lens, mbc_config.num_batches
+        )
         # Reverse dummy_mask in the same way as batches
         bwd_tick_dummy_mask = _block_reverse_list(cur_tick_dummy_mask, mbc_config.num_batches)
     else:
         # None CP flip logic.
         bwd_tick_per_rank_doc_lens, bwd_tick_dummy_mask = create_pipeline_doclens(
-            cur_tick_per_rank_doc_lens, add_dummy=False, is_backward=True,
+            cur_tick_per_rank_doc_lens,
+            add_dummy=False,
+            is_backward=True,
             **create_pp_doclen_kwargs,
         )
-    
+
     items = batch_to_items_with_dummy(
-        batches=bwd_tick_per_rank_doc_lens, 
+        batches=bwd_tick_per_rank_doc_lens,
         num_tokens_per_rank=mbc_config.num_token_per_rank,
         as_world_size=mbc_config.as_world_size,
         model_config=temp_model_config,
         dummy_mask=bwd_tick_dummy_mask,
     )
     bwd_planner_out = planner.items_to_shardinfo(items)
-    
+
     (
-        qkv_resend_and_out_grad_linear_to_attn_fa2a, 
+        qkv_resend_and_out_grad_linear_to_attn_fa2a,
         qkv_grad_attn_to_linear_fa2a,
-        bwd_attn_metadata
+        bwd_attn_metadata,
     ) = backward_from_planner_output(
-         mbc_config.as_world_size, bwd_planner_out, mbc_config.hidden_size_q_tp, mbc_config.hidden_size_k_tp,
-         mbc_config.softmax_lse_size, mbc_config.element_size,
-     )
+        mbc_config.as_world_size,
+        bwd_planner_out,
+        mbc_config.hidden_size_q_tp,
+        mbc_config.hidden_size_k_tp,
+        mbc_config.softmax_lse_size,
+        mbc_config.element_size,
+    )
 
-    return (fwd_attn_metadata, bwd_attn_metadata,
-            qkv_linear_to_attn_fa2a, qkv_grad_attn_to_linear_fa2a,
-            out_attn_to_linear_fa2a, qkv_resend_and_out_grad_linear_to_attn_fa2a,
-            cur_tick_per_rank_doc_lens,)
-
+    return (
+        fwd_attn_metadata,
+        bwd_attn_metadata,
+        qkv_linear_to_attn_fa2a,
+        qkv_grad_attn_to_linear_fa2a,
+        out_attn_to_linear_fa2a,
+        qkv_resend_and_out_grad_linear_to_attn_fa2a,
+        cur_tick_per_rank_doc_lens,
+    )
 
 
 def create_pp_microbatches(
     mbc_config: MicrobatchCreateConfig,
-) -> 'List[MicroBatchItem]':
+) -> "list[MicroBatchItem]":
     # MicroBatchItem = Dict[str, Thing]
     #     "tokens": torch.Tensor,
     #     "labels": torch.Tensor,
@@ -1843,7 +2073,7 @@ def create_pp_microbatches(
     #     "packed_seq_params": PingPangSingleStepPackedSeqParams,
 
     num_microbatch = mbc_config.num_microbatch
-    pp_degree = mbc_config.pp_size # this is just pp-size, not pp-rank.
+    pp_degree = mbc_config.pp_size  # this is just pp-size, not pp-rank.
     as_rank = mbc_config.as_rank
     as_world_size = mbc_config.as_world_size
     num_token_per_rank = mbc_config.num_token_per_rank
@@ -1858,41 +2088,45 @@ def create_pp_microbatches(
         # add a dummy forward microbatch at PP rank 0.
         add_dummy_forward = i >= num_microbatch
         (
-            fa_fwd_params, 
+            fa_fwd_params,
             fa_bwd_params,
-            qkv_fwd_fa2a_metadata, 
+            qkv_fwd_fa2a_metadata,
             qkv_bwd_fa2a_metadata,
-            attn_out_fwd_fa2a_metadata, 
+            attn_out_fwd_fa2a_metadata,
             attn_out_qkv_bwd_fa2a_metadata,
-            tick_per_rank_doc_lens, 
+            tick_per_rank_doc_lens,
         ) = create_qkv_dispatch_pipeline_tick(
             mbc_config=mbc_config,
             ref_doc_lens=tick_per_rank_doc_lens,
             add_dummy=add_dummy_forward,
         )
-        
-        # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, 
+
+        # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP,
         # so each rank knows its number of tokens.
         #
         # Example 1 DP case:
-        # tick_per_rank_doc_lens cp list: List[List[int]] 
+        # tick_per_rank_doc_lens cp list: List[List[int]]
         #     = [[8], [8], [8], [8], [256, 256],[128, 384],[512], [10, 502] ]
-        # tick_per_rank_doc_lens mlp list 
+        # tick_per_rank_doc_lens mlp list
         #     = [[8], [8], [8], [8], [256, 256],[128, 384],[512], [10, 502] ]
         #
         # Example 2 CP case:
-        # tick_per_rank_doc_lens cp list: List[List[int]] 
+        # tick_per_rank_doc_lens cp list: List[List[int]]
         #     = [[8], [8], [8], [8], [256, 768],[512, 10, 502] ]
-        # tick_per_rank_doc_lens mlp list 
+        # tick_per_rank_doc_lens mlp list
         #     = [[8], [8], [8], [8], [256, 128, 128], [256, 256], [512], [10, 502]]
         #
         tick_per_rank_doc_lens_after_cp_transfer = cp_list_to_mlp_list(
             tick_per_rank_doc_lens, as_world_size, num_token_per_rank
         )
         this_rank_num_tokens = sum(tick_per_rank_doc_lens_after_cp_transfer[as_rank])
-        logger.info(f"[create_pp_microbatches] [as_rank = {as_rank}] this_rank_num_tokens: {this_rank_num_tokens}, tick_per_rank_doc_lens_after_cp_transfer: {tick_per_rank_doc_lens_after_cp_transfer}, num_token_per_rank: {num_token_per_rank}")
+        logger.info(
+            f"[create_pp_microbatches] [as_rank = {as_rank}] this_rank_num_tokens: {this_rank_num_tokens}, tick_per_rank_doc_lens_after_cp_transfer: {tick_per_rank_doc_lens_after_cp_transfer}, num_token_per_rank: {num_token_per_rank}"
+        )
         bwd_packed_seq_params = PackedSeqParams(qkv_format="thd", **fa_bwd_params[as_rank])
-        tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens_after_cp_transfer[as_rank], dtype=torch.int32)
+        tensor_doc_lens = torch.tensor(
+            tick_per_rank_doc_lens_after_cp_transfer[as_rank], dtype=torch.int32
+        )
         mlp_packed_seq_params = get_attn_metadata(tensor_doc_lens, get_packed_seq_params=True)
 
         # Create packed_params. Note that we do not add backward params here.
@@ -1912,12 +2146,14 @@ def create_pp_microbatches(
         # tokens, labels, loss_mask, position_ids
 
         # Concatenate the different tokens, labels, loss_mask, and position_ids
-        tokens = torch.cat([b['tokens'] for b in batch_registry[0]], dim=0)
-        labels = torch.cat([b['labels'] for b in batch_registry[0]], dim=0)
-        loss_mask = torch.cat([b['loss_mask'] for b in batch_registry[0]], dim=0)
-        position_ids = torch.cat([b['position_ids'] for b in batch_registry[0]], dim=0)
+        tokens = torch.cat([b["tokens"] for b in batch_registry[0]], dim=0)
+        labels = torch.cat([b["labels"] for b in batch_registry[0]], dim=0)
+        loss_mask = torch.cat([b["loss_mask"] for b in batch_registry[0]], dim=0)
+        position_ids = torch.cat([b["position_ids"] for b in batch_registry[0]], dim=0)
 
-        logger.debug(f'create_pp_microbatches[{i}] batch_registry: {len(batch_registry)}, doclength_registry: {len(doclength_registry)}')
+        logger.debug(
+            f"create_pp_microbatches[{i}] batch_registry: {len(batch_registry)}, doclength_registry: {len(doclength_registry)}"
+        )
 
         # position_ids_local = torch.arange(this_rank_num_tokens)
         microbatch = {
@@ -1935,30 +2171,32 @@ def create_pp_microbatches(
         # store the corresponding bwd metadata (for later ticks)
         bwd_metadata.append(
             (
-                qkv_bwd_fa2a_metadata.get_slice(as_rank), 
-                attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank), 
-                bwd_packed_seq_params
+                qkv_bwd_fa2a_metadata.get_slice(as_rank),
+                attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank),
+                bwd_packed_seq_params,
             )
         )
 
     # put bwd metadata to the corresponding side
     for i, microbatch in enumerate(microbatches):
-        # 
-        # When mb_i is computed on pp_rank at forward tick t, 
+        #
+        # When mb_i is computed on pp_rank at forward tick t,
         # assume the backward right after this forward is at tick t'.
         # mb_i requires another (pp_degree - 1 - pp_rank) forward steps to start mb_i backward,
-        # and another (pp_degree - 1 - pp_rank) 
+        # and another (pp_degree - 1 - pp_rank)
         # backward steps to compute mb_i backward on this pp_rank.
         #
         # Since in 1F1B, every forward follows a backward, so backward tick
         # t' + 2 * (pp_degree - 1 - pp_rank) is the one to compute mb_i on this pp_rank.
-        # Note that at the end of PP warmup, forward tick is pp_degree - 1, 
-        # while backward tick is 0. 
+        # Note that at the end of PP warmup, forward tick is pp_degree - 1,
+        # while backward tick is 0.
         #
         # Therefore, t - t' = pp_degree - 1, and thus
         # t' + 2 * (pp_degree - 1 - pp_rank) == t + pp_degree - 1 - pp_rank * 2
         bwd_metadata_idx = (i + pp_degree - 1 - pp_rank * 2) % len(bwd_metadata)
-        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[bwd_metadata_idx]
+        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[
+            bwd_metadata_idx
+        ]
         packed_seq_params = microbatch["packed_seq_params"]
         packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
         packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
@@ -1974,8 +2212,7 @@ def create_combined_ping_pong_microbatches(
     Create combined microbatches for ping-pong (two dispatchers).
     Returns a list of combined microbatches.
     """
-    from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams
-    
+
     # Create microbatches for ping-pong (two dispatchers)
     microbatches_0 = create_pp_microbatches(mbc_config)
     # assert len(microbatches_0) == mbc_config.num_microbatch + mbc_config.pp_size - 1, f"microbatches_0: {len(microbatches_0)}"
@@ -1991,7 +2228,7 @@ def create_combined_ping_pong_microbatches(
         mb_1_mlp_psp = mb_1_psp.mlp_packed_seq_params
         mb_0_psp.dispatcher_id = 0
         mb_1_psp.dispatcher_id = 1
-        
+
         ping_pong_params = PingPangPackedSeqParams(
             seq_params=[mb_0_psp, mb_1_psp],
             mlp_layout_seq_params=[mb_0_mlp_psp, mb_1_mlp_psp],
@@ -1999,22 +2236,21 @@ def create_combined_ping_pong_microbatches(
             max_seqlen_kv=max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
         )
         num_tokens = sum(mb["position_ids"].numel() for mb in [mb_0, mb_1])
-        
+
         # TODO: Need to implement the input_ids as the token ids from the data loader.
         # # For ping-pong mode, input_ids should be 1D (num_tokens,) not 2D (1, num_tokens)
         # # because gptmodel_forward will unsqueeze(0) if pre_process is True, and ping-pong
         # # needs to split hidden_states along batch dimension into 2 parts for the 2 dispatchers.
         # # The actual splitting happens based on packed_seq_params which contains metadata
         # # for both dispatchers (mb_0 and mb_1).
-        
+
         # # This is the reference shape of the input_ids, labels, loss_mask, and position_ids tensors
         # input_ids = torch.randint(10, 1000, (num_tokens,), device=torch.cuda.current_device())
         # labels = torch.randint(10, 1000, (num_tokens,), device=torch.cuda.current_device())
         # loss_mask = torch.randint(0, 2, (num_tokens,), device=torch.cuda.current_device())
         # position_ids = torch.concat([mb_0["position_ids"], mb_1["position_ids"]])
         # labels = labels.unsqueeze(0)
-        
-        
+
         as_rank = mbc_config.as_rank
 
         dim = 1
@@ -2022,7 +2258,9 @@ def create_combined_ping_pong_microbatches(
         labels = torch.cat([mb_0["labels"], mb_1["labels"]], dim=dim).reshape(-1)
         loss_mask = torch.cat([mb_0["loss_mask"], mb_1["loss_mask"]], dim=dim).reshape(-1)
         position_ids = torch.cat([mb_0["position_ids"], mb_1["position_ids"]], dim=dim).reshape(-1)
-        logger.info(f"[create_combined_ping_pong_microbatches] Before slicing: {input_ids.shape = }, {labels.shape = }, {loss_mask.shape = }, {position_ids.shape = }")
+        logger.info(
+            f"[create_combined_ping_pong_microbatches] Before slicing: {input_ids.shape = }, {labels.shape = }, {loss_mask.shape = }, {position_ids.shape = }"
+        )
 
         # Only take the as_rank portion of the tensor
         my_rank_slice = slice(as_rank * num_token_per_rank, (as_rank + 1) * num_token_per_rank)
@@ -2030,10 +2268,14 @@ def create_combined_ping_pong_microbatches(
         labels = labels[my_rank_slice]
         loss_mask = loss_mask[my_rank_slice]
         position_ids = position_ids[my_rank_slice]
-        logger.info(f"[create_combined_ping_pong_microbatches] [as_rank = {as_rank}] After slicing: {input_ids.shape = }, {labels.shape = }, {loss_mask.shape = }, {position_ids.shape = }")
+        logger.info(
+            f"[create_combined_ping_pong_microbatches] [as_rank = {as_rank}] After slicing: {input_ids.shape = }, {labels.shape = }, {loss_mask.shape = }, {position_ids.shape = }"
+        )
 
         labels = labels.unsqueeze(0)
-        logger.info(f"[create_combined_ping_pong_microbatches] [as_rank = {as_rank}] After unsqueezing: {labels.shape = }")
+        logger.info(
+            f"[create_combined_ping_pong_microbatches] [as_rank = {as_rank}] After unsqueezing: {labels.shape = }"
+        )
 
         combined_mb = dict(
             input_ids=input_ids,
@@ -2043,12 +2285,14 @@ def create_combined_ping_pong_microbatches(
             packed_seq_params=ping_pong_params,
         )
         combined_microbatches.append(combined_mb)
-    
+
     return combined_microbatches
 
 
-logger.info(f"Creating microbatches: num_microbatch={num_microbatches}, pp_size={pp_size}, "
-            f"as_rank={as_rank}, as_world_size={as_world_size}")
+logger.info(
+    f"Creating microbatches: num_microbatch={num_microbatches}, pp_size={pp_size}, "
+    f"as_rank={as_rank}, as_world_size={as_world_size}"
+)
 
 # combined_microbatches = create_combined_ping_pong_microbatches(mbc_config)
 
@@ -2059,15 +2303,15 @@ logger.info(f"Creating microbatches: num_microbatch={num_microbatches}, pp_size=
 # ===============================================
 
 iteration = 0
-max_iterations = args.train_iters if hasattr(args, 'train_iters') else 1
+max_iterations = args.train_iters if hasattr(args, "train_iters") else 1
 
 # Register NaN detection hooks (uncomment to enable)
 if args.distca_debug_nan_detector:
     nan_hooks, nan_detected = register_nan_detection_hooks(
-        model, 
-        logger=logger, 
+        model,
+        logger=logger,
         raise_on_nan=True,  # Set to True to stop on first NaN
-        check_inputs=True,    # Set to True to also check inputs
+        check_inputs=True,  # Set to True to also check inputs
         log_all_modules=True,
         log_tensor_stats=True,
         tensor_stats_elements=10,
@@ -2076,17 +2320,16 @@ if args.distca_debug_nan_detector:
 for iteration in range(max_iterations):
     logger.info(f"Starting iteration {iteration}")
 
-
-    # TODO: (Refactor) Every rank will fetch the dataset. This is not so good! 
+    # TODO: (Refactor) Every rank will fetch the dataset. This is not so good!
     # In theory, we should let Rank 0 fetch the dataset and broadcast to the other ranks.
     combined_microbatches = create_combined_ping_pong_microbatches(mbc_config)
     logger.info(f"Created {len(combined_microbatches)} combined microbatches")
     torch.distributed.barrier()
-    
-    logger.info(f"Barrier passed")
+
+    logger.info("Barrier passed")
 
     # Run forward_backward_batch
-    logger.info(f"Running forward_backward_batch")
+    logger.info("Running forward_backward_batch")
     losses_reduced = forward_backward_batch(
         microbatches=combined_microbatches,
         model=model,
@@ -2094,7 +2337,7 @@ for iteration in range(max_iterations):
         mode="ping_pong",
         with_dummy=True,
     )
-    
+
     # Reduce losses across data parallel groups
     print(f"losses_reduced: {losses_reduced}")
     if losses_reduced:
@@ -2103,8 +2346,8 @@ for iteration in range(max_iterations):
         numerator = 0
         denominator = 0
         for loss_dict in losses_reduced:
-            if 'lm loss' in loss_dict:
-                val = loss_dict['lm loss']
+            if "lm loss" in loss_dict:
+                val = loss_dict["lm loss"]
                 if isinstance(val, (tuple, list)) and len(val) == 2:
                     numerator += val[0]  # sum of losses
                     denominator += val[1]  # sum of token counts
@@ -2113,22 +2356,20 @@ for iteration in range(max_iterations):
             logger.info(f"Iteration {iteration}, reduced loss: {reduced_loss.item()}")
         else:
             logger.warning(f"Iteration {iteration}, no valid loss found")
-    
+
     # Optimizer step
     optimizer.step()
-    
-    # TODO: Some logic including increment the opt_param_scheduler 
+
+    # TODO: Some logic including increment the opt_param_scheduler
     # step should be included here.
 
     # Zero gradients (handled by optimizer, but can be explicit)
     optimizer.zero_grad()
-    
+
     logger.info(f"Completed iteration {iteration}")
 
 num_floating_point_operations_so_far = 0  # Calculate if needed
 logger.info(f"Training completed. Total iterations: {iteration + 1}")
-
-
 
 
 # ================================
@@ -2147,4 +2388,3 @@ if wandb_writer:
 
 logger.info(f"Rank {rank} is exiting")
 torch.distributed.destroy_process_group()
-

@@ -26,45 +26,58 @@ test_megatron_e2e_pipeline_with_cp.py --num-gpus-per-node 4 --pp-size 2 --num-mi
 """
 
 import argparse
-from functools import partial
+import json
 import os
 import time
-import json
-from global_batch_provider import setup_global_batch, get_next_batch
-from distca.utils import training_utils as _training_utils
+from contextlib import nullcontext
+from functools import partial
+
 import megatron.core.parallel_state as mpu
+import torch
+from global_batch_provider import setup_global_batch
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-import torch
+from megatron_test_utils import (
+    gptmodel_forward,
+    make_batch_generator,
+    unwrap_model,
+)
+from test_megatron_e2e import MegatronE2eWorker as BaseMegatronE2eWorker
+from test_megatron_e2e import set_random_seed
+from test_util import (
+    ParallelConfig,
+    create_qkv_dispatch_pipeline_tick,
+    init_worker_torch_distributed,
+)
 from transformers import AutoConfig
 
-from distca.runtime.compute_metadata import get_attn_metadata
-from distca.runtime.megatron.packed_seq_params import arg_to_cuda, PingPangSingleStepPackedSeqParams, PingPangPackedSeqParams, MLPLayoutPackedSeqParams
-from distca.runtime.megatron.forward_backward_func import forward_backward_pipelining_without_interleaving as forward_backward_func
-from distca.planner.planner import cp_list_to_mlp_list
-
-from test_util import ParallelConfig, init_worker_torch_distributed, create_qkv_dispatch_pipeline_tick
-from test_megatron_e2e import MegatronE2eWorker as BaseMegatronE2eWorker, set_random_seed
-from megatron_test_utils import (
-    gptmodel_forward, make_batch_generator, unwrap_model,
-)
 import distca.mem
-from contextlib import nullcontext
-
+from distca.planner.planner import cp_list_to_mlp_list
+from distca.runtime.compute_metadata import get_attn_metadata
+from distca.runtime.megatron.forward_backward_func import (
+    forward_backward_pipelining_without_interleaving as forward_backward_func,
+)
+from distca.runtime.megatron.packed_seq_params import (
+    PingPangPackedSeqParams,
+    PingPangSingleStepPackedSeqParams,
+    arg_to_cuda,
+)
+from distca.utils import training_utils as _training_utils
 
 # --------------------------------
 # Better traceback formatting
 # --------------------------------
-from distca.utils.traceback import enable_clickable_excepthook, enable_trace_calls
+from distca.utils.traceback import enable_clickable_excepthook
+
 enable_clickable_excepthook()
 
 
-import time
 start_time__ = time.time()
 
-import psutil, os
-rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID","0")))
-local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID","0")))
+import psutil
+
+rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
 p = psutil.Process(os.getpid())
 p.cpu_affinity([local * 16, (local + 1) * 16])  # pin to core based on local rank
 print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
@@ -73,6 +86,7 @@ print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
 # Taskset confirm
 # ----------------
 import check_cpu_binding
+
 aff, mems = check_cpu_binding.check_cpu_binding()
 print(f"CPUS={aff} MEMS={mems}")
 
@@ -84,12 +98,17 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         torch.cuda.set_device(local_rank)
         torch.set_default_device(torch.device("cuda", local_rank))
 
-    def forward_backward_batch(self, microbatches: list[dict], forward_only: bool=False,
-                               mode: str="ping_pong", with_dummy: bool=True):
+    def forward_backward_batch(
+        self,
+        microbatches: list[dict],
+        forward_only: bool = False,
+        mode: str = "ping_pong",
+        with_dummy: bool = True,
+    ):
 
-        microbatches = [{
-            k: arg_to_cuda(v) for k, v in microbatch.items()
-        } for microbatch in microbatches]
+        microbatches = [
+            {k: arg_to_cuda(v) for k, v in microbatch.items()} for microbatch in microbatches
+        ]
         if "orig" in mode:
             for mb in microbatches:
                 psp = mb["packed_seq_params"]
@@ -103,26 +122,31 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         n_micro_batch = len(microbatches) - pp_size + 1
         # thd layout
-        total_seqlen = microbatches[0]['input_ids'].shape[0]
+        total_seqlen = microbatches[0]["input_ids"].shape[0]
 
         def loss_func(output):
             # NOTE: this is a dummy loss function.
             loss = output.mean()
-            return loss, {'loss': loss}
+            return loss, {"loss": loss}
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
             torch.cuda.nvtx.range_push("forward_step")
-            input_ids = batch['input_ids']
-            position_ids = batch['position_ids']
+            input_ids = batch["input_ids"]
+            position_ids = batch["position_ids"]
             attention_mask = None
-            packed_seq_params = batch['packed_seq_params']
+            packed_seq_params = batch["packed_seq_params"]
             # returns "hidden_states" if not model.post_process (not the last layer)
             # returns "logits" when label is None.)
             print(f"🟡 forward_step: {input_ids.shape=}, {self.tf_config.sequence_parallel = }")
             output = gptmodel_forward(
-                model, input_ids, attention_mask, position_ids, self.tf_config.sequence_parallel,
-                packed_seq_params, labels=input_ids.unsqueeze(0),
+                model,
+                input_ids,
+                attention_mask,
+                position_ids,
+                self.tf_config.sequence_parallel,
+                packed_seq_params,
+                labels=input_ids.unsqueeze(0),
             )
             torch.cuda.nvtx.range_pop()
             return output, loss_func
@@ -138,15 +162,20 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
         # shift bwd metadata since the order it runs is different from the
         # corresponding dummy forward's.
         dummy_bwd_packed_seq_params = [
-            microbatch['packed_seq_params'] for microbatch in
-            (microbatches[-pp_size + pp_rank + 1:][:pp_size - pp_rank - 1] + microbatches[:pp_rank])
+            microbatch["packed_seq_params"]
+            for microbatch in (
+                microbatches[-pp_size + pp_rank + 1 :][: pp_size - pp_rank - 1]
+                + microbatches[:pp_rank]
+            )
         ]
-        dummy_bwd_packed_seq_params = dummy_bwd_packed_seq_params[pp_rank:] + dummy_bwd_packed_seq_params[:pp_rank]
+        dummy_bwd_packed_seq_params = (
+            dummy_bwd_packed_seq_params[pp_rank:] + dummy_bwd_packed_seq_params[:pp_rank]
+        )
 
         assert mode in ["ping_pong", "orig_reimpl", "single_sided"]
 
         for module in self.train_module:
-            debug = (mode != "ping_pong")
+            debug = mode != "ping_pong"
             debug_fwd_impl = mode if debug else None
             unwrap_model(module).set_debug(debug=debug, debug_fwd_impl=debug_fwd_impl)
             unwrap_model(module).train()
@@ -154,13 +183,13 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
 
         dummy_bwd_packed_seq_params_iter = iter(dummy_bwd_packed_seq_params)
         batch_generator = make_batch_generator(
-            microbatches if with_dummy else microbatches[pp_rank:],
-            vpp_size=len(self.train_module)
+            microbatches if with_dummy else microbatches[pp_rank:], vpp_size=len(self.train_module)
         )
         # if mpu.get_pipeline_model_parallel_world_size() > 1:
 
         torch.cuda.synchronize()
         from distca.runtime.attn_kernels.ops import nvshmem_barrier_all
+
         nvshmem_barrier_all()
 
         # from distca.utils.traceback import TraceFunctions
@@ -191,7 +220,11 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
                 micro_batch_size=1,  # no use when input_shapes was set
                 forward_only=forward_only,
             )
-        grad_sample = unwrap_model(self.train_module[0]).decoder.layers[-1].self_attention.linear_proj.weight.main_grad.clone()
+        grad_sample = (
+            unwrap_model(self.train_module[0])
+            .decoder.layers[-1]
+            .self_attention.linear_proj.weight.main_grad.clone()
+        )
 
         # when testing numerical correctness, instead of running optimizer step, reset grads.
         for tm in self.train_module:
@@ -201,25 +234,33 @@ class MegatronE2eWorker(BaseMegatronE2eWorker):
 
 
 def init_megatron_e2e_test(
-    hidden_size_q: int, hidden_size_kv: int, num_heads: int, num_tokens: int,
-    world_size: int, max_cp_degree: int, tp_size: int, pp_size: int,
-    dtype, worker_cls=MegatronE2eWorker
+    hidden_size_q: int,
+    hidden_size_kv: int,
+    num_heads: int,
+    num_tokens: int,
+    world_size: int,
+    max_cp_degree: int,
+    tp_size: int,
+    pp_size: int,
+    dtype,
+    worker_cls=MegatronE2eWorker,
 ):
     token_bytes_q = hidden_size_q * dtype.itemsize // tp_size
     token_bytes_kv = hidden_size_kv * dtype.itemsize // tp_size
     max_tokens_query = num_tokens * (world_size // tp_size)
     max_tokens_key_value = num_tokens * (world_size // tp_size)
     buffer_size = (
-        token_bytes_q * max_tokens_query * 3 +
+        token_bytes_q * max_tokens_query * 3
+        +
         # lse_norm. TODO: the factor of 2 might be removed
-        num_heads * torch.float32.itemsize * 2 * max_tokens_query +
-        token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
+        num_heads * torch.float32.itemsize * 2 * max_tokens_query
+        + token_bytes_kv * max_tokens_key_value * max_cp_degree * 2
     )
     EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB = os.environ.get("EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB", "-1")
     try:
         EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB = float(EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB)
         if EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB > 0:
-            EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB *= (1024 ** 3)
+            EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB *= 1024**3
             EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB = int(EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB)
             buffer_size = EXPERIMENT_NVSHMEM_BUFFER_SIZE_GB
             pass
@@ -234,25 +275,30 @@ def init_megatron_e2e_test(
     )
 
     log_memory_usage("before init_worker_torch_distributed", force=True)
-    worker = init_worker_torch_distributed(
-        world_size, buffer_size,
-        worker_cls, parallel_config
-    )
+    worker = init_worker_torch_distributed(world_size, buffer_size, worker_cls, parallel_config)
     log_memory_usage("after init_worker_torch_distributed (also init_nvshmem)", force=True)
     print("Communication groups initialized")
     return worker
 
 
 def create_pp_microbatches(
-    num_microbatch: int, pp_degree: int, as_rank: int,
-    as_world_size: int, total_seq_len: int, num_seqs: int,
-    max_cp_degree: int, hidden_size_q_tp: int,
-    hidden_size_k_tp: int, element_size: int,
-    num_head_in_dtype: int, tp_size: int, dp_size: int,
+    num_microbatch: int,
+    pp_degree: int,
+    as_rank: int,
+    as_world_size: int,
+    total_seq_len: int,
+    num_seqs: int,
+    max_cp_degree: int,
+    hidden_size_q_tp: int,
+    hidden_size_k_tp: int,
+    element_size: int,
+    num_head_in_dtype: int,
+    tp_size: int,
+    dp_size: int,
     num_token_per_rank: int,
     num_batches: int = None,
-    use_planner: bool=False,
-    return_seq_lens: bool=False
+    use_planner: bool = False,
+    return_seq_lens: bool = False,
 ):
     # print("Create pp microbatches")
     tick_per_rank_doc_lens = None
@@ -262,7 +308,6 @@ def create_pp_microbatches(
         print("Enable planner. Get real batch.")
     else:
         print("No planner. Use random batch.")
-
 
     start_time = time.time()
     all_original_seq_lens = []
@@ -274,13 +319,23 @@ def create_pp_microbatches(
         start_time = time.time()
         print(f"🟡 tick_per_rank_doc_lens: {tick_per_rank_doc_lens}")
         (
-            fa_fwd_params, fa_bwd_params,
-            qkv_fwd_fa2a_metadata, qkv_bwd_fa2a_metadata,
-            attn_out_fwd_fa2a_metadata, attn_out_qkv_bwd_fa2a_metadata,
-            tick_per_rank_doc_lens, original_tick_per_rank_doc_lens,
+            fa_fwd_params,
+            fa_bwd_params,
+            qkv_fwd_fa2a_metadata,
+            qkv_bwd_fa2a_metadata,
+            attn_out_fwd_fa2a_metadata,
+            attn_out_qkv_bwd_fa2a_metadata,
+            tick_per_rank_doc_lens,
+            original_tick_per_rank_doc_lens,
         ) = create_qkv_dispatch_pipeline_tick(
-            as_world_size, total_seq_len, num_seqs, max_cp_degree,
-            hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
+            as_world_size,
+            total_seq_len,
+            num_seqs,
+            max_cp_degree,
+            hidden_size_q_tp,
+            hidden_size_k_tp,
+            element_size,
+            num_head_in_dtype,
             ref_doc_lens=tick_per_rank_doc_lens,
             add_dummy=add_dummy_forward,
             tp_size=tp_size,
@@ -295,7 +350,7 @@ def create_pp_microbatches(
         all_original_seq_lens.append(original_tick_per_rank_doc_lens)
         end_time = time.time()
         print(f"🟡 create_qkv_dispatch_pipeline_tick duration: {end_time - start_time} seconds")
-        
+
         # For MLP-CP, we need to transfer List[List[int]] from CP layout back to DP, so each rank knows its number of tokens.
         #   Example1 DP case:
         # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 256],[128, 384],[512], [10, 502] ]
@@ -304,13 +359,15 @@ def create_pp_microbatches(
         # tick_per_rank_doc_lens cp list: List[List[int]] = [[8], [8], [8], [8], [256, 768],[512, 10, 502] ]
         # tick_per_rank_doc_lens mlp list: [[8], [8], [8], [8], [256, 128, 128], [256, 256], [512], [10, 502]]
         start_time = time.time()
-        tick_per_rank_doc_lens_after_cp_transfer = cp_list_to_mlp_list(tick_per_rank_doc_lens, as_world_size, num_token_per_rank)
-        
-        this_rank_num_tokens = sum(tick_per_rank_doc_lens_after_cp_transfer[as_rank])
-        bwd_packed_seq_params = PackedSeqParams(
-            qkv_format="thd", **fa_bwd_params[as_rank]
+        tick_per_rank_doc_lens_after_cp_transfer = cp_list_to_mlp_list(
+            tick_per_rank_doc_lens, as_world_size, num_token_per_rank
         )
-        tensor_doc_lens = torch.tensor(tick_per_rank_doc_lens_after_cp_transfer[as_rank], dtype=torch.int32)
+
+        this_rank_num_tokens = sum(tick_per_rank_doc_lens_after_cp_transfer[as_rank])
+        bwd_packed_seq_params = PackedSeqParams(qkv_format="thd", **fa_bwd_params[as_rank])
+        tensor_doc_lens = torch.tensor(
+            tick_per_rank_doc_lens_after_cp_transfer[as_rank], dtype=torch.int32
+        )
         mlp_packed_seq_params = get_attn_metadata(tensor_doc_lens, get_packed_seq_params=True)
         end_time = time.time()
         print(f"🟡 get_attn_metadata duration: {end_time - start_time} seconds")
@@ -338,16 +395,21 @@ def create_pp_microbatches(
 
         # store the corresponding bwd metadata (for later ticks)
         bwd_metadata.append(
-            (qkv_bwd_fa2a_metadata.get_slice(as_rank), attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank), bwd_packed_seq_params)
+            (
+                qkv_bwd_fa2a_metadata.get_slice(as_rank),
+                attn_out_qkv_bwd_fa2a_metadata.get_slice(as_rank),
+                bwd_packed_seq_params,
+            )
         )
         end_time = time.time()
-        print(f"🟡 create_pp_microbatches - append microbatch duration: {end_time - start_time} seconds")
-
-
+        print(
+            f"🟡 create_pp_microbatches - append microbatch duration: {end_time - start_time} seconds"
+        )
 
     loop_end_time = time.time()
-    print(f"🟡 create_pp_microbatches - first for loop duration: {loop_end_time - loop_start_time} seconds")
-
+    print(
+        f"🟡 create_pp_microbatches - first for loop duration: {loop_end_time - loop_start_time} seconds"
+    )
 
     pp_rank = as_rank // dp_size
     dp_rank = as_rank % dp_size
@@ -364,7 +426,9 @@ def create_pp_microbatches(
         # is 0. Therefore, t - t' = pp_degree - 1, and thus
         # t' + 2 * (pp_degree - 1 - pp_rank) == t + pp_degree - 1 - pp_rank * 2
         bwd_metadata_idx = (i + pp_degree - 1 - pp_rank * 2) % len(bwd_metadata)
-        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[bwd_metadata_idx]
+        qkv_bwd_metadata, attn_out_bwd_metadata, bwd_packed_seq_params = bwd_metadata[
+            bwd_metadata_idx
+        ]
         packed_seq_params = microbatch["packed_seq_params"]
         packed_seq_params.qkv_bwd_metadata = qkv_bwd_metadata
         packed_seq_params.attn_out_bwd_metadata = attn_out_bwd_metadata
@@ -378,21 +442,24 @@ def create_pp_microbatches(
 
 
 from contextlib import contextmanager
+
+
 @contextmanager
 def time_me(msg):
     rank = torch.distributed.get_rank()
     print(f"⚪ [Rank {rank}] start {msg}")
-    torch.cuda.synchronize(); torch.distributed.barrier(); 
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
     start_time = time.time()
     yield
-    torch.cuda.synchronize(); torch.distributed.barrier(); 
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
     end_time = time.time()
-    duration_ms = ((end_time - start_time) * 1000)
+    duration_ms = (end_time - start_time) * 1000
     print(f"⚪ [Rank {rank}] finish {msg}, duration: {duration_ms} ms")
 
 
-import distca.mem
-def log_memory_usage(message: str, force:bool = False):
+def log_memory_usage(message: str, force: bool = False):
     distca.mem.log_memory_usage(message, force=force)
 
 
@@ -415,7 +482,9 @@ def test(args):
     benchmark_log_path = os.path.join(output_dir, "benchmark.raw.jsonl")
     benchmark_log_path__distca = os.path.join(output_dir, "benchmark.raw.distca.jsonl")
     benchmark_log_path__baseline = os.path.join(output_dir, "benchmark.raw.baseline.jsonl")
-    benchmark_log_path__baseline_with_dummy = os.path.join(output_dir, "benchmark.raw.baseline_with_dummy.jsonl")
+    benchmark_log_path__baseline_with_dummy = os.path.join(
+        output_dir, "benchmark.raw.baseline_with_dummy.jsonl"
+    )
     benchmark_final_path = os.path.join(output_dir, "benchmark.json")
     network_inspect_path = os.path.join(output_dir, "network_inspect.jsonl")
     network_inspect_summary_path = os.path.join(output_dir, "network_inspect.summary.jsonl")
@@ -442,13 +511,15 @@ def test(args):
     _dp_size = world_size // (tp_size * pp_size)
     assert dpcp_size == _dp_size, f"dpcp_size: {dpcp_size} != _dp_size: {_dp_size}"
 
-    assert num_microbatch >= pp_size, f"num_microbatch need bigger than pp_size. Current num_microbatch: {num_microbatch}, pp size: {pp_size}"
+    assert num_microbatch >= pp_size, (
+        f"num_microbatch need bigger than pp_size. Current num_microbatch: {num_microbatch}, pp size: {pp_size}"
+    )
 
-    # Set num_batches. 
+    # Set num_batches.
     # If None, we use MLP-DP. will get DP number of new batches per tick.
     # If set, num_batches < dp_size && dp_size % num_batches == 0, Will get num_batches number of List per tick.
     num_token_per_rank = num_tokens * num_batches // dpcp_size
-    total_seq_len = num_tokens 
+    total_seq_len = num_tokens
 
     dtype = torch.bfloat16
     element_size = dtype.itemsize
@@ -460,7 +531,9 @@ def test(args):
         os.environ.get("EXPERIMENT_SHOULD_LOG_MEMORY_DURING_WARMUP", "1") == "1"
     )
 
-    print(f"tp_size: {tp_size}, pp_size: {pp_size}, dpcp_size: {dpcp_size}, world_size: {world_size}, num_tokens_per_rank: {num_token_per_rank}, total_seq_len: {total_seq_len}, num_batches: {num_batches}")
+    print(
+        f"tp_size: {tp_size}, pp_size: {pp_size}, dpcp_size: {dpcp_size}, world_size: {world_size}, num_tokens_per_rank: {num_token_per_rank}, total_seq_len: {total_seq_len}, num_batches: {num_batches}"
+    )
 
     should_balance_ping_pong = os.environ.get("EXPERIMENT_BALANCE_PING_PONG", "0") == "1"
     print(f"should_balance_ping_pong: {should_balance_ping_pong}")
@@ -482,7 +555,6 @@ def test(args):
         sample_name=args.sample_name,
         balance_ping_pong_batch_size=balance_ping_pong_batch_size,
     )
-    from distca.utils import training_utils as _training_utils
     # When use_planner=True, test_util.py uses _training_utils.get_next_batch
     # which requires _training_utils.GLOBAL_BATCH to be initialized
     if args.use_planner:
@@ -501,7 +573,6 @@ def test(args):
     # for _ in range(20):
     #     print(f"🟡 get_next_batch: {get_next_batch(int(num_microbatch * num_batches * 2))}")
     # exit(0)
-    
 
     # Use local cache to avoid HuggingFace rate limiting
     try:
@@ -515,15 +586,23 @@ def test(args):
 
     hidden_size_kv = hidden_size_q
     if hasattr(hf_config, "num_key_value_heads"):
-        hidden_size_kv = (hidden_size_kv * hf_config.num_key_value_heads //
-                          hf_config.num_attention_heads)
+        hidden_size_kv = (
+            hidden_size_kv * hf_config.num_key_value_heads // hf_config.num_attention_heads
+        )
 
     log_memory_usage("before init_megatron_e2e_test", force=True)
 
     worker: MegatronE2eWorker = init_megatron_e2e_test(
-        hidden_size_q, hidden_size_kv, hf_config.num_attention_heads, num_tokens,
-        world_size, dpcp_size, tp_size, pp_size,
-        dtype, MegatronE2eWorker
+        hidden_size_q,
+        hidden_size_kv,
+        hf_config.num_attention_heads,
+        num_tokens,
+        world_size,
+        dpcp_size,
+        tp_size,
+        pp_size,
+        dtype,
+        MegatronE2eWorker,
     )
     log_memory_usage("after init_megatron_e2e_test", force=True)
 
@@ -534,20 +613,20 @@ def test(args):
         gradient_checkpointing_kwargs = dict(
             # activations_checkpoint_method="mlp",
             activations_checkpoint_granularity="selective",
-            activations_checkpoint_num_layers=None, # num-layers
-            activations_checkpoint_recompute_modules = ["mlp"],
+            activations_checkpoint_num_layers=None,  # num-layers
+            activations_checkpoint_recompute_modules=["mlp"],
         )
     print(f"🟡 [Rank {worker.rank}] Adding selective checkpoint ?: {gradient_checkpointing_kwargs}")
     worker.set_config(
         dtype=dtype,
         enable_gradient_checkpointing=enable_gradient_checkpointing,
-        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
     )
     log_memory_usage("before worker.init", force=True)
     worker.init(model_path, seed=seed)
     log_memory_usage("after worker.init", force=True)
     rank = torch.distributed.get_rank()
-    
+
     # set again to potentially adapt to the ray launch case.
     set_random_seed(seed, set_megatron=False)
 
@@ -562,57 +641,89 @@ def test(args):
 
     hidden_size_q_tp = hidden_size_q // tp_size
     hidden_size_k_tp = hidden_size_kv // tp_size
-    num_head_in_dtype = (hf_config.num_attention_heads *
-                         torch.float32.itemsize // element_size // tp_size)
+    num_head_in_dtype = (
+        hf_config.num_attention_heads * torch.float32.itemsize // element_size // tp_size
+    )
 
     dp_size = dpcp_size
     num_batched_token_per_as_rank = total_seq_len * num_batches // dp_size
     os.environ["D2_SEQ_LEN"] = str(num_batched_token_per_as_rank)
-    print(f"🟡 [Rank {as_rank}] {dp_size=}, {num_batched_token_per_as_rank=}, {os.environ['D2_SEQ_LEN']=}")
+    print(
+        f"🟡 [Rank {as_rank}] {dp_size=}, {num_batched_token_per_as_rank=}, {os.environ['D2_SEQ_LEN']=}"
+    )
 
-    worker.train_module[0].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
-
+    worker.train_module[
+        0
+    ].module.module.decoder.init_layer_cuda_graphs()  # FIXME: hardcode for now, where to put?
 
     # for _ in range(20):
-    #     print(f"🟡 get_next_batch: {get_next_batch(num_batches * 2)}")    
-    final_durations_ms = [] # only for distca
+    #     print(f"🟡 get_next_batch: {get_next_batch(num_batches * 2)}")
+    final_durations_ms = []  # only for distca
     for sample_idx in range(max_sample_id):
         os.environ["__PRG__INTERNAL__EXPERIMENT_SAMPLE_ID"] = str(sample_idx)
         # this total_seq_len is token per rank.
         # Some explanations of the parameters inside `create_pp_microbatches`:
-        # - num_microbatch: 
+        # - num_microbatch:
         #   Iterate `num_microbatch + pp_degree - 1` to create each tick's metadata
-        # - num_batches: 
-        #   For each tick, getting `num_batches` number of list from the data loader (GLOBAL_BATCH iterator). 
+        # - num_batches:
+        #   For each tick, getting `num_batches` number of list from the data loader (GLOBAL_BATCH iterator).
         #   This is the parameter controlling the number of batches per tick.
-        # 
+        #
         start_time = time.time()
 
-        print(f"""create_pp_microbatches(num_microbatch={num_microbatch}, pp_degree={pp_size}, as_rank={as_rank}, as_world_size={as_world_size}, total_seq_len={total_seq_len}, num_seqs={num_seqs}, max_cp_degree={dpcp_size}, hidden_size_q_tp={hidden_size_q_tp}, hidden_size_k_tp={hidden_size_k_tp}, element_size={element_size}, num_head_in_dtype={num_head_in_dtype}, tp_size={tp_size}, dp_size={dpcp_size}, num_token_per_rank={num_token_per_rank}, num_batches={num_batches}, use_planner={args.use_planner}, return_seq_lens=True)""")
+        print(
+            f"""create_pp_microbatches(num_microbatch={num_microbatch}, pp_degree={pp_size}, as_rank={as_rank}, as_world_size={as_world_size}, total_seq_len={total_seq_len}, num_seqs={num_seqs}, max_cp_degree={dpcp_size}, hidden_size_q_tp={hidden_size_q_tp}, hidden_size_k_tp={hidden_size_k_tp}, element_size={element_size}, num_head_in_dtype={num_head_in_dtype}, tp_size={tp_size}, dp_size={dpcp_size}, num_token_per_rank={num_token_per_rank}, num_batches={num_batches}, use_planner={args.use_planner}, return_seq_lens=True)"""
+        )
         microbatches_0, tick_per_rank_doc_lens_0 = create_pp_microbatches(
-            num_microbatch, pp_size, as_rank,
-            as_world_size, total_seq_len, num_seqs, dpcp_size,
-            hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-            tp_size, dpcp_size, 
-            num_token_per_rank, num_batches, args.use_planner,  
+            num_microbatch,
+            pp_size,
+            as_rank,
+            as_world_size,
+            total_seq_len,
+            num_seqs,
+            dpcp_size,
+            hidden_size_q_tp,
+            hidden_size_k_tp,
+            element_size,
+            num_head_in_dtype,
+            tp_size,
+            dpcp_size,
+            num_token_per_rank,
+            num_batches,
+            args.use_planner,
             return_seq_lens=True,
         )
         end_time = time.time()
-        duration = (end_time - start_time)
-        print(f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches(0): {duration} seconds")
+        duration = end_time - start_time
+        print(
+            f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches(0): {duration} seconds"
+        )
 
         start_time = time.time()
         microbatches_1, tick_per_rank_doc_lens_1 = create_pp_microbatches(
-            num_microbatch, pp_size, as_rank,
-            as_world_size, total_seq_len, num_seqs, dpcp_size,
-            hidden_size_q_tp, hidden_size_k_tp, element_size, num_head_in_dtype,
-            tp_size, dpcp_size, 
-            num_token_per_rank, num_batches, args.use_planner,
+            num_microbatch,
+            pp_size,
+            as_rank,
+            as_world_size,
+            total_seq_len,
+            num_seqs,
+            dpcp_size,
+            hidden_size_q_tp,
+            hidden_size_k_tp,
+            element_size,
+            num_head_in_dtype,
+            tp_size,
+            dpcp_size,
+            num_token_per_rank,
+            num_batches,
+            args.use_planner,
             return_seq_lens=True,
         )
         end_time = time.time()
-        duration = (end_time - start_time)
-        print(f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches(1): {duration} seconds")
+        duration = end_time - start_time
+        print(
+            f"⚪ [Rank {rank}] [sample {sample_idx}] create_pp_microbatches(1): {duration} seconds"
+        )
 
         seq_lens = [tick_per_rank_doc_lens_0, tick_per_rank_doc_lens_1]
         # print(f"🟡 [sample_idx = {sample_idx}] seq_lens is: {seq_lens}")
@@ -636,10 +747,10 @@ def test(args):
             mb_0_psp.dispatcher_id = 0
             mb_1_psp.dispatcher_id = 1
             ping_pong_params = PingPangPackedSeqParams(
-                seq_params = [mb_0_psp, mb_1_psp],
-                mlp_layout_seq_params = [mb_0_mlp_psp, mb_1_mlp_psp],
-                max_seqlen_q = max(mb_0_mlp_psp.max_seqlen_q, mb_1_mlp_psp.max_seqlen_q),
-                max_seqlen_kv = max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
+                seq_params=[mb_0_psp, mb_1_psp],
+                mlp_layout_seq_params=[mb_0_mlp_psp, mb_1_mlp_psp],
+                max_seqlen_q=max(mb_0_mlp_psp.max_seqlen_q, mb_1_mlp_psp.max_seqlen_q),
+                max_seqlen_kv=max(mb_0_mlp_psp.max_seqlen_kv, mb_1_mlp_psp.max_seqlen_kv),
             )
             num_tokens = sum(mb["position_ids"].numel() for mb in [mb_0, mb_1])
             input_ids = torch.randint(10, 1000, (num_tokens,))
@@ -653,18 +764,24 @@ def test(args):
                     f.write(f"🟡 [sample_idx = {sample_idx}] input_ids: {input_ids.shape}\n")
             microbatches.append(mb)
 
-            cu_seqlens_q = torch.concat([
-                mb_0_mlp_psp.cu_seqlens_q, mb_1_mlp_psp.cu_seqlens_q[1:] + mb_0_mlp_psp.cu_seqlens_q[-1]
-            ])
-            cu_seqlens_kv = torch.concat([
-                mb_0_mlp_psp.cu_seqlens_kv, mb_1_mlp_psp.cu_seqlens_kv[1:] + mb_0_mlp_psp.cu_seqlens_kv[-1]
-            ])
+            cu_seqlens_q = torch.concat(
+                [
+                    mb_0_mlp_psp.cu_seqlens_q,
+                    mb_1_mlp_psp.cu_seqlens_q[1:] + mb_0_mlp_psp.cu_seqlens_q[-1],
+                ]
+            )
+            cu_seqlens_kv = torch.concat(
+                [
+                    mb_0_mlp_psp.cu_seqlens_kv,
+                    mb_1_mlp_psp.cu_seqlens_kv[1:] + mb_0_mlp_psp.cu_seqlens_kv[-1],
+                ]
+            )
             packed_seq_params = PackedSeqParams(
                 qkv_format="thd",
-                cu_seqlens_q = cu_seqlens_q,
-                cu_seqlens_kv = cu_seqlens_kv,
-                max_seqlen_q = ping_pong_params.max_seqlen_q,
-                max_seqlen_kv = ping_pong_params.max_seqlen_kv,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=ping_pong_params.max_seqlen_q,
+                max_seqlen_kv=ping_pong_params.max_seqlen_kv,
             )
             orig_mb = {
                 "input_ids": mb["input_ids"],
@@ -673,7 +790,9 @@ def test(args):
             }
             orig_impl_microbatches.append(orig_mb)
         loop_end_time = time.time()
-        print(f"⚪ create_pp_microbatches - constructing PingPangPackedSeqParams: {loop_end_time - loop_start_time} seconds")
+        print(
+            f"⚪ create_pp_microbatches - constructing PingPangPackedSeqParams: {loop_end_time - loop_start_time} seconds"
+        )
 
         log_memory_usage("complete microbatches construction", force=True)
 
@@ -696,13 +815,9 @@ def test(args):
         except:
             pass
 
-        
-
         if should_run_baseline_with_dummy:
-
             durations = []
             for _ in range(n_repeats + n_warmup):
-
                 mem_ctx = nullcontext()
                 if _ < n_warmup and should_log_memory_during_warmup:
                     mem_ctx = distca.mem.log_memory_usage_context()
@@ -711,29 +826,39 @@ def test(args):
                 print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start baseline dummy {_}")
                 with torch.cuda.nvtx.range(f"baseline_dummy[sample={sample_idx}][repeat={_}]"):
                     with mem_ctx:
-                        torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        start_time = time.time()
                         loss_orig_reimpl, grad_orig_reimpl = worker.forward_backward_batch(
                             microbatches=orig_impl_microbatches,
-
                             forward_only=False,
                             mode="orig_reimpl",
                             with_dummy=True,
                         )
 
-                        torch.cuda.synchronize(); torch.distributed.barrier(); end_time = time.time()
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        end_time = time.time()
                         duration_ms = (end_time - start_time) * 1000
                         durations.append(duration_ms)
-                        print(f"⚪ [Rank {rank}] [sample {sample_idx}] baseline dummy {_}: {duration_ms} ms")
+                        print(
+                            f"⚪ [Rank {rank}] [sample {sample_idx}] baseline dummy {_}: {duration_ms} ms"
+                        )
                 time.sleep(1)
-            
+
             if rank == 0:
                 with open(benchmark_log_path__baseline_with_dummy, "a") as f:
-                    f.write(json.dumps({
-                        "sample_id": sample_idx,
-                        "duration_ms": duration_ms,
-                        "duration_list": durations,
-                        "seq_lens": seq_lens,
-                    }) + "\n")
+                    f.write(
+                        json.dumps(
+                            {
+                                "sample_id": sample_idx,
+                                "duration_ms": duration_ms,
+                                "duration_list": durations,
+                                "seq_lens": seq_lens,
+                            }
+                        )
+                        + "\n"
+                    )
 
         if should_run_baseline:
             durations = []
@@ -746,32 +871,43 @@ def test(args):
                 print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start baseline {_}")
                 with torch.cuda.nvtx.range(f"baseline[sample={sample_idx}][repeat={_}]"):
                     with mem_ctx:
-                        torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        start_time = time.time()
                         loss_orig, grad_orig = worker.forward_backward_batch(
                             microbatches=orig_impl_microbatches,
                             forward_only=False,
                             mode="orig_reimpl",
                             with_dummy=False,
                         )
-                        torch.cuda.synchronize(); torch.distributed.barrier(); end_time = time.time()
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        end_time = time.time()
                         duration_ms = (end_time - start_time) * 1000
                         durations.append(duration_ms)
-                        print(f"⚪ [Rank {rank}] [sample {sample_idx}] baseline {_}: {duration_ms} ms")
+                        print(
+                            f"⚪ [Rank {rank}] [sample {sample_idx}] baseline {_}: {duration_ms} ms"
+                        )
                 time.sleep(1)
-            
+
             if rank == 0:
                 with open(benchmark_log_path__baseline, "a") as f:
-                    f.write(json.dumps({
-                        "sample_id": sample_idx,
-                        "duration_ms": duration_ms,
-                        "duration_list": durations,
-                        "seq_lens": seq_lens,
-                    }) + "\n")
+                    f.write(
+                        json.dumps(
+                            {
+                                "sample_id": sample_idx,
+                                "duration_ms": duration_ms,
+                                "duration_list": durations,
+                                "seq_lens": seq_lens,
+                            }
+                        )
+                        + "\n"
+                    )
 
-        
-        
         if should_run_distca:
-            print(f"Prepare to run distca with total runs: {n_repeats = } + {n_warmup = } = {n_repeats + n_warmup = }")
+            print(
+                f"Prepare to run distca with total runs: {n_repeats = } + {n_warmup = } = {n_repeats + n_warmup = }"
+            )
             durations = []
             for _ in range(n_repeats + n_warmup):
                 mem_ctx = nullcontext()
@@ -781,10 +917,14 @@ def test(args):
 
                 config_name = f"n{num_nodes}t{num_tokens}b{num_batches}mb{num_microbatch}-cp{dpcp_size}pp{pp_size}tp{tp_size}"
                 print(f"⚪ [Rank {rank}] [sample {sample_idx}] Start pingpong dummy {_}")
-                with torch.cuda.nvtx.range(f"distca({config_name})[sample={sample_idx}][repeat={_}]"):
+                with torch.cuda.nvtx.range(
+                    f"distca({config_name})[sample={sample_idx}][repeat={_}]"
+                ):
                     with mem_ctx:
-                        torch.cuda.synchronize(); torch.distributed.barrier(); start_time = time.time()
-                        
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        start_time = time.time()
+
                         if True:
                             loss_reduced, grad_sample = worker.forward_backward_batch(
                                 microbatches=microbatches,
@@ -792,28 +932,36 @@ def test(args):
                                 mode="ping_pong",
                                 with_dummy=True,
                             )
-                        torch.cuda.synchronize(); torch.distributed.barrier(); end_time = time.time()
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        end_time = time.time()
                         duration_ms = (end_time - start_time) * 1000
                         durations.append(duration_ms)
-                        print(f"⚪ [Rank {rank}] [sample {sample_idx}] pingpong with dummy {_}: {duration_ms} ms")
+                        print(
+                            f"⚪ [Rank {rank}] [sample {sample_idx}] pingpong with dummy {_}: {duration_ms} ms"
+                        )
                 time.sleep(1)
-                
+
             final_durations_ms.append(duration_ms)
             if rank == 0:
                 with open(benchmark_log_path, "a") as f:
-                    f.write(json.dumps({
-                        "sample_id": sample_idx,
-                        "duration_ms": duration_ms,
-                        "duration_list": durations,
-                        "seq_lens": seq_lens,
-                    }) + "\n")
-        
-            
+                    f.write(
+                        json.dumps(
+                            {
+                                "sample_id": sample_idx,
+                                "duration_ms": duration_ms,
+                                "duration_list": durations,
+                                "seq_lens": seq_lens,
+                            }
+                        )
+                        + "\n"
+                    )
+
             # print(f"{loss_reduced=}, {loss_orig_reimpl=}, {loss_orig=}")
         # torch.testing.assert_close(grad_orig_reimpl, grad_orig)
         # if worker.as_rank == 1:
         #     torch.testing.assert_close(grad_orig_reimpl, grad_sample, rtol=1.1e-3, atol=1.1e-3)
-    
+
     torch.cuda.synchronize()
     print(f"⚪ [Rank {rank}] [sample {sample_idx}] finish pingpong")
     print(f"🟡 [Rank {rank}] [sample {sample_idx}] Write benchmark log to {benchmark_log_path}")
@@ -822,20 +970,29 @@ def test(args):
 
     benchmark_final_path = os.path.join(output_dir, "benchmark.json")
     config = dict(
-        mode="distca", 
+        mode="distca",
         nodes=args.num_nodes,
         num_gpus_per_node=args.num_gpus_per_node,
-        tp_size=tp_size, dp_size=1, cp_size=dpcp_size, 
-        num_tokens=num_tokens, model_path=model_path, num_layers=num_layers, 
-        max_sample_id=max_sample_id, up_sample_factor=args.up_sample_factor, filter_threshold=args.filter_threshold, filter_ratio=args.filter_ratio, 
+        tp_size=tp_size,
+        dp_size=1,
+        cp_size=dpcp_size,
+        num_tokens=num_tokens,
+        model_path=model_path,
+        num_layers=num_layers,
+        max_sample_id=max_sample_id,
+        up_sample_factor=args.up_sample_factor,
+        filter_threshold=args.filter_threshold,
+        filter_ratio=args.filter_ratio,
         elongate_factor=args.elongate_factor,
         sample_name=args.sample_name,
         change_long_doc_ratio=args.change_long_doc_ratio,
     )
     if rank == 0:
         from datetime import datetime
+
         import pytz
-        pst = pytz.timezone('US/Pacific')
+
+        pst = pytz.timezone("US/Pacific")
         timestamp = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S PST")
         with open(benchmark_final_path, "w") as f:
             benchmark_data = {
@@ -845,17 +1002,19 @@ def test(args):
                 "config": config,
                 "samples": [],
             }
-            
+
             for idx in range(len(final_durations_ms)):
                 # samples = new_batch
                 samples = []
                 duration = final_durations_ms[idx]
-                benchmark_data["samples"].append({
-                    "sample_id": idx,
-                    "duration_ms": duration,
-                    "samples": samples,
-                })
-            
+                benchmark_data["samples"].append(
+                    {
+                        "sample_id": idx,
+                        "duration_ms": duration,
+                        "samples": samples,
+                    }
+                )
+
             with open(benchmark_final_path, "w") as f:
                 json.dump(benchmark_data, f, indent=2)
 
@@ -863,7 +1022,9 @@ def test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1024)
-    parser.add_argument("--num-batches", type=int, default=1)  # this is for cp. set num_batches and num_tokens to control cp doc length.
+    parser.add_argument(
+        "--num-batches", type=int, default=1
+    )  # this is for cp. set num_batches and num_tokens to control cp doc length.
     parser.add_argument("--cp-size", type=int, default=2)
     parser.add_argument("--num-seqs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)

@@ -4,25 +4,31 @@ import os
 import time
 
 import torch
-
-from distca.runtime.compute_metadata import from_planner_output, backward_from_planner_output
-from distca.runtime.metadata import AlltoAllMetadata
-
-from test_util import create_random_shard_info
 from test_fa2a_metadata import (
-    simulate_fa2a, simulate_fa2a_send_qkv, simulate_fa2a_send_qkv_rev,
-    simulate_fa2a_recv_qkv, simulate_fa2a_recv_qkv_rev
+    simulate_fa2a,
+    simulate_fa2a_recv_qkv,
+    simulate_fa2a_recv_qkv_rev,
+    simulate_fa2a_send_qkv,
+    simulate_fa2a_send_qkv_rev,
 )
+from test_util import create_random_shard_info
+
+from distca.runtime.compute_metadata import backward_from_planner_output, from_planner_output
+from distca.runtime.metadata import AlltoAllMetadata
 
 
 def simulate_all2all(
-    q: list[torch.Tensor], k: list[torch.Tensor], v: list[torch.Tensor],
+    q: list[torch.Tensor],
+    k: list[torch.Tensor],
+    v: list[torch.Tensor],
     metadata: AlltoAllMetadata,
-    element_size: int, hidden_q: int, hidden_k: int,
+    element_size: int,
+    hidden_q: int,
+    hidden_k: int,
     is_from_linear_layout: bool,
     # init kv grad cache with torch.zeros instead of torch.empty.
     # This is to compare with the behavior of the real op.
-    zero_mask_kv_grad: bool=False,
+    zero_mask_kv_grad: bool = False,
 ):
     world_size = len(q)
     has_kv = k is not None
@@ -40,12 +46,8 @@ def simulate_all2all(
     max_recv_bytes = int(torch.max(tot_recv_bytes).item())
     dtype = q[0].dtype
     device = q[0].device
-    src_buffer = torch.empty(
-        (world_size, max_send_bytes), dtype=dtype, device=device
-    )
-    dst_buffer = torch.empty(
-        (world_size, max_recv_bytes), dtype=dtype, device=device
-    )
+    src_buffer = torch.empty((world_size, max_send_bytes), dtype=dtype, device=device)
+    dst_buffer = torch.empty((world_size, max_recv_bytes), dtype=dtype, device=device)
     for rank in range(world_size):
         metadata_local = metadata.get_slice(rank)
         max_cp = metadata_local.kv_replica_mask.shape[1] if has_kv else None
@@ -70,17 +72,20 @@ def simulate_all2all(
             k_seqlens = None
 
         src_buffer[rank] = fn(
-            q[rank].flatten(), local_k, local_v,
+            q[rank].flatten(),
+            local_k,
+            local_v,
             src_buffer[rank],
             *metadata_local.send_memcpy_metadata,
             *pad_memcpy_arg_for_no_kv,
             metadata_local.seq_lens[0].send_seqlens,
-            k_seqlens, hidden_q, hidden_k, element_size,
+            k_seqlens,
+            hidden_q,
+            hidden_k,
+            element_size,
             *fwd_args,
         )
-    dst_buffer = simulate_fa2a(
-        src_buffer, dst_buffer, metadata.fa2a_metadata, element_size
-    )
+    dst_buffer = simulate_fa2a(src_buffer, dst_buffer, metadata.fa2a_metadata, element_size)
     dst_qs = []
     dst_ks = []
     dst_vs = []
@@ -121,13 +126,17 @@ def simulate_all2all(
             k_recv_seqlens = None
 
         dst_q, dst_k, dst_v = fn(
-            dst_q, dst_k, dst_v,
+            dst_q,
+            dst_k,
+            dst_v,
             dst_buffer[rank],
             *metadata_local.recv_memcpy_metadata,
             *pad_memcpy_arg_for_no_kv,
             metadata_local.seq_lens[0].recv_seqlens,
             k_recv_seqlens,
-            hidden_q, hidden_k, element_size,
+            hidden_q,
+            hidden_k,
+            element_size,
             *bwd_args,
         )
         if has_kv:
@@ -148,7 +157,7 @@ def seq_mask_to_token_mask(mask: torch.Tensor, seqlens: torch.Tensor):
     for seq in range(num_seqs):
         seqlen = seqlens[seq].item()
         for cp in range(cp_degree):
-            token_mask[cp, cur_token:cur_token + seqlen] = mask[seq, cp]
+            token_mask[cp, cur_token : cur_token + seqlen] = mask[seq, cp]
         cur_token += seqlen
     return token_mask
 
@@ -170,16 +179,25 @@ def test(args):
     num_head = args.num_head
     element_size = torch.bfloat16.itemsize
     INT_4_BYTES = 16
-    lse_size = math.ceil(num_head * torch.float32.itemsize / INT_4_BYTES) * INT_4_BYTES // element_size
+    lse_size = (
+        math.ceil(num_head * torch.float32.itemsize / INT_4_BYTES) * INT_4_BYTES // element_size
+    )
 
     scheduler_output, src_num_token = create_random_shard_info(
         seed, world_size, num_doc, max_num_shard, max_shard_len, min_shard_len
     )
 
     tik = time.time()
-    fwd_qkv_metadata, bwd_qkv_metadata, fwd_attn_out_metadata, bwd_attn_out_metadata, _ = from_planner_output(
-        world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
-        is_pipeline_tick=False
+    fwd_qkv_metadata, bwd_qkv_metadata, fwd_attn_out_metadata, bwd_attn_out_metadata, _ = (
+        from_planner_output(
+            world_size,
+            scheduler_output,
+            hidden_size_q,
+            hidden_size_k,
+            lse_size,
+            element_size,
+            is_pipeline_tick=False,
+        )
     )
     tok = time.time()
     print("gen metadata time:", tok - tik)
@@ -198,11 +216,23 @@ def test(args):
     ]
     # 1. without pp, send with fwd_qkv_metadata and bwd_qkv_metadata, examine if received is the same as sent
     dst_qs, dst_ks, dst_vs = simulate_all2all(
-        src_qs, src_ks, src_vs, fwd_qkv_metadata, element_size, hidden_size_q, hidden_size_k,
+        src_qs,
+        src_ks,
+        src_vs,
+        fwd_qkv_metadata,
+        element_size,
+        hidden_size_q,
+        hidden_size_k,
         is_from_linear_layout=True,
     )
     rev_qs, rev_ks, rev_vs = simulate_all2all(
-        dst_qs, dst_ks, dst_vs, bwd_qkv_metadata, element_size, hidden_size_q, hidden_size_k,
+        dst_qs,
+        dst_ks,
+        dst_vs,
+        bwd_qkv_metadata,
+        element_size,
+        hidden_size_q,
+        hidden_size_k,
         is_from_linear_layout=False,
     )
     # verify answer
@@ -230,16 +260,28 @@ def test(args):
     attn_out_attn_layout = dst_qs
     hidden_attn_out = hidden_size_q
     recv_attn_out, _, _ = simulate_all2all(
-        attn_out_attn_layout, None, None, fwd_attn_out_metadata,
-        element_size, hidden_attn_out, None, is_from_linear_layout=False
+        attn_out_attn_layout,
+        None,
+        None,
+        fwd_attn_out_metadata,
+        element_size,
+        hidden_attn_out,
+        None,
+        is_from_linear_layout=False,
     )
     torch.testing.assert_close(src_qs, recv_attn_out)
     print("forward without pipeline, attn out forward is correct")
     # let grad equal itself for simplicity.
     attn_out_grad_linear_layout = recv_attn_out
     attn_out_grad_attn_layout, _, _ = simulate_all2all(
-        attn_out_grad_linear_layout, None, None, bwd_attn_out_metadata,
-        element_size, hidden_attn_out, None, is_from_linear_layout=True
+        attn_out_grad_linear_layout,
+        None,
+        None,
+        bwd_attn_out_metadata,
+        element_size,
+        hidden_attn_out,
+        None,
+        is_from_linear_layout=True,
     )
     torch.testing.assert_close(attn_out_grad_attn_layout, attn_out_attn_layout)
     print("forward without pipeline, attn out backward is correct")
@@ -250,42 +292,67 @@ def test(args):
     lse_attn_layout = [torch.rand_like(q)[:, :lse_size] for q in dst_qs]
     # For attn out, simulate an reference answer.
     recv_attn_outs_ref, _, _ = simulate_all2all(
-        attn_outs_attn_layout, None, None, fwd_attn_out_metadata,
-        element_size, hidden_attn_out, None, is_from_linear_layout=False
+        attn_outs_attn_layout,
+        None,
+        None,
+        fwd_attn_out_metadata,
+        element_size,
+        hidden_attn_out,
+        None,
+        is_from_linear_layout=False,
     )
     # update metadata to the fused version
     hidden_attn_out_merged = hidden_size_q + lse_size
     fwd_qkv_metadata, _, fwd_attn_out_metadata, _, _ = from_planner_output(
-        world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size,
-        is_pipeline_tick=True
+        world_size,
+        scheduler_output,
+        hidden_size_q,
+        hidden_size_k,
+        lse_size,
+        element_size,
+        is_pipeline_tick=True,
     )
     # We use the same scheduler output for backward to verify correctness. It should be different
-    qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear, _ = backward_from_planner_output(
-        world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size
+    qkv_resend_and_out_grad_linear_to_attn, qkv_grad_attn_to_linear, _ = (
+        backward_from_planner_output(
+            world_size, scheduler_output, hidden_size_q, hidden_size_k, lse_size, element_size
+        )
     )
     merged_attn_outs_lse_attn_layout = [
         torch.concat([ao, l], dim=1) for ao, l in zip(attn_outs_attn_layout, lse_attn_layout)
     ]
     merged_attn_outs_lse_linear_layout, _, _ = simulate_all2all(
-        merged_attn_outs_lse_attn_layout, None, None, fwd_attn_out_metadata,
-        element_size, hidden_attn_out_merged, None, is_from_linear_layout=False
+        merged_attn_outs_lse_attn_layout,
+        None,
+        None,
+        fwd_attn_out_metadata,
+        element_size,
+        hidden_attn_out_merged,
+        None,
+        is_from_linear_layout=False,
     )
     # test the new attn outs AttnLayout -> LinearLayout
-    attn_outs_linear_layout = [
-        t[:, :hidden_attn_out] for t in merged_attn_outs_lse_linear_layout
-    ]
+    attn_outs_linear_layout = [t[:, :hidden_attn_out] for t in merged_attn_outs_lse_linear_layout]
     torch.testing.assert_close(recv_attn_outs_ref, attn_outs_linear_layout)
     print("with pipeline, attn outs & lse forward is correct.")
     # backward AttnOutGrad and AttnOut and lse and qkv
     attn_out_grad_linear_layout = attn_outs_linear_layout
     merged_attn_out_grad_resend_q_linear_layout = [
-        torch.concat([aog, aol, q], dim=1) for aog, aol, q in
-        zip(attn_out_grad_linear_layout, merged_attn_outs_lse_linear_layout, src_qs)
+        torch.concat([aog, aol, q], dim=1)
+        for aog, aol, q in zip(
+            attn_out_grad_linear_layout, merged_attn_outs_lse_linear_layout, src_qs
+        )
     ]
     hidden_size_q_merged = hidden_size_q * 3 + lse_size
     merged_attn_out_grad_resend_q_attn_layout, k_resends, v_resends = simulate_all2all(
-        merged_attn_out_grad_resend_q_linear_layout, src_ks, src_vs, qkv_resend_and_out_grad_linear_to_attn,
-        element_size, hidden_size_q_merged, hidden_size_k, is_from_linear_layout=True,
+        merged_attn_out_grad_resend_q_linear_layout,
+        src_ks,
+        src_vs,
+        qkv_resend_and_out_grad_linear_to_attn,
+        element_size,
+        hidden_size_q_merged,
+        hidden_size_k,
+        is_from_linear_layout=True,
     )
     torch.testing.assert_close(k_resends, dst_ks)
     torch.testing.assert_close(v_resends, dst_vs)
@@ -296,14 +363,12 @@ def test(args):
     torch.testing.assert_close(attn_out_grad_attn_layout, attn_outs_attn_layout)
     print("backward attn out grad is correct")
     attn_out_and_lse_attn_layout = [
-        t[:, hidden_attn_out:hidden_attn_out + hidden_attn_out_merged]
+        t[:, hidden_attn_out : hidden_attn_out + hidden_attn_out_merged]
         for t in merged_attn_out_grad_resend_q_attn_layout
     ]
     torch.testing.assert_close(attn_out_and_lse_attn_layout, merged_attn_outs_lse_attn_layout)
     print("backward resend attn out and lse is correct")
-    resend_qs = [
-        t[:, -hidden_size_q:] for t in merged_attn_out_grad_resend_q_attn_layout
-    ]
+    resend_qs = [t[:, -hidden_size_q:] for t in merged_attn_out_grad_resend_q_attn_layout]
     torch.testing.assert_close(resend_qs, dst_qs)
     print("backward resend q is correct")
 

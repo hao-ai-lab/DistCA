@@ -186,3 +186,10 @@ env.sh
 logs/
 # playground/
 logs-latest
+
+# Build / vendored / local
+.build/
+.venv-lint/
+Megatron-LM/
+TransformerEngine/
+models/

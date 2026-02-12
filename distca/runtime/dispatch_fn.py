@@ -1,11 +1,13 @@
 import torch
 
 from distca.runtime.attn_kernels.dispatch import (
-    pre_a2a_qkv, post_a2a_qkv, pre_a2a_attn_out, post_a2a_attn_out
+    post_a2a_attn_out,
+    post_a2a_qkv,
+    pre_a2a_attn_out,
+    pre_a2a_qkv,
 )
 from distca.runtime.attn_kernels.ops import fast_a2a
 from distca.runtime.metadata import AlltoAllMetadata
-
 
 """
 We split dispatch into 3 autograd functions to only place all2all on the
@@ -29,9 +31,14 @@ The same applies for attn_out dispatch, but _MLP and _ATTN are swapped.
 class pre_all2all_layout_transfer(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        metadata: AlltoAllMetadata, bwd_metadata: AlltoAllMetadata,
-        dispatcher_id: int, is_qkv: bool,
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: AlltoAllMetadata,
+        bwd_metadata: AlltoAllMetadata,
+        dispatcher_id: int,
+        is_qkv: bool,
     ):
         # a signal tensor output to maintain the autograd graph dependency.
         signal = torch.empty((1,), dtype=q.dtype, device=q.device)
@@ -44,25 +51,35 @@ class pre_all2all_layout_transfer(torch.autograd.Function):
             q_seq_lens = metadata.seq_lens[0].send_seqlens
             k_seq_lens = metadata.seq_lens[1].send_seqlens
             pre_a2a_qkv(
-                q, k, v, metadata.kv_replica_mask, q_seq_lens, k_seq_lens,
+                q,
+                k,
+                v,
+                metadata.kv_replica_mask,
+                q_seq_lens,
+                k_seq_lens,
                 *metadata.send_memcpy_metadata,
-                is_fwd=True, instance_id=dispatcher_id,
+                is_fwd=True,
+                instance_id=dispatcher_id,
             )
             save_tensors.append(bwd_metadata.kv_replica_mask)
         else:
             q = q.contiguous()
             assert k is None and v is None
             pre_a2a_attn_out(
-                q, metadata.seq_lens[0].send_seqlens,
-                *metadata.send_memcpy_metadata, instance_id=dispatcher_id
+                q,
+                metadata.seq_lens[0].send_seqlens,
+                *metadata.send_memcpy_metadata,
+                instance_id=dispatcher_id,
             )
-        save_tensors.extend([
-            # q seq_lens and k seq_lens for the backward receiver.
-            *(sl.recv_seqlens for sl in bwd_metadata.seq_lens),
-            # TODO: send memcpy metadata at fwd is the recv memcpy metadata at bwd
-            # we should directly reuse it and can thus merge the two metadata together.
-            *bwd_metadata.recv_memcpy_metadata,
-        ])
+        save_tensors.extend(
+            [
+                # q seq_lens and k seq_lens for the backward receiver.
+                *(sl.recv_seqlens for sl in bwd_metadata.seq_lens),
+                # TODO: send memcpy metadata at fwd is the recv memcpy metadata at bwd
+                # we should directly reuse it and can thus merge the two metadata together.
+                *bwd_metadata.recv_memcpy_metadata,
+            ]
+        )
         ctx.dispatcher_id = dispatcher_id
         ctx.is_qkv = is_qkv
         ctx.bwd_recv_shapes = tuple(ts.recv_shape for ts in bwd_metadata.tensor_shape)
@@ -79,7 +96,9 @@ class pre_all2all_layout_transfer(torch.autograd.Function):
             grad_k = torch.zeros(grad_k_shape, dtype=signal_grad.dtype, device=signal_grad.device)
             grad_v = torch.zeros_like(grad_k)
             post_a2a_qkv(
-                grad_q, grad_k, grad_v,
+                grad_q,
+                grad_k,
+                grad_v,
                 # qkv dispatch, q_seq_tokens, k_seq_tokens, v_seq_tokens, q_offset, k_offset, v_offset
                 *ctx.saved_tensors,
                 is_fwd=False,
@@ -108,15 +127,22 @@ class pre_all2all_layout_transfer(torch.autograd.Function):
 # a stream outside this function.
 class all_to_all(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, signal: torch.Tensor, metadata: AlltoAllMetadata,
-                bwd_metadata: AlltoAllMetadata, dispatcher_id: int,
-                stream: torch.cuda.Stream = None):
+    def forward(
+        ctx,
+        signal: torch.Tensor,
+        metadata: AlltoAllMetadata,
+        bwd_metadata: AlltoAllMetadata,
+        dispatcher_id: int,
+        stream: torch.cuda.Stream = None,
+    ):
         if stream is None or metadata.single_stream:
             stream = torch.cuda.current_stream()
         with torch.cuda.stream(stream):
             fast_a2a(
                 *metadata.fa2a_metadata,
-                metadata.my_rank_send_offset, metadata.my_rank_recv_offset, metadata.my_rank_send_sz,
+                metadata.my_rank_send_offset,
+                metadata.my_rank_recv_offset,
+                metadata.my_rank_send_sz,
                 instance_id=dispatcher_id,
             )
         ctx.dispatcher_id = dispatcher_id
@@ -126,13 +152,16 @@ class all_to_all(torch.autograd.Function):
         ctx.my_rank_send_sz = bwd_metadata.my_rank_send_sz
         ctx.save_for_backward(*bwd_metadata.fa2a_metadata)
         return signal
+
     @staticmethod
     def backward(ctx, grad_signal: torch.Tensor):
         stream = ctx.stream
         with torch.cuda.stream(stream):
             fast_a2a(
                 *ctx.saved_tensors,
-                ctx.my_rank_send_offset, ctx.my_rank_recv_offset, ctx.my_rank_send_sz,
+                ctx.my_rank_send_offset,
+                ctx.my_rank_recv_offset,
+                ctx.my_rank_send_sz,
                 instance_id=ctx.dispatcher_id,
             )
         return (grad_signal,) + (None,) * 4
@@ -140,9 +169,14 @@ class all_to_all(torch.autograd.Function):
 
 class post_all2all_layout_transfer(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, signal: torch.Tensor, metadata: AlltoAllMetadata,
-                bwd_metadata: AlltoAllMetadata, dispatcher_id: int,
-                is_qkv: bool,):
+    def forward(
+        ctx,
+        signal: torch.Tensor,
+        metadata: AlltoAllMetadata,
+        bwd_metadata: AlltoAllMetadata,
+        dispatcher_id: int,
+        is_qkv: bool,
+    ):
         # NOTE: no stream because this should always run on the compute stream.
         saved_tensors = []
         switch_buffer = dispatcher_id is None
@@ -153,8 +187,12 @@ class post_all2all_layout_transfer(torch.autograd.Function):
             recv_k = torch.empty(recv_k_shape, dtype=signal.dtype, device=signal.device)
             recv_v = torch.empty_like(recv_k)
             post_a2a_qkv(
-                recv_q, recv_k, recv_v, None,
-                metadata.seq_lens[0].recv_seqlens, metadata.seq_lens[1].recv_seqlens,
+                recv_q,
+                recv_k,
+                recv_v,
+                None,
+                metadata.seq_lens[0].recv_seqlens,
+                metadata.seq_lens[1].recv_seqlens,
                 *metadata.recv_memcpy_metadata,
                 is_fwd=True,
                 switch_buffer=switch_buffer,
@@ -163,8 +201,7 @@ class post_all2all_layout_transfer(torch.autograd.Function):
             saved_tensors.append(metadata.kv_replica_mask)
         else:
             recv_shape = metadata.tensor_shape[0].recv_shape
-            recv_attn_out = torch.empty(
-                recv_shape, dtype=signal.dtype, device=signal.device)
+            recv_attn_out = torch.empty(recv_shape, dtype=signal.dtype, device=signal.device)
             post_a2a_attn_out(
                 recv_attn_out,
                 metadata.seq_lens[0].recv_seqlens,
@@ -174,17 +211,21 @@ class post_all2all_layout_transfer(torch.autograd.Function):
             )
         ctx.dispatcher_id = dispatcher_id
         ctx.is_qkv = is_qkv
-        saved_tensors.extend([
-            *(sl.send_seqlens for sl in bwd_metadata.seq_lens),
-            *bwd_metadata.send_memcpy_metadata,
-        ])
+        saved_tensors.extend(
+            [
+                *(sl.send_seqlens for sl in bwd_metadata.seq_lens),
+                *bwd_metadata.send_memcpy_metadata,
+            ]
+        )
         if is_qkv:
             assert bwd_metadata.kv_grad_send_dedup is not None
-            saved_tensors.extend([
-                bwd_metadata.kv_grad_send_dedup.main_copy_mask,
-                bwd_metadata.kv_grad_send_dedup.num_copies,
-                bwd_metadata.kv_grad_send_dedup.copy_start_id,
-            ])
+            saved_tensors.extend(
+                [
+                    bwd_metadata.kv_grad_send_dedup.main_copy_mask,
+                    bwd_metadata.kv_grad_send_dedup.num_copies,
+                    bwd_metadata.kv_grad_send_dedup.copy_start_id,
+                ]
+            )
         ctx.save_for_backward(*saved_tensors)
 
         if is_qkv:
@@ -195,22 +236,40 @@ class post_all2all_layout_transfer(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         if ctx.is_qkv:
-            (kv_replica_mask, q_shard_lens, kv_shard_lens,
-             q_memcpy, k_memcpy, v_memcpy,
-             main_copy_mask, num_copies, copy_start_id) = ctx.saved_tensors
+            (
+                kv_replica_mask,
+                q_shard_lens,
+                kv_shard_lens,
+                q_memcpy,
+                k_memcpy,
+                v_memcpy,
+                main_copy_mask,
+                num_copies,
+                copy_start_id,
+            ) = ctx.saved_tensors
             grad_q, grad_k, grad_v = grads
             memcpy_dedup_args = (num_copies, copy_start_id, kv_shard_lens)
             pre_a2a_qkv(
-                grad_q, grad_k, grad_v, kv_replica_mask,
-                q_shard_lens, kv_shard_lens,
-                q_memcpy, k_memcpy, v_memcpy,
-                is_fwd=False, instance_id=ctx.dispatcher_id,
+                grad_q,
+                grad_k,
+                grad_v,
+                kv_replica_mask,
+                q_shard_lens,
+                kv_shard_lens,
+                q_memcpy,
+                k_memcpy,
+                v_memcpy,
+                is_fwd=False,
+                instance_id=ctx.dispatcher_id,
                 kv_grad_copy_shard_mask=main_copy_mask,
-                pre_a2a_grad_acc_args=memcpy_dedup_args
+                pre_a2a_grad_acc_args=memcpy_dedup_args,
             )
         else:
-            grad_q, = grads
-            pre_a2a_attn_out(grad_q, *ctx.saved_tensors,
-                             instance_id=ctx.dispatcher_id,)
+            (grad_q,) = grads
+            pre_a2a_attn_out(
+                grad_q,
+                *ctx.saved_tensors,
+                instance_id=ctx.dispatcher_id,
+            )
         signal_grad = torch.empty((1,), dtype=grad_q.dtype, device=grad_q.device)
         return (signal_grad,) + (None,) * 4

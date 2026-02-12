@@ -1,8 +1,9 @@
-import pandas as pd
-import numpy as np
-import streamlit as st
-from pathlib import Path
 import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config & data load
@@ -17,6 +18,7 @@ df_raw = pd.read_csv(CSV_PATH)
 # ────────────────────────────────────────────────────────────────────────────────
 _SUFFIX = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30, "": 1}
 
+
 def parse_qty(txt: str) -> int:
     """Parse quantities like "1M", "256k", "1024" → int."""
     m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([kKmMgG]?)\s*", txt)
@@ -25,11 +27,13 @@ def parse_qty(txt: str) -> int:
     val, suf = m.groups()
     return int(float(val) * _SUFFIX[suf.lower()])
 
+
 def fmt_qty(x: int) -> str:
     for suf, mul in reversed(_SUFFIX.items()):
         if x >= mul and mul != 1:
             return f"{x / mul:.2f}{suf.upper()}"
     return str(x)
+
 
 def interp(xq: int, xs: np.ndarray, ys: np.ndarray) -> float:
     """Linear interpolation/extrapolation for a monotonic x-axis."""
@@ -44,6 +48,7 @@ def interp(xq: int, xs: np.ndarray, ys: np.ndarray) -> float:
         x0, x1, y0, y1 = xs[idx - 1], xs[idx], ys[idx - 1], ys[idx]
     slope = (y1 - y0) / (x1 - x0)
     return y0 + slope * (xq - x0)
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
@@ -91,18 +96,21 @@ if submit:
 
     # Plot curve with point
     import altair as alt
+
     chart_df = seg.copy()
     chart_df["lat_ms"] = chart_df["latency(ms)"]
     chart_df["label"] = "data"
-    point_df = pd.DataFrame({
-        "nelem": [nelem_req],
-        "lat_ms": [est_ms],
-        "label": ["estimate"],
-    })
+    point_df = pd.DataFrame(
+        {
+            "nelem": [nelem_req],
+            "lat_ms": [est_ms],
+            "label": ["estimate"],
+        }
+    )
     full_df = pd.concat([chart_df[["nelem", "lat_ms", "label"]], point_df])
     base = alt.Chart(full_df).encode(
         x=alt.X("nelem", title="Elements per GPU", scale=alt.Scale(type="log")),
         y=alt.Y("lat_ms", title="Latency (ms)"),
-        color="label"
+        color="label",
     )
     st.altair_chart(base.mark_line(point=True), use_container_width=True)

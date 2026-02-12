@@ -23,12 +23,12 @@
 
 ##
 
-<!-- **DistCA** is an LLM training system that efficiently handles long-context training. DistCA disaggregates the **C**ore **A**ttention (the $\text{softmax}(QK^T)V$ operation) from the rest of the model, fundamentally 
+<!-- **DistCA** is an LLM training system that efficiently handles long-context training. DistCA disaggregates the **C**ore **A**ttention (the $\text{softmax}(QK^T)V$ operation) from the rest of the model, fundamentally
 
 DistCA build on top of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM). -->
 
 
-**DistCA** is a distributed LLM training system designed for efficient **long-context** training. DistCA introduces **Core Attention Disaggregation (CAD)**, a system-level technique that separates the quadratic **core attention** computation (i.e. $\text{softmax}(QK^T)V$, or the FlashAttention kernel) from the remaining linear components of the model. 
+**DistCA** is a distributed LLM training system designed for efficient **long-context** training. DistCA introduces **Core Attention Disaggregation (CAD)**, a system-level technique that separates the quadratic **core attention** computation (i.e. $\text{softmax}(QK^T)V$, or the FlashAttention kernel) from the remaining linear components of the model.
 
 
 
@@ -38,9 +38,9 @@ DistCA addresses a fundamental limitation in long-context LLM training: severe w
 
 DistCA treats core attention (CA, the $\text{softmax}(QK^T)V$ operation) as an independent unit of work and dynamically redistributes CA tasks across GPUs, while keeping the rest of the model execution unchanged. This design enables:
 
-- Balanced core attention execution across DP and PP ranks  
-- Elimination of stragglers and pipeline bubbles  
-- Significantly lower communication overhead than context parallelism  
+- Balanced core attention execution across DP and PP ranks
+- Elimination of stragglers and pipeline bubbles
+- Significantly lower communication overhead than context parallelism
 - Near-linear scalability to very long context lengths
 
 
@@ -49,7 +49,7 @@ DistCA treats core attention (CA, the $\text{softmax}(QK^T)V$ operation) as an i
     <img src="assets/distca.gif" width="75%" alt="How DistCA works" />
   </picture>
   <br/>
-  <i>How DistCA works</i>   
+  <i>How DistCA works</i>
 </p>
 
 
@@ -71,9 +71,9 @@ We provide a preliminary slurm script for training a 8B LLaMA model with 128K co
 sbatch pretrain_llama.sh
 ```
 
-or using `salloc`: 
+or using `salloc`:
 ```bash
-salloc -N 2 -G 16 -t 01:00:00 --job-name=distca 
+salloc -N 2 -G 16 -t 01:00:00 --job-name=distca
 bash pretrain_llama.sh
 # NNODES=2 TP_SIZE=8 PP_SIZE=2 bash pretrain_llama.sh
 ```
@@ -107,6 +107,10 @@ We provide a set of environment variables for tuning the performance of DistCA. 
 
 
 
+
+## Development
+
+CI and pre-commit (Ruff, ShellCheck, clang-format): see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Citation
 If you find DistCA useful in your research, please consider citing us:

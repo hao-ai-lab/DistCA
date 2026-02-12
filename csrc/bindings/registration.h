@@ -1,5 +1,6 @@
 /*
-Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT License.
+Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT
+License.
 */
 
 #pragma once
@@ -24,7 +25,7 @@ Code modified from https://github.com/ppl-ai/pplx-kernels and subject to the MIT
 // via python's import statement.
 #define REGISTER_EXTENSION(NAME)                                                                   \
   PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                         \
-    static struct PyModuleDef module = {                                                           \
-        PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr};                              \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0,        \
+                                        nullptr};                                                  \
     return PyModule_Create(&module);                                                               \
   }

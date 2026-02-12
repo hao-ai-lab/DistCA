@@ -1,51 +1,57 @@
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
 import torch
 import transformer_engine.pytorch.attention.dot_product_attention.utils as dpa_utils
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 
 """
 Copied from transformer_engine.pytorch.attention.dot_product_attention.utils.
 This is to monkey patch the get_attention_backend function to enable the per doc CP case.
 """
-import os
 import logging
-
+import os
 from dataclasses import fields
-from packaging.version import Version as PkgVersion
 
-import torch
 import transformer_engine as te
+from packaging.version import Version as PkgVersion
+from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+    _NVTE_FLASH_ATTN,
+    AttentionLogging,
+    AttentionParams,
+    FlashAttentionUtils,
+    _get_supported_versions,
+    check_set_window_size,
+    get_qkv_format,
+    tex,
+)
+from transformer_engine.pytorch.constants import TE_DType
 from transformer_engine.pytorch.cpp_extensions.fused_attn import (
-    QKVLayout,
     AttnBiasType,
     AttnMaskType,
     FusedAttnBackend,
+    QKVLayout,
 )
 from transformer_engine.pytorch.float8_tensor import Float8Tensor
 from transformer_engine.pytorch.fp8 import get_fp8_te_dtype
-from transformer_engine.pytorch.constants import TE_DType
-
-
 from transformer_engine.pytorch.utils import (
-    get_device_compute_capability,
     get_cudnn_version,
-)
-from transformer_engine.pytorch.attention.dot_product_attention.utils import (
-    AttentionLogging, AttentionParams, FlashAttentionUtils,
-    check_set_window_size, get_qkv_format, tex, _NVTE_FLASH_ATTN, _get_supported_versions
+    get_device_compute_capability,
 )
 
 __already_called_get_attention_backend = False
 __ret_value = None
+
+
 def get_attention_backend(attention_params):
     global __already_called_get_attention_backend
     global __ret_value
 
     # if __already_called_get_attention_backend:
     #     pass
-    if os.getenv("EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND", "1") == "1" and __already_called_get_attention_backend:
+    if (
+        os.getenv("EXPERIMENT_D2_FLASH_ATTN_SKIP_GET_BACKEND", "1") == "1"
+        and __already_called_get_attention_backend
+    ):
         return __ret_value
 
-    
     # NOTE: As part of refactoring attention.py, populating the _attention_backends cache in attention
     # is no longer performed at the end of get_attention_backend(), but the responsibility of doing so
     # is shifted over to the caller of this function
@@ -793,7 +799,7 @@ class MonkeyPatch:
         # TODO(yonghao): as now max_seqlen is an int, this is cheap, maybe
         # no need to do the monkey patching
         AttentionParams.__eq__ = attn_params_eq
-    
+
     def __exit__(self, exc_type, exc_value, traceback):
         dpa_utils.get_attention_backend = self.backup_get_attention_backend
         AttentionParams.__eq__ = self.backup_attn_param_eq
@@ -809,4 +815,3 @@ class PerDocCPAttention(TEDotProductAttention):
     def forward(self, *args, **kwargs):
         with MonkeyPatch():
             return super().forward(*args, **kwargs)
-    

@@ -2,26 +2,17 @@
 
 """Pretrain GPT."""
 
-import datetime
-import os
-import torch
-
 from functools import partial
-from typing import List, Optional, Tuple, Union
+
+import torch
 from megatron.core import parallel_state
-from megatron.training import get_args
-from megatron.training import inprocess_restart
-from megatron.training import print_rank_0
-from megatron.training import get_timers
-from megatron.training import get_tokenizer
-from megatron.core import mpu
-from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import (
-    GPTDataset, GPTDatasetConfig, MockGPTDataset, 
+    GPTDataset,
+    GPTDatasetConfig,
+    MockGPTDataset,
     # OptimalGPTDataset
 )
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -36,11 +27,17 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import StragglerDetector
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    inprocess_restart,
+    pretrain,
+    print_rank_0,
+)
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
 )
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
@@ -62,8 +59,8 @@ stimer = StragglerDetector()
 
 
 def model_provider(
-    pre_process=True, post_process=True, vp_stage: Optional[int] = None
-) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+    pre_process=True, post_process=True, vp_stage: int | None = None
+) -> GPTModel | megatron.legacy.model.GPTModel:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -94,18 +91,18 @@ def model_provider(
 
         def oom_observer(device, alloc, device_alloc, device_free):
             # snapshot right after an OOM happened
-            print('saving allocated state during OOM')
+            print("saving allocated state during OOM")
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
             dump(
                 snapshot,
-                open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'),
+                open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", "wb"),
             )
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
-    print_rank_0('building GPT model ...')
+    print_rank_0("building GPT model ...")
     # Experimental loading arguments from yaml
     if args.yaml_cfg is not None:
         config = core_transformer_config_from_yaml(args, "language_model")
@@ -127,7 +124,11 @@ def model_provider(
             if args.num_experts:
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
+                    config,
+                    use_transformer_engine=use_te,
+                    normalization=args.normalization,
+                    qk_l2_norm=args.qk_l2_norm,
+                    vp_stage=vp_stage,
                 )
             elif args.heterogeneous_layers_config_path is not None:
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
@@ -140,7 +141,7 @@ def model_provider(
                         args.qk_layernorm,
                         args.multi_latent_attention,
                         args.moe_use_legacy_grouped_gemm,
-                        qk_l2_norm=args.qk_l2_norm
+                        qk_l2_norm=args.qk_l2_norm,
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
@@ -179,10 +180,10 @@ def model_provider(
 
 
 def setup_batches(max_seq_len: int = 4096):
-    
+
     # TODO: (Hack) Read the list of batches from the optimal files and record it.
     # This represents the optimal batch scheduling based on the configuration of the cluster.
-    # TODO: Include the config of the cluster (DP, PP, CP, etc.), 
+    # TODO: Include the config of the cluster (DP, PP, CP, etc.),
     # but the file (batch schedule) should already reflect this.
     batches = [
         [4096] * 1,
@@ -197,19 +198,21 @@ def setup_batches(max_seq_len: int = 4096):
         # [8] * 32,
     ]
 
-    def read_batches(file_path: str="batches.json"):
+    def read_batches(file_path: str = "batches.json"):
         import json
-        with open(file_path, "r") as f:
+
+        with open(file_path) as f:
             batches = json.load(f)
             # TODO: assert batches is a list of lists of ints.
             return batches
-    
+
     # batches = read_batches()
 
     # Now build the attention mask based on a particular document.
     from itertools import cycle
+
     batches = cycle(batches)
-    
+
     for idx, token_lens in enumerate(batches):
         micro_batch_size = len(token_lens)
         # TODO: Memory allocation can be delayed.
@@ -218,18 +221,24 @@ def setup_batches(max_seq_len: int = 4096):
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
-        labels = torch.ones(
-            (micro_batch_size, max_seq_len),
-            dtype=torch.int64,
-            device=torch.cuda.current_device(),
-        ) + 1
+        labels = (
+            torch.ones(
+                (micro_batch_size, max_seq_len),
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            + 1
+        )
         loss_mask = torch.ones(
             (micro_batch_size, max_seq_len),
             dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
         attention_mask = torch.ones(
-            micro_batch_size, 1, max_seq_len, max_seq_len, 
+            micro_batch_size,
+            1,
+            max_seq_len,
+            max_seq_len,
             dtype=torch.bool,
             device=torch.cuda.current_device(),
         )
@@ -244,14 +253,14 @@ def setup_batches(max_seq_len: int = 4096):
                 torch.zeros(token_len, token_len, dtype=torch.bool)
             )
             loss_mask[batch_id, :token_len] = 1.0
-        
+
         batch = dict(
-            tokens = tokens,
-            labels = labels,
-            loss_mask = loss_mask,
-            attention_mask = attention_mask,
-            position_ids = position_ids,
-            token_lens = token_lens,
+            tokens=tokens,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            token_lens=token_lens,
         )
         yield batch
 
@@ -264,8 +273,8 @@ from context_parallel import (
     prepare_packed_seq_params,
 )
 
-
 USING_WLB_LLM = True
+
 
 def get_batch(data_iterator):
     """Generate a batch."""
@@ -292,8 +301,8 @@ def get_batch(data_iterator):
     """
     # batch = get_batch_on_this_tp_rank(data_iterator)
     batch = next(global_batches)
-    token_lens = batch['token_lens']
-    batch.pop('token_lens')
+    token_lens = batch["token_lens"]
+    batch.pop("token_lens")
     # ____debug_print_batches(batch)
 
     # slice batch along sequence dimension for context parallelism
@@ -301,7 +310,7 @@ def get_batch(data_iterator):
         batch = get_batch_on_this_cp_rank__balanced_seq(batch, token_lens)
     else:
         batch = get_batch_on_this_cp_rank(batch)
-    
+
     for k, v in batch.items():
         print(k, v.shape)
     """
@@ -314,9 +323,7 @@ def get_batch(data_iterator):
 SPIKY_LOSS_FACTOR = 10
 
 
-def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
-):
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTModel | None = None):
     """Loss function.
 
     Args:
@@ -373,8 +380,7 @@ def loss_func(
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
-    return (loss, num_tokens, {'lm loss': reporting_loss})
-
+    return (loss, num_tokens, {"lm loss": reporting_loss})
 
 
 def forward_step(data_iterator, model: GPTModel):
@@ -388,11 +394,13 @@ def forward_step(data_iterator, model: GPTModel):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator', log_level=2).start()
+    timers("batch-generator", log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        (tokens, labels, loss_mask, attention_mask, position_ids), token_lens = get_batch(data_iterator)
-    timers('batch-generator').stop()
+        (tokens, labels, loss_mask, attention_mask, position_ids), token_lens = get_batch(
+            data_iterator
+        )
+    timers("batch-generator").stop()
 
     cp_size = parallel_state.get_context_parallel_world_size()
     cp_rank = parallel_state.get_context_parallel_rank()
@@ -400,8 +408,10 @@ def forward_step(data_iterator, model: GPTModel):
     max_seq_len = tokens.shape[1]
 
     packed_seq_params = prepare_packed_seq_params(
-        token_lens, max_seq_len, 
-        cp_size, cp_rank,
+        token_lens,
+        max_seq_len,
+        cp_size,
+        cp_rank,
         device=tokens.device,
     )
 
@@ -410,9 +420,12 @@ def forward_step(data_iterator, model: GPTModel):
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
             output_tensor = model(
-                tokens, position_ids, attention_mask, 
+                tokens,
+                position_ids,
+                attention_mask,
                 # packed_seq_params=packed_seq_params,
-                labels=labels, loss_mask=loss_mask, 
+                labels=labels,
+                loss_mask=loss_mask,
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -430,8 +443,8 @@ def core_gpt_dataset_config_from_args(args):
     tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend: tuple[list[str], list[float] | None] | None
+    blend_per_split: list[tuple[list[str], list[float] | None] | None] | None
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
     return GPTDatasetConfig(
@@ -481,7 +494,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
-
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
@@ -493,7 +505,7 @@ if __name__ == "__main__":
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         store=store,
     )

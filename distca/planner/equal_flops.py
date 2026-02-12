@@ -5,26 +5,28 @@ Rebalance attention across batches.
 
 The purpose of the algorithm is to rebalacne the attention (flops) across the differnet bathces.
 
-Given a particular batch, seuqence information and its GPU placement, 
+Given a particular batch, seuqence information and its GPU placement,
 ```python
 item = dict(q=int, kv=int, gpuid=int, seqid=int, dst_gpuid=int, flops=int, is_original=bool)
 batch[0] = [all items where dst_gpuid == 0]
 ```
-we want to rebalance the attentions across the batches. 
+we want to rebalance the attentions across the batches.
 
 Specifically, given a particular batch information, we take the following steps:
 1. Calculate the min/max across all batches.
-2. Get the longest sequence which is the original sequence. 
+2. Get the longest sequence which is the original sequence.
 3. Split the sequence into these batches such tht they get balanced as much as possible.
 """
-import torch
+
 from collections import defaultdict
 from copy import deepcopy
 from itertools import zip_longest
+
 import rich
-from copy import deepcopy
+import torch
 
 K = 1024
+
 
 def get_flops(q=None, kv=None, **kwargs):
     assert q is not None and kv is not None, "q and kv must be provided"
@@ -40,11 +42,16 @@ def batch_to_items(batches):
     items = []
     for gpuid, batch in enumerate(batches):
         for seqid, seq_len in enumerate(batch):
-            items.append(dict(
-                q=seq_len, kv=seq_len, 
-                gpuid=gpuid, seqid=seqid, src_gpuid=gpuid, 
-                is_original=True
-            ))
+            items.append(
+                dict(
+                    q=seq_len,
+                    kv=seq_len,
+                    gpuid=gpuid,
+                    seqid=seqid,
+                    src_gpuid=gpuid,
+                    is_original=True,
+                )
+            )
     return items
 
 
@@ -53,7 +60,7 @@ def plot_batch_v1(items, title=None):
     # plot a bar chart for each GPU - height as the sum of flops
     import matplotlib.pyplot as plt
     import numpy as np
-    
+
     fig, ax = plt.subplots()
     bottom = np.zeros(ngpu)
 
@@ -65,15 +72,14 @@ def plot_batch_v1(items, title=None):
             if item["gpuid"] == gpuid:
                 _y.append(get_flops(**item))
         y.append(_y)
-    
 
     for idx, _ys in enumerate(zip_longest(*y, fillvalue=0)):
         ax.bar(x, _ys, bottom=bottom)
         bottom += _ys
-    
+
     if title is not None:
         ax.set_title(title)
-    
+
     plt.show()
     return
 
@@ -83,7 +89,7 @@ def plot_batch_v2(items, title=None):
     # plot a bar chart for each GPU - height as the sum of flops
     import matplotlib.pyplot as plt
     import numpy as np
-    
+
     fig, ax = plt.subplots()
     bottom = np.zeros(ngpu)
 
@@ -96,17 +102,19 @@ def plot_batch_v2(items, title=None):
         for item in items:
             if item["gpuid"] == gpuid:
                 _y.append(get_flops(**item))
-                _colors.append('blue' if item["is_original"] else 'orange')
+                _colors.append("blue" if item["is_original"] else "orange")
         y.append(_y)
         colors.append(_colors)
-    
-    for idx, (_ys, _colors) in enumerate(zip(zip_longest(*y, fillvalue=0), zip_longest(*colors, fillvalue='blue'))):
+
+    for idx, (_ys, _colors) in enumerate(
+        zip(zip_longest(*y, fillvalue=0), zip_longest(*colors, fillvalue="blue"))
+    ):
         ax.bar(x, _ys, bottom=bottom, color=_colors)
         bottom += _ys
-    
+
     if title is not None:
         ax.set_title(title)
-    
+
     plt.show()
     return
 
@@ -115,27 +123,25 @@ plot_batch = plot_batch_v1
 
 
 def get_oustanding_seq_v1(items):
-    from collections import defaultdict
 
     ngpu = max(item["gpuid"] for item in items) + 1
-    
+
     # Get each GPU's flops
     flops_per_gpu = [0] * ngpu
     for item in items:
         flops_per_gpu[item["gpuid"]] += get_flops(**item)
-    
+
     # Get the GPU with the max flops
     max_flops_gpu_id = flops_per_gpu.index(max(flops_per_gpu))
-    
+
     # Get the item with the max flops within that GPU
-    max_flops_item = max([
-        item for item in items if item["gpuid"] == max_flops_gpu_id
-    ], key=lambda x: get_flops(**x))
+    max_flops_item = max(
+        [item for item in items if item["gpuid"] == max_flops_gpu_id], key=lambda x: get_flops(**x)
+    )
     return max_flops_item
 
 
 def get_oustanding_seq_v2(items):
-    from collections import defaultdict
 
     # Get the item with the max flops within that GPU
     max_flops_item = max(items, key=lambda x: get_flops(**x))
@@ -149,9 +155,8 @@ def plot_flops(items, plan_flops_per_gpu, title=None):
     fixed_flops_per_gpu = [0] * len(plan_flops_per_gpu)
     for item in items:
         fixed_flops_per_gpu[item["gpuid"]] += get_flops(**item)
-    
+
     import matplotlib.pyplot as plt
-    import numpy as np
 
     fig, ax = plt.subplots()
     x = range(len(plan_flops_per_gpu))
@@ -161,14 +166,14 @@ def plot_flops(items, plan_flops_per_gpu, title=None):
         ax.set_title(title)
     ax.legend()
     plt.show()
-        
+
     pass
 
 
 def plan_relocation(items_, verbose=False, plot=True):
     """
     Relocate q/kv(s) across GPUs such that the flops are balanced.
-    
+
     TODO:
     - Remainder balancing logic is not very elegant.
     - Locality awareness is not optimal, but so far so good.
@@ -180,22 +185,22 @@ def plan_relocation(items_, verbose=False, plot=True):
         if verbose:
             rich.print(message)
 
-    def rplot(data, title, plot_type='batch'):
+    def rplot(data, title, plot_type="batch"):
         if plot:
-            if plot_type == 'batch':
+            if plot_type == "batch":
                 plot_batch(data, title)
-            elif plot_type == 'flops':
+            elif plot_type == "flops":
                 plot_flops(data[0], data[1], title)
 
     rlog(items)
-    rplot(items, f"Before removing the outstanding sequence", plot_type='batch')
+    rplot(items, "Before removing the outstanding sequence", plot_type="batch")
 
     # Remove the outstanding sequence from the items
     outstanding_seq = get_oustanding_seq(items)
     items.remove(outstanding_seq)
 
     rlog(items)
-    rplot(items, f"After removing the outstanding sequence", plot_type='batch')
+    rplot(items, "After removing the outstanding sequence", plot_type="batch")
 
     # ------------------------
     # Information Gathering
@@ -229,12 +234,14 @@ def plan_relocation(items_, verbose=False, plot=True):
     #   - `plan_to_move_flops`: the flops we want to move to each GPU.
     # ------------------------
     plan_to_move_flops = [0] * ngpu
-    rplot((items, plan_to_move_flops), f"(Flops) Before planning the flops movement", plot_type='flops')
+    rplot(
+        (items, plan_to_move_flops), "(Flops) Before planning the flops movement", plot_type="flops"
+    )
     remaining_flops = get_flops(**outstanding_seq)
     for k in range(2, ngpu + 1):
-        # Find the topK largest deficit GPUs, 
+        # Find the topK largest deficit GPUs,
         # and then try to fill them up with the remaining budgets.
-        # The remaining budgets will try to equally allocate to these topK GPUs 
+        # The remaining budgets will try to equally allocate to these topK GPUs
         # until the remaining budgets are all allocated.
 
         topK_deficit_gpus_ids = sorted(range(ngpu), key=lambda x: deficit[x], reverse=True)[:k]
@@ -263,7 +270,11 @@ def plan_relocation(items_, verbose=False, plot=True):
                 # remaining_flops -= equal_flops
             remaining_flops = 0
 
-        rplot((items, plan_to_move_flops), f"(Flops) After planning the flops movement - Round {k}", plot_type='flops')
+        rplot(
+            (items, plan_to_move_flops),
+            f"(Flops) After planning the flops movement - Round {k}",
+            plot_type="flops",
+        )
         if remaining_flops == 0:
             break
 
@@ -273,7 +284,11 @@ def plan_relocation(items_, verbose=False, plot=True):
         for gpu_id in range(ngpu):
             plan_to_move_flops[gpu_id] += flops
         remaining_flops = 0
-        rplot((items, plan_to_move_flops), f"(Flops) After planning the flops movement - remainder", plot_type='flops')
+        rplot(
+            (items, plan_to_move_flops),
+            "(Flops) After planning the flops movement - remainder",
+            plot_type="flops",
+        )
 
     # Note: remaining_flops can be float.
 
@@ -282,13 +297,15 @@ def plan_relocation(items_, verbose=False, plot=True):
     # - Use `plan_to_move_flops` to assign the work to the GPUs.
     # - `outstanding_seq` is the sequence that we want to move the flops to the GPUs.
     # ------------------------
-    def round_up(x): 
-        if x > int(x): 
+    def round_up(x):
+        if x > int(x):
             x = x + 1
         return int(x)
 
     # Handle locality. First, we satisfy the need for the outstanding sequence's GPU.
-    filling_gpu_ids = [outstanding_seq["gpuid"]] + [i for i in range(ngpu) if i != outstanding_seq["gpuid"]]
+    filling_gpu_ids = [outstanding_seq["gpuid"]] + [
+        i for i in range(ngpu) if i != outstanding_seq["gpuid"]
+    ]
     rlog(f"filling_gpu_ids = {filling_gpu_ids}")
 
     # TODO: - Make this a generator -
@@ -304,41 +321,33 @@ def plan_relocation(items_, verbose=False, plot=True):
             return []
 
         # outstanding_seq = {
-        #     'q': 32768, 'kv': 32768, 'gpuid': 1, 'seqid': 0, 
+        #     'q': 32768, 'kv': 32768, 'gpuid': 1, 'seqid': 0,
         #     'src_gpuid': 1, 'is_original': True
         # }
 
         if works + _current_work > _max_work:
-            # assign everything to this GPU. 
+            # assign everything to this GPU.
             works = _max_work - _current_work
             head = outstanding_seq.copy()
-            head.update(dict(
-                q=works,
-                kv=_current_work + works,
-                gpuid=gpu_id,
-                is_original=False
-            ))
+            head.update(dict(q=works, kv=_current_work + works, gpuid=gpu_id, is_original=False))
         else:
             head = outstanding_seq.copy()
-            head.update(dict(
-                q=works,
-                kv=_current_work + works,
-                gpuid=gpu_id,
-                is_original=False
-            ))
+            head.update(dict(q=works, kv=_current_work + works, gpuid=gpu_id, is_original=False))
             tail = outstanding_seq.copy()
-            tail.update(dict(
-                q=works,
-                kv=outstanding_seq["kv"] - _current_work,
-                gpuid=gpu_id,
-                is_original=False
-            ))
+            tail.update(
+                dict(
+                    q=works,
+                    kv=outstanding_seq["kv"] - _current_work,
+                    gpuid=gpu_id,
+                    is_original=False,
+                )
+            )
 
         _current_work += works
         return [head, tail]
 
     rlog(f"outstanding_seq = {outstanding_seq}")
-    rplot(items, f"Work assignment - Before", plot_type='batch')
+    rplot(items, "Work assignment - Before", plot_type="batch")
 
     rlog(f"outstanding_seq = {outstanding_seq}")
 
@@ -357,26 +366,27 @@ def plan_relocation(items_, verbose=False, plot=True):
         rlog(f"[Round {idx}] works = {works}")
         if works:
             extended_items.extend(works)
-            
-        rplot(items + extended_items, f"Work assignment - Round {idx}", plot_type='batch')
-    
+
+        rplot(items + extended_items, f"Work assignment - Round {idx}", plot_type="batch")
+
     # Handle remainder
     # - Essentially realign the extended_items to ensure there are no gaps.
     extended_items.sort(key=lambda x: x["kv"])
     cum_qlen = extended_items[0]["q"]
     for i in range(1, len(extended_items)):
-        x, y = extended_items[i-1], extended_items[i]
-        assert y['q'] + cum_qlen <= y['kv']
-        if y['q'] + cum_qlen < y['kv']:
-            y['q'] = y['kv'] - cum_qlen
+        x, y = extended_items[i - 1], extended_items[i]
+        assert y["q"] + cum_qlen <= y["kv"]
+        if y["q"] + cum_qlen < y["kv"]:
+            y["q"] = y["kv"] - cum_qlen
             pass
-        cum_qlen += y['q']
+        cum_qlen += y["q"]
         pass
     items.extend(extended_items)
 
-    rplot(items, f"Result", plot_type='batch')
+    rplot(items, "Result", plot_type="batch")
     rlog(items)
     return items
+
 
 def postprocess_items(items) -> list[dict]:
     """
@@ -387,18 +397,19 @@ def postprocess_items(items) -> list[dict]:
     - sort them by the `kv` to determine the shard id of that sequence.
     """
     from copy import deepcopy
+
     items = deepcopy(items)
 
     for item in items:
         if item["is_original"]:
             item["shard_id"] = 0
-    
+
     # now handle the non-original sequences.
     non_original_items = [item for item in items if not item["is_original"]]
     src_gpuid_seqid_to_items = defaultdict(list)
     for item in non_original_items:
         src_gpuid_seqid_to_items[(item["src_gpuid"], item["seqid"])].append(item)
-    
+
     for src_gpuid_seqid, items_ in src_gpuid_seqid_to_items.items():
         items_.sort(key=lambda x: x["kv"])
         for i, item in enumerate(items_):
@@ -420,7 +431,7 @@ def item_to_intermediate_tensors(items, verbose=False):
 
     from collections import defaultdict
     from copy import deepcopy
-    
+
     # Prepare the info_mapping[(src_gpuid, seqid)] -> [items]
     items = deepcopy(items)
     info_mapping = defaultdict(list)
@@ -429,9 +440,7 @@ def item_to_intermediate_tensors(items, verbose=False):
         info_mapping[sid].append(item)
 
     info_list = list(info_mapping.items())
-    info_list.sort(
-        key=lambda x: x[0]
-    )
+    info_list.sort(key=lambda x: x[0])
     for key, values in info_list:
         values.sort(key=lambda x: x["kv"])
         pass
@@ -440,10 +449,7 @@ def item_to_intermediate_tensors(items, verbose=False):
 
     world_size = max(item["src_gpuid"] for item in items) + 1
     num_seqs = max(item["seqid"] for item in items) + 1
-    max_cp_degree = max(
-        len(value)
-        for value in info_mapping.values()
-    )
+    max_cp_degree = max(len(value) for value in info_mapping.values())
     world_info = dict(world_size=world_size, num_seqs=num_seqs, max_cp_degree=max_cp_degree)
     print_if_verbose(world_info)
 
@@ -483,12 +489,11 @@ def item_to_intermediate_tensors(items, verbose=False):
 
     return world_info, (items, info_mapping, info_list), (seq_lens, cp_num, cp_dst, seq_shard_lens)
 
+
 def calculate_flops_factor_in_each_gpu(items):
-    """Calculate the flops (factor) in each GPU. 
+    """Calculate the flops (factor) in each GPU.
     This is a constant away from the real theoretic FLOPS."""
-    ngpus = set(
-        item["gpuid"] for item in items
-    )
+    ngpus = set(item["gpuid"] for item in items)
     # print("ngpus", ngpus)
     gpu_flops = [0] * len(ngpus)
     for item in items:

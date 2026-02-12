@@ -9,78 +9,106 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
 torchrun --nnodes 1 --nproc_per_node 2 test_dispatch_fast.py \
     --world-size 2
 """
-import torch
 
-from distca.runtime.attn_kernels.ops import (
-    nvshmem_barrier_all
-)
+import torch
+from test_shard_info_to_fa2a import simulate_all2all
+from test_util import BaseWorker, init_worker_torch_distributed, random_shard_info_linear_layout_dp
+
 # TODO: test fast_a2a_attn_out and its metadata by sending q_attn_layout back to q_mlp_layout via attn_out metadata.
-from distca.runtime.attn_kernels.dispatch import (
-    pre_a2a_qkv, post_a2a_qkv
-)
-from distca.runtime.attn_kernels.ops import fast_a2a
+from distca.runtime.attn_kernels.dispatch import post_a2a_qkv, pre_a2a_qkv
+from distca.runtime.attn_kernels.ops import fast_a2a, nvshmem_barrier_all
 from distca.runtime.compute_metadata import from_planner_output
 from distca.runtime.metadata import AlltoAllMetadata
 
-from test_util import (
-    BaseWorker, init_worker_torch_distributed,
-    random_shard_info_linear_layout_dp
-)
-from test_shard_info_to_fa2a import simulate_all2all
-
 
 def _fast_a2a_qkv(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_dispatch_mask: torch.Tensor,
-    recv_q: torch.Tensor, recv_k: torch.Tensor, recv_v: torch.Tensor,
-    q_seq_tokens: torch.Tensor, k_seq_tokens: torch.Tensor,
-    q_recv_seq_tokens: torch.Tensor, k_recv_seq_tokens: torch.Tensor,
-    q_send_buffer_offset: torch.Tensor, k_send_buffer_offset: torch.Tensor, v_send_buffer_offset: torch.Tensor,
-    q_recv_buffer_offset: torch.Tensor, k_recv_buffer_offset: torch.Tensor, v_recv_buffer_offset: torch.Tensor,
-    sender_send_disp: torch.Tensor, sender_transfer_sz: torch.Tensor,
-    sender_recv_disp: torch.Tensor, recver_transfer_sz: torch.Tensor,
-    my_rank_send_offset: int, my_rank_recv_offset: int, my_rank_send_sz: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_dispatch_mask: torch.Tensor,
+    recv_q: torch.Tensor,
+    recv_k: torch.Tensor,
+    recv_v: torch.Tensor,
+    q_seq_tokens: torch.Tensor,
+    k_seq_tokens: torch.Tensor,
+    q_recv_seq_tokens: torch.Tensor,
+    k_recv_seq_tokens: torch.Tensor,
+    q_send_buffer_offset: torch.Tensor,
+    k_send_buffer_offset: torch.Tensor,
+    v_send_buffer_offset: torch.Tensor,
+    q_recv_buffer_offset: torch.Tensor,
+    k_recv_buffer_offset: torch.Tensor,
+    v_recv_buffer_offset: torch.Tensor,
+    sender_send_disp: torch.Tensor,
+    sender_transfer_sz: torch.Tensor,
+    sender_recv_disp: torch.Tensor,
+    recver_transfer_sz: torch.Tensor,
+    my_rank_send_offset: int,
+    my_rank_recv_offset: int,
+    my_rank_send_sz: int,
     is_fwd: bool,
     # TODO: reorder args to make it more logical
-    kv_grad_copy_shard_mask: torch.Tensor=None,
+    kv_grad_copy_shard_mask: torch.Tensor = None,
 ):
     switch_buffer = True
     instance_id = None
     # copy in advance
     # NOTE: in this test, kv grads = kv values, so we don't accumulate them due to the ease of value checking.
     q, k, v = pre_a2a_qkv(
-        q, k, v, kv_dispatch_mask, q_seq_tokens, k_seq_tokens,
-        q_send_buffer_offset, k_send_buffer_offset, v_send_buffer_offset,
-        is_fwd=is_fwd, instance_id=instance_id,
+        q,
+        k,
+        v,
+        kv_dispatch_mask,
+        q_seq_tokens,
+        k_seq_tokens,
+        q_send_buffer_offset,
+        k_send_buffer_offset,
+        v_send_buffer_offset,
+        is_fwd=is_fwd,
+        instance_id=instance_id,
         kv_grad_copy_shard_mask=kv_grad_copy_shard_mask,
     )
     # all2all
     fast_a2a(
-        sender_send_disp, sender_transfer_sz,
-        sender_recv_disp, recver_transfer_sz,
-        my_rank_send_offset, my_rank_recv_offset, my_rank_send_sz,
+        sender_send_disp,
+        sender_transfer_sz,
+        sender_recv_disp,
+        recver_transfer_sz,
+        my_rank_send_offset,
+        my_rank_recv_offset,
+        my_rank_send_sz,
         instance_id=instance_id,
     )
     # copy back
     recv_q, recv_k, recv_v = post_a2a_qkv(
-        recv_q, recv_k, recv_v, kv_dispatch_mask,
-        q_recv_seq_tokens, k_recv_seq_tokens,
-        q_recv_buffer_offset, k_recv_buffer_offset, v_recv_buffer_offset,
-        is_fwd=is_fwd, switch_buffer=switch_buffer, instance_id=instance_id,
+        recv_q,
+        recv_k,
+        recv_v,
+        kv_dispatch_mask,
+        q_recv_seq_tokens,
+        k_recv_seq_tokens,
+        q_recv_buffer_offset,
+        k_recv_buffer_offset,
+        v_recv_buffer_offset,
+        is_fwd=is_fwd,
+        switch_buffer=switch_buffer,
+        instance_id=instance_id,
     )
     return recv_q, recv_k, recv_v
 
 
 class Worker(BaseWorker):
-
     def run_qkv(
-        self, fa2a_metadata_fwd: AlltoAllMetadata,
+        self,
+        fa2a_metadata_fwd: AlltoAllMetadata,
         fa2a_metadata_rev: AlltoAllMetadata,
-        tensor_q: torch.Tensor, tensor_kv: torch.Tensor,
+        tensor_q: torch.Tensor,
+        tensor_kv: torch.Tensor,
     ):
         tensor_q = tensor_q.cuda()
         tensor_kv = tensor_kv.cuda()
-        tensor_k = tensor_kv[:, :tensor_kv.shape[-1] // 2]
-        tensor_v = tensor_kv[:, tensor_kv.shape[-1] // 2:]
+        tensor_k = tensor_kv[:, : tensor_kv.shape[-1] // 2]
+        tensor_v = tensor_kv[:, tensor_kv.shape[-1] // 2 :]
 
         fa2a_metadata_fwd = fa2a_metadata_fwd.normalize()
         fa2a_metadata_rev = fa2a_metadata_rev.normalize()
@@ -89,18 +117,20 @@ class Worker(BaseWorker):
         device = tensor_q.device
 
         dst_tensor_q = torch.zeros(
-            fa2a_metadata_fwd.tensor_shape[0].recv_shape,
-            dtype=dtype, device=device
+            fa2a_metadata_fwd.tensor_shape[0].recv_shape, dtype=dtype, device=device
         )
         dst_tensor_k = torch.zeros(
-            fa2a_metadata_fwd.tensor_shape[1].recv_shape,
-            dtype=dtype, device=device
+            fa2a_metadata_fwd.tensor_shape[1].recv_shape, dtype=dtype, device=device
         )
         dst_tensor_v = dst_tensor_k.clone()
         _fast_a2a_qkv(
-            tensor_q, tensor_k, tensor_v,
+            tensor_q,
+            tensor_k,
+            tensor_v,
             fa2a_metadata_fwd.kv_replica_mask,
-            dst_tensor_q, dst_tensor_k, dst_tensor_v,
+            dst_tensor_q,
+            dst_tensor_k,
+            dst_tensor_v,
             fa2a_metadata_fwd.seq_lens[0].send_seqlens,
             fa2a_metadata_fwd.seq_lens[1].send_seqlens,
             fa2a_metadata_fwd.seq_lens[0].recv_seqlens,
@@ -111,7 +141,7 @@ class Worker(BaseWorker):
             fa2a_metadata_fwd.my_rank_send_offset,
             fa2a_metadata_fwd.my_rank_recv_offset,
             fa2a_metadata_fwd.my_rank_send_sz,
-            is_fwd=True
+            is_fwd=True,
         )
 
         nvshmem_barrier_all()
@@ -120,12 +150,10 @@ class Worker(BaseWorker):
 
         # reverse communication buffer
         back_tensor_q = torch.zeros(
-            fa2a_metadata_rev.tensor_shape[0].recv_shape,
-            dtype=dtype, device=device
+            fa2a_metadata_rev.tensor_shape[0].recv_shape, dtype=dtype, device=device
         )
         back_tensor_k: torch.Tensor = torch.zeros(
-            fa2a_metadata_rev.tensor_shape[1].recv_shape,
-            dtype=dtype, device=device
+            fa2a_metadata_rev.tensor_shape[1].recv_shape, dtype=dtype, device=device
         )
         back_tensor_v = back_tensor_k.clone()
 
@@ -133,9 +161,13 @@ class Worker(BaseWorker):
 
         copy_seq_mask = fa2a_metadata_rev.kv_grad_send_dedup.main_copy_mask
         _fast_a2a_qkv(
-            dst_tensor_q, dst_tensor_k, dst_tensor_v,
+            dst_tensor_q,
+            dst_tensor_k,
+            dst_tensor_v,
             fa2a_metadata_rev.kv_replica_mask,
-            back_tensor_q, back_tensor_k, back_tensor_v,
+            back_tensor_q,
+            back_tensor_k,
+            back_tensor_v,
             fa2a_metadata_rev.seq_lens[0].send_seqlens,
             fa2a_metadata_rev.seq_lens[1].send_seqlens,
             fa2a_metadata_rev.seq_lens[0].recv_seqlens,
@@ -168,98 +200,140 @@ class Worker(BaseWorker):
 def create_answer(
     fwd_qkv_metadata: AlltoAllMetadata,
     bwd_qkv_metadata: AlltoAllMetadata,
-    world_size: int, num_tokens: int, max_cp_degree: int,
-    hidden_size_q: int, hidden_size_k: int, dtype: torch.dtype,
+    world_size: int,
+    num_tokens: int,
+    max_cp_degree: int,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    dtype: torch.dtype,
 ):
     device = "cpu"
 
     ### Init tensor ###
-    src_qs = torch.randn(
-        world_size, num_tokens, hidden_size_q,
-        dtype=dtype, device=device
-    )
-    src_ks = torch.randn(
-        world_size, num_tokens, hidden_size_k,
-        dtype=dtype, device=device
-    )
-    src_vs = torch.randn(
-        world_size, num_tokens, hidden_size_k,
-        dtype=dtype, device=device
-    )
+    src_qs = torch.randn(world_size, num_tokens, hidden_size_q, dtype=dtype, device=device)
+    src_ks = torch.randn(world_size, num_tokens, hidden_size_k, dtype=dtype, device=device)
+    src_vs = torch.randn(world_size, num_tokens, hidden_size_k, dtype=dtype, device=device)
     element_size = dtype.itemsize
 
     ### Init output tensor ###
     dst_qs, dst_ks, dst_vs = simulate_all2all(
-        src_qs, src_ks, src_vs, fwd_qkv_metadata, element_size, hidden_size_q, hidden_size_k,
+        src_qs,
+        src_ks,
+        src_vs,
+        fwd_qkv_metadata,
+        element_size,
+        hidden_size_q,
+        hidden_size_k,
         is_from_linear_layout=True,
     )
     rev_qs, rev_ks, rev_vs = simulate_all2all(
-        dst_qs, dst_ks, dst_vs, bwd_qkv_metadata, element_size, hidden_size_q, hidden_size_k,
-        is_from_linear_layout=False, zero_mask_kv_grad=True,
+        dst_qs,
+        dst_ks,
+        dst_vs,
+        bwd_qkv_metadata,
+        element_size,
+        hidden_size_q,
+        hidden_size_k,
+        is_from_linear_layout=False,
+        zero_mask_kv_grad=True,
     )
     kv_mask = fwd_qkv_metadata.kv_replica_mask
-    src_kvs = [
-        torch.concat((src_ks[r], src_vs[r]), dim=-1)
-        for r in range(world_size)
-    ]
-    dst_kvs = [
-        torch.concat((dst_ks[r], dst_vs[r]), dim=-1)
-        for r in range(world_size)
-    ]
-    rev_kvs = [
-        torch.concat((rev_ks[r], rev_vs[r]), dim=-1)
-        for r in range(world_size)
-    ]
+    src_kvs = [torch.concat((src_ks[r], src_vs[r]), dim=-1) for r in range(world_size)]
+    dst_kvs = [torch.concat((dst_ks[r], dst_vs[r]), dim=-1) for r in range(world_size)]
+    rev_kvs = [torch.concat((rev_ks[r], rev_vs[r]), dim=-1) for r in range(world_size)]
 
     return src_qs, src_kvs, dst_qs, dst_kvs, rev_qs, rev_kvs
 
 
-def create_test_case(seed: int, world_size: int, total_seq_len: int, num_docs: int,
-                     max_cp_degree: int, hidden_size_q: int, hidden_size_k: int):
+def create_test_case(
+    seed: int,
+    world_size: int,
+    total_seq_len: int,
+    num_docs: int,
+    max_cp_degree: int,
+    hidden_size_q: int,
+    hidden_size_k: int,
+):
     dtype = torch.float16
     planner_output, doc_lens = random_shard_info_linear_layout_dp(
-        world_size, num_docs, total_seq_len, seed=seed,max_num_shard=max_cp_degree,
+        world_size,
+        num_docs,
+        total_seq_len,
+        seed=seed,
+        max_num_shard=max_cp_degree,
     )
     lse_size = 0
     element_size = dtype.itemsize
-    (fa2a_metadata_qkv_fwd, fa2a_metadata_qkv_rev,
-     fa2a_metadata_attn_out_fwd, fa2a_metadata_attn_out_rev, _) = from_planner_output(
-        world_size, planner_output, hidden_size_q, hidden_size_k,
-        lse_size, element_size, is_pipeline_tick=False
+    (
+        fa2a_metadata_qkv_fwd,
+        fa2a_metadata_qkv_rev,
+        fa2a_metadata_attn_out_fwd,
+        fa2a_metadata_attn_out_rev,
+        _,
+    ) = from_planner_output(
+        world_size,
+        planner_output,
+        hidden_size_q,
+        hidden_size_k,
+        lse_size,
+        element_size,
+        is_pipeline_tick=False,
     )
 
     # create answers:
-    (
-        tensor_q, tensor_kv, output_tensor_q, output_tensor_kv,
-        back_tensor_q, back_tensor_kv
-    ) = create_answer(
-        fa2a_metadata_qkv_fwd, fa2a_metadata_qkv_rev,
-        world_size, total_seq_len, max_cp_degree,
-        hidden_size_q, hidden_size_k, dtype,
+    (tensor_q, tensor_kv, output_tensor_q, output_tensor_kv, back_tensor_q, back_tensor_kv) = (
+        create_answer(
+            fa2a_metadata_qkv_fwd,
+            fa2a_metadata_qkv_rev,
+            world_size,
+            total_seq_len,
+            max_cp_degree,
+            hidden_size_q,
+            hidden_size_k,
+            dtype,
+        )
     )
 
     print("metadata compute done.")
     return (
-        tensor_q, tensor_kv, output_tensor_q, output_tensor_kv,
-        back_tensor_q, back_tensor_kv,
-        fa2a_metadata_qkv_fwd, fa2a_metadata_qkv_rev,
-        fa2a_metadata_attn_out_fwd, fa2a_metadata_attn_out_rev
+        tensor_q,
+        tensor_kv,
+        output_tensor_q,
+        output_tensor_kv,
+        back_tensor_q,
+        back_tensor_kv,
+        fa2a_metadata_qkv_fwd,
+        fa2a_metadata_qkv_rev,
+        fa2a_metadata_attn_out_fwd,
+        fa2a_metadata_attn_out_rev,
     )
 
 
 @torch.no_grad()
 def test_qkv(
-    seed: int, world_size: int, total_seq_len: int, num_docs: int,
-    max_cp_degree: int, worker: Worker, hidden_size_q: int, hidden_size_k: int,
+    seed: int,
+    world_size: int,
+    total_seq_len: int,
+    num_docs: int,
+    max_cp_degree: int,
+    worker: Worker,
+    hidden_size_q: int,
+    hidden_size_k: int,
 ):
     torch.manual_seed(seed)
     (
-        tensor_q, tensor_kv, output_tensor_q, output_tensor_kv,
-        back_tensor_q, back_tensor_kv,
-        fa2a_metadata_qkv_fwd, fa2a_metadata_qkv_rev, _, _
+        tensor_q,
+        tensor_kv,
+        output_tensor_q,
+        output_tensor_kv,
+        back_tensor_q,
+        back_tensor_kv,
+        fa2a_metadata_qkv_fwd,
+        fa2a_metadata_qkv_rev,
+        _,
+        _,
     ) = create_test_case(
-        seed, world_size, total_seq_len, num_docs, max_cp_degree,
-        hidden_size_q, hidden_size_k
+        seed, world_size, total_seq_len, num_docs, max_cp_degree, hidden_size_q, hidden_size_k
     )
 
     rank = worker.rank
@@ -269,10 +343,7 @@ def test_qkv(
     fa2a_metadata_rev_slice = fa2a_metadata_qkv_rev.get_slice(rank)
 
     # run this communication
-    out_dict = worker.run_qkv(
-        fa2a_metadata_fwd_slice, fa2a_metadata_rev_slice,
-        q_slice, kv_slice
-    )
+    out_dict = worker.run_qkv(fa2a_metadata_fwd_slice, fa2a_metadata_rev_slice, q_slice, kv_slice)
     dst_q = out_dict["dst_q"]
     out_q_shard = output_tensor_q[rank]
     out_kv = out_dict["dst_kv"]
@@ -296,22 +367,29 @@ def test(args):
     max_tokens_key_value = args.num_tokens * world_size
     max_cp_degree = args.max_cp_degree
 
-    buffer_size = (
-        stride_q * max_tokens_query +
-        stride_kv * max_tokens_key_value * max_cp_degree * 2
-    )
+    buffer_size = stride_q * max_tokens_query + stride_kv * max_tokens_key_value * max_cp_degree * 2
     worker = init_worker_torch_distributed(
-        world_size, buffer_size, Worker, None,
+        world_size,
+        buffer_size,
+        Worker,
+        None,
     )
     print("init done.")
     test_qkv(
-        args.seed, world_size, args.num_tokens, args.num_docs, max_cp_degree,
-        worker, args.hidden_size_query, args.hidden_size_kv
+        args.seed,
+        world_size,
+        args.num_tokens,
+        args.num_docs,
+        max_cp_degree,
+        worker,
+        args.hidden_size_query,
+        args.hidden_size_kv,
     )
 
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--num-tokens", type=int, default=1024)

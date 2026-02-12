@@ -1,19 +1,14 @@
-import os
 import json
-import numpy as np
-from typing import Deque, Iterable, List, Sequence
 from collections import deque
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+import numpy as np
 
 data_folder = Path(__file__).parent.parent / "data"
 
-def sample_random_docs(
-    *,
-    max_ctx_length: int,
-    size: int,
-    seed: int = 42
-) -> list[int]:
+
+def sample_random_docs(*, max_ctx_length: int, size: int, seed: int = 42) -> list[int]:
     """
     Create a deque of `size` random document lengths in (1, max_ctx_length].
 
@@ -38,11 +33,11 @@ def sample_random_docs(
 
 
 def sample_multimodal_gaussian(
-    means:   Sequence[float],
-    sigmas:  Sequence[float],
+    means: Sequence[float],
+    sigmas: Sequence[float],
     weights: Sequence[float],
-    size:    int,
-    seed:    int = 42
+    size: int,
+    seed: int = 42,
 ) -> list[int]:
     """
     Draw `size` samples from a mixture of k Gaussians.
@@ -86,11 +81,7 @@ def sample_multimodal_gaussian(
     return docs.tolist()
 
 
-def sample_wlbllm_docs(
-    *,
-    size: int,
-    seed: int = 42
-) -> list[int]:
+def sample_wlbllm_docs(*, size: int, seed: int = 42) -> list[int]:
     """
     Sample `size` documents from the WLB-LLM distribution.
 
@@ -107,7 +98,7 @@ def sample_wlbllm_docs(
         A list of document lengths.
     """
     docpath = data_folder / "dist_wlbllm.json"
-    with open(docpath, "r") as f:
+    with open(docpath) as f:
         docs = json.load(f)
     rng = np.random.default_rng(seed)
     docs = rng.choice(docs, size=size, replace=False)
@@ -137,12 +128,12 @@ def sample_wlbllm_docs_altered(
         A list of document lengths.
     """
     docpath = data_folder / "dist_wlbllm.json"
-    with open(docpath, "r") as f:
+    with open(docpath) as f:
         docs = json.load(f)
     shorter_docs = [doc for doc in docs if doc < filter_threshold]
     longer_docs = [doc for doc in docs if doc >= filter_threshold]
-    
-    docs = shorter_docs[:int(filter_ratio * len(shorter_docs))] + longer_docs
+
+    docs = shorter_docs[: int(filter_ratio * len(shorter_docs))] + longer_docs
 
     rng = np.random.default_rng(seed)
     docs = rng.choice(docs, size=size, replace=False)
@@ -182,7 +173,7 @@ def sample_wlbllm_docs_upsample(
         A list of sampled document lengths.
     """
     docpath = data_folder / "dist_wlbllm.json"
-    with open(docpath, "r") as f:
+    with open(docpath) as f:
         docs = json.load(f)
 
     shorter_docs = [doc for doc in docs if doc < filter_threshold]
@@ -190,7 +181,7 @@ def sample_wlbllm_docs_upsample(
 
     # Downsample short docs
     if 0 < filter_ratio < 1.0:
-        shorter_docs = shorter_docs[:int(len(shorter_docs) * filter_ratio)]
+        shorter_docs = shorter_docs[: int(len(shorter_docs) * filter_ratio)]
 
     # Upsample long docs
     # if upsample_long_factor > 1.0:
@@ -219,15 +210,15 @@ def sample_prolong_docs(
     print("ctx_length", ctx_length)
     # short_doc_dist = []
     docpath = data_folder / "dist_prolong.json"
-    with open(docpath, "r") as f:
+    with open(docpath) as f:
         docs = json.load(f)
 
-    # as usualy, we 
+    # as usualy, we
     shorter_docs = [doc for doc in docs if doc < filter_threshold]
     longer_docs = [doc for doc in docs if doc >= filter_threshold]
     # Downsample short docs
     if 0 < filter_ratio < 1.0:
-        shorter_docs = shorter_docs[:int(len(shorter_docs) * filter_ratio)]
+        shorter_docs = shorter_docs[: int(len(shorter_docs) * filter_ratio)]
 
     # Upsample long docs
     # if upsample_long_factor > 1.0:
@@ -251,11 +242,8 @@ def sample_prolong_docs(
 
 
 def batch_documents(
-    docs: Sequence[int],
-    *,
-    max_ctx_length: int,
-    multiple_of: int = 16
-) -> Iterable[List[int]]:
+    docs: Sequence[int], *, max_ctx_length: int, multiple_of: int = 16
+) -> Iterable[list[int]]:
     """
     Yield batches whose token-sums never exceed `max_ctx_length`.
     If a document would overflow the current batch, split it
@@ -274,7 +262,7 @@ def batch_documents(
         A batch (list of token counts) whose sum ≤ `max_ctx_length`.
         All batches except possibly the last have sum == `max_ctx_length`.
     """
-    batch: List[int] = []
+    batch: list[int] = []
 
     if not isinstance(docs, deque):
         docs = deque(docs)
@@ -286,7 +274,7 @@ def batch_documents(
         assert doc > 0, f"doc={doc} is not positive"
         assert doc % multiple_of == 0, f"doc={doc} is not a multiple of {multiple_of}"
 
-        while doc:                                  # may need multiple splits
+        while doc:  # may need multiple splits
             space_left = max_ctx_length - sum(batch)
 
             # If it fits, drop it in and move on
@@ -295,12 +283,11 @@ def batch_documents(
                 doc = 0
             else:
                 # Fill the batch, yield it, and keep the remainder
-                if space_left:                      # avoid 0-length chunks
+                if space_left:  # avoid 0-length chunks
                     batch.append(space_left)
                     doc -= space_left
                 yield batch
                 batch = []
 
-    if batch:                                       # flush tail
+    if batch:  # flush tail
         yield batch
-

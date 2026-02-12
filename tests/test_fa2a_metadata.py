@@ -1,13 +1,18 @@
 """TODO: deprecate this file."""
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from torch import Tensor
 
 
 def simulate_fa2a_copy_non_cp(
-    q: Tensor, buffer: Tensor, q_offsets: Tensor, q_seqlen: Tensor,
-    hidden_size_q: int, element_size: int, is_send: bool=True
+    q: Tensor,
+    buffer: Tensor,
+    q_offsets: Tensor,
+    q_seqlen: Tensor,
+    hidden_size_q: int,
+    element_size: int,
+    is_send: bool = True,
 ):
 
     q_seq_offset = 0
@@ -16,22 +21,23 @@ def simulate_fa2a_copy_non_cp(
         q_dst_offset = q_offset_bytes // element_size
         q_size = seq_len * hidden_size_q
         if is_send:
-            buffer[q_dst_offset:q_dst_offset + q_size] = (
-                q[q_seq_offset:q_seq_offset + q_size]
-            )
+            buffer[q_dst_offset : q_dst_offset + q_size] = q[q_seq_offset : q_seq_offset + q_size]
         else:
-            q[q_seq_offset:q_seq_offset + q_size] = (
-                buffer[q_dst_offset:q_dst_offset + q_size]
-            )
+            q[q_seq_offset : q_seq_offset + q_size] = buffer[q_dst_offset : q_dst_offset + q_size]
         q_seq_offset += q_size
     return buffer if is_send else q
 
 
 def simulate_fa2a_copy_cp(
-    k: Tensor, buffer: Tensor,
-    k_offsets: Tensor, k_seqlen: Tensor,
-    hidden_size_k: int, element_size: int, max_cp: int,
-    send_mask: Tensor, is_send: bool=True
+    k: Tensor,
+    buffer: Tensor,
+    k_offsets: Tensor,
+    k_seqlen: Tensor,
+    hidden_size_k: int,
+    element_size: int,
+    max_cp: int,
+    send_mask: Tensor,
+    is_send: bool = True,
 ):
     """
     Simulate the fa2a send: MLP layout (CP) -> a2a layout.
@@ -48,22 +54,31 @@ def simulate_fa2a_copy_cp(
             k_offset_bytes = k_offsets[cp_id, seq_id]
             k_dst_offset = k_offset_bytes // element_size
             if is_send:
-                buffer[k_dst_offset:k_dst_offset + k_size] = (
-                    k[k_seq_offset:k_seq_offset + k_size]
-                )
+                buffer[k_dst_offset : k_dst_offset + k_size] = k[
+                    k_seq_offset : k_seq_offset + k_size
+                ]
             else:
-                k[cp_id, k_seq_offset:k_seq_offset + k_size] = (
-                    buffer[k_dst_offset:k_dst_offset + k_size]
-                )
+                k[cp_id, k_seq_offset : k_seq_offset + k_size] = buffer[
+                    k_dst_offset : k_dst_offset + k_size
+                ]
             k_seq_offset += k_size
     return buffer if is_send else k
 
 
 def simulate_fa2a_send_qkv(
-    q: Tensor, k: Tensor, v: Tensor,
-    dst_tensor: Tensor, q_offset: Tensor, k_offset: Tensor, v_offset: Tensor,
-    q_seqlen: Tensor, k_seqlen: Tensor,
-    hidden_size_q: int, hidden_size_k: int, element_size: int, max_cp: int,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dst_tensor: Tensor,
+    q_offset: Tensor,
+    k_offset: Tensor,
+    v_offset: Tensor,
+    q_seqlen: Tensor,
+    k_seqlen: Tensor,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    element_size: int,
+    max_cp: int,
     send_mask: Tensor,
 ):
     """QKV (MLP) -> a2a send layout"""
@@ -73,12 +88,26 @@ def simulate_fa2a_send_qkv(
     if k is not None:
         assert v is not None
         dst_tensor = simulate_fa2a_copy_cp(
-            k, dst_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
-            max_cp, send_mask, is_send=True,
+            k,
+            dst_tensor,
+            k_offset,
+            k_seqlen,
+            hidden_size_k,
+            element_size,
+            max_cp,
+            send_mask,
+            is_send=True,
         )
         dst_tensor = simulate_fa2a_copy_cp(
-            v, dst_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
-            max_cp, send_mask, is_send=True,
+            v,
+            dst_tensor,
+            v_offset,
+            k_seqlen,
+            hidden_size_k,
+            element_size,
+            max_cp,
+            send_mask,
+            is_send=True,
         )
     else:
         assert v is None
@@ -86,10 +115,18 @@ def simulate_fa2a_send_qkv(
 
 
 def simulate_fa2a_send_qkv_rev(
-    q: Tensor, k: Tensor, v: Tensor,
-    dst_tensor: Tensor, q_offset: Tensor, k_offset: Tensor, v_offset: Tensor,
-    q_seqlen: Tensor, k_seqlen: Tensor,
-    hidden_size_q: int, hidden_size_k: int, element_size: int
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dst_tensor: Tensor,
+    q_offset: Tensor,
+    k_offset: Tensor,
+    v_offset: Tensor,
+    q_seqlen: Tensor,
+    k_seqlen: Tensor,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    element_size: int,
 ):
     """QKV grad (ATTN) -> a2a send layout"""
     dst_tensor = simulate_fa2a_copy_non_cp(
@@ -109,10 +146,18 @@ def simulate_fa2a_send_qkv_rev(
 
 
 def simulate_fa2a_recv_qkv(
-    q: Tensor, k: Tensor, v: Tensor,
-    src_tensor: Tensor, q_offset: Tensor, k_offset: Tensor, v_offset: Tensor,
-    q_seqlen: Tensor, k_seqlen: Tensor,
-    hidden_size_q: int, hidden_size_k: int, element_size: int
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    src_tensor: Tensor,
+    q_offset: Tensor,
+    k_offset: Tensor,
+    v_offset: Tensor,
+    q_seqlen: Tensor,
+    k_seqlen: Tensor,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    element_size: int,
 ):
     """a2a recv layout -> QKV (ATTN)"""
     q = simulate_fa2a_copy_non_cp(
@@ -132,11 +177,20 @@ def simulate_fa2a_recv_qkv(
 
 
 def simulate_fa2a_recv_qkv_rev(
-    q: Tensor, k: Tensor, v: Tensor,
-    src_tensor: Tensor, q_offset: Tensor, k_offset: Tensor, v_offset: Tensor,
-    q_seqlen: Tensor, k_seqlen: Tensor,
-    hidden_size_q: int, hidden_size_k: int, element_size: int,
-    max_cp: int, send_mask: Tensor
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    src_tensor: Tensor,
+    q_offset: Tensor,
+    k_offset: Tensor,
+    v_offset: Tensor,
+    q_seqlen: Tensor,
+    k_seqlen: Tensor,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    element_size: int,
+    max_cp: int,
+    send_mask: Tensor,
 ):
     """a2a recv layout -> QKV grad (MLP)"""
     q = simulate_fa2a_copy_non_cp(
@@ -145,31 +199,45 @@ def simulate_fa2a_recv_qkv_rev(
     if k is not None:
         assert v is not None
         k = simulate_fa2a_copy_cp(
-            k, src_tensor, k_offset, k_seqlen, hidden_size_k, element_size,
-            max_cp, send_mask, is_send=False,
+            k,
+            src_tensor,
+            k_offset,
+            k_seqlen,
+            hidden_size_k,
+            element_size,
+            max_cp,
+            send_mask,
+            is_send=False,
         )
         v = simulate_fa2a_copy_cp(
-            v, src_tensor, v_offset, k_seqlen, hidden_size_k, element_size,
-            max_cp, send_mask, is_send=False,
+            v,
+            src_tensor,
+            v_offset,
+            k_seqlen,
+            hidden_size_k,
+            element_size,
+            max_cp,
+            send_mask,
+            is_send=False,
         )
     else:
         assert v is None
     return q, k, v
 
 
-def simulate_fa2a(send_buffer: Tensor, recv_buffer: Tensor,
-                  fa2a_metadata: Sequence[Tensor], element_size: int):
+def simulate_fa2a(
+    send_buffer: Tensor, recv_buffer: Tensor, fa2a_metadata: Sequence[Tensor], element_size: int
+):
     """Simulate all2all from send buffer to recv buffer."""
     world_size = send_buffer.shape[0]
     assert recv_buffer.shape[0] == world_size
-    (sender_send_disp, sender_transfer_sz, sender_recv_disp,
-     recver_transfer_sz) = fa2a_metadata
+    (sender_send_disp, sender_transfer_sz, sender_recv_disp, recver_transfer_sz) = fa2a_metadata
     for src_rank in range(world_size):
         for dst_rank in range(world_size):
             send_offset = sender_send_disp[src_rank, dst_rank] // element_size
             recv_offset = sender_recv_disp[src_rank, dst_rank] // element_size
             size = sender_transfer_sz[src_rank, dst_rank] // element_size
-            recv_buffer[dst_rank][recv_offset:recv_offset + size] = (
-                send_buffer[src_rank][send_offset:send_offset + size]
-            )
+            recv_buffer[dst_rank][recv_offset : recv_offset + size] = send_buffer[src_rank][
+                send_offset : send_offset + size
+            ]
     return recv_buffer

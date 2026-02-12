@@ -1,28 +1,27 @@
 import wlbllm
 import wlbllm.registry
 from wlbllm.per_doc_cp_attn import PerDocumentCPAttention
-import rich
-import time
+
 
 def wlbllm_func(*args, **kwargs):
     """
-    Patch to 
+    Patch to
         TransformerEngine/transformer_engine/pytorch/attention/dot_product_attention/backends.py
-    
+
     This is a wrapper of PerDocumentCPAttention.apply()
     """
-    # import traceback    
+    # import traceback
     # traceback.print_stack()
     # print("kwargs:", kwargs)
     # time.sleep(10)
     # exit(0)
     (
-        q, 
+        q,
         k,
         v,
         cu_seqlens_q,
         cu_seqlens_k,
-        max_seqlen_q, 
+        max_seqlen_q,
         max_seqlen_k,
         dropout_p,
     ) = args
@@ -40,22 +39,24 @@ def wlbllm_func(*args, **kwargs):
     max_seqlen_kv_list = wlbllm.registry.get("max_seqlen_kv_list")
 
     out = PerDocumentCPAttention.apply(
-        q, 
-        k, 
+        q,
+        k,
         v,
-        cu_seqlens_q_list, 
+        cu_seqlens_q_list,
         cu_seqlens_kv_list,
-        max_seqlen_q_list, 
+        max_seqlen_q_list,
         max_seqlen_kv_list,
         doc_lens,
         doc_shards,
-        kv_idx_list, 
+        kv_idx_list,
         dropout_p,
-        softmax_scale, 
+        softmax_scale,
         "causal",
         cp_group,
-        cp_stream ,
-        None, None, None,
+        cp_stream,
+        None,
+        None,
+        None,
     )
     # torch.cuda.synchronize()
     return out

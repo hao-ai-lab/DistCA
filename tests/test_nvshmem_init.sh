@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # set -x
 # LOG_DIR="./logs/$(TZ=America/Los_Angeles date +%Y%m%d_%H%M%S)"
 
@@ -10,7 +11,7 @@
 #     '
 # set +x
 
-export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
 export NVSHMEM_IB_ENABLE_IBGDA=true
 
 : "${CUDA_DIR:?Must set CUDA_DIR}"

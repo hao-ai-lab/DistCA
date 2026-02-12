@@ -1,0 +1,61 @@
+# DistCA: pre-commit hooks (lint & format)
+# See https://pre-commit.com
+# Exclude submodules / vendored code: Megatron-LM, TransformerEngine, .build
+#
+# Ruff rule selection and per-file-ignores live in pyproject.toml, not here.
+# We relax lint in tests/, playground/, baseline/, and temporarily in distca/ so
+# CI passes; see pyproject.toml [tool.ruff.lint.per-file-ignores] and tighten
+# distca/ in follow-up PRs (best practice: strict source, relaxed tests only).
+
+default_language_version:
+  python: python3.12
+
+ci:
+  autofix_prs: true
+  autoupdate_commit_msg: "[pre-commit.ci] pre-commit suggestions"
+  submodules: false
+
+# Files in these paths are skipped by all hooks (submodules / build artifacts)
+exclude: ^(Megatron-LM/|TransformerEngine/|\.build/)
+
+repos:
+  # Generic checks (YAML, whitespace, merge conflicts, large files)
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  # Python: Ruff (lint + format) — one tool, fast
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # Shell: ShellCheck (no Docker; uses shellcheck-py binary)
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        # Only our scripts; submodules excluded via top-level exclude
+        files: \.sh$
+        # Only fail on error level so existing scripts don't block CI; tighten to warning later
+        args: ["--severity=error"]
+        exclude: ^(env\.sh|baseline/wlbllm_original/wlbllm/run_correctness_check\.sh|baseline/wlbllm_original/wlbllm/run_cp_performance_compare\.sh)$
+
+  # C++/CUDA: clang-format (mirror provides binary)
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.6
+    hooks:
+      - id: clang-format
+        entry: clang-format -i
+        args: ["-style=file"]
+        types_or: [c++, cuda]
+        # Only our csrc and baseline C++/CUDA; submodules excluded
+        files: ^(csrc/|baseline/).*\.(cpp|cc|cxx|cu|cuh|h|hpp)$

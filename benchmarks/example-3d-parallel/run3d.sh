@@ -1,4 +1,4 @@
-
+#!/usr/bin/env bash
 export TP_SIZE=${TP_SIZE:-8}
 
 
@@ -45,8 +45,8 @@ for sample_config in \
 for model_config in \
 "deepseek-ai/DeepSeek-R1-Distill-Llama-8B 64000 3" \
 ; do
-    
-    
+
+
 #    s r b   tok  e n
 for config in \
     "1 1 2 32768 2 1" \
@@ -55,7 +55,7 @@ for config in \
     read -r selective_ckpt resend_qkv batch_size num_tokens elongate_factor nnodes <<< "$config"
     read -r sample_name change_long_doc_ratio <<< "$sample_config"
     read -r model_path attn_linear_breakpoint num_layers <<< "$model_config"
-    
+
     export EXPERIMENT_ADD_SELECTIVE_CKPT=$selective_ckpt
     export EXPERIMENT_SHOULD_RESEND_QKV=$resend_qkv
     export BATCH_SIZE=$batch_size
@@ -67,7 +67,7 @@ for config in \
     export CHANGE_LONG_DOC_RATIO=$change_long_doc_ratio
     export ATTN_LINEAR_BREAKPOINT=$attn_linear_breakpoint
     export NUM_LAYERS=$num_layers
-    
+
     CP_SIZE=$NNODES
     DP_SIZE=$((NNODES / CP_SIZE))
     export MODE=distca CP_SIZE=$CP_SIZE

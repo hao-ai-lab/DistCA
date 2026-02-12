@@ -25,15 +25,17 @@ torchrun --nnodes 1 --nproc_per_node 4 test_pingpong_layer.py \
 import argparse
 import os
 
-from megatron.core.packed_seq_params import PackedSeqParams
 import torch
+from megatron.core.packed_seq_params import PackedSeqParams
+from test_megatron_layer import MegatronLayerWorker, init_megatron_test
+from test_util import random_shard_info_linear_layout_dp
 
 from distca.runtime.attn_kernels.ops import DispatcherWrapper
 from distca.runtime.compute_metadata import from_planner_output, get_attn_metadata
-from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
-
-from test_util import random_shard_info_linear_layout_dp
-from test_megatron_layer import MegatronLayerWorker, init_megatron_test
+from distca.runtime.megatron.packed_seq_params import (
+    PingPangPackedSeqParams,
+    PingPangSingleStepPackedSeqParams,
+)
 
 
 class PingPangLayerWorker(MegatronLayerWorker):
@@ -49,20 +51,24 @@ class PingPangLayerWorker(MegatronLayerWorker):
         self.stream = torch.cuda.Stream(device=self.device, priority=-1)
         DispatcherWrapper.comm_stream = self.stream
 
-    def forward_ping_pang(self, tensor_input: torch.Tensor, packed_seq_params: PingPangPackedSeqParams,
-                          run_backward: bool = False):
+    def forward_ping_pang(
+        self,
+        tensor_input: torch.Tensor,
+        packed_seq_params: PingPangPackedSeqParams,
+        run_backward: bool = False,
+    ):
         packed_seq_params = packed_seq_params.to_device()
         tensor_input = tensor_input.cuda()
         self.layer.train()
         # if not debug, add communication stream here.
         if not packed_seq_params.debug:
             for params in packed_seq_params.seq_params:
-                setattr(params, "stream", self.stream)
-            setattr(packed_seq_params.seq_params[0], "dispatcher_id", 0)
-            setattr(packed_seq_params.seq_params[0], "dispatcher_id", 1)
+                params.stream = self.stream
+            packed_seq_params.seq_params[0].dispatcher_id = 0
+            packed_seq_params.seq_params[0].dispatcher_id = 1
         else:
             for params in packed_seq_params.seq_params:
-                setattr(params, "stream", torch.cuda.current_stream())
+                params.stream = torch.cuda.current_stream()
         torch.distributed.barrier()
 
         if run_backward:
@@ -81,43 +87,66 @@ class PingPangLayerWorker(MegatronLayerWorker):
 
 
 def create_one_batch(
-    seed: int, world_size: int, total_token_per_rank: int, num_docs: int,
-    max_cp_degree: int, hidden_size_q: int, hidden_size_k: int, element_size: int
+    seed: int,
+    world_size: int,
+    total_token_per_rank: int,
+    num_docs: int,
+    max_cp_degree: int,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    element_size: int,
 ):
     planner_output, doc_lens_per_rank = random_shard_info_linear_layout_dp(
-        world_size, num_docs, tot_num_token=total_token_per_rank,
-        max_num_shard=max_cp_degree, seed=seed,
+        world_size,
+        num_docs,
+        tot_num_token=total_token_per_rank,
+        max_num_shard=max_cp_degree,
+        seed=seed,
     )
     doc_lens_per_rank = [
-        torch.tensor(val, dtype=torch.int32, device='cuda') for val in doc_lens_per_rank
+        torch.tensor(val, dtype=torch.int32, device="cuda") for val in doc_lens_per_rank
     ]
 
     lse_size = 0
-    (qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
-     attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
-     as_attn_metadata,
+    (
+        qkv_fwd_fa2a_metadata,
+        qkv_rev_fa2a_metadata,
+        attn_out_fwd_fa2a_metadata,
+        attn_out_rev_fa2a_metadata,
+        as_attn_metadata,
     ) = from_planner_output(
-        world_size, planner_output, hidden_size_q, hidden_size_k,
-        lse_size, element_size, is_pipeline_tick=False
+        world_size,
+        planner_output,
+        hidden_size_q,
+        hidden_size_k,
+        lse_size,
+        element_size,
+        is_pipeline_tick=False,
     )
     fa2a_metadata = (
-        qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
-        attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
+        qkv_fwd_fa2a_metadata,
+        qkv_rev_fa2a_metadata,
+        attn_out_fwd_fa2a_metadata,
+        attn_out_rev_fa2a_metadata,
     )
     return planner_output, fa2a_metadata, as_attn_metadata, doc_lens_per_rank
 
 
 # TODO(yonghao): move this to planner / distca/utils.py because it's not only used for test.
 def get_single_step_packed_seq_params(
-    fa2a_metadata, attn_metadata, rank: int, resend_qkv: bool=False
+    fa2a_metadata, attn_metadata, rank: int, resend_qkv: bool = False
 ):
     (
-        qkv_fwd_fa2a_metadata, qkv_rev_fa2a_metadata,
-        attn_out_fwd_fa2a_metadata, attn_out_rev_fa2a_metadata,
+        qkv_fwd_fa2a_metadata,
+        qkv_rev_fa2a_metadata,
+        attn_out_fwd_fa2a_metadata,
+        attn_out_rev_fa2a_metadata,
     ) = fa2a_metadata
 
     stream = None
-    should_use_same_stream_for_comm_and_compute = os.environ.get("D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE", "0") == "1"
+    should_use_same_stream_for_comm_and_compute = (
+        os.environ.get("D2_SHOULD_USE_SAME_STREAM_FOR_COMM_AND_COMPUTE", "0") == "1"
+    )
     if should_use_same_stream_for_comm_and_compute:
         stream = torch.cuda.current_stream()
 
@@ -128,9 +157,9 @@ def get_single_step_packed_seq_params(
         qkv_bwd_metadata=qkv_rev_fa2a_metadata.get_slice(rank),
         attn_out_fwd_metadata=attn_out_fwd_fa2a_metadata.get_slice(rank),
         attn_out_bwd_metadata=attn_out_rev_fa2a_metadata.get_slice(rank),
-        bwd_packed_seq_params=PackedSeqParams(
-            qkv_format="thd", **attn_metadata[rank]
-        ) if resend_qkv else None,
+        bwd_packed_seq_params=PackedSeqParams(qkv_format="thd", **attn_metadata[rank])
+        if resend_qkv
+        else None,
         stream=stream,
     )
     return ping_pang_params
@@ -138,9 +167,16 @@ def get_single_step_packed_seq_params(
 
 @torch.no_grad()
 def test_forward(
-    seed, total_token_per_rank, num_docs, max_cp_degree,
-    worker: PingPangLayerWorker, hidden_size_q: int, hidden_size_k: int,
-    debug=False, profile=False, tp_size: int = 1
+    seed,
+    total_token_per_rank,
+    num_docs,
+    max_cp_degree,
+    worker: PingPangLayerWorker,
+    hidden_size_q: int,
+    hidden_size_k: int,
+    debug=False,
+    profile=False,
+    tp_size: int = 1,
 ):
     torch.manual_seed(seed)
     dtype = torch.float16
@@ -153,34 +189,41 @@ def test_forward(
 
     # Create two splits for ping-pong
     _, fa2a_metadata_0, attn_metadata_0, doc_lens_0 = create_one_batch(
-        seed, as_world_size, total_token_per_rank, num_docs, max_cp_degree,
-        hidden_size_q_tp, hidden_size_k_tp, element_size
+        seed,
+        as_world_size,
+        total_token_per_rank,
+        num_docs,
+        max_cp_degree,
+        hidden_size_q_tp,
+        hidden_size_k_tp,
+        element_size,
     )
     _, fa2a_metadata_1, attn_metadata_1, doc_lens_1 = create_one_batch(
-        seed + 1, as_world_size, total_token_per_rank, num_docs, max_cp_degree,
-        hidden_size_q_tp, hidden_size_k_tp, element_size
+        seed + 1,
+        as_world_size,
+        total_token_per_rank,
+        num_docs,
+        max_cp_degree,
+        hidden_size_q_tp,
+        hidden_size_k_tp,
+        element_size,
     )
 
     # Create tensor input
     torch.manual_seed(seed)
     # NOTE: this input is not sharded.
-    tensors = torch.randn(
-        (as_world_size, total_token_per_rank * 2, 1, hidden_size_q), dtype=dtype
-    )
+    tensors = torch.randn((as_world_size, total_token_per_rank * 2, 1, hidden_size_q), dtype=dtype)
     as_rank = worker.as_rank
     tensor_shard = tensors[as_rank]
 
     # packed seq params for orig impl
-    doc_lens_local = torch.concat(
-        (doc_lens_0[as_rank], doc_lens_1[as_rank])
-    )
+    doc_lens_local = torch.concat((doc_lens_0[as_rank], doc_lens_1[as_rank]))
     packed_seq_params = get_attn_metadata(
-        doc_lens_local, get_packed_seq_params=True,
+        doc_lens_local,
+        get_packed_seq_params=True,
     )
     # orig forward
-    normal_forward_out, debug_ref = worker.forward_normal(
-        tensor_shard, packed_seq_params
-    )
+    normal_forward_out, debug_ref = worker.forward_normal(tensor_shard, packed_seq_params)
 
     ping_pang_params_0 = get_single_step_packed_seq_params(
         fa2a_metadata_0, attn_metadata_0, as_rank
@@ -188,10 +231,11 @@ def test_forward(
     ping_pang_params_1 = get_single_step_packed_seq_params(
         fa2a_metadata_1, attn_metadata_1, as_rank
     )
-    print(f"{worker.rank=}, Attention Server Rank {as_rank}, pingpong 0 send bytes:{ping_pang_params_0.qkv_fwd_metadata.fa2a_metadata[1]}, pingpong 1 send bytes:{ping_pang_params_1.qkv_fwd_metadata.fa2a_metadata[1]}")
+    print(
+        f"{worker.rank=}, Attention Server Rank {as_rank}, pingpong 0 send bytes:{ping_pang_params_0.qkv_fwd_metadata.fa2a_metadata[1]}, pingpong 1 send bytes:{ping_pang_params_1.qkv_fwd_metadata.fa2a_metadata[1]}"
+    )
     mlp_layout_seq_params = get_attn_metadata(
-        (doc_lens_0[as_rank], doc_lens_1[as_rank]),
-        get_packed_seq_params=True
+        (doc_lens_0[as_rank], doc_lens_1[as_rank]), get_packed_seq_params=True
     )
     max_seqlens = max(psp.max_seqlen_q for psp in mlp_layout_seq_params)
     ping_pang_params = PingPangPackedSeqParams(
@@ -203,25 +247,17 @@ def test_forward(
         do_gather=True,
         debug=debug,
     )
-    ans = worker.forward_ping_pang(
-        tensor_shard, ping_pang_params
-    )
+    ans = worker.forward_ping_pang(tensor_shard, ping_pang_params)
     torch.testing.assert_close(ans, normal_forward_out)
     print(f"Rank {as_rank} forward ping-pang passed.")
     if profile:
         for _ in range(3):
-            worker.forward_ping_pang(
-                tensor_shard, ping_pang_params,
-                run_backward=True
-            )
+            worker.forward_ping_pang(tensor_shard, ping_pang_params, run_backward=True)
         torch.cuda.synchronize()
         torch.distributed.barrier()
         print("warmup done")
         for _ in range(20):
-            worker.forward_ping_pang(
-                tensor_shard, ping_pang_params,
-                run_backward=True
-            )
+            worker.forward_ping_pang(tensor_shard, ping_pang_params, run_backward=True)
         torch.cuda.synchronize()
         torch.distributed.barrier()
         print("ping-pang forward done")
@@ -244,14 +280,28 @@ def test(args):
     hidden_size_kv = (hidden_size * num_query_heads) // num_heads
 
     worker = init_megatron_test(
-        world_size, hidden_size, num_heads, num_query_heads, dtype,
-        max_tokens_query, max_tokens_key_value, max_cp_degree, tp_size, seed,
-        PingPangLayerWorker
+        world_size,
+        hidden_size,
+        num_heads,
+        num_query_heads,
+        dtype,
+        max_tokens_query,
+        max_tokens_key_value,
+        max_cp_degree,
+        tp_size,
+        seed,
+        PingPangLayerWorker,
     )
     test_forward(
-        args.seed, args.num_tokens, args.num_docs, max_cp_degree,
-        worker, hidden_size, hidden_size_kv,
-        profile=args.profile, tp_size=tp_size,
+        args.seed,
+        args.num_tokens,
+        args.num_docs,
+        max_cp_degree,
+        worker,
+        hidden_size,
+        hidden_size_kv,
+        profile=args.profile,
+        tp_size=tp_size,
     )
 
 
@@ -268,6 +318,10 @@ if __name__ == "__main__":
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-query-heads", type=int, default=2)
-    parser.add_argument("--profile", action="store_true", default=False,)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+    )
     args = parser.parse_args()
     test(args)

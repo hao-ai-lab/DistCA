@@ -8,7 +8,9 @@ srun -N 2 -G 8 --ntasks-per-node=1 \
         python test_nvshmem_init.py
     '
 """
+
 import os
+
 import torch
 
 rank = os.environ["RANK"]
@@ -18,7 +20,7 @@ world_size = int(world_size)
 local_rank = os.environ["LOCAL_RANK"]
 local_rank = int(local_rank)
 
-buffer_size = 4 * 1024 ** 3
+buffer_size = 4 * 1024**3
 
 # worker.init_torch_distributed()
 print(f"[Rank {rank}] init_torch_distributed: {rank = } {world_size = } {local_rank = }")
@@ -29,8 +31,11 @@ print(f"[Rank {rank}] init_torch_distributed done")
 
 # worker.init_nvshmem(buffer_size, local_rank=local_rank)
 from distca.runtime.attn_kernels.ops import (
-    nvshmem_get_unique_id, nvshmem_alloc_empty_unique_id, DispatcherWrapper
+    DispatcherWrapper,
+    nvshmem_alloc_empty_unique_id,
+    nvshmem_get_unique_id,
 )
+
 print(f"[Rank {rank}] ====== init_nvshmem ======")
 if rank == 0:
     uid = nvshmem_get_unique_id()
@@ -44,7 +49,5 @@ torch.distributed.barrier()
 # print(f"[Rank {rank}] uid = {uid}")
 
 print("DispatcherWrapper.init")
-DispatcherWrapper.init(
-    rank, local_rank, world_size, buffer_size, uid
-)
+DispatcherWrapper.init(rank, local_rank, world_size, buffer_size, uid)
 print(f"[Rank {rank}] ====== init_nvshmem done ======")
