@@ -61,7 +61,6 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron_test_utils import (
     get_megatron_optimizer_param_scheduler,
     get_model,
-    get_torch_device,
     gptmodel_forward,
     hf_to_mcore_config,
     init_mcore_model,
@@ -117,22 +116,6 @@ def debug_print(*args, **kwargs):
     return
 
 
-def set_random_seed(seed, set_megatron: bool = True):
-    """Set worker side random seed."""
-    import random
-
-    import numpy as np
-    import torch
-
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    if get_torch_device().device_count() > 0 and set_megatron:
-        from megatron.core import tensor_parallel
-
-        tensor_parallel.model_parallel_cuda_manual_seed(seed)
-
-
 def log_memory_usage(message: str, force: bool = False):
     distca.mem.log_memory_usage(message, force=force)
 
@@ -159,8 +142,10 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self,
         dtype=torch.bfloat16,
         enable_gradient_checkpointing=False,
-        gradient_checkpointing_kwargs={},
+        gradient_checkpointing_kwargs=None,
     ):
+        if gradient_checkpointing_kwargs is None:
+            gradient_checkpointing_kwargs = {}
         self.dtype = dtype
         self.enable_gradient_checkpointing = enable_gradient_checkpointing
         self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
@@ -637,7 +622,9 @@ try:
     import wlbllm.megatron_patch.backends
     import wlbllm.megatron_patch.dot_product_attention
     import wlbllm.registry
-    import wlbllm.utils
+    import wlbllm.utils  # availability check for WLBLLM stack
+
+    _ = wlbllm.utils
     from wlbllm.fastmemcpy.fast_memcpy import prepare_metadata as wlb_memcpy_prepare_metadata
 except ImportError as e:
     traceback.print_exc()
@@ -1246,7 +1233,7 @@ def test(args):
 
                 if verbose:
 
-                    def print_2d_tensor(name: str, tensor):
+                    def print_2d_tensor(name: str, tensor, rank=rank):
                         print(f"🟡 [Rank {rank}] {name} = ")
                         for row in tensor.tolist():
                             print(f"    {row}")
@@ -1402,7 +1389,9 @@ def test(args):
                 # Check size:
                 buffer_size = DispatcherWrapper.instance[0].buffer_size
 
-                def _check_self_overflow(fa2a_metadata, as_rank_):
+                def _check_self_overflow(
+                    fa2a_metadata, as_rank_, rank=rank, buffer_size=buffer_size
+                ):
                     """Return the self-overflow status and the maximum size provisioned."""
                     send_sz = [
                         torch.sum(m.fa2a_metadata[1][as_rank_]).item() for m in fa2a_metadata

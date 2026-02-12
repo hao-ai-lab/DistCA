@@ -42,19 +42,16 @@ ignore = [
 "tests/**" = [
     "E402", "E722", "E741", "F403", "F821", "B007", "B905", "C408", "F841",
     "B018",   # useless attribute access (test fixtures)
-    "F811",   # redefinition (set_random_seed from test_util)
-    "B006",   # mutable default (gradient_checkpointing_kwargs={})
-    "F401",   # unused import (wlbllm.utils for availability check)
-    "B023",   # loop variable in closure
 ]
 "playground/**" = [
     "E402", "E722", "E741", "F403", "F821", "B007", "B905", "C408", "F841",
-    "B011", "UP028", "E712", "E711", "F401", "F811",
+    "B011", "UP028", "E712", "E711",
 ]
 "distca/**" = [
     "E402", "E722", "E741", "F403", "F821", "B007", "B905", "C408", "F841",
-    "B011", "B018", "B023", "B006", "F631", "UP031", "E712", "E711",
-    "B020", "C401", "C416", "F401", "F811", "B028", "UP007",
+    "B011", "B018", "B023", "F631", "UP031", "E712", "E711",
+    "B020", "C401", "C416",
+    "B028", "UP007",
 ]
 "baseline/**" = [
     "E402", "E722", "E741", "F821", "B905", "F841", "E712", "B007", "B011",
@@ -64,7 +61,9 @@ ignore = [
 [tool.ruff.format]
 quote-style = "double"
 
-# Optional: mypy can be enabled in CI later
-# [tool.mypy]
-# python_version = "3.12"
-# ignore_missing_imports = true
+# Optional: type checking — prefer Astral ty (faster, aligns with Ruff/uv).
+# When enabling: add ty to pre-commit and dev deps; exclude CI/benchmark or
+# allow native extension imports (e.g. _qdp) in [tool.ty] as needed.
+# [tool.ty]
+# exclude = ["benchmarks", "Megatron-LM", "TransformerEngine", ".build"]
+# (allow native/optional modules per https://docs.astral.sh/ty/configuration/)

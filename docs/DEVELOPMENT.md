@@ -49,12 +49,26 @@ After `pre-commit run --all-files`, run `git diff`. You should see only final ne
 
 **2. Run tests (recommended)**
 
-Tests are scripts under `tests/` (e.g. `test_planner.py`, `test_rope.py`); many require GPU. After pre-commit changes, run your usual test command (e.g. `python tests/test_planner.py` or the scripts in `tests/*.sh`). CI does not run the full test suite; local test run is the authority for “no behavior change.”
-
-**3. Optional: one-liner**
+Tests are scripts under `tests/` (e.g. `test_planner.py`, `test_rope.py`); many require GPU. They import the `distca` package, so run from the **repo root** with the package on `PYTHONPATH`, or install it first:
 
 ```bash
-pre-commit run --all-files && python tests/test_planner.py
+# From repo root — Option A: set PYTHONPATH
+PYTHONPATH=. python3 tests/test_planner.py
+
+# Option B: install package in editable mode (once)
+pip install -e .
+python3 tests/test_planner.py
 ```
 
-Replace the test command with whatever you normally use.
+Install dependencies first if needed (use a **virtual environment** on systems where system Python is externally managed, e.g. Ubuntu 24.04 / PEP 668):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # or on Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+Then run tests with `python3 tests/test_planner.py` (or `PYTHONPATH=. python3 tests/...` if not using `pip install -e .`).
+
+CI does not run the full test suite; local test run is the authority for “no behavior change.”

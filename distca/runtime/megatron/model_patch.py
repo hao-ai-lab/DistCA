@@ -9,7 +9,6 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
     get_mlp_module_spec,
 )

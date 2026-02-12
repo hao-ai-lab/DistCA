@@ -29,15 +29,13 @@ from megatron.core.utils import (
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
 
+    _ = torch_FSDP  # availability check for HAVE_FSDP2
     HAVE_FSDP2 = True
 except ImportError:
     HAVE_FSDP2 = False
 
 from megatron.core.distributed import finalize_model_grads
-from megatron.core.num_microbatches_calculator import (
-    get_num_microbatches,
-    update_num_microbatches,
-)
+from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.pipeline_parallel import (
     get_forward_backward_func as get_original_forward_backward_func,
 )
