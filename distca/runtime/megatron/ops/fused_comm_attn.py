@@ -52,7 +52,7 @@ _fa_bwd_uses_positional = _fa_uses_positional_api(_flash_attn_varlen_bwd)
 try:
     _fa_fwd_positional_accepts_block_table = "block_table" in inspect.signature(_flash_attn_varlen_fwd).parameters
 except (ValueError, TypeError):
-    _fa_fwd_positional_accepts_block_table = True
+    _fa_fwd_positional_accepts_block_table = False  # safer default: omit block_table rather than risk crash
 from distca.runtime.attn_kernels.ops import DispatcherWrapper, fast_a2a
 from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -254,7 +254,33 @@ def _qkv_to_attn_out_bwd(
         print("🟡 _qkv_to_attn_out_bwd: alibi_slopes.shape = ", fa_args.alibi_slopes.shape if fa_args.alibi_slopes is not None else None)
         print("🟡 _qkv_to_attn_out_bwd: deterministic = ", fa_args.deterministic)
 
-    if _fa_bwd_uses_positional:
+    if _use_fa_varlen_func:
+        # Public API path: flash_attn_varlen_func handles backward internally via autograd.
+        # We need to call it again with grad enabled, or use the lower-level backward if available.
+        # Since we saved S_dmask=None and rng_state=None in this path, we fall through to
+        # the positional/kwargs backward which should still work with _flash_attn_varlen_bwd.
+        if _flash_attn_varlen_bwd is not None:
+            if _fa_bwd_uses_positional:
+                _flash_attn_varlen_bwd(
+                    dout_padded, q, k, v, out_padded.contiguous(), softmax_lse, dq, dk, dv,
+                    cu_seqlen_q, cu_seqlen_kv, max_seqlen_q, max_seqlen_kv,
+                    fa_args.dropout_p, softmax_scale, fa_args.causal,
+                    fa_args.window_size, fa_args.alibi_slopes, fa_args.deterministic,
+                )
+            else:
+                _flash_attn_varlen_bwd(
+                    dout_padded, q, k, v, out_padded.contiguous(), softmax_lse, dq, dk, dv,
+                    cu_seqlen_q, cu_seqlen_kv, max_seqlen_q, max_seqlen_kv,
+                    fa_args.dropout_p, softmax_scale, fa_args.causal,
+                    fa_args.window_size[0], fa_args.window_size[1], fa_args.softcap, fa_args.alibi_slopes,
+                    fa_args.deterministic,
+                )
+        else:
+            raise RuntimeError(
+                "flash_attn backward not available. The public API (flash_attn_varlen_func) was used for forward, "
+                "but no low-level backward function was found. Install a flash-attn build with varlen backward support."
+            )
+    elif _fa_bwd_uses_positional:
         # Dao-AILab v2.5.x: _flash_attn_varlen_backward(..., window_size, alibi_slopes, deterministic) — no softcap
         _flash_attn_varlen_bwd(
             dout_padded, q, k, v, out_padded.contiguous(), softmax_lse, dq, dk, dv,
@@ -277,6 +303,74 @@ def _qkv_to_attn_out_bwd(
     dk = dk.reshape(dk.shape[0], num_heads_kv * head_dim)
     dv = dv.reshape(dv.shape[0], num_heads_kv * head_dim)
     return dq, dk, dv
+
+
+def _normalize_softmax_lse(softmax_lse, total_tokens, cu_seqlens_q=None, max_seqlen_q=None):
+    """Normalize softmax_lse to shape (total_tokens, num_heads) for dispatch.
+
+    Flash-attn versions return softmax_lse in different layouts:
+      - 2D (total_tokens, num_heads): already correct, pass through.
+      - 2D (num_heads, total_tokens): transpose.
+      - 3D (batch_size, num_heads, max_seqlen_q): C++ varlen_fwd format; unpack
+        using cu_seqlens_q to strip padding per sequence.
+      - 3D with trailing 1: squeeze then handle as 2D.
+      - 3D with one dim == total_tokens: permute that dim to front and reshape.
+
+    Args:
+        softmax_lse: Tensor from flash-attn forward.
+        total_tokens: Expected first dimension (= attn_out.shape[0]).
+        cu_seqlens_q: Cumulative sequence lengths (int32 tensor), optional.
+        max_seqlen_q: Maximum sequence length, optional.
+
+    Returns:
+        Tensor of shape (total_tokens, num_heads).
+    """
+    if softmax_lse.ndim == 3:
+        if softmax_lse.shape[-1] == 1:
+            softmax_lse = softmax_lse.squeeze(-1)
+        else:
+            batch_size = softmax_lse.shape[0]
+            num_heads_fa = softmax_lse.shape[1]
+            max_sq = softmax_lse.shape[2]
+            # C++ varlen returns (batch_size, num_heads, max_seqlen_q); unpack to (total_tokens, num_heads).
+            if (cu_seqlens_q is not None
+                    and (cu_seqlens_q.shape[0] - 1) == batch_size
+                    and max_sq == max_seqlen_q):
+                out_lse = torch.empty(
+                    total_tokens, num_heads_fa,
+                    dtype=softmax_lse.dtype, device=softmax_lse.device,
+                )
+                for i in range(batch_size):
+                    start = cu_seqlens_q[i].item()
+                    end = cu_seqlens_q[i + 1].item()
+                    seqlen = end - start
+                    # (num_heads, max_seqlen_q) -> [:, :seqlen] -> .T -> (seqlen, num_heads)
+                    out_lse[start:end].copy_(softmax_lse[i, :, :seqlen].T.contiguous())
+                softmax_lse = out_lse
+            else:
+                for i in range(3):
+                    if softmax_lse.shape[i] == total_tokens:
+                        perm = [i] + [j for j in range(3) if j != i]
+                        softmax_lse = softmax_lse.permute(*perm).reshape(total_tokens, -1)
+                        break
+
+    if softmax_lse.ndim == 2 and softmax_lse.shape[0] != total_tokens:
+        softmax_lse = softmax_lse.T.contiguous()
+
+    if softmax_lse.shape[0] != total_tokens:
+        numel = softmax_lse.numel()
+        if numel % total_tokens == 0:
+            softmax_lse = softmax_lse.reshape(total_tokens, -1)
+        else:
+            raise RuntimeError(
+                f"softmax_lse layout incompatible with packed tokens: "
+                f"attn_out.shape[0] (total_tokens) = {total_tokens}, "
+                f"softmax_lse.shape = {softmax_lse.shape}, softmax_lse.numel() = {numel}. "
+                f"Flash-attn varlen should return (total_tokens, num_heads); "
+                f"this build returns layout that cannot be reshaped."
+            )
+
+    return softmax_lse
 
 
 class FusedCommAttn(torch.autograd.Function):
@@ -338,49 +432,9 @@ class FusedCommAttn(torch.autograd.Function):
         assert attn_out.shape == recv_q.shape
         softmax_lse_dtype = softmax_lse.dtype
         total_tokens = attn_out.shape[0]
-        # Dispatch expects softmax_lse.shape[0] == attn_out.shape[0] (total_tokens). Flash-attn may return:
-        # - 3D (batch_size, num_heads, max_seqlen_q) from C++ varlen_fwd; unpack with cu_seqlens_q.
-        # - 3D with trailing 1; squeeze. Or 3D with one dim == total_tokens; permute and reshape.
-        # - 2D (num_heads, total_tokens) or (total_tokens, num_heads); transpose if needed.
-        if softmax_lse.ndim == 3:
-            if softmax_lse.shape[-1] == 1:
-                softmax_lse = softmax_lse.squeeze(-1)
-            else:
-                batch_size, num_heads_fa, max_sq = softmax_lse.shape[0], softmax_lse.shape[1], softmax_lse.shape[2]
-                cu = fwd_fa_params.cu_seqlens_q
-                # C++ varlen returns (batch_size, num_heads, max_seqlen_q); unpack to (total_tokens, num_heads).
-                if cu is not None and (cu.shape[0] - 1) == batch_size and max_sq == fwd_fa_params.max_seqlen_q:
-                    out_lse = torch.empty(
-                        total_tokens, num_heads_fa,
-                        dtype=softmax_lse.dtype, device=softmax_lse.device,
-                    )
-                    for i in range(batch_size):
-                        start = cu[i].item()
-                        end = cu[i + 1].item()
-                        seqlen = end - start
-                        # softmax_lse[i] is (num_heads, max_seqlen_q); take [:, :seqlen] -> (num_heads, seqlen), then .T -> (seqlen, num_heads)
-                        out_lse[start:end].copy_(softmax_lse[i, :, :seqlen].T.contiguous())
-                    softmax_lse = out_lse
-                else:
-                    for i in range(3):
-                        if softmax_lse.shape[i] == total_tokens:
-                            perm = [i] + [j for j in range(3) if j != i]
-                            softmax_lse = softmax_lse.permute(*perm).reshape(total_tokens, -1)
-                            break
-        if softmax_lse.ndim == 2 and softmax_lse.shape[0] != total_tokens:
-            softmax_lse = softmax_lse.T.contiguous()
-        if softmax_lse.shape[0] != total_tokens:
-            numel = softmax_lse.numel()
-            if numel % total_tokens == 0:
-                softmax_lse = softmax_lse.reshape(total_tokens, -1)
-            else:
-                raise RuntimeError(
-                    f"softmax_lse layout incompatible with packed tokens: "
-                    f"attn_out.shape[0] (total_tokens) = {total_tokens}, "
-                    f"softmax_lse.shape = {softmax_lse.shape}, softmax_lse.numel() = {numel}. "
-                    f"Flash-attn varlen should return (total_tokens, num_heads); "
-                    f"this build returns layout that cannot be reshaped (e.g. (max_seqlen_q, num_heads) with max_seqlen_q != total_tokens)."
-                )
+        softmax_lse = _normalize_softmax_lse(
+            softmax_lse, total_tokens, fwd_fa_params.cu_seqlens_q, fwd_fa_params.max_seqlen_q,
+        )
         attn_out = pre_a2a_attn_out_with_lse(
             attn_out, softmax_lse, fwd_attn_out_metadata.seq_lens[0].send_seqlens,
             fwd_attn_out_metadata.send_memcpy_metadata[0],

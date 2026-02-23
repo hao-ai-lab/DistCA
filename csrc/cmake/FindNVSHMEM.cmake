@@ -14,11 +14,35 @@ endif()
 set(NVSHMEM_INCLUDE_DIR "${NVSHMEM_PREFIX}/include")
 set(NVSHMEM_LIB_DIR "${NVSHMEM_PREFIX}/lib")
 
-# Pip package: libnvshmem_host.so.3 (no .so symlink), libnvshmem_device.a
-set(NVSHMEM_HOST_LIBRARY "${NVSHMEM_LIB_DIR}/libnvshmem_host.so.3")
-set(NVSHMEM_DEVICE_LIBRARY "${NVSHMEM_LIB_DIR}/libnvshmem_device.a")
+# Find NVSHMEM libraries dynamically instead of hardcoding soversions.
+# Pip package ships libnvshmem_host.so.3 (no .so symlink) and libnvshmem_device.a.
+find_library(NVSHMEM_HOST_LIBRARY
+  NAMES nvshmem_host
+  PATHS "${NVSHMEM_LIB_DIR}"
+  NO_DEFAULT_PATH
+)
+# Fallback: glob for any libnvshmem_host.so* if find_library fails (no .so symlink)
+if(NOT NVSHMEM_HOST_LIBRARY)
+  file(GLOB _nvshmem_host_candidates "${NVSHMEM_LIB_DIR}/libnvshmem_host.so*")
+  if(_nvshmem_host_candidates)
+    list(GET _nvshmem_host_candidates 0 NVSHMEM_HOST_LIBRARY)
+  endif()
+endif()
 
-if(NOT EXISTS "${NVSHMEM_HOST_LIBRARY}" OR NOT EXISTS "${NVSHMEM_DEVICE_LIBRARY}")
+find_library(NVSHMEM_DEVICE_LIBRARY
+  NAMES nvshmem_device
+  PATHS "${NVSHMEM_LIB_DIR}"
+  NO_DEFAULT_PATH
+)
+# Fallback: look for static archive directly
+if(NOT NVSHMEM_DEVICE_LIBRARY)
+  if(EXISTS "${NVSHMEM_LIB_DIR}/libnvshmem_device.a")
+    set(NVSHMEM_DEVICE_LIBRARY "${NVSHMEM_LIB_DIR}/libnvshmem_device.a")
+  endif()
+endif()
+
+if(NOT NVSHMEM_HOST_LIBRARY OR NOT NVSHMEM_DEVICE_LIBRARY)
+  message(STATUS "FindNVSHMEM: could not locate host or device library in ${NVSHMEM_LIB_DIR}")
   set(NVSHMEM_FOUND FALSE)
   return()
 endif()

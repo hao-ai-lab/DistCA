@@ -93,8 +93,17 @@ else:
 export NVSHMEM_PREFIX
 echo "=== NVSHMEM_PREFIX=$NVSHMEM_PREFIX ==="
 
-# Build csrc (libas_comm.so). Ampere = 86; Hopper = 90a. Override with CMAKE_CUDA_ARCHITECTURES if needed.
-ARCH="${CMAKE_CUDA_ARCHITECTURES:-86}"
+# Build csrc (libas_comm.so). Auto-detect GPU arch; override with CMAKE_CUDA_ARCHITECTURES if needed.
+if [ -z "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
+  # Auto-detect compute capability from first GPU (e.g. "86" for A100, "90" for H100)
+  ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.' 2>/dev/null || true)
+  if [ -z "$ARCH" ]; then
+    echo "=== WARNING: Could not auto-detect CUDA arch; defaulting to 86 (Ampere). Set CMAKE_CUDA_ARCHITECTURES to override. ==="
+    ARCH="86"
+  fi
+else
+  ARCH="$CMAKE_CUDA_ARCHITECTURES"
+fi
 echo "=== Building csrc (CUDA arch $ARCH) ==="
 cd csrc
 rm -rf build
