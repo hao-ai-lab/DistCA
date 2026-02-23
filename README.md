@@ -62,6 +62,10 @@ git clone --depth 1 https://github.com/hao-ai-lab/DistCA
 See the [installation guide](./README.Installation.md) for detailed instructions.
 
 
+## Docker single-GPU verification
+
+You can verify the setup with Docker on a single GPU (no Slurm). See the [Docker guide](./README.Docker.md) for smoke test, benchmark, and interactive shell options.
+
 ## Usage
 
 We provide a preliminary slurm script for training a 8B LLaMA model with 128K context length on 2 nodes:

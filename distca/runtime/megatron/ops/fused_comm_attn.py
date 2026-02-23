@@ -1,9 +1,58 @@
 from dataclasses import dataclass
+import inspect
 import math
 import os
 from typing import Tuple
 
 import flash_attn.flash_attn_interface
+# Support multiple flash-attn API shapes across versions/builds.
+# Dao-AILab source exposes _flash_attn_varlen_forward / _flash_attn_varlen_backward (with underscore).
+_fa_iface = flash_attn.flash_attn_interface
+_flash_attn_varlen_fwd = (
+    getattr(_fa_iface, "_wrapped_flash_attn_varlen_forward", None)
+    or getattr(_fa_iface, "flash_attn_varlen_forward", None)
+    or getattr(_fa_iface, "_flash_attn_varlen_forward", None)
+)
+_flash_attn_varlen_bwd = (
+    getattr(_fa_iface, "_wrapped_flash_attn_varlen_backward", None)
+    or getattr(_fa_iface, "flash_attn_varlen_backward", None)
+    or getattr(_fa_iface, "_flash_attn_varlen_backward", None)
+    or getattr(_fa_iface, "flash_attn_varlen_bwd", None)
+)
+# Public API: flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, ...) -> (out, softmax_lse)
+_use_fa_varlen_func = False
+if _flash_attn_varlen_fwd is None:
+    _flash_attn_varlen_fwd = getattr(_fa_iface, "flash_attn_varlen_func", None) or getattr(
+        __import__("flash_attn", fromlist=["flash_attn_varlen_func"]),
+        "flash_attn_varlen_func",
+        None,
+    )
+    _use_fa_varlen_func = _flash_attn_varlen_fwd is not None
+if _flash_attn_varlen_bwd is None:
+    _flash_attn_varlen_bwd = getattr(_fa_iface, "flash_attn_varlen_bwd", None)
+if _flash_attn_varlen_fwd is None:
+    raise ImportError(
+        "flash_attn: need one of _wrapped_flash_attn_varlen_forward, flash_attn_varlen_forward, "
+        "_flash_attn_varlen_forward, or flash_attn_varlen_func. Your build exposes none. See installation docs / flash-attn build."
+    )
+if _flash_attn_varlen_bwd is None:
+    raise ImportError(
+        "flash_attn: need one of _wrapped_flash_attn_varlen_backward, flash_attn_varlen_backward, "
+        "_flash_attn_varlen_backward, or flash_attn_varlen_bwd (required for backward). Your build exposes none. See installation docs / flash-attn build."
+    )
+# Dao-AILab v2.5.x uses positional args and window_size tuple; no window_size_left/right kwargs, no softcap.
+# Older builds may have 13-arg forward (no block_table); newer have 14.
+def _fa_uses_positional_api(fn):
+    try:
+        return "window_size_left" not in inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return False
+_fa_fwd_uses_positional = _fa_uses_positional_api(_flash_attn_varlen_fwd)
+_fa_bwd_uses_positional = _fa_uses_positional_api(_flash_attn_varlen_bwd)
+try:
+    _fa_fwd_positional_accepts_block_table = "block_table" in inspect.signature(_flash_attn_varlen_fwd).parameters
+except (ValueError, TypeError):
+    _fa_fwd_positional_accepts_block_table = True
 from distca.runtime.attn_kernels.ops import DispatcherWrapper, fast_a2a
 from distca.runtime.megatron.packed_seq_params import PingPangPackedSeqParams, PingPangSingleStepPackedSeqParams
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -97,22 +146,55 @@ def _qkv_to_attn_out_fwd(q: Tensor, k: Tensor, v: Tensor,
         print("🟡 _qkv_to_attn_out_fwd: return_attn_probs = ", fa_args.return_attn_probs)
         print("🟡 _qkv_to_attn_out_fwd: block_table.shape = ", fa_args.block_table.shape if fa_args.block_table is not None else None)
     
-    out_padded, softmax_lse, S_dmask, rng_state = flash_attn.flash_attn_interface._wrapped_flash_attn_varlen_forward(
-        q, k, v,
-        fa_params.cu_seqlens_q,
-        fa_params.cu_seqlens_kv,
-        fa_params.max_seqlen_q,
-        fa_params.max_seqlen_kv,
-        fa_args.dropout_p,
-        softmax_scale,
-        causal=fa_args.causal,
-        window_size_left=fa_args.window_size[0],
-        window_size_right=fa_args.window_size[1],
-        softcap=fa_args.softcap,
-        alibi_slopes=fa_args.alibi_slopes,
-        return_softmax=fa_args.return_attn_probs and fa_args.dropout_p > 0,
-        block_table=fa_args.block_table,
-    )
+    if _use_fa_varlen_func:
+        # flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal)
+        result = _flash_attn_varlen_fwd(
+            q, k, v,
+            fa_params.cu_seqlens_q,
+            fa_params.cu_seqlens_kv,
+            fa_params.max_seqlen_q,
+            fa_params.max_seqlen_kv,
+            fa_args.dropout_p,
+            softmax_scale,
+            causal=fa_args.causal,
+        )
+        out_padded, softmax_lse = result[0], result[1]
+        S_dmask, rng_state = None, None
+    elif _fa_fwd_uses_positional:
+        # Dao-AILab v2.5.x: returns (out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state). Some builds have 13 args (no block_table).
+        _pos_args = (
+            q, k, v,
+            fa_params.cu_seqlens_q,
+            fa_params.cu_seqlens_kv,
+            fa_params.max_seqlen_q,
+            fa_params.max_seqlen_kv,
+            fa_args.dropout_p,
+            softmax_scale,
+            fa_args.causal,
+            fa_args.window_size,
+            fa_args.alibi_slopes,
+            fa_args.return_attn_probs and fa_args.dropout_p > 0,
+        )
+        if _fa_fwd_positional_accepts_block_table:
+            _pos_args = _pos_args + (fa_args.block_table,)
+        _out, _q, _k, _v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_fwd(*_pos_args)
+    else:
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_fwd(
+            q, k, v,
+            fa_params.cu_seqlens_q,
+            fa_params.cu_seqlens_kv,
+            fa_params.max_seqlen_q,
+            fa_params.max_seqlen_kv,
+            fa_args.dropout_p,
+            softmax_scale,
+            causal=fa_args.causal,
+            window_size_left=fa_args.window_size[0],
+            window_size_right=fa_args.window_size[1],
+            softcap=fa_args.softcap,
+            alibi_slopes=fa_args.alibi_slopes,
+            return_softmax=fa_args.return_attn_probs and fa_args.dropout_p > 0,
+            block_table=fa_args.block_table,
+        )
     # remove padding, if necessary; then reshape
     out = out_padded[..., :head_size_og]
     out = out.reshape(out.shape[0], fa_args.num_heads_q * fa_args.head_dim)
@@ -172,13 +254,22 @@ def _qkv_to_attn_out_bwd(
         print("🟡 _qkv_to_attn_out_bwd: alibi_slopes.shape = ", fa_args.alibi_slopes.shape if fa_args.alibi_slopes is not None else None)
         print("🟡 _qkv_to_attn_out_bwd: deterministic = ", fa_args.deterministic)
 
-    flash_attn.flash_attn_interface._wrapped_flash_attn_varlen_backward(
-        dout_padded, q, k, v, out_padded.contiguous(), softmax_lse, dq, dk, dv,
-        cu_seqlen_q, cu_seqlen_kv, max_seqlen_q, max_seqlen_kv,
-        fa_args.dropout_p, softmax_scale, fa_args.causal,
-        fa_args.window_size[0], fa_args.window_size[1], fa_args.softcap, fa_args.alibi_slopes,
-        fa_args.deterministic,
-    )
+    if _fa_bwd_uses_positional:
+        # Dao-AILab v2.5.x: _flash_attn_varlen_backward(..., window_size, alibi_slopes, deterministic) — no softcap
+        _flash_attn_varlen_bwd(
+            dout_padded, q, k, v, out_padded.contiguous(), softmax_lse, dq, dk, dv,
+            cu_seqlen_q, cu_seqlen_kv, max_seqlen_q, max_seqlen_kv,
+            fa_args.dropout_p, softmax_scale, fa_args.causal,
+            fa_args.window_size, fa_args.alibi_slopes, fa_args.deterministic,
+        )
+    else:
+        _flash_attn_varlen_bwd(
+            dout_padded, q, k, v, out_padded.contiguous(), softmax_lse, dq, dk, dv,
+            cu_seqlen_q, cu_seqlen_kv, max_seqlen_q, max_seqlen_kv,
+            fa_args.dropout_p, softmax_scale, fa_args.causal,
+            fa_args.window_size[0], fa_args.window_size[1], fa_args.softcap, fa_args.alibi_slopes,
+            fa_args.deterministic,
+        )
     dq = dq[..., : dout.shape[-1]]
     dk = dk[..., : dout.shape[-1]]
     dv = dv[..., : dout.shape[-1]]
@@ -246,7 +337,50 @@ class FusedCommAttn(torch.autograd.Function):
         # Step 3: pre-dispatch attn out
         assert attn_out.shape == recv_q.shape
         softmax_lse_dtype = softmax_lse.dtype
-        softmax_lse = softmax_lse.T.contiguous()
+        total_tokens = attn_out.shape[0]
+        # Dispatch expects softmax_lse.shape[0] == attn_out.shape[0] (total_tokens). Flash-attn may return:
+        # - 3D (batch_size, num_heads, max_seqlen_q) from C++ varlen_fwd; unpack with cu_seqlens_q.
+        # - 3D with trailing 1; squeeze. Or 3D with one dim == total_tokens; permute and reshape.
+        # - 2D (num_heads, total_tokens) or (total_tokens, num_heads); transpose if needed.
+        if softmax_lse.ndim == 3:
+            if softmax_lse.shape[-1] == 1:
+                softmax_lse = softmax_lse.squeeze(-1)
+            else:
+                batch_size, num_heads_fa, max_sq = softmax_lse.shape[0], softmax_lse.shape[1], softmax_lse.shape[2]
+                cu = fwd_fa_params.cu_seqlens_q
+                # C++ varlen returns (batch_size, num_heads, max_seqlen_q); unpack to (total_tokens, num_heads).
+                if cu is not None and (cu.shape[0] - 1) == batch_size and max_sq == fwd_fa_params.max_seqlen_q:
+                    out_lse = torch.empty(
+                        total_tokens, num_heads_fa,
+                        dtype=softmax_lse.dtype, device=softmax_lse.device,
+                    )
+                    for i in range(batch_size):
+                        start = cu[i].item()
+                        end = cu[i + 1].item()
+                        seqlen = end - start
+                        # softmax_lse[i] is (num_heads, max_seqlen_q); take [:, :seqlen] -> (num_heads, seqlen), then .T -> (seqlen, num_heads)
+                        out_lse[start:end].copy_(softmax_lse[i, :, :seqlen].T.contiguous())
+                    softmax_lse = out_lse
+                else:
+                    for i in range(3):
+                        if softmax_lse.shape[i] == total_tokens:
+                            perm = [i] + [j for j in range(3) if j != i]
+                            softmax_lse = softmax_lse.permute(*perm).reshape(total_tokens, -1)
+                            break
+        if softmax_lse.ndim == 2 and softmax_lse.shape[0] != total_tokens:
+            softmax_lse = softmax_lse.T.contiguous()
+        if softmax_lse.shape[0] != total_tokens:
+            numel = softmax_lse.numel()
+            if numel % total_tokens == 0:
+                softmax_lse = softmax_lse.reshape(total_tokens, -1)
+            else:
+                raise RuntimeError(
+                    f"softmax_lse layout incompatible with packed tokens: "
+                    f"attn_out.shape[0] (total_tokens) = {total_tokens}, "
+                    f"softmax_lse.shape = {softmax_lse.shape}, softmax_lse.numel() = {numel}. "
+                    f"Flash-attn varlen should return (total_tokens, num_heads); "
+                    f"this build returns layout that cannot be reshaped (e.g. (max_seqlen_q, num_heads) with max_seqlen_q != total_tokens)."
+                )
         attn_out = pre_a2a_attn_out_with_lse(
             attn_out, softmax_lse, fwd_attn_out_metadata.seq_lens[0].send_seqlens,
             fwd_attn_out_metadata.send_memcpy_metadata[0],
