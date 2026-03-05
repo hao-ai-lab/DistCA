@@ -196,11 +196,11 @@ def test(args):
         copy_seq_mask = metadata_slice.kv_grad_send_dedup.main_copy_mask
         a2a_memcpy_non_cp(
             attn_k_shard, k_send_offsets, metadata_slice.seq_lens[1].send_seqlens,
-            to_nvshmem=True, buffer=dst_shard, copy_seq_mask=copy_seq_mask
+            to_nvshmem=True, buffer=dst_shard, instance_id=copy_seq_mask
         )
         a2a_memcpy_non_cp(
             attn_v_shard, v_send_offsets, metadata_slice.seq_lens[1].send_seqlens,
-            to_nvshmem=True, buffer=dst_shard, copy_seq_mask=copy_seq_mask
+            to_nvshmem=True, buffer=dst_shard, instance_id=copy_seq_mask
         )
         torch.testing.assert_close(dst_shard, dst_buffer[rank])
         print(f"copying rank {rank} grads to send buffer done.")
