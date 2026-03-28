@@ -1,5 +1,7 @@
 # Docker single-GPU verification (quick smoke / benchmark)
 
+This is the primary supported execution path for the `Artifacts Evaluated – Functional` badge.
+
 If you use Docker, you can verify the setup with a single GPU without Slurm. Two ways:
 
 ## 1. Run once then container exits (one-shot, good for CI / quick check)

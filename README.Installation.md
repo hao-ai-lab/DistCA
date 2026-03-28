@@ -1,5 +1,12 @@
 # Installation
 
+This document describes the full author/developer installation path.
+
+For artifact review, use the Docker-based smoke-test path first:
+
+- [artifact_evaluation/README.md](./artifact_evaluation/README.md)
+- [README.Docker.md](./README.Docker.md)
+
 ## Overview
 
 We use the following environment in our setup and testing:
@@ -9,10 +16,10 @@ We use the following environment in our setup and testing:
     - NVSHMEM 3.2.5
     - OPENMPI 5.0.8
     - PyTorch 2.7.0
-- Hardware: NVIDIA H200 GPU
+- Hardware: NVIDIA DGX H200 node with 8 H200 GPUs
 - Interconnect: 
-    - Intranode: NVLink
-    - Internode: 40GB/s InfiniBand
+    - Intranode: NVLink/NVSwitch
+    - Internode: 500 Gbps InfiniBand
 
 
 ## Installation
