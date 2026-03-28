@@ -18,6 +18,9 @@
   <a href="https://opensource.org/licenses/Apache-2.0">
     <img src="https://flat.badgen.net/badge/License/Apache--2.0/blue" alt="License">
   </a>
+  <a href="https://doi.org/10.5281/zenodo.3802578">
+    <img src="https://zenodo.org/badge/161216439.svg" alt="DOI">
+  </a>
 </p>
 
 
@@ -61,6 +64,11 @@ git clone --depth 1 https://github.com/hao-ai-lab/DistCA
 
 See the [installation guide](./README.Installation.md) for detailed instructions.
 
+## Artifact Evaluation
+
+For artifact review, please refer to the artifact evaluation guide:
+
+- [`artifact_evaluation/README.md`](./artifact_evaluation/README.md)
 
 ## Docker single-GPU verification
 
