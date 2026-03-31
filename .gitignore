@@ -190,3 +190,7 @@ logs-latest
 .build/
 
 models/
+
+.draft
+
+.env.local
