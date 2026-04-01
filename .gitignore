@@ -194,3 +194,4 @@ models/
 .draft
 
 .env.local
+tmp/
