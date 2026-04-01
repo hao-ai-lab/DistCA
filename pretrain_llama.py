@@ -44,8 +44,16 @@ enable_clickable_excepthook()
 rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
 local = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
 p = psutil.Process(os.getpid())
-NCPU_PER_PROC = 16
-p.cpu_affinity(list(range(local * NCPU_PER_PROC, (local + 1) * NCPU_PER_PROC)))  # pin to core based on local rank
+available_cpus = p.cpu_affinity()
+world_size = int(os.environ.get("WORLD_SIZE", "1"))
+cores_per_proc = max(1, len(available_cpus) // max(1, world_size))
+start_cpu = local * cores_per_proc
+end_cpu = min(start_cpu + cores_per_proc, len(available_cpus))
+if start_cpu < len(available_cpus):
+    try:
+        p.cpu_affinity(available_cpus[start_cpu:end_cpu] or available_cpus)
+    except Exception as exc:
+        print(f"[{rank}] skipping cpu affinity pinning: {exc}")
 print(f"[{rank}] allowed CPUs:", p.cpu_affinity())
 
 aff, mems = check_cpu_binding.check_cpu_binding()

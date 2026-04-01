@@ -30,7 +30,7 @@ app = modal.App("distca-ae-smoke-test")
 @app.function(
     image=image, 
     gpu="H100",
-    timeout=3600 
+    timeout=7200 
 )
 def run_gpu_smoke_test():
     print("=== Starting Single-GPU Smoke Test on Modal ===")

@@ -4,6 +4,8 @@ logs/
 .env.local
 tmp/
 .git/
+**/__pycache__/
+**/*.pyc
 *.md
 LICENSE
 Dockerfile.cpu

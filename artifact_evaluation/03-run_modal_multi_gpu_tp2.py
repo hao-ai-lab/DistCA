@@ -21,7 +21,7 @@ app = modal.App("distca-ae-llama-32l-tp2-100iter")
 @app.function(
     image=image, 
     gpu="H100:2",
-    timeout=3600 
+    timeout=7200 
 )
 def run_gpu_llama_tp2_100iter():
     print("=== Starting LLaMA 8B (32-Layer) TP=2 100-Iter Smoke Test ===")

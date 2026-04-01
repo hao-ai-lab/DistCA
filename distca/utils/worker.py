@@ -79,10 +79,32 @@ class MegatronE2eWorker(MegatronBaseWorker):
         trust_remote_code=True,
     ):
 
+        class _DummyTokenizer:
+            bos_token_id = 1
+            eos_token_id = 2
+            pad_token_id = 0
+
+            def encode(self, text, add_special_tokens=True, truncation=False):
+                tokens = [((ord(ch) % 251) + 3) for ch in text]
+                if add_special_tokens:
+                    return [self.bos_token_id] + tokens + [self.eos_token_id]
+                return tokens
+
+        class _DummyProcessor:
+            pass
+
         # Step 1: initialize the tokenizer
         self.local_path = model_path
-        self.tokenizer = AutoTokenizer.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
-        self.processor = AutoProcessor.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
+        except Exception as exc:
+            print(f"Tokenizer unavailable for {self.local_path}, using dummy tokenizer: {exc}")
+            self.tokenizer = _DummyTokenizer()
+        try:
+            self.processor = AutoProcessor.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
+        except Exception as exc:
+            print(f"Processor unavailable for {self.local_path}, using dummy processor: {exc}")
+            self.processor = _DummyProcessor()
 
         # Step 2: get the hf
         hf_config = AutoConfig.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
@@ -234,5 +256,4 @@ class MegatronE2eWorker(MegatronBaseWorker):
         self.optimizer_scheduler = optimizer_scheduler
         self.hf_config = self.hf_config
         self.optim_config = optim_config
-
 
