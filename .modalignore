@@ -1,0 +1,11 @@
+.draft/
+artifact_evaluation/
+logs/
+.env.local
+tmp/
+.git/
+*.md
+LICENSE
+Dockerfile.cpu
+scripts/docker_install_and_build_cpu.sh
+scripts/run_docker_cpu_smoke.sh
