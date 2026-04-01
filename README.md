@@ -18,8 +18,8 @@
   <a href="https://opensource.org/licenses/Apache-2.0">
     <img src="https://flat.badgen.net/badge/License/Apache--2.0/blue" alt="License">
   </a>
-  <a href="https://doi.org/10.5281/zenodo.3802578">
-    <img src="https://zenodo.org/badge/161216439.svg" alt="DOI">
+  <a href="https://doi.org/10.5281/zenodo.19364553">
+    <img src="https://zenodo.org/badge/DOI/10.5281/zenodo.19364553.svg" alt="DOI">
   </a>
 </p>
 
