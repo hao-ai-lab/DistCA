@@ -11,6 +11,12 @@ DISTCA_ROOT = Path(__file__).parent.parent.resolve()
 image = (
     modal.Image.from_dockerfile(DISTCA_ROOT / "Dockerfile")
     .add_local_dir(DISTCA_ROOT, remote_path="/workspace/DistCA", copy=True)
+    # models/ is gitignored, so we must copy the tiny smoke model config explicitly
+    .add_local_file(
+        DISTCA_ROOT / "models" / "tiny-smoke-llama8" / "config.json",
+        remote_path="/workspace/DistCA/models/tiny-smoke-llama8/config.json",
+        copy=True,
+    )
     .workdir("/workspace/DistCA")
     .run_commands("git clone https://github.com/NVIDIA/TransformerEngine.git && cd TransformerEngine && git checkout v2.4 && git submodule update --init --recursive")
     .run_commands("git clone https://github.com/NVIDIA/Megatron-LM.git && cd Megatron-LM && git checkout core_v0.12.1 && git submodule update --init --recursive")
@@ -53,7 +59,7 @@ def run_gpu_llama_multi_node():
     use_cluster_profile = CLUSTER_SIZE > 1
     effective_gpus_per_node = 8 if use_cluster_profile else 1
     effective_tp_size = 8 if use_cluster_profile else 1
-    effective_num_layers = 32 if use_cluster_profile else 1
+    effective_num_layers = int(os.environ.get("DISTCA_NUM_LAYERS", "32" if use_cluster_profile else "1"))
     
     print(f"=== Starting LLaMA 8B (32-Layer) 2-Node Test (TP=8, DP=2) on rank {rank}/{world_size} ===")
     
